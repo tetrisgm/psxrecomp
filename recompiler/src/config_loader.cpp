@@ -637,6 +637,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             rt.runtime_cpu_overclock =
                 (uint32_t)toml::find<int>(video, "cpu_overclock");
         }
+        if (video.contains("hd_textures")) {
+            rt.video_hd_textures = toml::find<bool>(video, "hd_textures");
+        }
+        if (video.contains("hd_texture_dump")) {
+            rt.video_hd_texture_dump = toml::find<bool>(video, "hd_texture_dump");
+        }
+        if (video.contains("hd_texture_dir")) {
+            rt.video_hd_texture_dir = toml::find<std::string>(video, "hd_texture_dir");
+        }
         if (video.contains("geometry_correction")) {
             rt.video_geometry_correction =
                 toml::find<bool>(video, "geometry_correction");
