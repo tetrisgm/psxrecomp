@@ -11099,6 +11099,11 @@ int main(int argc, char** argv) {
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
+            if (gc.runtime.runtime_cpu_overclock != 100u) {
+                psx_set_cpu_overclock(gc.runtime.runtime_cpu_overclock);
+                std::fprintf(stdout, "psxrecomp: CPU overclock %u%%\n",
+                             psx_get_cpu_overclock());
+            }
             if (const char *probe_overclock =
                     std::getenv("PSX_CANDIDATE_CPU_OVERCLOCK")) {
                 char *end = nullptr;
