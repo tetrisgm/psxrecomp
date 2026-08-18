@@ -264,6 +264,11 @@ int psx_mod_set_load_acceleration(uint32_t wall_clock_multiplier,
 int psx_mod_set_disc_speed(uint32_t divisor,
                            uint32_t instant_max_per_frame);
 
+/* Fingerprint of the resolved mod plan for this session ("" when no mods
+ * runtime is active). Savestates embed it (BS_SEC_MODSET) so a load into a
+ * session with a different enabled mod set refuses cleanly. */
+const char* psx_mod_runtime_fingerprint_cstr(void);
+
 /* Controller presentation values exposed to trusted game-owned plugins. */
 enum {
     PSX_MOD_CONTROLLER_ANALOG = 1,
