@@ -99,9 +99,141 @@ static std::string manifest(const std::string& id, const std::string& version,
         "game_id = \"SLUS-TEST\"\n" + extra;
 }
 
+static fs::path find_wipeout3_title_root() {
+    if (const char* override_root =
+            std::getenv("PSXRECOMP_WIPEOUT3_TITLE_ROOT")) {
+        if (*override_root) return fs::path(override_root);
+    }
+
+    std::vector<fs::path> starts = {
+        fs::path(__FILE__).parent_path(), fs::current_path()};
+    for (fs::path start : starts) {
+        std::error_code ec;
+        start = fs::absolute(start, ec);
+        if (ec) continue;
+        for (unsigned depth = 0; depth < 8 && !start.empty(); ++depth) {
+            if (fs::is_regular_file(start / "game.toml", ec) &&
+                fs::is_directory(start / "mods/preloaded/packages", ec) &&
+                fs::is_directory(start / "psxrecomp/mods/builtin/packages", ec))
+                return start;
+            const fs::path parent = start.parent_path();
+            if (parent == start) break;
+            start = parent;
+        }
+    }
+    return {};
+}
+
+static void noop_title_plugin() {}
+
+static void check_wipeout3_direct_catalog(const fs::path& scratch_root) {
+    const fs::path title_root = find_wipeout3_title_root();
+    if (title_root.empty()) {
+        std::cout << "WipEout 3 title catalog not present; integration check skipped\n";
+        return;
+    }
+
+    const fs::path catalog = scratch_root / "wipeout3-direct-catalog";
+    std::error_code ec;
+    fs::remove_all(catalog, ec);
+    ec.clear();
+    fs::create_directories(scratch_root, ec);
+    check(!ec, "WipEout 3 catalog scratch directory must be creatable");
+    if (ec) return;
+    fs::copy(title_root / "mods/preloaded", catalog,
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing,
+             ec);
+    check(!ec, "WipEout 3 preloaded catalog must copy into the test fixture");
+    if (ec) return;
+
+    const fs::path builtin =
+        title_root / "psxrecomp/mods/builtin/packages";
+    for (const fs::directory_entry& package : fs::directory_iterator(builtin)) {
+        if (!package.is_directory()) continue;
+        fs::copy(package.path(), catalog / "packages" /
+                                      package.path().filename(),
+                 fs::copy_options::recursive |
+                     fs::copy_options::overwrite_existing,
+                 ec);
+        check(!ec, "framework built-in packages must merge into the fixture");
+        if (ec) return;
+    }
+
+    ModPackageManager manager(catalog);
+    std::string error;
+    check(manager.scan(&error), error.c_str());
+    check(manager.load_state(&error), error.c_str());
+
+    struct ExpectedPackage {
+        const char* id;
+        const char* compatibility;
+    };
+    static const ExpectedPackage expected[] = {
+        {"wipeout3.convenience.skip-intro", "shared"},
+        {"wipeout3.enhancement.birds", "shared"},
+        {"wipeout3.enhancement.draw-distance-far", "shared"},
+        {"wipeout3.enhancement.hue-8mb-title", "isolated"},
+        {"wipeout3.enhancement.ship-distance", "shared"},
+        {"wipeout3.enhancement.ship-lod", "shared"},
+    };
+    for (const ExpectedPackage& item : expected) {
+        const ModPackage* package = manager.selected_package(item.id);
+        const std::string message =
+            std::string("direct package must parse and select: ") + item.id;
+        check(package != nullptr, message.c_str());
+        if (package) {
+            const std::string compatibility_message =
+                std::string("direct package has wrong save compatibility: ") +
+                item.id;
+            check(package->save_compatibility == item.compatibility,
+                  compatibility_message.c_str());
+        }
+    }
+
+    mod_clear_plugins_for_tests();
+    for (const auto& [id, versions] : manager.packages()) {
+        (void)id;
+        for (const auto& [version, package] : versions) {
+            (void)version;
+            for (const ModPlugin& plugin : package.plugins)
+                (void)mod_register_activation_plugin(plugin.id,
+                                                     noop_title_plugin);
+        }
+    }
+
+    const ModResolution resolution = manager.resolve(
+        "SCES-02845",
+        "0213f5292fa1d995ebe61f42d5dbdb6614e481cb3840ac5f1521c2dfdccc0a4d",
+        "003bdc41068252e791ea7dd99ba1b94814dc48b967e57a7cdc4bf6e1cf4cb1e9");
+    if (!resolution.ok) {
+        for (const std::string& item : resolution.errors)
+            std::cerr << "WipEout catalog resolve: " << item << "\n";
+    }
+    check(resolution.ok,
+          "reviewed WipEout direct-mod state must resolve as one valid plan");
+    check(resolution.writes.empty() && resolution.overlays.empty() &&
+              resolution.derived_discs.empty(),
+          "reviewed WipEout direct-mod defaults must not select patches, "
+          "overlays, or derived discs");
+    for (const ExpectedPackage& item : expected) {
+        const bool active = std::any_of(
+            resolution.ordered.begin(), resolution.ordered.end(),
+            [&](const ModPackage* package) {
+                return package && package->id == item.id;
+            });
+        const std::string message =
+            std::string("direct package must be active in default plan: ") +
+            item.id;
+        check(active, message.c_str());
+    }
+    mod_clear_plugins_for_tests();
+    fs::remove_all(catalog, ec);
+}
+
 int main() {
     const fs::path root = fs::temp_directory_path() / "psxrecomp-mod-package-test";
     std::error_code ec;
+    check_wipeout3_direct_catalog(root);
     fs::remove_all(root, ec);
 
     {

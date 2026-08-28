@@ -1,5 +1,8 @@
 #include "mod_runtime.h"
 #include "mod_packages.h"
+#include "mod_plugins.h"
+#include "cpu_state.h"
+#include "psx_lobby_client.h"
 #include "psx_sha256.h"
 
 #include <array>
@@ -16,6 +19,12 @@ static std::array<uint8_t, 2 * 1024 * 1024> ram;
 static int failures;
 static int activation_calls;
 static int plugin_calls;
+static int instruction_site_calls;
+static int instruction_fanout_calls;
+static int instruction_disabled_calls;
+static int instruction_substitute_calls;
+static uint32_t plugin_phase;
+static uint32_t plugin_counter;
 
 extern "C" uint8_t psx_read_byte(uint32_t address) {
     return ram[address & 0x1fffffu];
@@ -60,6 +69,11 @@ extern "C" int psx_ws_x_margin(void) { return 0; }
 
 extern "C" void dirty_ram_mark_executable_range(uint32_t, uint32_t) {}
 extern "C" int fntrace_is_game_started(void) { return 1; }
+extern "C" int psx_dual_machine_live(void) { return -1; }
+extern "C" int psx_lobby_in_lobby(void) { return 0; }
+extern "C" const PsxLobbyMatchCaps* psx_lobby_match_caps(void) {
+    return nullptr;
+}
 
 static void test_vblank_plugin(void) {
     plugin_calls++;
@@ -67,6 +81,61 @@ static void test_vblank_plugin(void) {
 
 static void test_activation_plugin(void) {
     activation_calls++;
+}
+
+static uint32_t test_state_size(void) { return 8u; }
+
+static int test_state_save(uint8_t* out, uint32_t size) {
+    if (!out || size != 8u) return 0;
+    out[0] = (uint8_t)plugin_phase;
+    out[1] = (uint8_t)(plugin_phase >> 8);
+    out[2] = (uint8_t)(plugin_phase >> 16);
+    out[3] = (uint8_t)(plugin_phase >> 24);
+    out[4] = (uint8_t)plugin_counter;
+    out[5] = (uint8_t)(plugin_counter >> 8);
+    out[6] = (uint8_t)(plugin_counter >> 16);
+    out[7] = (uint8_t)(plugin_counter >> 24);
+    return 1;
+}
+
+static int test_state_load(const uint8_t* data, uint32_t size, int apply) {
+    if (!data || size != 8u) return 0;
+    const uint32_t phase = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+    const uint32_t counter = (uint32_t)data[4] | ((uint32_t)data[5] << 8) |
+        ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24);
+    if (phase > 7u) return 0;
+    if (apply) {
+        plugin_phase = phase;
+        plugin_counter = counter;
+    }
+    return 1;
+}
+
+static uint32_t test_instruction_site_plugin(CPUState* cpu,
+                                             uint32_t address) {
+    instruction_site_calls++;
+    cpu->gpr[2] = 0x12345678u;
+    cpu->hi = 0x11111111u;
+    cpu->lo = 0x22222222u;
+    return address + 0x20u;
+}
+
+static uint32_t test_instruction_fanout_plugin(CPUState* cpu, uint32_t) {
+    instruction_fanout_calls++;
+    cpu->gpr[3] = 0x87654321u;
+    return 0u;
+}
+
+static uint32_t test_instruction_disabled_plugin(CPUState*, uint32_t) {
+    instruction_disabled_calls++;
+    return 0u;
+}
+
+static uint32_t test_instruction_substitute_plugin(CPUState* cpu, uint32_t) {
+    instruction_substitute_calls++;
+    cpu->gpr[5] = 0xCAFEBABEu;
+    return PSX_MOD_INSTRUCTION_SUBSTITUTE_LOAD;
 }
 
 static void check(bool value, const char* message) {
@@ -156,6 +225,9 @@ int main() {
         "[[feature]]\n"
         "id = \"vblank-plugin\"\n"
         "name = \"VBlank Plugin\"\n"
+        "[[feature]]\n"
+        "id = \"instruction-fanout\"\n"
+        "name = \"Instruction Fanout\"\n"
         "[[option]]\n"
         "feature = \"dynamic-main\"\n"
         "id = \"count\"\n"
@@ -240,7 +312,10 @@ int main() {
             sha256_hex(std::vector<uint8_t>(overlay.size(), 0)) + "\"\n"
         "[[plugin]]\n"
         "feature = \"vblank-plugin\"\n"
-        "id = \"runtime.test-vblank\"\n");
+        "id = \"runtime.test-vblank\"\n"
+        "[[plugin]]\n"
+        "feature = \"instruction-fanout\"\n"
+        "id = \"runtime.test-instruction-fanout\"\n");
     write_text(root / "state.toml",
         "format_version = 2\n"
         "[[package]]\n"
@@ -285,6 +360,10 @@ int main() {
         "[[feature]]\n"
         "package_id = \"runtime.test\"\n"
         "id = \"vblank-plugin\"\n"
+        "enabled = true\n"
+        "[[feature]]\n"
+        "package_id = \"runtime.test\"\n"
+        "id = \"instruction-fanout\"\n"
         "enabled = true\n");
 
     std::string error;
@@ -295,6 +374,30 @@ int main() {
     check(PSXRecompV4::mod_register_vblank_plugin(
               "runtime.test-vblank", test_vblank_plugin),
           "runtime test plugin must register");
+    check(psx_mod_register_instruction_site_plugin(
+              "runtime.test-instruction-fanout", 0x80012340u,
+              test_instruction_fanout_plugin),
+          "runtime test zero-continuation fan-out hook must register");
+    check(psx_mod_register_instruction_site_plugin(
+              "runtime.test-disabled", 0x80012340u,
+              test_instruction_disabled_plugin),
+          "runtime test disabled instruction-site hook must register");
+    check(psx_mod_register_instruction_site_plugin(
+              "runtime.test-vblank", 0x80012340u,
+              test_instruction_site_plugin),
+          "runtime test instruction-site hook must register");
+    check(psx_mod_register_instruction_site_plugin(
+              "runtime.test-vblank", 0x80012400u,
+              test_instruction_site_plugin),
+          "one selected plugin id may fan out to multiple instruction sites");
+    check(psx_mod_register_instruction_site_plugin(
+              "runtime.test-vblank", 0x80012500u,
+              test_instruction_substitute_plugin),
+          "runtime test load-substitution hook must register");
+    check(psx_mod_register_state_plugin(
+              "runtime.test-vblank", 3u, test_state_size,
+              test_state_save, test_state_load),
+          "runtime test native-state provider must register");
     check(PSXRecompV4::mod_runtime_initialize(
               root, "SLUS-RUNTIME", 0x80002000, {}, &error),
           error.c_str());
@@ -306,6 +409,55 @@ int main() {
     mod_runtime_on_vblank();
     check(plugin_calls == 1,
           "resolved trusted plugin must run on guest VBlank");
+    check(psx_mod_plugin_state_required() == 1,
+          "selected state provider must make its section required");
+    plugin_phase = 5u;
+    plugin_counter = 0x89ABCDEFu;
+    std::vector<uint8_t> plugin_state(psx_mod_plugin_state_bytes());
+    check(!plugin_state.empty() &&
+              psx_mod_plugin_state_write(plugin_state.data(),
+                                         (uint32_t)plugin_state.size()),
+          "selected native plugin state must serialize");
+    plugin_phase = 1u;
+    plugin_counter = 2u;
+    check(psx_mod_plugin_state_validate(plugin_state.data(),
+                                        (uint32_t)plugin_state.size()) &&
+              plugin_phase == 1u && plugin_counter == 2u,
+          "native plugin preflight must validate without mutation");
+    check(psx_mod_plugin_state_apply(plugin_state.data(),
+                                     (uint32_t)plugin_state.size()) &&
+              plugin_phase == 5u && plugin_counter == 0x89ABCDEFu,
+          "native plugin state must restore exact provider payload");
+    std::vector<uint8_t> wrong_schema = plugin_state;
+    wrong_schema[20] ^= 1u; /* first record schema_version */
+    check(!psx_mod_plugin_state_validate(wrong_schema.data(),
+                                         (uint32_t)wrong_schema.size()),
+          "native plugin state must reject a schema-version mismatch");
+    std::vector<uint8_t> wrong_id = plugin_state;
+    wrong_id[32] ^= 1u; /* first byte of first stable provider id */
+    check(!psx_mod_plugin_state_validate(wrong_id.data(),
+                                         (uint32_t)wrong_id.size()),
+          "native plugin state must reject a provider-id mismatch");
+    CPUState hook_cpu{};
+    check(psx_mod_instruction_site(&hook_cpu, 0x80012344u) == 0u &&
+              instruction_site_calls == 0,
+          "runtime dispatcher ignores unregistered instruction sites");
+    check(psx_mod_instruction_site(&hook_cpu, 0x80012340u) == 0x80012360u &&
+              instruction_site_calls == 1 &&
+              instruction_fanout_calls == 1 &&
+              instruction_disabled_calls == 0 &&
+              hook_cpu.gpr[2] == 0x12345678u &&
+              hook_cpu.gpr[3] == 0x87654321u &&
+              hook_cpu.hi == 0x11111111u && hook_cpu.lo == 0x22222222u,
+          "indexed dispatcher preserves enabled fan-out order, filters disabled hooks, and supplies continuation");
+    check(psx_mod_instruction_site(&hook_cpu, 0x80012400u) == 0x80012420u &&
+              instruction_site_calls == 2,
+          "one manifest-selected plugin dispatches at every registered site");
+    check(psx_mod_instruction_site(&hook_cpu, 0x80012500u) ==
+              PSX_MOD_INSTRUCTION_SUBSTITUTE_LOAD &&
+              instruction_substitute_calls == 1 &&
+              hook_cpu.gpr[5] == 0xCAFEBABEu,
+          "runtime dispatcher propagates the load-substitution sentinel and callback value unchanged");
 
     ram[0x1000] = 1; ram[0x1001] = 2; ram[0x1002] = 3; ram[0x1003] = 4;
     ram[0x1100] = 0; ram[0x1101] = 0;

@@ -11,6 +11,26 @@ typedef void (*PSXModActivationCallback)(void);
 struct CPUState;
 typedef void (*PSXModFunctionEntryCallback)(struct CPUState* cpu,
                                             uint32_t address);
+/* A load-site callback may write the replacement value to the load's target
+ * GPR and return this sentinel. Generated code then preserves the original
+ * load's timing, memory access, load-delay, PGXP, and cosim machinery while
+ * substituting that value for the memory result. This action is supported only
+ * for LB/LH/LW/LBU/LHU sites whose target is not $zero. */
+#define PSX_MOD_INSTRUCTION_SUBSTITUTE_LOAD UINT32_MAX
+
+/* Return 0 to execute the original instruction. Return a nonzero guest PC
+ * after implementing/replacing it; generated code exits the current owner and
+ * lets the normal dispatcher resume there. Returning address+4 is the common
+ * single-instruction replacement/skip case. At a supported load site, the
+ * substitution sentinel above is the sole non-PC action. */
+typedef uint32_t (*PSXModInstructionSiteCallback)(struct CPUState* cpu,
+                                                  uint32_t address);
+typedef uint32_t (*PSXModStateSizeCallback)(void);
+typedef int (*PSXModStateSaveCallback)(uint8_t* out, uint32_t size);
+/* `apply == 0` is a non-mutating validation pass. A provider must accept or
+ * reject exactly the same payload it would accept with `apply == 1`. */
+typedef int (*PSXModStateLoadCallback)(const uint8_t* data, uint32_t size,
+                                      int apply);
 
 /*
  * Register a trusted, statically linked plugin implementation. Package
@@ -27,6 +47,31 @@ int psx_mod_register_function_entry_plugin(
     const char* id, uint32_t address, PSXModFunctionEntryCallback callback);
 /* Called only from generated functions explicitly listed by the game config. */
 void psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
+int psx_mod_register_instruction_site_plugin(
+    const char* id, uint32_t address, PSXModInstructionSiteCallback callback);
+/* Called only at exact PCs listed by [recompiler].mod_instruction_sites. */
+uint32_t psx_mod_instruction_site(struct CPUState* cpu, uint32_t address);
+
+/*
+ * Register deterministic host-side plugin state for savestates. The stable
+ * id must be the id selected by the package manifest. The runtime serializes
+ * only enabled providers, sorted by id, and requires an exact id/version set
+ * on restore. Payloads are bounded by the runtime and validated before any
+ * machine state is applied, so an old state cannot silently resume with a
+ * reset scheduler phase.
+ */
+int psx_mod_register_state_plugin(const char* id, uint32_t version,
+                                  PSXModStateSizeCallback size_callback,
+                                  PSXModStateSaveCallback save_callback,
+                                  PSXModStateLoadCallback load_callback);
+
+/* Boot-state integration. These remain public C ABI so boot_state.c does not
+ * depend on the C++ registry implementation. */
+uint32_t psx_mod_plugin_state_bytes(void);
+int psx_mod_plugin_state_write(uint8_t* out, uint32_t size);
+int psx_mod_plugin_state_validate(const uint8_t* data, uint32_t size);
+int psx_mod_plugin_state_apply(const uint8_t* data, uint32_t size);
+int psx_mod_plugin_state_required(void);
 
 /* Narrow guest services available to trusted plugin callbacks. */
 int psx_mod_game_started(void);

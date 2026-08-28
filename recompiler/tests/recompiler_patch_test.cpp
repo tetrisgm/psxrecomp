@@ -115,6 +115,33 @@ fs::path write_config(const fs::path& root, const std::string& suffix,
 }
 
 void parser_tests(const fs::path& root) {
+    const auto instruction_sites = write_config(root, "instruction-sites", R"toml(
+mod_instruction_sites = ["0x80012340", "0x80012344"]
+)toml");
+    const auto instruction_site_config =
+        PSXRecompV4::load_game_config(instruction_sites);
+    check(instruction_site_config.mod_instruction_sites ==
+              std::vector<uint32_t>{0x80012340u, 0x80012344u},
+          "parser preserves exact trusted instruction hook sites");
+
+    const auto unaligned_instruction_site = write_config(
+        root, "unaligned-instruction-site", R"toml(
+mod_instruction_sites = ["0x80012342"]
+)toml");
+    check_throws(
+        [&] { (void)PSXRecompV4::load_game_config(unaligned_instruction_site); },
+        "instruction-aligned",
+        "parser rejects unaligned trusted instruction hook sites");
+
+    const auto aliased_instruction_sites = write_config(
+        root, "aliased-instruction-sites", R"toml(
+mod_instruction_sites = ["0x80012340", "0xA0012340"]
+)toml");
+    check_throws(
+        [&] { (void)PSXRecompV4::load_game_config(aliased_instruction_sites); },
+        "physical address",
+        "parser rejects duplicate aliased trusted instruction hook sites");
+
     const auto valid = write_config(root, "valid", R"toml(
 [[recompiler.patch]]
 id = "gameplay-rate"
@@ -525,6 +552,81 @@ expected = "0x28620370"
         "parser rejects incomplete aspect-cone queue metadata");
 }
 
+void instruction_site_codegen_tests() {
+    constexpr uint32_t base = 0x80010000u;
+    PSXRecomp::CodeGenConfig hooked;
+    hooked.mod_instruction_sites.insert(base);
+    const std::string code = generate_first_instruction(
+        0x24020002u, {}, false, hooked);  // addiu v0,zero,2
+    const size_t hook_pos =
+        code.find("psx_mod_instruction_site(cpu, 0x80010000u)");
+    const size_t original_pos = code.find("0x80010000: 0x24020002");
+    check(hook_pos != std::string::npos &&
+          original_pos != std::string::npos &&
+          hook_pos < original_pos,
+          "codegen emits the trusted instruction hook before stock semantics");
+    check(code.find("cpu->pc = _mod_next; return;") != std::string::npos,
+          "non-fallthrough callback targets retain exit-and-redispatch");
+    check(code.find("psx_mod_instruction_site(cpu, 0x80010004u)") ==
+              std::string::npos,
+          "codegen emits zero instruction-hook calls at unconfigured PCs");
+    const size_t cycle_pos = code.rfind("psx_cyc_step", hook_pos);
+    check(cycle_pos != std::string::npos && cycle_pos < hook_pos,
+          "a hooked instruction charges its guest cycle before callback dispatch");
+
+    const std::string lw = generate_first_instruction(
+        0x8C220000u, {}, false, hooked);  // lw v0,0(at)
+    const size_t lw_hook =
+        lw.find("psx_mod_instruction_site(cpu, 0x80010000u)");
+    const size_t lw_load = lw.find("psx_cyc_load_word");
+    const size_t lw_substitute = lw.find(
+        "if (_mod_substitute_load_80010000) cpu->gpr[2] = "
+        "_mod_load_value_80010000;");
+    const size_t lw_pgxp = lw.find("PGXP_LOAD(");
+    const size_t lw_cosim = lw.find("cosim_instr(0x80010000u)");
+    check(lw_hook != std::string::npos && lw_load != std::string::npos &&
+              lw_substitute != std::string::npos &&
+              lw_pgxp != std::string::npos && lw_cosim != std::string::npos &&
+              lw_hook < lw_load && lw_load < lw_substitute &&
+              lw_substitute < lw_pgxp && lw_pgxp < lw_cosim,
+          "load substitution preserves load timing/read, then PGXP and cosim ordering");
+    check(lw.find("_mod_next_80010000 == 0xFFFFFFFFu") !=
+              std::string::npos &&
+              lw.find("if (_mod_next_80010000 != 0u && "
+                      "!_mod_substitute_load_80010000)") != std::string::npos,
+          "load hook distinguishes substitution from existing zero/PC actions");
+    const size_t lw_capture = lw.find(
+        "_mod_load_value_80010000 = cpu->gpr[2]");
+    const size_t lw_restore = lw.find(
+        "cpu->gpr[2] = _mod_load_old_80010000");
+    check(lw_capture != std::string::npos && lw_restore != std::string::npos &&
+              lw_capture < lw_restore && lw_restore < lw_load,
+          "load substitution restores the pre-callback target before effective-address and interlock work");
+
+    const std::string lhu = generate_first_instruction(
+        0x94220000u, {}, false, hooked);  // lhu v0,0(at)
+    check(lhu.find("psx_cyc_load_half") != std::string::npos &&
+              lhu.find("if (_mod_substitute_load_80010000) cpu->gpr[2]") !=
+                  std::string::npos,
+          "load substitution supports unsigned halfword loads");
+
+    PSXRecomp::CodeGenConfig inert;
+    const std::string plain = generate_first_instruction(
+        0x24020002u, {}, false, inert);
+    check(plain.find("psx_mod_instruction_site(cpu") == std::string::npos,
+          "empty instruction-site config has zero generated call overhead");
+
+    PSXRecomp::CodeGenConfig delay_slot;
+    delay_slot.mod_instruction_sites.insert(base + 4u);
+    check_throws(
+        [&] {
+            (void)generate_first_instruction(
+                0x10000001u, {}, false, delay_slot);  // beq zero,zero,+1
+        },
+        "MIPS delay slot",
+        "codegen rejects ambiguous instruction hooks in MIPS delay slots");
+}
+
 void capture_history_config_tests(const fs::path& root) {
     const auto valid = write_config(root, "capture-history", R"toml(
 [runtime]
@@ -608,6 +710,24 @@ overlay_capture_persist_dir = ".aot_capture_history/..keep/TEST-00000"
     check(dotted_cfg.runtime.overlay_capture_persist_dir ==
               ".aot_capture_history/..keep/TEST-00000",
           "parser accepts a capture history component that merely starts with dots");
+}
+
+void overlay_region_floor_config_tests(const fs::path& root) {
+    const auto valid = write_config(root, "overlay-region-floor", R"toml(
+[runtime]
+overlay_region_floor = "0x16F000"
+)toml");
+    const auto cfg = PSXRecompV4::load_game_config(valid);
+    check(cfg.runtime.overlay_region_floor == 0x0016F000u,
+          "parser preserves a validated per-title overlay region floor");
+
+    const auto kernel = write_config(root, "overlay-region-floor-kernel", R"toml(
+[runtime]
+overlay_region_floor = "0x0F000"
+)toml");
+    check_throws([&] { (void)PSXRecompV4::load_game_config(kernel); },
+                 "at or above 0x00010000",
+                 "parser rejects an overlay floor inside the kernel window");
 }
 
 void codegen_tests() {
@@ -1043,7 +1163,9 @@ void cfg_codegen_load_delay_test() {
     function.name = "cfg_load_delay";
     PSXRecomp::ControlFlowAnalyzer analyzer(exe);
     const auto cfg = analyzer.analyze_function(function);
-    PSXRecomp::CodeGenerator generator(exe);
+    PSXRecomp::CodeGenConfig config;
+    config.mod_instruction_sites.insert(base);
+    PSXRecomp::CodeGenerator generator(exe, config);
     const std::string code = generator.generate_function(function, cfg).full_code;
 
     const size_t deferred = code.find("uint32_t psx_ldd_80003590 =");
@@ -1054,6 +1176,15 @@ void cfg_codegen_load_delay_test() {
           writeback != std::string::npos && deferred < successor &&
           successor < writeback,
           "CFG codegen preserves MIPS-I dependent load-delay value semantics");
+    const size_t load = code.find("psx_cyc_load_word");
+    const size_t substitute = code.find(
+        "if (_mod_substitute_load_80003590) psx_ldd_80003590 = "
+        "_mod_load_value_80003590;");
+    const size_t pgxp = code.find("PGXP_LOAD(");
+    check(load != std::string::npos && substitute != std::string::npos &&
+              pgxp != std::string::npos && load < substitute &&
+              substitute < pgxp && pgxp < successor && successor < writeback,
+          "dependent load substitution overrides the deferred value without exposing it to the successor");
 }
 
 } // namespace
@@ -1066,7 +1197,9 @@ int main() {
 
     try {
         parser_tests(root);
+        instruction_site_codegen_tests();
         capture_history_config_tests(root);
+        overlay_region_floor_config_tests(root);
         codegen_tests();
         gte_codegen_classification_tests();
         jump_table_producer_codegen_test();

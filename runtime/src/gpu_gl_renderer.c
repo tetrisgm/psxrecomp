@@ -5247,6 +5247,10 @@ static void gl_swap_with_osd(void) {
     {
         extern int  present_shot_take(char *out, int n);
         extern void present_shot_done(int ok);
+#ifdef PSX_PRESENT_SHOT_LISTENER
+        extern void present_shot_write_async(const char *path, uint8_t *rgb,
+                                             uint32_t width, uint32_t height);
+#endif
         char shot_path[512];
         if (present_shot_take(shot_path, (int)sizeof(shot_path))) {
             int ww = 0, wh = 0;
@@ -5262,17 +5266,24 @@ static void gl_swap_with_osd(void) {
                         memcpy(flip + (size_t)y * ww * 3,
                                rows + (size_t)(wh - 1 - y) * ww * 3,
                                (size_t)ww * 3);
+#ifdef PSX_PRESENT_SHOT_LISTENER
+                    present_shot_write_async(shot_path, flip,
+                                             (uint32_t)ww, (uint32_t)wh);
+                    flip = NULL; /* worker owns it */
+                    wrote = -1;  /* completion is asynchronous */
+#else
                     FILE *pf = fopen(shot_path, "wb");
                     if (pf) {
                         wrote = png_write_rgb(pf, flip, (uint32_t)ww, (uint32_t)wh);
                         fclose(pf);
                     }
+#endif
                 }
                 /* free() tolerates NULL, so both exits are covered. */
                 free(flip);
                 free(rows);
             }
-            present_shot_done(wrote);
+            if (wrote >= 0) present_shot_done(wrote);
         }
     }
     SDL_GL_SwapWindow(s_win);

@@ -1860,6 +1860,38 @@ std::string CodeGenerator::translate_basic_block(
         ss << indent << fmt::format("cosim_instr(0x{:08X}u);\n", insn_addr);
         ss << "#endif\n";
     };
+    auto emit_mod_instruction_hook = [&](uint32_t insn_addr, int load_dest = -1) {
+        if (!config_.mod_instruction_sites.count(insn_addr)) return;
+        if (load_dest > 0) {
+            const std::string suffix = fmt::format("{:08X}", insn_addr);
+            ss << config_.indent << fmt::format(
+                "uint32_t _mod_load_old_{} = cpu->gpr[{}];\n",
+                suffix, load_dest);
+            ss << config_.indent << fmt::format(
+                "uint32_t _mod_next_{} = psx_mod_instruction_site(cpu, "
+                "0x{:08X}u);\n", suffix, insn_addr);
+            ss << config_.indent << fmt::format(
+                "uint32_t _mod_load_value_{} = cpu->gpr[{}];\n",
+                suffix, load_dest);
+            ss << config_.indent << fmt::format(
+                "int _mod_substitute_load_{} = (_mod_next_{} == "
+                "0xFFFFFFFFu);\n", suffix, suffix);
+            ss << config_.indent << fmt::format(
+                "if (_mod_next_{} != 0u && !_mod_substitute_load_{}) {{ "
+                "cpu->pc = _mod_next_{}; return; }}\n",
+                suffix, suffix, suffix);
+            ss << config_.indent << fmt::format(
+                "if (_mod_substitute_load_{}) cpu->gpr[{}] = "
+                "_mod_load_old_{};  /* preserve the load's source state */\n",
+                suffix, load_dest, suffix);
+            return;
+        }
+        ss << config_.indent << fmt::format(
+            "{{ uint32_t _mod_next = psx_mod_instruction_site(cpu, "
+            "0x{:08X}u); if (_mod_next != 0u) {{ ", insn_addr);
+        ss << "cpu->pc = _mod_next; return; } }  "
+              "/* trusted opt-in instruction-site hook */\n";
+    };
     if (!cycle_per_insn && block_exec_cycles > 0) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
         ss << config_.indent << fmt::format("psx_advance_cycles({}u);\n",
@@ -1961,6 +1993,12 @@ std::string CodeGenerator::translate_basic_block(
 
         // Skip the delay slot at end_addr - it's emitted as part of the branch handling below
         if (exit_uses_delay_slot && addr == block.end_addr) {
+            if (config_.mod_instruction_sites.count(addr)) {
+                throw std::runtime_error(fmt::format(
+                    "trusted instruction-site hook at 0x{:08X} is a MIPS "
+                    "delay slot; hook the owning control transfer instead",
+                    addr));
+            }
             addr += 4;
             break;
         }
@@ -1983,6 +2021,20 @@ std::string CodeGenerator::translate_basic_block(
         if (!is_cf) {
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
+            int load_dest = simple_load_dest(instr);
+            if (delayed_load_active &&
+                config_.mod_instruction_sites.count(addr)) {
+                throw std::runtime_error(fmt::format(
+                    "trusted instruction-site hook at 0x{:08X} follows a "
+                    "dependent MIPS-I load-delay instruction; choose the "
+                    "load site or the next stable PC",
+                    addr));
+            }
+            // Callback runs after this instruction's timing charge but before
+            // its guest semantics. Zero executes the original instruction;
+            // nonzero means the callback implemented/replaced it and supplied
+            // the safe redispatch continuation.
+            emit_mod_instruction_hook(addr, load_dest);
             // If this is the successor half of a deferred load pair AND it is an
             // LWL/LWR merging into that same register, hardware forwards the
             // pending load into the merge (see set_lwlr_merge_forward). Point
@@ -1999,7 +2051,6 @@ std::string CodeGenerator::translate_basic_block(
             }
             std::string emitted = translate_instruction(addr, instr);
             if (forward_to_lwlr) clear_lwlr_merge_forward();
-            int load_dest = simple_load_dest(instr);
             bool defer_load = false;
             if (!delayed_load_active && load_dest > 0 && addr + 4u <= block.end_addr &&
                 !extra_labels_.count(addr + 4u)) {
@@ -2035,6 +2086,22 @@ std::string CodeGenerator::translate_basic_block(
                     delayed_load_active = true;
                 }
             }
+            if (load_dest > 0 && config_.mod_instruction_sites.count(addr)) {
+                const size_t pgxp = emitted.find("PGXP_LOAD(");
+                if (pgxp == std::string::npos) {
+                    throw std::runtime_error(fmt::format(
+                        "trusted load substitution at 0x{:08X} has no PGXP "
+                        "load boundary", addr));
+                }
+                const bool load_is_deferred =
+                    delayed_load_active && delayed_load_addr == addr;
+                const std::string target = load_is_deferred
+                    ? fmt::format("psx_ldd_{:08X}", addr)
+                    : fmt::format("cpu->gpr[{}]", load_dest);
+                emitted.insert(pgxp, fmt::format(
+                    "if (_mod_substitute_load_{:08X}) {} = "
+                    "_mod_load_value_{:08X};\n", addr, target, addr));
+            }
             ss << emitted << "\n";
             if (delayed_load_active && addr == delayed_load_addr + 4u) {
                 if (forward_to_lwlr) {
@@ -2059,6 +2126,17 @@ std::string CodeGenerator::translate_basic_block(
             if (addr == exit_branch_addr) {
                 std::string delay_saved_cond;    // branch condition captured before delay
                 std::string delay_saved_target;  // JR/JALR target captured before delay
+
+                if (cycle_per_insn)
+                    emit_pre_icache(exit_branch_addr, config_.indent);
+                if (cycle_per_insn)
+                    emit_pre_timing(block.exit_instr.instruction,
+                                    config_.indent);
+                /* Control transfers own architectural delay-slot behavior;
+                 * their callback continuations must remain explicit outer
+                 * dispatches rather than pretending address+4 is a normal
+                 * instruction fallthrough. */
+                emit_mod_instruction_hook(addr);
 
                 const uint32_t branch_opcode =
                     (block.exit_instr.instruction >> 26) & 0x3Fu;
@@ -2102,11 +2180,6 @@ std::string CodeGenerator::translate_basic_block(
                 // runs at the branch PC, THEN the delay slot's at PC+4. Emit the branch
                 // step FIRST (it is pure timing — does not touch GPR values, so it is
                 // safe before the branch-condition capture below).
-                if (cycle_per_insn)
-                    emit_pre_icache(exit_branch_addr, config_.indent);
-                if (cycle_per_insn)
-                    emit_pre_timing(block.exit_instr.instruction, config_.indent);
-
                 // Register-indirect targets are resolved at the jump instruction.
                 // The delay slot may overwrite the source register, so all JR/JALR
                 // paths below consume this pre-delay snapshot.
@@ -2164,6 +2237,14 @@ std::string CodeGenerator::translate_basic_block(
                     }
                     {
                         uint32_t delay_instr = *delay_instr_opt;
+
+                        if (config_.mod_instruction_sites.count(delay_slot_addr)) {
+                            throw std::runtime_error(fmt::format(
+                                "trusted instruction-site hook at 0x{:08X} is a "
+                                "MIPS delay slot; hook the owning control "
+                                "transfer instead",
+                                delay_slot_addr));
+                        }
 
                         // For branch-likely variants, delay slot is conditional
                         if (block.exit_instr.is_likely) {
@@ -3272,6 +3353,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "#endif\n";
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
     ss << "extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);  /* trusted opt-in game-mod hook */\n";
+    ss << "extern uint32_t psx_mod_instruction_site(CPUState* cpu, uint32_t address);  /* trusted exact instruction hook */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";

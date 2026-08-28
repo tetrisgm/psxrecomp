@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Optional
 
@@ -943,6 +944,68 @@ def run_prepare_disc(
     return cue.resolve()
 
 
+def apply_aot_patch_manifest(
+    exe_path: Path,
+    manifest_path: Path,
+    *,
+    load_address: int,
+    progress: ProgressReporter,
+) -> None:
+    """Apply guarded arbitrary-byte main-EXE edits before AOT generation.
+
+    Runtime mod patches are still applied to the stock disc stream.  This
+    derived emitter input mirrors those bytes so the generated native code and
+    the executable loaded by the guest agree without dirtying compiled pages.
+    """
+    manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    patches = manifest.get("patch") or []
+    if not isinstance(patches, list) or not patches:
+        raise ValueError(f"AOT patch manifest has no [[patch]] entries: {manifest_path}")
+
+    image = bytearray(exe_path.read_bytes())
+    patched_bytes = 0
+    for index, patch in enumerate(patches, start=1):
+        if not isinstance(patch, dict):
+            raise ValueError(f"AOT patch #{index} is not a table")
+        if patch.get("target", "main_exe") != "main_exe":
+            raise ValueError(f"AOT patch #{index} targets {patch.get('target')!r}, not main_exe")
+        address_value = patch.get("address")
+        address = (
+            int(address_value, 0)
+            if isinstance(address_value, str)
+            else int(address_value)
+        )
+        try:
+            expected = bytes.fromhex(str(patch["expected"]))
+            replacement = bytes.fromhex(str(patch["replace"]))
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"AOT patch #{index} has invalid expected/replace bytes") from exc
+        if not expected or len(expected) != len(replacement):
+            raise ValueError(
+                f"AOT patch #{index} at 0x{address:08X} has unequal or empty byte spans"
+            )
+        offset = 2048 + address - load_address
+        end = offset + len(expected)
+        if offset < 2048 or end > len(image):
+            raise ValueError(
+                f"AOT patch #{index} at 0x{address:08X} falls outside {exe_path.name}"
+            )
+        actual = bytes(image[offset:end])
+        if actual != expected:
+            raise ValueError(
+                f"AOT patch guard mismatch at 0x{address:08X}: "
+                f"expected {expected.hex()}, found {actual.hex()}"
+            )
+        image[offset:end] = replacement
+        patched_bytes += len(replacement)
+
+    exe_path.write_bytes(image)
+    progress.log(
+        f"Applied {len(patches)} guarded AOT patches ({patched_bytes} bytes) "
+        f"from {manifest_path}"
+    )
+
+
 def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
     config = Path(args.config).expanduser().resolve()
     if not config.is_file():
@@ -1013,8 +1076,40 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
         if not game_exe_path.is_absolute():
             game_exe_path = project_root / game_exe_path
         game_exe_path = game_exe_path.resolve()
+        aot_manifest_rel = str(recomp.get("aot_patch_manifest") or "").strip()
         try:
-            if game_exe_path != boot_path.resolve():
+            if aot_manifest_rel:
+                aot_manifest_path = Path(aot_manifest_rel).expanduser()
+                if not aot_manifest_path.is_absolute():
+                    aot_manifest_path = project_root / aot_manifest_path
+                aot_manifest_path = aot_manifest_path.resolve()
+                if not aot_manifest_path.is_file():
+                    raise FileNotFoundError(
+                        f"AOT patch manifest not found: {aot_manifest_path}"
+                    )
+                if game_exe_path == boot_path.resolve():
+                    raise ValueError(
+                        "recompiler.aot_patch_manifest requires game.exe to be a "
+                        "derived path distinct from prepare_disc boot_exe"
+                    )
+                game_exe_path.parent.mkdir(parents=True, exist_ok=True)
+                # Always start from the freshly authenticated stock extraction;
+                # this keeps every guard meaningful and generation idempotent.
+                shutil.copy2(boot_path, game_exe_path)
+                progress.log(f"Staged stock boot EXE for AOT: {game_exe_path}")
+                load_address_value = game.get("load_address") or "0x80010000"
+                load_address = (
+                    int(load_address_value, 0)
+                    if isinstance(load_address_value, str)
+                    else int(load_address_value)
+                )
+                apply_aot_patch_manifest(
+                    game_exe_path,
+                    aot_manifest_path,
+                    load_address=load_address,
+                    progress=progress,
+                )
+            elif game_exe_path != boot_path.resolve():
                 game_exe_path.parent.mkdir(parents=True, exist_ok=True)
                 if (not game_exe_path.is_file()) or (
                     game_exe_path.stat().st_mtime_ns < boot_path.stat().st_mtime_ns
@@ -1023,7 +1118,7 @@ def cmd_generate(args: argparse.Namespace, progress: ProgressReporter) -> int:
                     progress.log(
                         f"Staged boot EXE for emitter: {game_exe_path}"
                     )
-        except OSError as exc:
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
             progress.error(
                 f"boot EXE ready at {boot_path} but cannot stage to "
                 f"game.exe path {game_exe_path}: {exc}",

@@ -224,15 +224,108 @@ static uint32_t s_geom_lookups = 0;      /* lookups attempted                  *
 static uint32_t s_geom_miss_unrec = 0;   /* nothing was ever recorded here     */
 static uint32_t s_geom_miss_ambig = 0;   /* recorded, but not unambiguously    */
 
-/* Exact GTE projection provenance now lives in the PGXP value-propagation
- * engine (pgxp.cpp): per-word RAM/scratchpad shadows plus per-GPR and per-GTE-
- * register shadows, validated on read (ENHANCEMENTS.md G1.2/G1.3). The
- * gte_precision_* entry points below are kept as the stable emit/ABI surface
- * (v14 swc2 sites, tests) and forward into that engine. The hashed
- * s_precision_store table and the s_precise_sxy FIFO it fed are retired —
- * the GTE register shadows ARE the FIFO now. */
+/* PGXP projection provenance lives in the value-propagation engine
+ * (pgxp.cpp). Exact NCLIP deliberately does not: the three values it consumes
+ * never leave the GTE SXY FIFO, so a tiny local sidecar is sufficient. This
+ * keeps precise_nclip independent of global CPU/RAM instruction tracking. */
+struct NclipSxy {
+    int64_t x16, y16;
+    uint32_t packed;
+    bool valid;
+};
+static NclipSxy s_nclip_sxy[4]{};
+static bool s_nclip_tracking_enabled = false;
 static uint32_t s_speculative_depth = 0;
 static int s_speculative_timeline_invalidated = 0;
+
+static void nclip_sxy_invalidate_all(void) {
+    for (NclipSxy &slot : s_nclip_sxy) slot.valid = false;
+}
+
+extern "C" void gte_nclip_precision_set(int enabled) {
+    const bool next = enabled != 0;
+    if (next == s_nclip_tracking_enabled) return;
+    s_nclip_tracking_enabled = next;
+    nclip_sxy_invalidate_all();
+}
+
+static void nclip_sxy_push(int64_t x16, int64_t y16, uint32_t packed) {
+    if (!s_nclip_tracking_enabled || s_speculative_depth != 0 ||
+        s_gte_replay_sandbox)
+        return;
+    s_nclip_sxy[0] = s_nclip_sxy[1];
+    s_nclip_sxy[1] = s_nclip_sxy[2];
+    s_nclip_sxy[2] = {x16, y16, packed, true};
+    s_nclip_sxy[3] = s_nclip_sxy[2];
+}
+
+static void nclip_sxy_guest_write(uint8_t reg) {
+    if (!s_nclip_tracking_enabled || s_speculative_depth != 0 ||
+        s_gte_replay_sandbox)
+        return;
+    switch (reg) {
+        case 12: s_nclip_sxy[0].valid = false; break;
+        case 13: s_nclip_sxy[1].valid = false; break;
+        case 14:
+            s_nclip_sxy[2].valid = false;
+            s_nclip_sxy[3].valid = false;
+            break;
+        case 15:
+            s_nclip_sxy[0] = s_nclip_sxy[1];
+            s_nclip_sxy[1] = s_nclip_sxy[2];
+            s_nclip_sxy[2].valid = false;
+            s_nclip_sxy[3].valid = false;
+            break;
+        default: break;
+    }
+}
+
+static bool nclip_sxy_get(uint32_t index, uint32_t expect,
+                          int64_t *x16, int64_t *y16) {
+    if (index >= 3 || !s_nclip_sxy[index].valid ||
+        s_nclip_sxy[index].packed != expect)
+        return false;
+    if (x16) *x16 = s_nclip_sxy[index].x16;
+    if (y16) *y16 = s_nclip_sxy[index].y16;
+    return true;
+}
+
+struct NclipWideUnsigned {
+    uint64_t hi, lo;
+};
+
+static NclipWideUnsigned nclip_mul_u64(uint64_t a, uint64_t b) {
+    const uint64_t a0 = (uint32_t)a, a1 = a >> 32;
+    const uint64_t b0 = (uint32_t)b, b1 = b >> 32;
+    uint64_t t = a0 * b0;
+    const uint64_t w0 = (uint32_t)t;
+    uint64_t carry = t >> 32;
+    t = a1 * b0 + carry;
+    const uint64_t w1 = (uint32_t)t;
+    const uint64_t w2 = t >> 32;
+    t = a0 * b1 + w1;
+    return {a1 * b1 + w2 + (t >> 32), (t << 32) + w0};
+}
+
+static uint64_t nclip_abs_u64(int64_t value) {
+    const uint64_t bits = (uint64_t)value;
+    return value < 0 ? ~bits + 1u : bits;
+}
+
+/* Exact sign of a*b-c*d without overflowing int64_t. Projection coordinates
+ * are 16.16 integers; retaining this full-width comparison avoids changing a
+ * nearly-degenerate triangle merely because two large products cancel. */
+static int nclip_product_difference_sign(int64_t a, int64_t b,
+                                         int64_t c, int64_t d) {
+    NclipWideUnsigned p = nclip_mul_u64(nclip_abs_u64(a), nclip_abs_u64(b));
+    NclipWideUnsigned q = nclip_mul_u64(nclip_abs_u64(c), nclip_abs_u64(d));
+    bool pneg = ((a < 0) != (b < 0)) && (p.hi != 0 || p.lo != 0);
+    bool qneg = ((c < 0) != (d < 0)) && (q.hi != 0 || q.lo != 0);
+    if (pneg != qneg) return pneg ? -1 : 1;
+    int magnitude = p.hi < q.hi ? -1 : (p.hi > q.hi ? 1 :
+                    (p.lo < q.lo ? -1 : (p.lo > q.lo ? 1 : 0)));
+    return pneg ? -magnitude : magnitude;
+}
 
 static void gte_geom_generation_advance(void) {
     if (++s_geom_generation == 0) {
@@ -252,6 +345,7 @@ extern "C" void gte_precision_timeline_invalidate(void) {
         s_speculative_timeline_invalidated = 1;
         return;
     }
+    nclip_sxy_invalidate_all();
     gte_geom_generation_advance();
 }
 
@@ -269,6 +363,7 @@ extern "C" void gte_precision_speculative_end(void) {
     pgxp_suppress_end();
     if (--s_speculative_depth == 0) {
         if (s_speculative_timeline_invalidated) {
+            nclip_sxy_invalidate_all();
             gte_geom_generation_advance();
             s_speculative_timeline_invalidated = 0;
         }
@@ -899,6 +994,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
         int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
         pgxp_gte_push_sxy((int32_t)cx16, (int32_t)cy16, gte->SZ[3],
                           (uint32_t)gte->SXY[2]);
+        nclip_sxy_push(sx16, sy16, (uint32_t)gte->SXY[2]);
     }
     geom_note((uint32_t)gte->SXY[2], sx16, sy16);
 
@@ -965,21 +1061,22 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
     s_nclip_last_precise_valid = false;
     /* Compute an exact 16.16 determinant for configured branch consumers, but
      * preserve native guest-visible MAC0 for every architectural reader. */
-    int32_t px0, py0, px1, py1, px2, py2;
+    int64_t px0, py0, px1, py1, px2, py2;
     if (gpu_ws_precise_nclip_enabled() &&
         !s_gte_replay_sandbox && s_speculative_depth == 0 &&
-        pgxp_get_gte_sxy_checked(0, gte->SXY[0], 1, &px0, &py0) &&
-        pgxp_get_gte_sxy_checked(1, gte->SXY[1], 1, &px1, &py1) &&
-        pgxp_get_gte_sxy_checked(2, gte->SXY[2], 1, &px2, &py2)) {
+        nclip_sxy_get(0, gte->SXY[0], &px0, &py0) &&
+        nclip_sxy_get(1, gte->SXY[1], &px1, &py1) &&
+        nclip_sxy_get(2, gte->SXY[2], &px2, &py2)) {
         s_nclip_precise_hits++;
-        const int64_t dx10 = (int64_t)px1 - px0;
-        const int64_t dy10 = (int64_t)py1 - py0;
-        const int64_t dx20 = (int64_t)px2 - px0;
-        const int64_t dy20 = (int64_t)py2 - py0;
-        const int64_t cross = dx10 * dy20 - dy10 * dx20;
-        s_nclip_last_precise_sign = cross < 0 ? -1 : (cross > 0 ? 1 : 0);
+        const int64_t dx10 = px1 - px0;
+        const int64_t dy10 = py1 - py0;
+        const int64_t dx20 = px2 - px0;
+        const int64_t dy20 = py2 - py0;
+        const int sign = nclip_product_difference_sign(dx10, dy20,
+                                                        dy10, dx20);
+        s_nclip_last_precise_sign = (int8_t)sign;
         s_nclip_last_precise_valid = true;
-        if ((cross > 0 && out <= 0) || (cross < 0 && out >= 0))
+        if ((sign > 0 && out <= 0) || (sign < 0 && out >= 0))
             s_nclip_disagreements++;
     } else if (gpu_ws_precise_nclip_enabled() &&
                !s_gte_replay_sandbox && s_speculative_depth == 0) {
@@ -1389,6 +1486,7 @@ void gte_gpl(GTEState* gte, uint32_t instr) {
 // MTC2 — Move To Coprocessor 2 (write GTE data register)
 // ---------------------------------------------------------------------------
 void gte_mtc2(GTEState* gte, uint8_t reg, uint32_t value) {
+    nclip_sxy_guest_write(reg);
     switch (reg) {
         case 0:  gte->V0[0] = value & 0xFFFF; gte->V0[1] = value >> 16; break;
         case 1:  gte->V0[2] = value & 0xFFFF; break;
@@ -2036,6 +2134,7 @@ extern "C" uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg) {
 extern "C" void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val) {
     if (reg >= 32) return;
     gte_cpu_canonicalize_backing(cpu);
+    PSXRecomp::GTE::nclip_sxy_guest_write(reg);
     switch (reg) {
         case 1: case 3: case 5: case 7:
         case 16: case 17: case 18: case 19:
@@ -2183,6 +2282,36 @@ extern "C" void gte_test_get_precise_projection(uint32_t index,
                                                   uint16_t* z,
                                                   uint8_t* valid) {
     pgxp_test_get_gte_sxy(index, packed, x16, y16, z, valid);
+}
+
+extern "C" void gte_test_seed_nclip_projection(uint32_t index,
+                                                  uint32_t packed,
+                                                  int64_t x16,
+                                                  int64_t y16,
+                                                  int valid) {
+    if (index >= 4) return;
+    auto &slot = PSXRecomp::GTE::s_nclip_sxy[index];
+    slot = {x16, y16, packed, valid != 0};
+}
+
+extern "C" uint32_t gte_test_get_nclip_valid_mask(void) {
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < 4; ++i)
+        if (PSXRecomp::GTE::s_nclip_sxy[i].valid) mask |= 1u << i;
+    return mask;
+}
+
+extern "C" void gte_test_get_nclip_projection(uint32_t index,
+                                                 uint32_t *packed,
+                                                 int32_t *x16,
+                                                 int32_t *y16,
+                                                 int *valid) {
+    if (index >= 4) return;
+    const auto &slot = PSXRecomp::GTE::s_nclip_sxy[index];
+    if (packed) *packed = slot.packed;
+    if (x16) *x16 = (int32_t)slot.x16;
+    if (y16) *y16 = (int32_t)slot.y16;
+    if (valid) *valid = slot.valid ? 1 : 0;
 }
 
 extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,

@@ -428,6 +428,25 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
         ok = write_section(o, BS_SEC_MODSET, fp, (uint64_t)strlen(fp));
     }
 
+    /* Native plugin microstate follows the pure fingerprint guard and still
+     * precedes every mutable machine section. The reader preflights this
+     * complete payload before applying even the CPU section. */
+    if (ok) {
+        uint32_t mb = psx_mod_plugin_state_bytes();
+        if (mb) {
+            uint8_t* buf = (uint8_t*)malloc(mb);
+            if (!buf) ok = 0;
+            else {
+                ok = psx_mod_plugin_state_write(buf, mb) &&
+                     write_section(o, BS_SEC_MODSTATE, buf, mb);
+                free(buf);
+            }
+        } else if (psx_mod_plugin_state_required()) {
+            /* A required provider reported an invalid/oversized payload. */
+            ok = 0;
+        }
+    }
+
     if (ok && !(s_section_exclude & (1u << BS_SEC_CPU)))
         ok = write_cpu_section(o, cpu);
     if (ok && !(s_section_exclude & (1u << BS_SEC_RAM)))
@@ -795,6 +814,8 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         }
         return 1;
     }
+    case BS_SEC_MODSTATE:
+        return psx_mod_plugin_state_apply(p, len);
     case BS_SEC_TEXPACK: {
         /* Applies AFTER BS_SEC_VRAM in stream order; pixels rebuild from the
          * freshly restored CPU VRAM mirror and are hash-verified inside. */
@@ -831,6 +852,102 @@ static int boot_state_parse_header(const uint8_t* file, size_t file_len,
         !pst_r_u32(&hr, &h_out->codegen_ver) ||
         !pst_r_u32(&hr, &h_out->section_count) ||
         !pst_r_u32(&hr, &h_out->reserved)) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Validate enabled native-plugin state before apply_section mutates any
+ * subsystem. Section headers stay raw even when payloads are compressed, so
+ * this also rejects an old state missing required scheduler state without
+ * leaving the current machine half-restored. */
+static int boot_state_preflight_modstate(const uint8_t* file, size_t file_len,
+                                         const BootStateHeader* h) {
+    const uint8_t* cur = file + BOOT_STATE_HEADER_WIRE_BYTES;
+    const uint8_t* end = file + file_len;
+    int found = 0;
+    int modset_found = 0;
+
+    for (uint32_t i = 0; i < h->section_count; ++i) {
+        PstR sh;
+        uint32_t tag = 0, flags = 0;
+        uint64_t len = 0;
+        const uint8_t* payload;
+        uint8_t* inflated = NULL;
+        const uint8_t* validate_ptr;
+        uint32_t validate_len;
+
+        if ((size_t)(end - cur) < 16u) return 0;
+        pst_r_init(&sh, cur, 16u);
+        if (!pst_r_u32(&sh, &tag) || !pst_r_u32(&sh, &flags) ||
+            !pst_r_u64(&sh, &len))
+            return 0;
+        cur += 16u;
+        if (len > 64u * 1024u * 1024u || (uint64_t)(end - cur) < len)
+            return 0;
+        payload = cur;
+        cur += (size_t)len;
+        if (tag == BS_SEC_MODSET) {
+            if (modset_found || flags != 0u || len > 0xffffffffu ||
+                !apply_section(BS_SEC_MODSET, payload, (uint32_t)len,
+                               NULL, h->entry_pc)) {
+                if (modset_found)
+                    fprintf(stderr,
+                            "savestate: REFUSED - duplicate mod-set section\n");
+                return 0;
+            }
+            modset_found = 1;
+            continue;
+        }
+        if (tag != BS_SEC_MODSTATE) continue;
+        if (found) {
+            fprintf(stderr,
+                    "savestate: REFUSED - duplicate native mod-state section\n");
+            return 0;
+        }
+        found = 1;
+
+        if (h->version >= 4u && flags == BOOT_STATE_SEC_ZLIB) {
+            PstR lr;
+            uint32_t raw_len = 0;
+            uLong dest_len;
+            if (len < 4u) return 0;
+            pst_r_init(&lr, payload, 4u);
+            if (!pst_r_u32(&lr, &raw_len) || raw_len == 0u ||
+                raw_len > 4u * 1024u * 1024u)
+                return 0;
+            inflated = (uint8_t*)malloc(raw_len);
+            if (!inflated) return 0;
+            dest_len = (uLong)raw_len;
+            if (uncompress(inflated, &dest_len, payload + 4u,
+                           (uLong)(len - 4u)) != Z_OK ||
+                dest_len != (uLong)raw_len) {
+                free(inflated);
+                return 0;
+            }
+            validate_ptr = inflated;
+            validate_len = raw_len;
+        } else if (flags != 0u || len > 0xffffffffu) {
+            return 0;
+        } else {
+            validate_ptr = payload;
+            validate_len = (uint32_t)len;
+        }
+
+        if (!psx_mod_plugin_state_validate(validate_ptr, validate_len)) {
+            fprintf(stderr,
+                    "savestate: REFUSED - native mod-state id, version, size, "
+                    "or payload differs from the enabled plugin set\n");
+            free(inflated);
+            return 0;
+        }
+        free(inflated);
+    }
+
+    if (psx_mod_plugin_state_required() && !found) {
+        fprintf(stderr,
+                "savestate: REFUSED - state predates required native mod "
+                "scheduler state; start a new session checkpoint\n");
         return 0;
     }
     return 1;
@@ -923,7 +1040,7 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     const uint8_t* end;
     BootStateHeader h;
     char reject[256];
-    const uint32_t required = ~s_section_exclude & (
+    uint32_t required = ~s_section_exclude & (
         (1u<<BS_SEC_CPU)|(1u<<BS_SEC_RAM)|(1u<<BS_SEC_SPAD)|(1u<<BS_SEC_IRQ)|
         (1u<<BS_SEC_TIMER)|(1u<<BS_SEC_CLOCK)|(1u<<BS_SEC_GPU)|(1u<<BS_SEC_VRAM)|
         (1u<<BS_SEC_SPU)|(1u<<BS_SEC_SPURAM)|(1u<<BS_SEC_CDROM)|(1u<<BS_SEC_DMA)|
@@ -937,6 +1054,9 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     double apply_spuram_ms = 0.0;
     double apply_other_ms = 0.0;
 
+    if (psx_mod_plugin_state_required())
+        required |= (1u << BS_SEC_MODSTATE);
+
     if (!boot_state_check_buffer(file, file_len, bios_checksum, entry_pc,
                                  reject, sizeof(reject))) {
         fprintf(stderr, "boot_state: reject — %s\n",
@@ -944,6 +1064,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         return 0;
     }
     if (!boot_state_parse_header(file, file_len, &h))
+        return 0;
+    if (!boot_state_preflight_modstate(file, file_len, &h))
         return 0;
 
     cur = file + BOOT_STATE_HEADER_WIRE_BYTES;

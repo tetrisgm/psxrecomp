@@ -206,6 +206,10 @@ extern void     gte_precision_speculative_begin(void);
 extern void     gte_precision_speculative_end(void);
 extern void     gte_precision_store_word(uint32_t addr, uint8_t reg);
 extern void     gte_precision_tracking_set(int enabled);
+/* Tiny GTE-local 16.16 SXY FIFO used only by exact widescreen NCLIP branch
+ * consumers. Unlike PGXP tracking, this never instruments CPU instructions or
+ * allocates RAM shadows. */
+extern void     gte_nclip_precision_set(int enabled);
 /* Sub-pixel vertex precision ([video] geometry_correction). Enables the side
  * cache that retains the 16.16 projection fraction the GTE discards when it
  * saturates SXY to integer screen pixels. Guest-visible GTE state is
@@ -220,9 +224,10 @@ extern uint32_t gte_geometry_correction_hits(void);
 extern void     gte_geometry_correction_stats(uint32_t *lookups, uint32_t *hits,
                                               uint32_t *miss_unrecorded,
                                               uint32_t *miss_ambiguous);
-/* Exact NCLIP audit coverage: precise = all three SXY shadows are coherent and
- * word-validated; fallback = native integer-only; disagreements counts cases
- * where sub-pixel and guest-visible integer signs differ. MAC0 stays native. */
+/* Exact NCLIP audit coverage: precise = all three GTE-local 16.16 SXY slots are
+ * coherent and word-validated; fallback = native integer-only; disagreements
+ * counts cases where sub-pixel and guest-visible integer signs differ. MAC0
+ * stays native. */
 extern void     gte_nclip_precise_stats(uint64_t *hits, uint64_t *fallbacks,
                                         uint64_t *disagreements);
 /* Title-scoped widescreen cull consumer. Returns the exact tracked NCLIP sign

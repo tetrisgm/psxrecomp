@@ -67,6 +67,11 @@ struct CodeGenConfig {
     // Only explicitly listed guest functions call the runtime dispatcher.
     std::set<uint32_t> mod_function_entry_funcs;
 
+    // Trusted game-mod instruction hooks ([recompiler]
+    // mod_instruction_sites). Only these exact guest PCs call the runtime
+    // dispatcher; every other instruction retains zero hook overhead.
+    std::set<uint32_t> mod_instruction_sites;
+
     // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
     // addresses (MotK VLC leaves, etc.). Host locality hint only.
     std::set<uint32_t> hot_funcs;

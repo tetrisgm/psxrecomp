@@ -309,6 +309,21 @@ if(BUILD_TESTING)
     target_include_directories(frame_pacing_test PRIVATE include)
     add_test(NAME frame_pacing_test COMMAND frame_pacing_test)
 
+    add_executable(present_shot_listener_test
+        tests/test_present_shot_listener.c
+        src/present_shot_listener.c)
+    target_include_directories(present_shot_listener_test PRIVATE include)
+    if(WIN32 OR MINGW)
+        target_link_libraries(present_shot_listener_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME present_shot_listener_test COMMAND present_shot_listener_test)
+
+    add_executable(present_shot_writer_test
+        tests/test_present_shot_writer.cpp
+        src/present_shot_writer.cpp)
+    target_include_directories(present_shot_writer_test PRIVATE include src)
+    add_test(NAME present_shot_writer_test COMMAND present_shot_writer_test)
+
     add_executable(gpu_primitive_reject_test tests/test_gpu_primitive_reject.c)
     target_include_directories(gpu_primitive_reject_test PRIVATE include)
     add_test(NAME gpu_primitive_reject_test COMMAND gpu_primitive_reject_test)

@@ -20,6 +20,8 @@ extern "C" void gte_test_set_timeline_generations(uint32_t precision,
 extern "C" uint32_t gte_test_get_precision_generation(void);
 extern "C" uint32_t gte_test_get_geometry_generation(void);
 extern "C" void gte_precision_tracking_set(int enabled);
+extern "C" void gte_nclip_precision_set(int enabled);
+extern "C" int pgxp_enabled(void);
 extern "C" void gte_precision_invalidate_word(uint32_t addr);
 extern "C" int gte_precision_load_word(uint32_t addr, uint32_t packed,
                                         int32_t *x16, int32_t *y16,
@@ -41,6 +43,19 @@ extern "C" void gte_test_get_precise_projection(uint32_t index,
 extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
                                         int32_t y16);
 extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
+extern "C" void gte_test_seed_nclip_projection(uint32_t index,
+                                                 uint32_t packed,
+                                                 int64_t x16,
+                                                 int64_t y16,
+                                                 int valid);
+extern "C" uint32_t gte_test_get_nclip_valid_mask(void);
+extern "C" void gte_test_get_nclip_projection(uint32_t index,
+                                                uint32_t *packed,
+                                                int32_t *x16,
+                                                int32_t *y16,
+                                                int *valid);
+extern "C" int gte_replay_side_effects_begin(void);
+extern "C" void gte_replay_side_effects_end(void);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
 extern "C" int gpu_ws_present_native_43(void) { return 0; }
@@ -557,7 +572,8 @@ int test_precise_sxy_invalidation() {
 
 int test_precise_nclip_is_title_scoped() {
     CPUState cpu{};
-    gte_precision_tracking_set(1);
+    gte_precision_tracking_set(0);
+    gte_nclip_precision_set(1);
     g_test_precise_nclip_enabled = 1;
 
     /* Native determinant is +1. The validated 16.16 positions have a negative
@@ -567,8 +583,11 @@ int test_precise_nclip_is_title_scoped() {
     const int32_t y16[3] = {19509, -59658, -20365};
     for (uint32_t i = 0; i < 3; ++i) {
         cpu.gte_data[12 + i] = packed[i];
-        gte_test_seed_precise_projection(i, packed[i], x16[i], y16[i], 100);
+        gte_test_seed_nclip_projection(i, packed[i], x16[i], y16[i], 1);
     }
+    if (pgxp_enabled())
+        return fail_value("precise NCLIP leaves PGXP disarmed", 0, 0x06u,
+                          0, 0u, 1u);
     uint64_t hit0 = 0, fallback0 = 0, disagree0 = 0;
     gte_nclip_precise_stats(&hit0, &fallback0, &disagree0);
     gte_execute(&cpu, 0x06u);
@@ -582,10 +601,19 @@ int test_precise_nclip_is_title_scoped() {
         return fail_value("title-scoped precise NCLIP predicate", 0, 0x06u,
                           0, 1u, 0u);
 
+    /* At native 4:3 the GPU gate is off. Even a coherent exact FIFO must be
+     * identity: the title-scoped branch consumes the guest MAC0 sign. */
+    g_test_precise_nclip_enabled = 0;
+    gte_execute(&cpu, 0x06u);
+    if (cpu.gte_data[24] != 1u || gte_nclip_precise_bltz(1))
+        return fail_value("4:3 precise NCLIP identity", 0, 0x06u,
+                          0, 1u, cpu.gte_data[24]);
+    g_test_precise_nclip_enabled = 1;
+
     /* A stale packed-word shadow must fail closed to the native sign and count
      * as a fallback, never as a precise hit. */
-    gte_test_seed_precise_projection(0, packed[0] ^ 1u,
-                                     x16[0], y16[0], 100);
+    gte_test_seed_nclip_projection(0, packed[0] ^ 1u,
+                                   x16[0], y16[0], 1);
     gte_execute(&cpu, 0x06u);
     uint64_t hit2 = 0, fallback2 = 0, disagree2 = 0;
     gte_nclip_precise_stats(&hit2, &fallback2, &disagree2);
@@ -595,6 +623,132 @@ int test_precise_nclip_is_title_scoped() {
         gte_nclip_precise_bltz(1))
         return fail_value("stale precise NCLIP falls back natively", 0, 0x06u,
                           0, 1u, cpu.gte_data[24]);
+
+    /* Two ~3.6e19 products differ by exactly one: wider than int64_t, but the
+     * exact 16.16 sign must still be negative rather than overflow-dependent. */
+    static constexpr int64_t kLarge = 6000000000ll;
+    const int64_t large_x[3] = {0, kLarge, kLarge + 1};
+    const int64_t large_y[3] = {0, kLarge + 1, kLarge + 2};
+    for (uint32_t i = 0; i < 3; ++i)
+        gte_test_seed_nclip_projection(i, packed[i], large_x[i], large_y[i], 1);
+    g_test_precise_nclip_enabled = 1;
+    gte_execute(&cpu, 0x06u);
+    if (cpu.gte_data[24] != 1u || !gte_nclip_precise_bltz(1))
+        return fail_value("wide exact NCLIP determinant", 0, 0x06u,
+                          0, 1u, cpu.gte_data[24]);
+    g_test_precise_nclip_enabled = 0;
+    return 0;
+}
+
+int test_nclip_fifo_and_invalidation() {
+    CPUState cpu{};
+    gte_nclip_precision_set(0);
+    gte_nclip_precision_set(1);
+    const uint32_t packed[4] = {
+        0x00010001u, 0x00020002u, 0x00030003u, 0x00040004u};
+    for (uint32_t i = 0; i < 4; ++i)
+        gte_test_seed_nclip_projection(i, packed[i],
+                                       static_cast<int32_t>((i + 1) << 16),
+                                       static_cast<int32_t>((i + 5) << 16), 1);
+
+    /* MTC2 SXY0/SXY1 invalidate their exact slot; SXY2 invalidates its SXYP
+     * mirror; SXYP shifts the two surviving FIFO entries before invalidating
+     * the newly-written tail. */
+    gte_write_data(&cpu, 12, 0x11111111u);
+    if (gte_test_get_nclip_valid_mask() != 0xEu)
+        return fail_value("NCLIP SXY0 invalidation", 0, 12, 0, 0xEu,
+                          gte_test_get_nclip_valid_mask());
+    gte_write_data(&cpu, 14, 0x22222222u);
+    if (gte_test_get_nclip_valid_mask() != 0x2u)
+        return fail_value("NCLIP SXY2 mirror invalidation", 0, 14, 0, 0x2u,
+                          gte_test_get_nclip_valid_mask());
+
+    for (uint32_t i = 0; i < 4; ++i)
+        gte_test_seed_nclip_projection(i, packed[i], 0, 0, 1);
+    gte_write_data(&cpu, 15, 0x33333333u);
+    if (gte_test_get_nclip_valid_mask() != 0x3u)
+        return fail_value("NCLIP SXYP FIFO invalidation", 0, 15, 0, 0x3u,
+                          gte_test_get_nclip_valid_mask());
+
+    gte_canonicalize_cpu_state(&cpu);
+    if (gte_test_get_nclip_valid_mask() != 0u)
+        return fail_value("NCLIP restore invalidation", 0, 0, 0, 0u,
+                          gte_test_get_nclip_valid_mask());
+
+    /* RTPS pushes the old SXY1/SXY2 into slots 0/1 and records its new exact
+     * 16.16 projection in SXY2/SXYP. Use a zero transform so OFX/OFY are the
+     * exact projection and the assertion does not depend on reciprocal math. */
+    for (uint32_t i = 0; i < 4; ++i)
+        gte_test_seed_nclip_projection(i, packed[i],
+                                       static_cast<int32_t>((i + 1) << 16),
+                                       static_cast<int32_t>((i + 5) << 16), 1);
+    cpu = {};
+    cpu.gte_ctrl[24] = 1 << 16;  /* OFX = 1.0 */
+    cpu.gte_ctrl[25] = 2 << 16;  /* OFY = 2.0 */
+    cpu.gte_ctrl[26] = 1;        /* H; SZ3=0 saturates division harmlessly */
+    gte_execute(&cpu, 0x01u);
+    uint32_t got_packed = 0;
+    int32_t got_x16 = 0, got_y16 = 0;
+    int got_valid = 0;
+    gte_test_get_nclip_projection(0, &got_packed, &got_x16, &got_y16,
+                                  &got_valid);
+    if (!got_valid || got_packed != packed[1])
+        return fail_value("NCLIP RTPS FIFO SXY0", 0, 0x01u, 0,
+                          packed[1], got_packed);
+    gte_test_get_nclip_projection(1, &got_packed, &got_x16, &got_y16,
+                                  &got_valid);
+    if (!got_valid || got_packed != packed[2])
+        return fail_value("NCLIP RTPS FIFO SXY1", 0, 0x01u, 0,
+                          packed[2], got_packed);
+    gte_test_get_nclip_projection(2, &got_packed, &got_x16, &got_y16,
+                                  &got_valid);
+    if (!got_valid || got_packed != 0x00020001u || got_x16 != (1 << 16) ||
+        got_y16 != (2 << 16))
+        return fail_value("NCLIP RTPS exact SXY2", 0, 0x01u, 0,
+                          0x00020001u, got_packed);
+    gte_test_get_nclip_projection(3, &got_packed, &got_x16, &got_y16,
+                                  &got_valid);
+    if (!got_valid || got_packed != 0x00020001u)
+        return fail_value("NCLIP RTPS SXYP mirror", 0, 0x01u, 0,
+                          0x00020001u, got_packed);
+
+    /* RTPT is exactly three RTPS FIFO pushes; all three live NCLIP vertices
+     * therefore come from this command and SXYP mirrors the last one. */
+    gte_execute(&cpu, 0x30u);
+    if (gte_test_get_nclip_valid_mask() != 0xFu)
+        return fail_value("NCLIP RTPT FIFO valid", 0, 0x30u, 0, 0xFu,
+                          gte_test_get_nclip_valid_mask());
+    for (uint32_t i = 0; i < 4; ++i) {
+        gte_test_get_nclip_projection(i, &got_packed, &got_x16, &got_y16,
+                                      &got_valid);
+        if (!got_valid || got_packed != 0x00020001u ||
+            got_x16 != (1 << 16) || got_y16 != (2 << 16))
+            return fail_value("NCLIP RTPT exact FIFO", 0, i, 0,
+                              0x00020001u, got_packed);
+    }
+
+    /* Replay and speculative validation execute real GTE commands against
+     * state that is rolled back. Neither may perturb the authoritative FIFO. */
+    gte_test_seed_nclip_projection(0, packed[0], 0x12345, -0x23456, 1);
+    if (!gte_replay_side_effects_begin())
+        return fail_value("NCLIP replay begin", 0, 0, 0, 1u, 0u);
+    gte_execute(&cpu, 0x01u);
+    gte_replay_side_effects_end();
+    gte_test_get_nclip_projection(0, &got_packed, &got_x16, &got_y16,
+                                  &got_valid);
+    if (!got_valid || got_packed != packed[0] || got_x16 != 0x12345 ||
+        got_y16 != -0x23456)
+        return fail_value("NCLIP replay preserves FIFO", 0, 0, 0,
+                          packed[0], got_packed);
+    gte_precision_speculative_begin();
+    gte_execute(&cpu, 0x01u);
+    gte_precision_speculative_end();
+    gte_test_get_nclip_projection(0, &got_packed, &got_x16, &got_y16,
+                                  &got_valid);
+    if (!got_valid || got_packed != packed[0] || got_x16 != 0x12345 ||
+        got_y16 != -0x23456)
+        return fail_value("NCLIP speculative preserves FIFO", 0, 0, 0,
+                          packed[0], got_packed);
     return 0;
 }
 
@@ -711,6 +865,7 @@ int main() {
     if (int rc = test_command_timing_hook()) return rc;
     if (int rc = test_precise_sxy_invalidation()) return rc;
     if (int rc = test_precise_nclip_is_title_scoped()) return rc;
+    if (int rc = test_nclip_fifo_and_invalidation()) return rc;
     if (int rc = test_precision_speculative_transaction()) return rc;
     std::puts("PASS: canonical GTE register helpers match GTEState transfer oracle");
     return 0;
