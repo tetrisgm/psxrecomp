@@ -464,15 +464,6 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("overlay_cache")) {
         rt.overlay_cache = toml::find<bool>(runtime, "overlay_cache");
     }
-    if (runtime.contains("overlay_region_floor")) {
-        rt.overlay_region_floor = parse_hex(
-            toml::find<std::string>(runtime, "overlay_region_floor"),
-            "runtime.overlay_region_floor") & 0x1FFFFFFFu;
-        if (rt.overlay_region_floor < 0x00010000u) {
-            throw std::runtime_error(
-                "runtime.overlay_region_floor must be at or above 0x00010000");
-        }
-    }
     if (runtime.contains("overlay_capture_history")) {
         rt.overlay_capture_history =
             toml::find<bool>(runtime, "overlay_capture_history");

@@ -266,11 +266,6 @@ struct RuntimeConfig {
     // overlay bytes to overlay_captures.json for offline compilation.
     bool                  overlay_cache = false;
 
-    // Optional per-title lower bound for RAM regions treated as streamed or
-    // overlay code. Zero keeps the default main-text-end inference. Some
-    // titles stream race/level code over pages inside nominal static text.
-    uint32_t              overlay_region_floor = 0;
-
     // overlay_capture_history: opt-in durable capture history. The runtime
     // keeps overlay_captures.json as an atomic latest snapshot for the live
     // compiler and additionally appends every changed coherent snapshot to
