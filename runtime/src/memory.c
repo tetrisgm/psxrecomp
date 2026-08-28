@@ -667,33 +667,6 @@ static uint32_t g_text_exact_last_ref = 0;
  * PSX_TEXT_GUARD_MEMO=0 disables the memo (bisect switch: if a stale-native
  * class ever appears, this proves or clears the memo in one run). */
 static uint32_t g_text_guard_gen = 1u;
-/* Fast exact epoch for the common no-write interval, plus page-local
- * generations for the write-heavy interval.  Hueponik streams mutable data
- * through pages in the guarded text window during races; globally invalidating
- * every function verdict on each such write turns the guard itself into the
- * dominant guest cost. */
-static uint64_t g_text_guard_epoch = 1u;
-static uint32_t text_guard_page_gen[DIRTY_RAM_PAGE_COUNT];
-
-static inline void text_guard_global_changed(void) {
-    g_text_guard_gen++;
-    g_text_guard_epoch++;
-}
-
-static inline uint32_t text_guard_ranges_gen(const uint32_t *lo_len_pairs,
-                                             uint32_t count) {
-    uint32_t sum = g_text_guard_gen;
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
-        uint32_t len = lo_len_pairs[i * 2u + 1u];
-        if (len == 0 || phys >= RAM_SIZE || len > RAM_SIZE - phys) continue;
-        uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
-        uint32_t last_page = (phys + len - 1u) >> DIRTY_RAM_PAGE_SHIFT;
-        for (uint32_t page = first_page; page <= last_page; page++)
-            sum += text_guard_page_gen[page];
-    }
-    return sum;
-}
 
 #define TEXT_OK_MEMO_SLOTS 8192u          /* power of two */
 typedef struct {
@@ -701,7 +674,6 @@ typedef struct {
     uint32_t        exec_pc;
     uint32_t        count;
     uint32_t        gen;
-    uint64_t        epoch;
     int             ok;
 } TextOkMemo;
 static TextOkMemo s_text_ok_memo[TEXT_OK_MEMO_SLOTS];
@@ -724,7 +696,7 @@ static inline uint32_t text_ok_memo_slot(const uint32_t *key, uint32_t exec_pc) 
 
 void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
-    text_guard_global_changed();
+    g_text_guard_gen++;
     if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
     if (len > RAM_SIZE - phys_lo) len = RAM_SIZE - phys_lo;
     text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
@@ -753,11 +725,11 @@ static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) 
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
         text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
-        /* Only verdicts whose emitted ranges cover this page need rechecking.
-         * The epoch invalidates the one-compare fast path; the range generation
-         * then proves unrelated functions unchanged without rescanning bytes. */
-        text_guard_page_gen[page]++;
-        g_text_guard_epoch++;
+        /* Live text now diverges here: any memoized "native ok" covering this
+         * address must be re-decided. A store that MATCHES the reference is
+         * deliberately not invalidated — it can only flip a verdict no->yes,
+         * and keeping the stale "no" costs interpretation, not correctness. */
+        g_text_guard_gen++;
     }
 }
 
@@ -817,15 +789,8 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
     if (text_ok_memo_enabled()) {
         memo = &s_text_ok_memo[text_ok_memo_slot(lo_len_pairs, exec_pc)];
         if (memo->key == lo_len_pairs && memo->exec_pc == exec_pc &&
-            memo->count == count) {
-            const uint64_t epoch = g_text_guard_epoch;
-            if (memo->epoch == epoch)
-                return memo->ok;
-            if (memo->gen == text_guard_ranges_gen(lo_len_pairs, count)) {
-                memo->epoch = epoch;
-                return memo->ok;
-            }
-        }
+            memo->count == count && memo->gen == g_text_guard_gen)
+            return memo->ok;
     }
 
     int ok = 0;
@@ -873,19 +838,58 @@ done:
         memo->key     = lo_len_pairs;
         memo->exec_pc = exec_pc;
         memo->count   = count;
-        memo->gen     = text_guard_ranges_gen(lo_len_pairs, count);
-        memo->epoch   = g_text_guard_epoch;
+        memo->gen     = g_text_guard_gen;
         memo->ok      = ok;
     }
     return ok;
 }
 
-/* Preserve the generated-code ABI.  The range memo below the static dispatch
- * lookup is page-granular; caching only by a global address generation would
- * recreate the all-pages invalidation that this guard is designed to avoid. */
+/* ---- Address-level text-guard memo --------------------------------------
+ *
+ * The generated psx_game_text_native_ok() has to binary-search the game
+ * dispatch table (21k+ entries on WipEout 3 — ~15 random cache lines, plus
+ * psx_ram_canon_code_addr) before it can even form the range key the verdict
+ * memo above is keyed on. The dirty interpreter asks that question on EVERY
+ * control transfer into game text, and on a mod-patched title the answer is a
+ * permanent "no" for hundreds of pages — so the search is re-run forever to
+ * re-derive a verdict that never changes.
+ *
+ * addr -> (ranges, count) is a static map and exec_pc IS addr, so a verdict
+ * keyed on (addr, g_text_guard_gen) is by construction the same verdict the
+ * range memo returns; it just skips the lookup that produces the key. Shares
+ * the PSX_TEXT_GUARD_MEMO=0 bisect switch with the range memo. */
+#define TEXT_ADDR_MEMO_SLOTS 8192u        /* power of two */
+typedef struct {
+    uint32_t addr;
+    uint32_t gen;
+    int      ok;
+} TextAddrMemo;
+static TextAddrMemo s_text_addr_memo[TEXT_ADDR_MEMO_SLOTS];
+
+static int text_addr_memo_enabled(void) {
+    static int s = -1;
+    if (s < 0) {
+        const char *e = getenv("PSX_TEXT_ADDR_MEMO");
+        s = (e && e[0] == '0') ? 0 : text_ok_memo_enabled();
+    }
+    return s;
+}
+
 int psx_game_text_native_ok_memo(uint32_t addr) {
     extern int psx_game_text_native_ok(uint32_t addr);
-    return psx_game_text_native_ok(addr);
+    TextAddrMemo *e;
+    int ok;
+
+    if (!text_addr_memo_enabled()) return psx_game_text_native_ok(addr);
+
+    e = &s_text_addr_memo[((addr * 2654435761u) >> 9) & (TEXT_ADDR_MEMO_SLOTS - 1u)];
+    if (e->addr == addr && e->gen == g_text_guard_gen) return e->ok;
+
+    ok = psx_game_text_native_ok(addr);
+    e->addr = addr;
+    e->gen  = g_text_guard_gen;
+    e->ok   = ok;
+    return ok;
 }
 
 /* Preserve the generated-code ABI used by existing game projects. */
@@ -926,7 +930,7 @@ void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
     const uint8_t *src = bytes + (lo - phys);
     if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
     memcpy(ref, src, hi - lo);
-    text_guard_global_changed(); /* reference image changed */
+    g_text_guard_gen++;   /* reference image changed — drop memoized verdicts */
     /* Re-open the affected pages: clear the sticky diverged bit so the next
      * dispatch re-runs the compare against the now-updated reference. */
     uint32_t first_page = lo >> DIRTY_RAM_PAGE_SHIFT;
@@ -960,7 +964,7 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     g_dirty_ram_code_gen++;
     /* DMA / mod-plan wrote new code bytes over this range (this is the path
      * apply_main_write uses): live text may now differ from the reference. */
-    text_guard_global_changed();
+    g_text_guard_gen++;
 }
 
 /* Force-interp mode (tooling): PSX_FORCE_INTERP=1 makes ALL RAM above the kernel
@@ -1052,7 +1056,7 @@ static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
 void dirty_ram_reset_for_boot(void) {
-    text_guard_global_changed();
+    g_text_guard_gen++;
     memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
@@ -1107,7 +1111,7 @@ uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
 void dirty_ram_text_guard_resync_after_restore(void) {
     /* Restored RAM replaced live text wholesale — every memoized verdict was
      * decided against the pre-load bytes. */
-    text_guard_global_changed();
+    g_text_guard_gen++;
     /* text_diverged_bitmap is sticky: once a page's entry bytes fail the
      * reference compare, native stays blocked forever. That is correct for
      * forward sim, but after a savestate/RB rewind the restored RAM may
