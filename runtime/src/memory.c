@@ -578,11 +578,20 @@ void dirty_ram_clear_image_baseline(void) {
          * frame budget — and (b) keeps the pages out of
          * overlay_cache_window_contains(), so the overlay pipeline can never
          * capture or shard them: the code is stuck at 1-2 insns per dispatch
-         * forever. Keep the dirty bit wherever live bytes differ from the
+         * forever. Assert the dirty bit wherever live bytes differ from the
          * reference; such a page is real overlay-class code, not a false
-         * positive. Pages outside the registered image keep historical
-         * behavior (cleared). */
-        if (!text_page_matches_ref_image(page)) { kept++; continue; }
+         * positive. Merely preserving a pre-existing bit is insufficient after
+         * savestate restore: bulk-restored RAM can contain replacement code on
+         * a page whose serialized dirty bitmap is clean. The exact text guard
+         * correctly rejects the stale static function in that case, but the
+         * overlay loader also needs the dirty bit to admit the page to its
+         * live-CRC-gated candidate window. Pages outside the registered image
+         * keep historical behavior (cleared). */
+        if (!text_page_matches_ref_image(page)) {
+            dirty_ram_mark_page(page << DIRTY_RAM_PAGE_SHIFT);
+            kept++;
+            continue;
+        }
         dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
     }
     if (kept)

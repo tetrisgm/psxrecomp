@@ -410,6 +410,9 @@ if(BUILD_TESTING)
         add_test(NAME host_refresh_sanitize_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_host_refresh_sanitize.py)
+        add_test(NAME divergent_text_baseline_test
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_divergent_text_baseline.py)
     endif()
 
     # DISABLED, not de-registered. It links and runs, but 147 of its 309 checks
