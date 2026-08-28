@@ -2393,6 +2393,11 @@ static void init_callbacks(void) {
             };
             s_callbacks.pgxp = &pgxp_hooks_table;
         }
+        {
+            extern int gte_nclip_precise_bltz(int32_t native_mac0);
+            s_callbacks.gte_nclip_precise_bltz =
+                gte_nclip_precise_bltz;
+        }
     }
 }
 

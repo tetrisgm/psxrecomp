@@ -86,14 +86,17 @@
  *      model participation with queue-safe guard/hysteresis policy. */
 /* v21: ws_angle_widen forwarder for exact, aspect-scaled 12-bit terrain
  *      frustum half-angle constants. */
-/* (PGXP, no version bump): OverlayCallbacks grew an appended-last PGXPHooks
+/* v22: gte_nclip_precise_bltz forwarder. Exact-NCLIP branches can be emitted
+ *      inside runtime-patched overlay code as well as the main executable;
+ *      without this callback those shards fail to link and stay interpreted. */
+/* (PGXP, no separate version bump): OverlayCallbacks grew an appended-last PGXPHooks
  *      table pointer (pgxp_hooks.h). Only pgxp-flavour shards (compiled with
  *      -DPSX_PGXP=1, PSX_OVERLAY_FLAVOR_PGXP set) reference the psx_pgxp_*
  *      forwarders, and the flavor half of the ABI tag already rejects any
  *      host/DLL flavor mix — base-flavour DLLs and hosts are untouched, so
  *      the version stays. The emit-content change (PGXP_*() macros in all
  *      generated C) is covered by the codegen hash + CODEGEN_VER below. */
-#define PSX_OVERLAY_ABI_VERSION 21
+#define PSX_OVERLAY_ABI_VERSION 22
 
 /* Process-lifetime overlay candidate capacity.  Every accepted manifest F
  * record consumes one slot, even when another DLL carries an identical
@@ -317,6 +320,10 @@ typedef struct {
      * load-bearing. The ABI version bump that arms this ships with the
      * emitter change (Phase 2 of ENHANCEMENTS.md G1 value propagation). */
     const PGXPHooks *pgxp;
+
+    /* Exact-NCLIP branch verdict (ABI v23). Reads the runtime's validated GTE
+     * shadow coordinates, so overlay code must forward to the host. */
+    int (*gte_nclip_precise_bltz)(int32_t native_mac0);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

@@ -13911,6 +13911,45 @@ int main(int argc, char** argv) {
             if (deferred_has_overlay_ac)
                 ac_cmd = &deferred_overlay_ac;
         }
+        /* game.toml may describe the developer GCC tier without baking one
+         * checkout's absolute paths into the title. Resolve its documented
+         * tokens at runtime so a normal build-directory launch gets the same
+         * native overlay path as an instrumented environment override. */
+        if (ac_cmd && ac_cmd == &deferred_overlay_ac &&
+            ac_cmd->find('{') != std::string::npos) {
+            auto replace_all = [](std::string& value,
+                                  const std::string& token,
+                                  const std::filesystem::path& path) {
+                const std::string replacement =
+                    std::string("\"") + std::filesystem::absolute(path).string() + "\"";
+                size_t pos = 0;
+                while ((pos = value.find(token, pos)) != std::string::npos) {
+                    value.replace(pos, token.size(), replacement);
+                    pos += replacement.size();
+                }
+            };
+            auto find_dev_path = [&](const std::filesystem::path& relative) {
+                std::filesystem::path found =
+                    find_upward(deferred_overlay_project_root, relative);
+                if (found.empty())
+                    found = find_upward(exe_dir_from_argv(argv[0]), relative);
+                return found.empty()
+                    ? deferred_overlay_project_root / relative
+                    : found / relative;
+            };
+            replace_all(deferred_overlay_ac, "{COMPILE_OVERLAYS}",
+                        find_dev_path("psxrecomp/tools/compile_overlays.py"));
+            replace_all(deferred_overlay_ac, "{GAME_TOML}",
+                        game_config_path ? std::filesystem::path(game_config_path)
+                                         : deferred_overlay_project_root / "game.toml");
+            replace_all(deferred_overlay_ac, "{RECOMPILER}",
+                        find_dev_path("psxrecomp/recompiler/build/psxrecomp-game.exe"));
+            replace_all(deferred_overlay_ac, "{RUNTIME_INCLUDE}",
+                        find_dev_path("psxrecomp/runtime/include"));
+            ac_cmd = &deferred_overlay_ac;
+            std::fprintf(stdout,
+                "psxrecomp: resolved overlay autocompile command tokens\n");
+        }
         if (const char *e = std::getenv("PSX_OVERLAY_AUTOCOMPILE_CMD")) {
             if (e[0]) {
                 env_ac_cmd = e;

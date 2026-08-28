@@ -282,6 +282,14 @@ uint32_t psx_ws_angle_widen(uint32_t vanilla) {
 void gte_precision_store_word(uint32_t addr, uint8_t reg) {
     if (g_cbs.gte_precision_store_word) g_cbs.gte_precision_store_word(addr, reg);
 }
+/* Exact-NCLIP branches may live in mod-patched overlay code. Forward the
+ * verdict to the host's validated GTE shadow state; native MAC0 is the safe
+ * fallback when exact widescreen NCLIP is unavailable. */
+int gte_nclip_precise_bltz(int32_t native_mac0) {
+    return g_cbs.gte_nclip_precise_bltz
+        ? g_cbs.gte_nclip_precise_bltz(native_mac0)
+        : native_mac0 < 0;
+}
 #if defined(PSX_PGXP) && PSX_PGXP
 /* PGXP dataflow-shadowing hooks (pgxp_hooks.h; ENHANCEMENTS.md G1.10). Only a
  * pgxp-flavour shard (compiled -DPSX_PGXP=1, flavor bit set) references these
