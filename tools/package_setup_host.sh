@@ -54,6 +54,7 @@ RUNTIME_DIRS=()
 RUNTIME_DIRS_OPTIONAL=()
 RUNTIME_BIN_DIR="${PSXRECOMP_RUNTIME_BIN_DIR:-${BPE_RUNTIME_BIN_DIR:-/usr/x86_64-w64-mingw32/bin}}"
 EMBED_TOOLCHAIN=0
+LEAN=0
 if [[ "${PSXRECOMP_EMBED_TOOLCHAIN:-0}" == "1" ]]; then
   EMBED_TOOLCHAIN=1
 fi
@@ -80,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --runtime-dir-optional) RUNTIME_DIRS_OPTIONAL+=("${2:?}"); shift 2 ;;
     --runtime-bin) RUNTIME_BIN_DIR="${2:?}"; shift 2 ;;
     --root) ROOT="${2:?}"; shift 2 ;;
+    --lean) LEAN=1; shift ;;
     --embed-toolchain) EMBED_TOOLCHAIN=1; shift ;;
     --no-embed-toolchain) EMBED_TOOLCHAIN=0; shift ;;
     *)
@@ -141,7 +143,11 @@ REQUESTED="$(printf '%s' "${REQUESTED}" | tr -d '[:space:]')"
 REQUESTED="${REQUESTED#v}"
 
 DIST="${ROOT}/dist"
-STAGE="${DIST}/stage-setup-${ARTIFACT}"
+if [[ "${LEAN}" -eq 1 ]]; then
+  STAGE="${DIST}/stage-lean-${ARTIFACT}"
+else
+  STAGE="${DIST}/stage-setup-${ARTIFACT}"
+fi
 
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}" "${DIST}"
@@ -198,7 +204,11 @@ if [[ -n "${REQUESTED}" && "${REQUESTED}" != "${BUILT}" ]]; then
 fi
 VERSION="${BUILT}"
 printf '%s\n' "${VERSION}" >"${ROOT}/VERSION"
-ZIP_NAME="${ZIP_PREFIX}-${VERSION}-${ARTIFACT}.zip"
+if [[ "${LEAN}" -eq 1 ]]; then
+  ZIP_NAME="${ZIP_PREFIX}-${VERSION}-${ARTIFACT}-lean.zip"
+else
+  ZIP_NAME="${ZIP_PREFIX}-${VERSION}-${ARTIFACT}.zip"
+fi
 rm -f "${DIST}/${ZIP_NAME}"
 
 cp -a "${EXE}" "${STAGE}/"
@@ -299,6 +309,15 @@ for d in "${PROJECT_DIRS[@]}"; do
   copy_proj "${d}"
 done
 
+# A title may deliberately ship a reviewed default selection in
+# mods/preloaded/state.toml.  Runtime staging excludes the developer machine's
+# mutable mods/state.toml above; seed the release from this immutable source
+# instead so dependency groups (for example PAL100 + 8 MB) start coherently.
+if [[ -f "${STAGE}/mods/preloaded/state.toml" ]]; then
+  cp -a "${STAGE}/mods/preloaded/state.toml" "${STAGE}/mods/state.toml"
+  echo "staged reviewed default mod state"
+fi
+
 copy_tree_filtered() {
   local src="$1" dest="$2"
   shift 2
@@ -313,59 +332,71 @@ copy_tree_filtered() {
   fi
 }
 
-if [[ ! -d "${ROOT}/psxrecomp" ]]; then
+if [[ "${LEAN}" -eq 0 && ! -d "${ROOT}/psxrecomp" ]]; then
   echo "error: ${ROOT}/psxrecomp missing (expected framework submodule)" >&2
   exit 1
 fi
-if [[ ! -d "${ROOT}/recomp-ui" ]]; then
+if [[ "${LEAN}" -eq 0 && ! -d "${ROOT}/recomp-ui" ]]; then
   echo "error: ${ROOT}/recomp-ui missing (expected UI submodule)" >&2
   exit 1
 fi
 
-copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
-  --exclude '.git' \
-  --exclude 'recompiler/build' \
-  --exclude 'generated' \
-  --exclude '__pycache__' \
-  --exclude 'build' \
-  --exclude 'build-*'
+if [[ "${LEAN}" -eq 0 ]]; then
+  copy_tree_filtered "${ROOT}/psxrecomp" "${STAGE}/psxrecomp" \
+    --exclude '.git' \
+    --exclude 'recompiler/build' \
+    --exclude 'generated' \
+    --exclude '__pycache__' \
+    --exclude 'build' \
+    --exclude 'build-*'
 
-copy_tree_filtered "${ROOT}/recomp-ui" "${STAGE}/recomp-ui" \
-  --exclude '.git' \
-  --exclude 'build' \
-  --exclude '__pycache__'
+  copy_tree_filtered "${ROOT}/recomp-ui" "${STAGE}/recomp-ui" \
+    --exclude '.git' \
+    --exclude 'build' \
+    --exclude '__pycache__'
+
+  STAGE_SDK="${SCRIPT_DIR}/stage_setup_sdk.sh"
+  if [[ ! -f "${STAGE_SDK}" ]]; then
+    echo "error: missing ${STAGE_SDK}" >&2
+    exit 1
+  fi
+  chmod +x "${STAGE_SDK}" 2>/dev/null || true
+
+  stage_args=(
+    --stage "${STAGE}"
+    --framework "${ROOT}/psxrecomp"
+    --search-dir "${EXE_DIR}"
+    --search-dir "${BUILD_DIR}"
+    --runtime-bin "${RUNTIME_BIN_DIR}"
+    --host-exe "${STAGE}/${EXE_BASENAME}"
+    --recompiler-build "${RECOMPILER_BUILD}"
+  )
+  if [[ "${EMBED_TOOLCHAIN}" -eq 1 ]]; then
+    if [[ -z "${PSXRECOMP_TOOLCHAIN_DIR:-${TOOLCHAIN_DIR:-${BPE_TOOLCHAIN_DIR:-}}}" ]]; then
+      echo "error: --embed-toolchain requires PSXRECOMP_TOOLCHAIN_DIR (or TOOLCHAIN_DIR)" >&2
+      exit 1
+    fi
+    stage_args+=(--toolchain-dir "${PSXRECOMP_TOOLCHAIN_DIR:-${TOOLCHAIN_DIR:-${BPE_TOOLCHAIN_DIR}}}")
+  else
+    stage_args+=(--allow-no-toolchain)
+  fi
+
+  bash "${STAGE_SDK}" "${stage_args[@]}"
+fi
 
 # Never ship game generated C or common disc working trees.
 rm -rf "${STAGE}/generated" "${STAGE}/bpe" "${STAGE}/motk" "${STAGE}/disc"
 
-STAGE_SDK="${SCRIPT_DIR}/stage_setup_sdk.sh"
-if [[ ! -f "${STAGE_SDK}" ]]; then
-  echo "error: missing ${STAGE_SDK}" >&2
-  exit 1
-fi
-chmod +x "${STAGE_SDK}" 2>/dev/null || true
+if [[ "${LEAN}" -eq 1 ]]; then
+cat >"${STAGE}/README-PLAY.txt" <<EOF
+${DISPLAY_NAME} ${VERSION} — ready-to-play package
+Platform: ${ARTIFACT}
 
-stage_args=(
-  --stage "${STAGE}"
-  --framework "${ROOT}/psxrecomp"
-  --search-dir "${EXE_DIR}"
-  --search-dir "${BUILD_DIR}"
-  --runtime-bin "${RUNTIME_BIN_DIR}"
-  --host-exe "${STAGE}/${EXE_BASENAME}"
-  --recompiler-build "${RECOMPILER_BUILD}"
-)
-if [[ "${EMBED_TOOLCHAIN}" -eq 1 ]]; then
-  if [[ -z "${PSXRECOMP_TOOLCHAIN_DIR:-${TOOLCHAIN_DIR:-${BPE_TOOLCHAIN_DIR:-}}}" ]]; then
-    echo "error: --embed-toolchain requires PSXRECOMP_TOOLCHAIN_DIR (or TOOLCHAIN_DIR)" >&2
-    exit 1
-  fi
-  stage_args+=(--toolchain-dir "${PSXRECOMP_TOOLCHAIN_DIR:-${TOOLCHAIN_DIR:-${BPE_TOOLCHAIN_DIR}}}")
+Run ${EXE_BASENAME}, provide ${DISC_HINT} and a supported BIOS when prompted,
+then play. This package includes the precompiled runtime cache and does not
+include source code, build tools, disc images, or retail BIOS dumps.
+EOF
 else
-  stage_args+=(--allow-no-toolchain)
-fi
-
-bash "${STAGE_SDK}" "${stage_args[@]}"
-
 cat >"${STAGE}/README-SETUP.txt" <<EOF
 ${DISPLAY_NAME} ${VERSION} — setup package
 Platform: ${ARTIFACT}
@@ -388,6 +419,7 @@ RetComM uses this same zip: it harvests emitters into a shared SDK cache,
 downloads the toolchain pack (or uses RETCOMM_TOOLCHAIN_DIR), and preserves
 saves/user config across updates.
 EOF
+fi
 
 find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {} +
 
@@ -395,8 +427,11 @@ find "${STAGE}" -exec touch -c {} + 2>/dev/null || find "${STAGE}" -exec touch {
   cd "${STAGE}"
   if command -v zip >/dev/null 2>&1; then
     zip -r -q "${DIST}/${ZIP_NAME}" .
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 "${SCRIPT_DIR}/create_release_zip.py" \
+      --source "${STAGE}" --output "${DIST}/${ZIP_NAME}"
   else
-    echo "error: zip not found" >&2
+    echo "error: neither zip nor python3 is available" >&2
     exit 1
   fi
 )

@@ -68,6 +68,8 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "recomp_audio_drc.h"
 #include "memcard.h"
 #include "debug_server.h"
+#include "present_shot_listener.h"
+#include "present_shot_writer.h"
 #include "crash_trace.h"
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
@@ -1743,6 +1745,9 @@ static char             s_present_shot_path[512];
 static bool             s_present_shot_pending = false;
 static std::atomic<int> s_present_shot_seq{0};   /* bumps on every completion */
 static std::atomic<int> s_present_shot_ok{0};    /* 1 = last completion wrote a PNG */
+#ifdef PSX_PRESENT_SHOT_LISTENER
+static std::atomic<int> s_present_shot_active{0}; /* readback or async write */
+#endif
 
 extern "C" int present_shot_request(const char *path)
 {
@@ -1753,6 +1758,11 @@ extern "C" int present_shot_request(const char *path)
      * fulfil the request. Refuse honestly instead of accepting a shot that can
      * never complete — CLAUDE.md rule 15. */
     if (g_vk_active) return 0;
+#ifdef PSX_PRESENT_SHOT_LISTENER
+    /* The lightweight protocol admits only one shot until its exact completion
+     * sequence advances. */
+    if (s_present_shot_active.load(std::memory_order_acquire)) return 0;
+#endif
     {
         std::lock_guard<std::mutex> lk(s_present_shot_mtx);
         std::snprintf(s_present_shot_path, sizeof(s_present_shot_path), "%s", path);
@@ -1770,6 +1780,9 @@ extern "C" int present_shot_take(char *out, int n)
     if (!s_present_shot_pending) return 0;
     std::snprintf(out, (size_t)n, "%s", s_present_shot_path);
     s_present_shot_pending = false;   /* claimed */
+#ifdef PSX_PRESENT_SHOT_LISTENER
+    s_present_shot_active.store(1, std::memory_order_release);
+#endif
     return 1;
 }
 
@@ -1779,6 +1792,9 @@ extern "C" void present_shot_done(int ok)
 {
     s_present_shot_ok.store(ok ? 1 : 0, std::memory_order_release);
     s_present_shot_seq.fetch_add(1, std::memory_order_release);
+#ifdef PSX_PRESENT_SHOT_LISTENER
+    s_present_shot_active.store(0, std::memory_order_release);
+#endif
 }
 
 extern "C" int present_shot_seq(void) { return s_present_shot_seq.load(std::memory_order_acquire); }
@@ -2823,6 +2839,10 @@ static void shutdown_runtime(void) {
     }
     if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
     close_controller();
+#ifdef PSX_PRESENT_SHOT_LISTENER
+    present_shot_writer_shutdown();
+    present_shot_listener_shutdown();
+#endif
     debug_server_shutdown();
 }
 
@@ -3255,6 +3275,7 @@ static void runtime_perf_bench_tick(uint64_t now) {
         end.capture_overlays - start.capture_overlays,
         (unsigned long long)end.capture_last_dispatch_delta);
     std::fflush(stdout);
+
     g_runtime_perf.bench_reported = true;
 }
 
@@ -6144,6 +6165,11 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     extern uint64_t s_frame_count;
     s_frame_count++;
     int override = -1;
+#ifdef PSX_PRESENT_SHOT_LISTENER
+    /* One non-blocking poll per guest vblank.  This build still defines
+     * PSX_NO_DEBUG_TOOLS, so generated/AOT block observers remain absent. */
+    present_shot_listener_poll();
+#endif
 #endif
 
     runtime_perf_frame_begin();
@@ -7196,16 +7222,24 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             }
         }
 #endif
-        int wrote = 0;
         if (packed && ow > 0 && oh > 0) {
+#ifdef PSX_PRESENT_SHOT_LISTENER
+            present_shot_write_async(shot_path, packed,
+                                     (uint32_t)ow, (uint32_t)oh);
+            packed = NULL; /* worker owns it */
+#else
+            int wrote = 0;
             FILE *pf = std::fopen(shot_path, "wb");
             if (pf) {
                 wrote = png_write_rgb(pf, packed, (uint32_t)ow, (uint32_t)oh);
                 std::fclose(pf);
             }
+            present_shot_done(wrote);
+#endif
+        } else {
+            present_shot_done(0);
         }
         std::free(packed);
-        present_shot_done(wrote);
     }
     /* §33: remember active rect for resim hold-last (not full 640x512). */
     s_sw_hold_src = src;
@@ -10997,6 +11031,19 @@ int main(int argc, char** argv) {
             g_video_pgxp_cpu_mode = gc.runtime.video_pgxp_cpu_mode ? 1 : 0;
             g_video_pgxp_tolerance = (float)gc.runtime.video_pgxp_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
+            if (const char *probe_overclock =
+                    std::getenv("PSX_CANDIDATE_CPU_OVERCLOCK")) {
+                char *end = nullptr;
+                const unsigned long requested =
+                    std::strtoul(probe_overclock, &end, 10);
+                if (end != probe_overclock && *end == '\0' &&
+                    requested >= 100ul && requested <= 6400ul) {
+                    psx_set_cpu_overclock((uint32_t)requested);
+                    std::fprintf(stdout,
+                                 "psxrecomp: candidate CPU overclock override %u%%\n",
+                                 psx_get_cpu_overclock());
+                }
+            }
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
@@ -11264,6 +11311,8 @@ int main(int argc, char** argv) {
                 uint32_t text_lo = gc.load_address & 0x1FFFFFFFu;
                 if (text_lo > 0x00010000u && text_lo < g_overlay_region_floor)
                     g_text_image_lo = text_lo;
+                if (gc.runtime.overlay_region_floor != 0u)
+                    g_overlay_region_floor = gc.runtime.overlay_region_floor;
                 /* PSX_OVERLAY_REGION_FLOOR: per-title override for games whose TEXT
                  * range is itself partially overwritten by streamed level data
                  * (Driver 2 streams mission code over pages inside its static text
@@ -13016,7 +13065,11 @@ session_reboot:
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
 #else
+#ifdef PSX_PRESENT_SHOT_LISTENER
+        present_shot_listener_init(debug_port);
+#else
         (void)debug_port;
+#endif
 #endif
 #ifdef PSX_COSIM
         cosim_init();  /* first-divergence oracle server */

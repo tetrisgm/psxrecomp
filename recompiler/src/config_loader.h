@@ -266,6 +266,11 @@ struct RuntimeConfig {
     // overlay bytes to overlay_captures.json for offline compilation.
     bool                  overlay_cache = false;
 
+    // Optional per-title lower bound for RAM regions treated as streamed or
+    // overlay code. Zero keeps the default main-text-end inference. Some
+    // titles stream race/level code over pages inside nominal static text.
+    uint32_t              overlay_region_floor = 0;
+
     // overlay_capture_history: opt-in durable capture history. The runtime
     // keeps overlay_captures.json as an atomic latest snapshot for the live
     // compiler and additionally appends every changed coherent snapshot to
@@ -818,6 +823,10 @@ struct GameConfig {
     // entries that dispatch trusted, statically linked mod callbacks. Empty by
     // default, so projects that do not opt in emit no callback overhead.
     std::vector<uint32_t> mod_function_entry_funcs;
+
+    // [recompiler] mod_instruction_sites: exact, instruction-aligned guest PCs
+    // at which generated code dispatches a trusted static mod callback.
+    std::vector<uint32_t> mod_instruction_sites;
 
     // [recompiler] hot_funcs: guest addresses that get __attribute__((hot))
     // on their generated C bodies (profile/host locality; no guest semantics).

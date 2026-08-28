@@ -83,9 +83,180 @@ struct FunctionEntryPlugin {
     PSXModFunctionEntryCallback callback = nullptr;
 };
 
+struct InstructionSitePlugin {
+    std::string id;
+    uint32_t address = 0;
+    PSXModInstructionSiteCallback callback = nullptr;
+};
+
+struct EnabledInstructionSite {
+    uint32_t address = 0;
+    std::vector<PSXModInstructionSiteCallback> callbacks;
+};
+
+struct StatePlugin {
+    std::string id;
+    uint32_t version = 0;
+    PSXModStateSizeCallback size_callback = nullptr;
+    PSXModStateSaveCallback save_callback = nullptr;
+    PSXModStateLoadCallback load_callback = nullptr;
+};
+
 std::vector<FunctionEntryPlugin>& function_entry_plugins() {
     static std::vector<FunctionEntryPlugin> value;
     return value;
+}
+
+std::vector<InstructionSitePlugin>& instruction_site_plugins() {
+    static std::vector<InstructionSitePlugin> value;
+    return value;
+}
+
+std::vector<EnabledInstructionSite>& enabled_instruction_sites() {
+    static std::vector<EnabledInstructionSite> value;
+    return value;
+}
+
+/* Resolve package IDs once, when either the committed plan or the registered
+ * callback set changes. Exact instruction hooks sit on renderer/simulation hot
+ * paths, so their dispatch must not scan strings and the complete plan for
+ * every guest instruction. Registration order remains the deterministic
+ * fan-out order for callbacks sharing one address. */
+void rebuild_enabled_instruction_sites() {
+    auto& enabled = enabled_instruction_sites();
+    enabled.clear();
+    RuntimeMods& runtime = state();
+    if (!runtime.initialized || !runtime.plan.ok) return;
+
+    for (const InstructionSitePlugin& plugin : instruction_site_plugins()) {
+        const bool selected = std::any_of(
+            runtime.plan.plugins.begin(), runtime.plan.plugins.end(),
+            [&](const ModResolution::Plugin& planned) {
+                return planned.id == plugin.id;
+            });
+        if (!selected) continue;
+        auto found = std::lower_bound(
+            enabled.begin(), enabled.end(), plugin.address,
+            [](const EnabledInstructionSite& site, uint32_t address) {
+                return site.address < address;
+            });
+        if (found == enabled.end() || found->address != plugin.address) {
+            found = enabled.insert(
+                found, EnabledInstructionSite{plugin.address, {}});
+        }
+        found->callbacks.push_back(plugin.callback);
+    }
+}
+
+std::vector<StatePlugin>& state_plugins() {
+    static std::vector<StatePlugin> value;
+    return value;
+}
+
+constexpr uint32_t kPluginStateMagic = 0x3153504Du; /* "MPS1" LE */
+constexpr uint32_t kPluginStateContainerVersion = 1u;
+constexpr uint32_t kPluginStateHeaderBytes = 16u;
+constexpr uint32_t kPluginStateRecordHeaderBytes = 16u;
+constexpr uint32_t kPluginStateMaxProviders = 32u;
+constexpr uint32_t kPluginStateMaxIdBytes = 127u;
+constexpr uint32_t kPluginStateMaxPayloadBytes = 1024u * 1024u;
+constexpr uint32_t kPluginStateMaxTotalBytes = 4u * 1024u * 1024u;
+
+void state_wire_u32(uint8_t* out, uint32_t value) {
+    out[0] = (uint8_t)value;
+    out[1] = (uint8_t)(value >> 8);
+    out[2] = (uint8_t)(value >> 16);
+    out[3] = (uint8_t)(value >> 24);
+}
+
+bool state_wire_read_u32(const uint8_t*& cursor, const uint8_t* end,
+                         uint32_t& value) {
+    if ((size_t)(end - cursor) < 4u) return false;
+    value = (uint32_t)cursor[0] | ((uint32_t)cursor[1] << 8) |
+            ((uint32_t)cursor[2] << 16) | ((uint32_t)cursor[3] << 24);
+    cursor += 4;
+    return true;
+}
+
+std::vector<const StatePlugin*> enabled_state_plugins() {
+    std::vector<const StatePlugin*> enabled;
+    RuntimeMods& runtime = state();
+    if (!runtime.initialized || !runtime.plan.ok) return enabled;
+    for (const StatePlugin& provider : state_plugins()) {
+        const bool selected = std::any_of(
+            runtime.plan.plugins.begin(), runtime.plan.plugins.end(),
+            [&](const ModResolution::Plugin& plugin) {
+                return plugin.id == provider.id;
+            });
+        if (selected) enabled.push_back(&provider);
+    }
+    std::sort(enabled.begin(), enabled.end(),
+              [](const StatePlugin* a, const StatePlugin* b) {
+                  return a->id < b->id;
+              });
+    return enabled;
+}
+
+bool plugin_state_size(const std::vector<const StatePlugin*>& enabled,
+                       uint32_t& out) {
+    if (enabled.empty()) {
+        out = 0u;
+        return true;
+    }
+    if (enabled.size() > kPluginStateMaxProviders) return false;
+    uint64_t total = kPluginStateHeaderBytes;
+    for (const StatePlugin* provider : enabled) {
+        const uint32_t payload = provider->size_callback();
+        if (provider->id.empty() || provider->id.size() > kPluginStateMaxIdBytes ||
+            payload > kPluginStateMaxPayloadBytes)
+            return false;
+        total += kPluginStateRecordHeaderBytes + provider->id.size() + payload;
+        if (total > kPluginStateMaxTotalBytes) return false;
+    }
+    out = (uint32_t)total;
+    return true;
+}
+
+bool plugin_state_load(const uint8_t* data, uint32_t size, bool apply) {
+    const std::vector<const StatePlugin*> enabled = enabled_state_plugins();
+    uint32_t expected_size = 0;
+    if (!plugin_state_size(enabled, expected_size) || !data ||
+        size != expected_size || enabled.empty())
+        return false;
+
+    const uint8_t* cursor = data;
+    const uint8_t* end = data + size;
+    uint32_t magic = 0, version = 0, count = 0, reserved = 0;
+    if (!state_wire_read_u32(cursor, end, magic) ||
+        !state_wire_read_u32(cursor, end, version) ||
+        !state_wire_read_u32(cursor, end, count) ||
+        !state_wire_read_u32(cursor, end, reserved) ||
+        magic != kPluginStateMagic || version != kPluginStateContainerVersion ||
+        reserved != 0u || count != enabled.size())
+        return false;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t id_size = 0, schema = 0, payload_size = 0, record_reserved = 0;
+        if (!state_wire_read_u32(cursor, end, id_size) ||
+            !state_wire_read_u32(cursor, end, schema) ||
+            !state_wire_read_u32(cursor, end, payload_size) ||
+            !state_wire_read_u32(cursor, end, record_reserved) ||
+            id_size == 0u || id_size > kPluginStateMaxIdBytes ||
+            payload_size > kPluginStateMaxPayloadBytes || record_reserved != 0u ||
+            (size_t)(end - cursor) < (size_t)id_size + payload_size)
+            return false;
+        const StatePlugin* provider = enabled[i];
+        if (provider->id.size() != id_size ||
+            std::memcmp(cursor, provider->id.data(), id_size) != 0 ||
+            schema != provider->version ||
+            payload_size != provider->size_callback())
+            return false;
+        cursor += id_size;
+        if (!provider->load_callback(cursor, payload_size, apply ? 1 : 0))
+            return false;
+        cursor += payload_size;
+    }
+    return cursor == end;
 }
 
 const ModPackage* selected_package(const std::string& id) {
@@ -1097,6 +1268,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
     s.effective_disc_path.clear();
     s.entry_phys = 0;
     s.initialized = false;
+    rebuild_enabled_instruction_sites();
     s.main_applied = false;
     s.disc_enabled = false;
     s.disc_guard_failed = false;
@@ -1114,6 +1286,7 @@ bool mod_runtime_initialize(const std::filesystem::path& root,
         s.error.clear();
     }
     s.initialized = true;
+    rebuild_enabled_instruction_sites();
     return true;
 }
 
@@ -1124,6 +1297,7 @@ bool mod_runtime_clear_for_netplay(std::string* error) {
         return true;
     }
     s.plan = {};
+    rebuild_enabled_instruction_sites();
     s.validation = {};
     s.raw_disc_index.clear();
     s.user_disc_index.clear();
@@ -1185,6 +1359,7 @@ bool mod_runtime_commit(const std::filesystem::path& disc_path, std::string* err
         return false;
     }
     s.plan = std::move(plan);
+    rebuild_enabled_instruction_sites();
     build_disc_index(s);
     s.effective_disc_path = std::move(effective_disc);
     s.main_applied = false;
@@ -1425,6 +1600,113 @@ extern "C" void psx_mod_function_entry(CPUState* cpu, uint32_t address) {
     for (const FunctionEntryPlugin& plugin : function_entry_plugins()) {
         if (plugin.address == address) plugin.callback(cpu, address);
     }
+}
+
+extern "C" int psx_mod_register_instruction_site_plugin(
+    const char* id, uint32_t address, PSXModInstructionSiteCallback callback) {
+    using namespace PSXRecompV4;
+    if (!id || !*id || !address || (address & 3u) != 0u || !callback)
+        return 0;
+    if (!mod_register_instruction_site_plugin_id(id)) return 0;
+    auto& plugins = instruction_site_plugins();
+    const auto duplicate = std::find_if(
+        plugins.begin(), plugins.end(), [&](const InstructionSitePlugin& item) {
+            return item.id == id && item.address == address;
+        });
+    if (duplicate != plugins.end()) return 0;
+    plugins.push_back(InstructionSitePlugin{id, address, callback});
+    rebuild_enabled_instruction_sites();
+    return 1;
+}
+
+extern "C" uint32_t psx_mod_instruction_site(CPUState* cpu,
+                                               uint32_t address) {
+    using namespace PSXRecompV4;
+    if (!cpu) return 0;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return 0;
+    auto& enabled = enabled_instruction_sites();
+    auto found = std::lower_bound(
+        enabled.begin(), enabled.end(), address,
+        [](const EnabledInstructionSite& site, uint32_t requested) {
+            return site.address < requested;
+        });
+    if (found == enabled.end() || found->address != address) return 0;
+    for (PSXModInstructionSiteCallback callback : found->callbacks) {
+        const uint32_t continuation = callback(cpu, address);
+        if (continuation != 0u) return continuation;
+    }
+    return 0;
+}
+
+extern "C" int psx_mod_register_state_plugin(
+    const char* id, uint32_t version,
+    PSXModStateSizeCallback size_callback,
+    PSXModStateSaveCallback save_callback,
+    PSXModStateLoadCallback load_callback) {
+    using namespace PSXRecompV4;
+    if (!id || !*id || std::strlen(id) > kPluginStateMaxIdBytes ||
+        version == 0u || !size_callback || !save_callback || !load_callback)
+        return 0;
+    auto& providers = state_plugins();
+    const auto duplicate = std::find_if(
+        providers.begin(), providers.end(), [&](const StatePlugin& provider) {
+            return provider.id == id;
+        });
+    if (duplicate != providers.end()) return 0;
+    providers.push_back(StatePlugin{id, version, size_callback,
+                                    save_callback, load_callback});
+    return 1;
+}
+
+extern "C" uint32_t psx_mod_plugin_state_bytes(void) {
+    using namespace PSXRecompV4;
+    const std::vector<const StatePlugin*> enabled = enabled_state_plugins();
+    uint32_t size = 0;
+    return plugin_state_size(enabled, size) ? size : 0u;
+}
+
+extern "C" int psx_mod_plugin_state_write(uint8_t* out, uint32_t size) {
+    using namespace PSXRecompV4;
+    const std::vector<const StatePlugin*> enabled = enabled_state_plugins();
+    uint32_t expected_size = 0;
+    if (!plugin_state_size(enabled, expected_size) || enabled.empty() ||
+        !out || size != expected_size)
+        return 0;
+    uint8_t* cursor = out;
+    state_wire_u32(cursor, kPluginStateMagic); cursor += 4;
+    state_wire_u32(cursor, kPluginStateContainerVersion); cursor += 4;
+    state_wire_u32(cursor, (uint32_t)enabled.size()); cursor += 4;
+    state_wire_u32(cursor, 0u); cursor += 4;
+    for (const StatePlugin* provider : enabled) {
+        const uint32_t id_size = (uint32_t)provider->id.size();
+        const uint32_t payload_size = provider->size_callback();
+        state_wire_u32(cursor, id_size); cursor += 4;
+        state_wire_u32(cursor, provider->version); cursor += 4;
+        state_wire_u32(cursor, payload_size); cursor += 4;
+        state_wire_u32(cursor, 0u); cursor += 4;
+        std::memcpy(cursor, provider->id.data(), id_size);
+        cursor += id_size;
+        if (!provider->save_callback(cursor, payload_size)) return 0;
+        cursor += payload_size;
+    }
+    return cursor == out + size;
+}
+
+extern "C" int psx_mod_plugin_state_validate(const uint8_t* data,
+                                               uint32_t size) {
+    return PSXRecompV4::plugin_state_load(data, size, false) ? 1 : 0;
+}
+
+extern "C" int psx_mod_plugin_state_apply(const uint8_t* data,
+                                            uint32_t size) {
+    /* A direct caller cannot bypass the non-mutating validation pass. */
+    if (!PSXRecompV4::plugin_state_load(data, size, false)) return 0;
+    return PSXRecompV4::plugin_state_load(data, size, true) ? 1 : 0;
+}
+
+extern "C" int psx_mod_plugin_state_required(void) {
+    return PSXRecompV4::enabled_state_plugins().empty() ? 0 : 1;
 }
 
 extern "C" void mod_runtime_patch_disc_sector(uint32_t lba, int raw_sector,

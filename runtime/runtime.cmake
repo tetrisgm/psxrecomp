@@ -62,6 +62,14 @@ else()
     option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
 
+# PSX_PRESENT_SHOT_LISTENER: production-speed visual-evidence seam.  This is
+# deliberately separate from PSX_DEBUG_TOOLS: generated/AOT code keeps
+# PSX_NO_DEBUG_TOOLS (therefore no per-block observers or trace rings), while a
+# tiny loopback listener exposes only present_shot + present_shot_seq.  It is
+# OFF by default and must be requested explicitly by capture builds.
+option(PSX_PRESENT_SHOT_LISTENER
+    "Build a lightweight present_shot-only loopback listener" OFF)
+
 # PSX_STATIC_RUNTIME: produce a 100% self-contained MinGW exe.
 #
 # A default MinGW build dynamically imports three NON-system DLLs —
@@ -268,6 +276,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/sio.c
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
     ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
+    ${PSXRECOMP_ROOT}/runtime/src/present_shot_listener.c
+    ${PSXRECOMP_ROOT}/runtime/src/present_shot_writer.cpp
     ${PSXRECOMP_ROOT}/runtime/src/debug_trace_ranges.c
     ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
     ${PSXRECOMP_ROOT}/runtime/src/game_dispatch_compat.c
@@ -1354,6 +1364,15 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+    if(PSX_PRESENT_SHOT_LISTENER AND NOT PSX_DEBUG_TOOLS)
+        target_compile_definitions(${target} PRIVATE
+            PSX_PRESENT_SHOT_LISTENER=1)
+        message(STATUS
+            "psxrecomp: lightweight present_shot listener enabled (debug hot-path tools remain disabled)")
+    elseif(PSX_PRESENT_SHOT_LISTENER)
+        message(STATUS
+            "psxrecomp: PSX_PRESENT_SHOT_LISTENER ignored because full PSX_DEBUG_TOOLS are enabled")
     endif()
 
     if(PSXRECOMP_HAS_RECOMP_NET)

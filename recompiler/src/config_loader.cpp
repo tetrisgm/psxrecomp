@@ -61,6 +61,7 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
 
     h.words("sprite_tag_funcs", c.ws_sprite_tag_funcs);
     h.words("mod_function_entry_funcs", c.mod_function_entry_funcs);
+    h.words("mod_instruction_sites", c.mod_instruction_sites);
     h.words("cull_bias", c.ws_cull_bias_sites);
     h.words("cull_range", c.ws_cull_range_sites);
     h.words("cull_a1", c.ws_cull_a1_sites);
@@ -462,6 +463,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     }
     if (runtime.contains("overlay_cache")) {
         rt.overlay_cache = toml::find<bool>(runtime, "overlay_cache");
+    }
+    if (runtime.contains("overlay_region_floor")) {
+        rt.overlay_region_floor = parse_hex(
+            toml::find<std::string>(runtime, "overlay_region_floor"),
+            "runtime.overlay_region_floor") & 0x1FFFFFFFu;
+        if (rt.overlay_region_floor < 0x00010000u) {
+            throw std::runtime_error(
+                "runtime.overlay_region_floor must be at or above 0x00010000");
+        }
     }
     if (runtime.contains("overlay_capture_history")) {
         rt.overlay_capture_history =
@@ -1448,6 +1458,24 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             mod_function_entry_funcs.push_back(
                 parse_hex(a, "recompiler.mod_function_entry_funcs"));
     }
+    std::vector<uint32_t> mod_instruction_sites;
+    if (recomp.contains("mod_instruction_sites")) {
+        const auto& arr = toml::find<std::vector<std::string>>(
+            recomp, "mod_instruction_sites");
+        std::set<uint32_t> seen_physical;
+        for (const auto& a : arr) {
+            const uint32_t address =
+                parse_hex(a, "recompiler.mod_instruction_sites");
+            if ((address & 3u) != 0u)
+                throw std::runtime_error(
+                    "recompiler.mod_instruction_sites must be instruction-aligned");
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            if (!seen_physical.insert(physical).second)
+                throw std::runtime_error(
+                    "duplicate recompiler.mod_instruction_sites physical address");
+            mod_instruction_sites.push_back(address);
+        }
+    }
     std::vector<uint32_t> hot_funcs;
     if (recomp.contains("hot_funcs")) {
         const auto& arr = toml::find<std::vector<std::string>>(recomp, "hot_funcs");
@@ -2098,6 +2126,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_auto_ui_squash*/      ws_auto_ui_squash,
         /*data_shard_funcs*/      data_shard_funcs,
         /*mod_function_entry_funcs*/ mod_function_entry_funcs,
+        /*mod_instruction_sites*/ mod_instruction_sites,
         /*hot_funcs*/             hot_funcs,
         /*load_charge_batch*/     load_charge_batch,
         /*load_charge_batch_funcs*/ load_charge_batch_funcs,

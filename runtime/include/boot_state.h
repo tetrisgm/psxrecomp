@@ -102,6 +102,17 @@ enum {
                               apart (MotK abort@940: fin cyc Δ8, v0 5c83/5c86
                               from identical baselines). Optional on load for
                               old blobs (left untouched when absent).          */
+    /* 0x11 remains reserved. Keep the imported branch's serialized tag values
+     * without importing its unrelated SIO1 snapshot behavior. */
+    BS_SEC_TEXPACK = 0x12, /* HD texture pack upload tracker (rects+hashes)      */
+    BS_SEC_MODSET  = 0x13, /* resolved mod-plan fingerprint (load guard):
+                            * loading a state into a session whose enabled mod
+                            * set differs poisons the machine (null-PC spin was
+                            * observed live) -- refuse BEFORE any apply instead.
+                            * Written FIRST so the reject precedes mutation.    */
+    BS_SEC_MODSTATE = 0x14,/* versioned host-side state for enabled native mod
+                              plugins. Validated before any section is applied;
+                              required when the live plan has a state provider. */
 };
 
 /* Save a COMPLETE snapshot at game handoff. Returns 1 on success. */

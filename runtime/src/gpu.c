@@ -220,11 +220,12 @@ static int ws_gameplay_state_value_count = 0;
 #define WS_GTE_GAME_MODE_HYSTERESIS 45u
 void gpu_ws_set_gte_game_mode(int on) { ws_gte_game_mode_cfg = on ? 1 : 0; }
 void gpu_pgxp_rederive_enable(void);
+extern void gte_nclip_precision_set(int enabled);
 void gpu_ws_set_precise_nclip(int on) {
     ws_precise_nclip_cfg = on ? 1 : 0;
-    /* Exact NCLIP consumes PGXP transport shadows even when every visual
-     * PGXP correction is disabled. Re-derive the internal transport arm. */
-    gpu_pgxp_rederive_enable();
+    /* Exact NCLIP needs only the GTE's three-entry projected-SXY FIFO. Do not
+     * arm the global PGXP CPU/RAM dataflow machinery for this local consumer. */
+    gte_nclip_precision_set(ws_precise_nclip_cfg);
 }
 int gpu_ws_precise_nclip_enabled(void) { return ws_precise_nclip_cfg && ws_active(); }
 void gpu_ws_set_gameplay_state_gate(uint32_t addr,
@@ -3280,12 +3281,11 @@ static int s_texture_correction_enabled = 0;
 extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
                                    int32_t *x16, int32_t *y16, uint16_t *z);
 
-/* Arm the PGXP dataflow transport for any consumer. Exact NCLIP is an internal
- * sign source only; this does not enable geometry or texture correction. */
+/* Arm the PGXP dataflow transport only for consumers that move projection
+ * provenance through guest RAM. Exact NCLIP has its own GTE-local FIFO. */
 void gpu_pgxp_rederive_enable(void) {
     pgxp_set_enabled(s_texture_correction_enabled ||
-                     gte_geometry_correction_enabled() ||
-                     ws_precise_nclip_cfg);
+                     gte_geometry_correction_enabled());
 }
 
 void gpu_texture_correction_set(int enabled) {
