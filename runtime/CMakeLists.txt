@@ -107,6 +107,16 @@ if(BUILD_TESTING)
     target_include_directories(pgxp_test PRIVATE include)
     add_test(NAME pgxp_test COMMAND pgxp_test)
 
+    # Legacy DuckStation/Beetle roots carry Hashes.ini beside exactly one
+    # *-texture-replacements folder. Pin discovery, logical font mappings,
+    # padded aliases, and fail-closed duplicate handling independently of GL.
+    add_executable(hd_texture_pack_test
+        tests/test_hd_texture_pack.cpp
+        src/hd_texture_pack.cpp)
+    target_include_directories(hd_texture_pack_test PRIVATE include)
+    find_package(Threads REQUIRED)
+    target_link_libraries(hd_texture_pack_test PRIVATE Threads::Threads)
+    add_test(NAME hd_texture_pack_test COMMAND hd_texture_pack_test)
     add_executable(psx_instr_cost_test tests/test_psx_instr_cost.cpp)
     target_include_directories(psx_instr_cost_test PRIVATE include)
     add_test(NAME psx_instr_cost_test COMMAND psx_instr_cost_test)

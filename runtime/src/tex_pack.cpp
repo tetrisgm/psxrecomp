@@ -21,6 +21,7 @@
 
 #include "gpu.h"
 #include "crc32.h"
+#include "hd_texture_pack.h"
 #include "png_write.h"
 
 /* Declarations only — STB_IMAGE_IMPLEMENTATION is compiled in
@@ -74,6 +75,10 @@ struct State {
     std::filesystem::path pack_dir;
     std::filesystem::path dump_dir;
     bool dump_dir_ready = false;
+    /* Deterministic legacy root/index. The current renderer remains the owner
+     * of upload tracking and GL objects; this object supplies only discovery,
+     * Hashes.ini metadata, exact alias paths, and ambiguity rejection. */
+    HdTexturePack *legacy_pack = nullptr;
 
     std::vector<Upload>  uploads;
     std::vector<PalMemo> pal_memo;
@@ -380,9 +385,15 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
     g.dump_on    = false;
     g.uploads.clear();
     g.pal_memo.clear();
+    if (g.legacy_pack) {
+        hd_texture_pack_destroy(g.legacy_pack);
+        g.legacy_pack = nullptr;
+    }
     g.known.clear();
     g.dumped.clear();
     g.matched.clear();
+    g.repl.clear();
+    g.excluded.clear();
     g.dump_dir_ready = false;
     g.started        = std::chrono::steady_clock::now();
 
@@ -410,6 +421,24 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
      * touching the disk. */
     if (g.replace_on) {
         std::error_code ec;
+        if (std::filesystem::is_directory(g.pack_dir, ec)) {
+            char error[512]{};
+            if (hd_texture_pack_create(g.pack_dir.string().c_str(),
+                                       &g.legacy_pack, error, sizeof(error))) {
+                HdTexturePackInfo info{};
+                hd_texture_pack_get_info(g.legacy_pack, &info);
+                g.pack_dir = std::filesystem::path(info.replacement_root);
+                std::printf("[tex_pack] legacy root indexed: files=%zu unique=%zu "
+                            "ambiguous=%zu mappings=%zu fonts=%s\n",
+                            info.replacement_file_count, info.unique_key_count,
+                            info.ambiguous_key_count, info.logical_mapping_count,
+                            info.complete_wip3out_fonts ? "complete" : "partial");
+            } else {
+                std::fprintf(stderr, "[tex_pack] pack rejected: %s (%s)\n",
+                             g.pack_dir.string().c_str(), error);
+            }
+        }
+        ec.clear();
         for (const auto &e : std::filesystem::directory_iterator(g.pack_dir, ec)) {
             if (ec) break;
             if (!e.is_regular_file(ec)) continue;
@@ -417,8 +446,16 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
             unsigned h = 0, p = 0;
             char ext[16] = {0};
             if (std::sscanf(fn.c_str(), "%x-%x.%15s", &h, &p, ext) != 3) continue;
-            if (std::strcmp(ext, "png") != 0) continue;   /* v1 decodes PNG only */
-            key_set_insert(g.known, pack_key(h, p));
+            const uint64_t key = pack_key(h, p);
+            if (g.legacy_pack) {
+                HdTexturePackEntry entry{};
+                if (hd_texture_pack_lookup(g.legacy_pack, h, p, &entry) !=
+                    HD_TEXTURE_LOOKUP_FOUND)
+                    continue; /* ambiguous numeric aliases fail closed */
+            } else if (std::strcmp(ext, "png") != 0) {
+                continue; /* legacy index accepts .PNG; fallback stays v1 */
+            }
+            key_set_insert(g.known, key);
         }
 
         /* Optional per-pack exclusions. */
@@ -490,6 +527,12 @@ extern "C" void tex_pack_shutdown(void) {
     g.dump_on    = false;
     g.uploads.clear();
     g.pal_memo.clear();
+    if (g.legacy_pack) {
+        hd_texture_pack_destroy(g.legacy_pack);
+        g.legacy_pack = nullptr;
+    }
+    g.known.clear();
+    g.repl.clear();
 }
 
 extern "C" int tex_pack_active(void) {
@@ -765,10 +808,20 @@ State::Repl *repl_get_locked(uint64_t key, const Upload &up, int shift,
     r.origin_u = (up.x - base_x) << shift;
     r.origin_v = up.y - base_y;
 
-    char name[64];
-    std::snprintf(name, sizeof(name), "%x-%x.png",
-                  (unsigned)(key >> 32), (unsigned)(key & 0xFFFFFFFFu));
-    const std::filesystem::path path = g.pack_dir / name;
+    std::filesystem::path path;
+    if (g.legacy_pack) {
+        HdTexturePackEntry entry{};
+        if (hd_texture_pack_lookup(g.legacy_pack,
+                                   (uint32_t)(key >> 32), (uint32_t)key,
+                                   &entry) == HD_TEXTURE_LOOKUP_FOUND)
+            path = std::filesystem::path(entry.replacement_path);
+    } else {
+        char name[64];
+        std::snprintf(name, sizeof(name), "%x-%x.png",
+                      (unsigned)(key >> 32),
+                      (unsigned)(key & 0xFFFFFFFFu));
+        path = g.pack_dir / name;
+    }
 
     std::vector<uint8_t> file;
     if (FILE *f = std::fopen(path.string().c_str(), "rb")) {

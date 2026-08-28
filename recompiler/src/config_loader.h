@@ -455,6 +455,12 @@ struct RuntimeConfig {
     // (awesome-wipeout.github.io) suit this exactly.
     std::string           video_bezel;
 
+    // External legacy replacement pack. Empty leaves normal cue-sibling
+    // discovery in effect, "off" disables it, "auto" requests unambiguous
+    // cue-sibling discovery, and any other value is a path (relative to the
+    // project root when not absolute). Asset bytes remain external.
+    std::string           video_hd_texture_pack;
+
     // hd_texture_dir: parent directory for both folders above. Empty (default)
     // means the directory the disc image lives in, which is where a pack
     // authored for RetroArch already expects to sit.
