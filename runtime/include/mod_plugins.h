@@ -219,6 +219,9 @@ int psx_mod_set_auto_skip_fmv(int enabled);
  * mod/resource path, the margins remain the historical black clear.
  */
 int psx_mod_set_bezel_artwork(const char* path);
+/* Compatibility selector for title catalogs that name artwork in the
+ * executable-relative bezels/ directory (or request "random"). */
+int psx_mod_set_bezel(const char* selection);
 
 /*
  * Upper bounds for the two loading-speed knobs below. Both are generous on

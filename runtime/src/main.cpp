@@ -118,6 +118,7 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <cctype>
 #include <cmath>
@@ -1496,6 +1497,18 @@ extern "C" int psx_mod_set_bezel_artwork(const char* path) {
         return 0;
     }
     g_bezel_path = path;
+    g_video_renderer = 1;
+    std::fprintf(stdout, "psxrecomp: mod selected bezel artwork %s\n",
+                 g_bezel_path.c_str());
+    return 1;
+}
+
+extern "C" int psx_mod_set_bezel(const char* selection) {
+    if (!selection || !selection[0] || std::strlen(selection) >= 256u) {
+        std::fprintf(stderr, "psxrecomp: mod rejected invalid bezel selection\n");
+        return 0;
+    }
+    g_bezel_path = selection;
     g_video_renderer = 1;
     std::fprintf(stdout, "psxrecomp: mod selected bezel artwork %s\n",
                  g_bezel_path.c_str());
@@ -13354,7 +13367,29 @@ session_reboot:
 
         /* Bezel artwork (Mods): load after the GL context exists. */
         if (!g_bezel_path.empty() && g_gl_active) {
-            std::filesystem::path bp(g_bezel_path);
+            std::filesystem::path bp;
+            const std::filesystem::path bezel_dir =
+                exe_dir_from_argv(argv[0]) / "bezels";
+            if (g_bezel_path == "random") {
+                std::vector<std::filesystem::path> pool;
+                std::error_code bezel_ec;
+                for (const auto &entry :
+                     std::filesystem::directory_iterator(bezel_dir, bezel_ec)) {
+                    if (bezel_ec) break;
+                    if (entry.is_regular_file(bezel_ec) &&
+                        entry.path().extension() == ".png")
+                        pool.push_back(entry.path());
+                }
+                std::sort(pool.begin(), pool.end());
+                if (!pool.empty()) {
+                    std::random_device random;
+                    bp = pool[random() % pool.size()];
+                }
+            } else {
+                bp = std::filesystem::path(g_bezel_path);
+                if (!bp.has_extension())
+                    bp = bezel_dir / (g_bezel_path + ".png");
+            }
             std::vector<unsigned char> file;
             if (FILE *bf = std::fopen(bp.string().c_str(), "rb")) {
                 std::fseek(bf, 0, SEEK_END);
