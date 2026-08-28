@@ -32,6 +32,27 @@ static bool bios_cycle_per_insn() {
     return true;
 }
 
+static std::string emit_cyc_step(uint32_t mask) {
+    uint32_t regs[3] = {};
+    uint32_t count = 0;
+    const uint32_t original = mask;
+    mask &= 0xFFFFFFFEu;
+    while (mask && count < 3u) {
+        uint32_t reg = 0;
+        while (((mask >> reg) & 1u) == 0u) reg++;
+        regs[count++] = reg;
+        mask &= mask - 1u;
+    }
+    if (mask != 0u)
+        return fmt::format("psx_cyc_step(cpu, 0x{:X}u);", original);
+    if (count == 0u) return "psx_cyc_step_0(cpu);";
+    if (count == 1u) return fmt::format("psx_cyc_step_1(cpu, {}u);", regs[0]);
+    if (count == 2u)
+        return fmt::format("psx_cyc_step_2(cpu, {}u, {}u);", regs[0], regs[1]);
+    return fmt::format("psx_cyc_step_3(cpu, {}u, {}u, {}u);",
+                       regs[0], regs[1], regs[2]);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -730,8 +751,8 @@ bool FullFunctionEmitter::emit_function(
         if (!per_insn_cycles) return;
         uint32_t op = w >> 26;
         if (op >= 0x20u && op <= 0x26u) return;   // CPU load: interlock inside psx_cyc_load_*
-        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_cyc_step(cpu, 0x{:X}u);\n#endif\n",
-                           psx_cyc_dep_res_mask(w));
+        out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    " +
+               emit_cyc_step(psx_cyc_dep_res_mask(w)) + "\n#endif\n";
     };
 
     // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
@@ -750,7 +771,7 @@ bool FullFunctionEmitter::emit_function(
     auto emit_icache_fetch = [&](uint32_t rom_addr) {
         if (!per_insn_cycles) return;
         if (!(block_leaders.count(rom_addr) || (rom_addr & 0xCu) == 0)) return;
-        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch(cpu, 0x{:08X}u);\n#endif\n",
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch_interp(cpu, 0x{:08X}u);\n#endif\n",
                            relocate_ra(rom_addr));
     };
 
@@ -1699,6 +1720,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
     out += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
+    out += "#include \"psx_icache.h\"  /* inline per-insn i-cache tag hit */\n";
     out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
@@ -1975,15 +1997,11 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        (w1 & 0xFFFF0000u) != 0x25080000u ||\n";
     out += "        w2 != 0x01000008u || w3 != 0u) return 0;\n";
     out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-    out += "    psx_icache_fetch(cpu, addr);\n";
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x3C080000u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x25080000u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x01000008u));
-    out += fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n",
-                       psx_cyc_dep_res_mask(0x00000000u));
+    out += "    psx_icache_fetch_interp(cpu, addr);\n";
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x3C080000u)) + "\n";
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x25080000u)) + "\n";
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x01000008u)) + "\n";
+    out += "    " + emit_cyc_step(psx_cyc_dep_res_mask(0x00000000u)) + "\n";
     out += "#endif\n";
     out += "    cpu->gpr[8] = ((w0 & 0xFFFFu) << 16) +\n";
     out += "                  (uint32_t)(int32_t)(int16_t)(w1 & 0xFFFFu);\n";
@@ -2377,6 +2395,7 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
     full_c += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
+    full_c += "#include \"psx_icache.h\"  /* inline per-insn i-cache tag hit */\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
