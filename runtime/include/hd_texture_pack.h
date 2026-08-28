@@ -189,4 +189,3 @@ void hd_texture_pixels_release(HdTexturePixels* pixels);
 #endif
 
 #endif /* PSXRECOMP_HD_TEXTURE_PACK_H */
-
