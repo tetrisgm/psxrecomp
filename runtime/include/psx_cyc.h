@@ -207,6 +207,61 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_lds(cpu);
 }
 
+/* Generated code knows the dependency mask at generation time. Avoid
+ * rediscovering its set bits for every retired instruction while preserving
+ * the exact base -> dependency clear -> DO_LDS ordering. */
+#if defined(PSX_OVERLAY_DLL_BUILD) || defined(PSX_ENABLE_BLOCK_CYCLES)
+static inline void psx_cyc_generated_base(CPUState* cpu) {
+    uint8_t w = cpu->read_absorb_which;
+    if (cpu->read_absorb[w]) {
+        cpu->read_absorb[w]--;
+        return;
+    }
+#if defined(PSX_OVERLAY_DLL_BUILD)
+    psx_cyc_charge(1u);
+#else
+#if !defined(PSX_COSIM)
+    if (g_psx_cyc_bb_defer > 0 && g_psx_cyc_local_acc == NULL &&
+        !g_ls_replay_active && !g_event_step_conservative &&
+        !psx_in_device_service && g_psx_cyc_batch != UINT32_MAX) {
+        g_psx_cyc_batch++;
+        return;
+    }
+#endif
+    psx_cyc_charge(1u);
+#endif
+}
+
+static inline void psx_cyc_step_0(CPUState* cpu) {
+    psx_cyc_generated_base(cpu);
+    psx_cyc_lds(cpu);
+}
+static inline void psx_cyc_step_1(CPUState* cpu, uint32_t r0) {
+    psx_cyc_generated_base(cpu);
+    cpu->read_absorb[r0] = 0u;
+    psx_cyc_lds(cpu);
+}
+static inline void psx_cyc_step_2(CPUState* cpu, uint32_t r0, uint32_t r1) {
+    psx_cyc_generated_base(cpu);
+    cpu->read_absorb[r0] = 0u;
+    cpu->read_absorb[r1] = 0u;
+    psx_cyc_lds(cpu);
+}
+static inline void psx_cyc_step_3(CPUState* cpu, uint32_t r0, uint32_t r1,
+                                  uint32_t r2) {
+    psx_cyc_generated_base(cpu);
+    cpu->read_absorb[r0] = 0u;
+    cpu->read_absorb[r1] = 0u;
+    cpu->read_absorb[r2] = 0u;
+    psx_cyc_lds(cpu);
+}
+#else
+void psx_cyc_step_0(CPUState* cpu);
+void psx_cyc_step_1(CPUState* cpu, uint32_t r0);
+void psx_cyc_step_2(CPUState* cpu, uint32_t r0, uint32_t r1);
+void psx_cyc_step_3(CPUState* cpu, uint32_t r0, uint32_t r1, uint32_t r2);
+#endif
+
 /* The GPR dep+res bitmask used by psx_cyc_step lives in psx_instr_cost.h
  * (psx_cyc_dep_res_mask) — a standalone pure function shared by the emitters
  * (gen-time literal) and the interpreter (runtime), with no CPUState dependency. */
