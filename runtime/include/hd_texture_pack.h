@@ -32,6 +32,7 @@ typedef struct HdTexturePackInfo {
     size_t unique_key_count;
     size_t ambiguous_key_count;
     size_t logical_mapping_count;
+    int complete_wip3out_fonts;   /* all 20 known font keys have unique PNGs */
 } HdTexturePackInfo;
 
 typedef struct HdTexturePackEntry {
@@ -67,8 +68,8 @@ typedef struct HdTextureMatch {
     uint16_t source_y;
 } HdTextureMatch;
 
-/* explicit_root wins. When it is NULL/empty, PSXRECOMP_HD_TEXTURE_ROOT is
- * consulted. Accepts either:
+/* explicit_root wins. When it is NULL/empty, WIPEOUT3SE_HD_ASSET_ROOT then
+ * PSXRECOMP_HD_TEXTURE_ROOT are consulted. Accepts either:
  *   root/Hashes.ini + exactly one <name>-texture-replacements directory, or
  *   the replacement directory directly (Hashes.ini is read from it or parent).
  * Returns 1 on success and leaves *out_pack NULL on failure. */

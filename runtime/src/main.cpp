@@ -11148,6 +11148,8 @@ int main(int argc, char** argv) {
             g_hd_textures      = gc.runtime.video_hd_textures ? 1 : 0;
             g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
+            g_hd_texture_pack  = gc.runtime.video_hd_texture_pack;
+            g_bezel_path       = gc.runtime.video_bezel;
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
@@ -12877,6 +12879,62 @@ int main(int argc, char** argv) {
         if (hd_env && hd_env[0]) g_hd_texture_dir = hd_env;
         hd_env = std::getenv("PSX_HD_TEXTURE_PACK");
         if (hd_env && hd_env[0]) g_hd_texture_pack = hd_env;
+    }
+    /* "off" and "auto" are title-config tokens, never literal directories.
+     * Environment and settings have already had their chance to override the
+     * title value. Empty is the existing cue-sibling discovery path. */
+    const bool hd_texture_auto = g_hd_texture_pack == "auto";
+    if (g_hd_texture_pack == "off") {
+        g_hd_textures = 0;
+        g_hd_texture_pack.clear();
+    } else if (hd_texture_auto) {
+        g_hd_texture_pack.clear();
+    }
+    /* Title-side authoring packs remain external user content. If the user
+     * placed a permitted replacement folder beside the disc, discover the
+     * exact Beetle convention first, then an explicit scale/coverage variant.
+     * Never search outside the disc directory and never copy the pack into
+     * the executable's release tree. */
+    if (g_hd_texture_pack.empty() && !resolved_disc.empty()) {
+        const std::filesystem::path parent = resolved_disc.parent_path();
+        const std::string stem = resolved_disc.stem().string();
+        const std::filesystem::path exact =
+            parent / (stem + "-texture-replacements");
+        std::error_code ec;
+        if (hd_texture_auto) {
+            std::filesystem::path selected;
+            const std::string prefix = stem + "-texture-replacements";
+            unsigned matches = 0;
+            for (const auto &entry : std::filesystem::directory_iterator(parent, ec)) {
+                if (ec) break;
+                if (!entry.is_directory(ec)) continue;
+                const std::string name = entry.path().filename().string();
+                if (name.rfind(prefix, 0) != 0) continue;
+                selected = entry.path();
+                if (++matches > 1) break;
+            }
+            if (!ec && matches == 1) {
+                g_hd_texture_pack = selected.string();
+            } else {
+                std::fprintf(stderr,
+                    "[tex_pack] auto-selection disabled: %s matching cue-sibling packs\n",
+                    ec ? "could not enumerate" : (matches ? "multiple" : "no"));
+            }
+        } else if (std::filesystem::is_directory(exact, ec)) {
+            g_hd_texture_pack = exact.string();
+        } else {
+            std::filesystem::path best;
+            const std::string prefix = stem + "-texture-replacements-";
+            for (const auto &entry : std::filesystem::directory_iterator(parent, ec)) {
+                if (ec) break;
+                if (!entry.is_directory(ec)) continue;
+                const std::string name = entry.path().filename().string();
+                if (name.rfind(prefix, 0) == 0 && name.size() > prefix.size()) {
+                    if (best.empty() || name < best.filename().string()) best = entry.path();
+                }
+            }
+            if (!best.empty()) g_hd_texture_pack = best.string();
+        }
     }
     tex_pack_init(resolved_disc.string().c_str(), g_hd_textures, g_hd_texture_dump,
                   g_hd_texture_dir.c_str(), g_hd_texture_pack.c_str());

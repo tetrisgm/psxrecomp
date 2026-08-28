@@ -130,6 +130,19 @@ struct TempTree {
     }
 };
 
+const char* const kFontKeys[20] = {
+    "3dc173e1-3da5d410", "3dc173e1-41e26c01",
+    "3dc173e1-7205c45b", "3dc173e1-8ec51178",
+    "3dc173e1-94f476b1", "4cb2ec4e-3da5d410",
+    "4cb2ec4e-7205c45b", "4cb2ec4e-8ec51178",
+    "4cb2ec4e-94f476b1", "4cb2ec4e-b6e6caeb",
+    "6b411011-273d3b40", "75f5e38b-3da5d410",
+    "75f5e38b-7205c45b", "75f5e38b-8ec51178",
+    "75f5e38b-94f476b1", "75f5e38b-b6e6caeb",
+    "861ad9f1-273d3b40", "861ad9f1-5888b400",
+    "d20dee94-273d3b40", "d20dee94-5888b400"
+};
+
 struct Fixture {
     TempTree temp;
     fs::path root;
@@ -168,6 +181,8 @@ struct Fixture {
         palette8_hash = hd_texture_hash_clut(
             vram.data(), vram.size(), 900, 8, HD_TEXTURE_DEPTH_8BPP);
 
+        for (const char* key : kFontKeys)
+            touch(replacements / (std::string(key) + ".png"));
         /* Native upload is 8 words * 4 pixels/word by 4 rows. The 64x8 PNG is
          * a valid uniform 2x replacement for the live GL aspect check. */
         write_test_png(replacements / key_name(upload_hash, palette4_hash), 64, 8);
@@ -225,7 +240,9 @@ void test_scan_mapping(Fixture& fixture) {
 
     HdTexturePackInfo info{};
     hd_texture_pack_get_info(pack, &info);
-    check(info.unique_key_count == 3,
+    check(info.complete_wip3out_fonts == 1,
+          "all 20 known font keys produce complete-font status");
+    check(info.unique_key_count == 23,
           "scanner accepts only valid numeric PNG keys");
     check(info.ambiguous_key_count == 0, "fixture has no ambiguous aliases");
     check(info.logical_mapping_count == 1, "Hashes.ini logical map is parsed");
@@ -267,6 +284,21 @@ void test_scan_mapping(Fixture& fixture) {
     _putenv_s("PSXRECOMP_HD_TEXTURE_ROOT", "");
 #else
     unsetenv("PSXRECOMP_HD_TEXTURE_ROOT");
+#endif
+
+#ifdef _WIN32
+    _putenv_s("WIPEOUT3SE_HD_ASSET_ROOT", fixture.root.string().c_str());
+#else
+    setenv("WIPEOUT3SE_HD_ASSET_ROOT", fixture.root.string().c_str(), 1);
+#endif
+    pack = nullptr;
+    check(hd_texture_pack_create(nullptr, &pack, error, sizeof(error)) == 1,
+          "Wipeout asset-root alias is used when explicit path is absent");
+    hd_texture_pack_destroy(pack);
+#ifdef _WIN32
+    _putenv_s("WIPEOUT3SE_HD_ASSET_ROOT", "");
+#else
+    unsetenv("WIPEOUT3SE_HD_ASSET_ROOT");
 #endif
 }
 
@@ -512,9 +544,45 @@ void test_bounded_async_decode(Fixture& fixture) {
     hd_texture_pixels_release(&pixels);
 }
 
+void inspect_external_pack(const char* path) {
+    HdTexturePack* pack = nullptr;
+    char error[512]{};
+    check(hd_texture_pack_create(path, &pack, error, sizeof(error)) == 1,
+          error[0] ? error : "external pack opens");
+    if (!pack) return;
+
+    HdTexturePackInfo info{};
+    hd_texture_pack_get_info(pack, &info);
+    check(info.replacement_file_count == 292,
+          "shipping external pack exposes its 292 replacement PNGs");
+    check(info.unique_key_count == 292 && info.ambiguous_key_count == 0,
+          "shipping external pack has 292 unambiguous numeric keys");
+    check(info.logical_mapping_count == 390,
+          "shipping external Hashes.ini exposes 390 logical mappings");
+    check(info.complete_wip3out_fonts == 1,
+          "shipping external pack contains all 20 required font keys");
+
+    /* Decode one known external key in place. This validates the real pack's
+     * PNG path without copying any payload into the repository. */
+    int decode = hd_texture_pack_request_decode(pack, 0x11b5d8d9u, 0x41d69974u);
+    HdTexturePixels pixels{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (decode != HD_TEXTURE_LOOKUP_FOUND &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        decode = hd_texture_pack_acquire_decoded(
+            pack, 0x11b5d8d9u, 0x41d69974u, &pixels);
+    }
+    check(decode == HD_TEXTURE_LOOKUP_FOUND && pixels.width == 256 &&
+              pixels.height == 112,
+          "shipping external pack decodes a known replacement asynchronously");
+    hd_texture_pixels_release(&pixels);
+    hd_texture_pack_destroy(pack);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     test_crc_exact_little_endian();
     Fixture fixture;
     test_scan_mapping(fixture);
@@ -523,6 +591,7 @@ int main() {
     test_wrapping(fixture);
     test_ambiguity_fallback();
     test_bounded_async_decode(fixture);
+    if (argc == 2) inspect_external_pack(argv[1]);
 
     if (failures) {
         std::fprintf(stderr, "test_hd_texture_pack: %d failure(s)\n", failures);

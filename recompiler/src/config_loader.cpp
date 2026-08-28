@@ -643,6 +643,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("hd_texture_dump")) {
             rt.video_hd_texture_dump = toml::find<bool>(video, "hd_texture_dump");
         }
+        if (video.contains("hd_texture_pack")) {
+            fs::path pack = toml::find<std::string>(video, "hd_texture_pack");
+            if (pack == "off" || pack == "auto" || pack.empty()) {
+                rt.video_hd_texture_pack = pack.string();
+            } else {
+                if (pack.is_relative()) pack = root / pack;
+                rt.video_hd_texture_pack = pack.lexically_normal().string();
+            }
+        }
         if (video.contains("hd_texture_dir")) {
             rt.video_hd_texture_dir = toml::find<std::string>(video, "hd_texture_dir");
         }

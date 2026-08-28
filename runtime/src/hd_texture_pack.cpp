@@ -564,6 +564,32 @@ void decode_worker(DecodeCache* cache) {
 }
 #endif
 
+const std::array<uint64_t, 20>& required_font_keys() {
+    static const std::array<uint64_t, 20> keys{{
+        make_key(0x3dc173e1u, 0x3da5d410u),
+        make_key(0x3dc173e1u, 0x41e26c01u),
+        make_key(0x3dc173e1u, 0x7205c45bu),
+        make_key(0x3dc173e1u, 0x8ec51178u),
+        make_key(0x3dc173e1u, 0x94f476b1u),
+        make_key(0x4cb2ec4eu, 0x3da5d410u),
+        make_key(0x4cb2ec4eu, 0x7205c45bu),
+        make_key(0x4cb2ec4eu, 0x8ec51178u),
+        make_key(0x4cb2ec4eu, 0x94f476b1u),
+        make_key(0x4cb2ec4eu, 0xb6e6caebu),
+        make_key(0x6b411011u, 0x273d3b40u),
+        make_key(0x75f5e38bu, 0x3da5d410u),
+        make_key(0x75f5e38bu, 0x7205c45bu),
+        make_key(0x75f5e38bu, 0x8ec51178u),
+        make_key(0x75f5e38bu, 0x94f476b1u),
+        make_key(0x75f5e38bu, 0xb6e6caebu),
+        make_key(0x861ad9f1u, 0x273d3b40u),
+        make_key(0x861ad9f1u, 0x5888b400u),
+        make_key(0xd20dee94u, 0x273d3b40u),
+        make_key(0xd20dee94u, 0x5888b400u)
+    }};
+    return keys;
+}
+
 bool directory_has_pack_png(const fs::path& directory) {
     std::error_code ec;
     for (fs::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
@@ -650,6 +676,7 @@ struct HdTexturePack {
     size_t replacement_file_count = 0;
     size_t ambiguous_key_count = 0;
     size_t logical_mapping_count = 0;
+    bool complete_fonts = false;
     uint64_t next_upload_serial = 1;
     std::vector<Upload> uploads;
     std::array<std::vector<uint64_t>, kUploadIndexCells> upload_index;
@@ -783,10 +810,12 @@ int hd_texture_pack_create(const char* explicit_root,
 
     try {
         const char* selected = explicit_root;
+        if (!selected || !selected[0]) selected = std::getenv("WIPEOUT3SE_HD_ASSET_ROOT");
         if (!selected || !selected[0]) selected = std::getenv("PSXRECOMP_HD_TEXTURE_ROOT");
         if (!selected || !selected[0]) {
             write_error(error, error_capacity,
-                        "HD asset root is unset (PSXRECOMP_HD_TEXTURE_ROOT)");
+                        "HD asset root is unset (WIPEOUT3SE_HD_ASSET_ROOT or "
+                        "PSXRECOMP_HD_TEXTURE_ROOT)");
             return 0;
         }
 
@@ -874,6 +903,13 @@ int hd_texture_pack_create(const char* explicit_root,
             pack->entries.emplace(key, std::move(record));
         }
 
+        pack->complete_fonts = std::all_of(
+            required_font_keys().begin(), required_font_keys().end(),
+            [&](uint64_t key) {
+                const auto it = pack->entries.find(key);
+                return it != pack->entries.end() && !it->second.ambiguous;
+            });
+
         *out_pack = pack.release();
         return 1;
     } catch (const std::exception& exception) {
@@ -897,6 +933,7 @@ void hd_texture_pack_get_info(const HdTexturePack* pack,
     out_info->unique_key_count = pack->entries.size() - pack->ambiguous_key_count;
     out_info->ambiguous_key_count = pack->ambiguous_key_count;
     out_info->logical_mapping_count = pack->logical_mapping_count;
+    out_info->complete_wip3out_fonts = pack->complete_fonts ? 1 : 0;
 }
 
 int hd_texture_pack_lookup(const HdTexturePack* pack,

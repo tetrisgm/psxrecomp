@@ -72,6 +72,8 @@ static void test_defaults_off() {
           "geometry_correction defaults OFF (known to crack meshes)");
     check(!gc.runtime.video_perspective_texturing,
           "perspective_texturing defaults OFF (faithful floor; opt-in)");
+    check(gc.runtime.video_hd_texture_pack.empty(),
+          "HD texture pack defaults to cue-sibling discovery");
     fs::remove(p);
 }
 
@@ -80,7 +82,8 @@ static void test_game_toml_opt_in() {
         "[video]\n"
         "window_width = 1920\n"
         "geometry_correction = true\n"
-        "perspective_texturing = true\n");
+        "perspective_texturing = true\n"
+        "hd_texture_pack = \"auto\"\n");
     auto gc = PSXRecompV4::load_game_config(p);
     check(gc.runtime.video_window_width == 1920,
           "[video] window_width is honoured");
@@ -88,6 +91,8 @@ static void test_game_toml_opt_in() {
           "[video] geometry_correction = true is honoured");
     check(gc.runtime.video_perspective_texturing,
           "[video] perspective_texturing = true is honoured");
+    check(gc.runtime.video_hd_texture_pack == "auto",
+          "[video] HD texture pack auto-selection is preserved");
     fs::remove(p);
 }
 
