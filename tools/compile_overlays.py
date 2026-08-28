@@ -2048,7 +2048,8 @@ def patch_generated_c(src: str, load_addr: int, size: int) -> str:
     """
     Post-process psxrecomp-game's _full.c output for standalone DLL compilation:
 
-    1. Prepend the dispatch function-pointer preamble (before any includes).
+    1. Insert the dispatch function-pointer preamble immediately after the
+       generated source's unconditional psx_runtime.h include.
     2. Remove forward declarations for functions outside the overlay range —
        they'd be unresolved externals in the DLL.
     3. Replace direct calls to out-of-range func_XXXXXXXX(cpu) with
@@ -2062,14 +2063,18 @@ def patch_generated_c(src: str, load_addr: int, size: int) -> str:
         phys = addr & 0x1FFFFFFF
         return ov_lo <= phys < ov_hi
 
-    # 1. Insert preamble AFTER the last #include line (so CPUState is complete)
-    last_inc = -1
-    for m in re.finditer(r'^#include\s+[<"].*[>"]\s*$', src, re.MULTILINE):
-        last_inc = m.end()
-    if last_inc == -1:
-        src = DISPATCH_PREAMBLE + src
-    else:
-        src = src[:last_inc] + '\n' + DISPATCH_PREAMBLE + src[last_inc:]
+    # 1. Anchor the shim to the unconditional runtime include. Generated code
+    # may place later includes inside conditional fast-path branches; inserting
+    # after the syntactically last include can therefore make the whole shim
+    # conditional and leave overlay DLLs with unresolved host-runtime symbols.
+    runtime_inc = re.search(
+        r'^#include[ \t]+"psx_runtime\.h"[ \t]*$', src, re.MULTILINE)
+    if runtime_inc is None:
+        raise ValueError(
+            'generated overlay source is missing unconditional '
+            '#include "psx_runtime.h"')
+    insert_at = runtime_inc.end()
+    src = src[:insert_at] + '\n' + DISPATCH_PREAMBLE + src[insert_at:]
 
     # 2. Remove out-of-range forward declarations
     def drop_extern(m):
