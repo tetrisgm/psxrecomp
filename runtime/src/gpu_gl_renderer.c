@@ -3533,12 +3533,6 @@ void gl_renderer_set_pgxp_depth(int enabled) {
 }
 int gl_renderer_pgxp_depth(void) { return s_pgxp_depth; }
 
-void gl_renderer_set_pillarbox_edge_fill(int enabled) {
-    s_pillarbox_edge_fill = enabled ? 1 : 0;
-}
-
-int gl_renderer_pillarbox_edge_fill(void) { return s_pillarbox_edge_fill; }
-
 void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
     interp_reset_history();

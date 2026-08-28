@@ -285,6 +285,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/text_xlate.cpp
     ${PSXRECOMP_ROOT}/runtime/src/hd_texture_pack.cpp
     ${PSXRECOMP_ROOT}/runtime/src/tex_pack.cpp
+    ${PSXRECOMP_ROOT}/runtime/include/tex_pack_rect_index.h
     ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/device_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/boot_state.c

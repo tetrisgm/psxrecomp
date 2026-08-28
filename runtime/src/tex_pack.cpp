@@ -23,6 +23,7 @@
 #include "crc32.h"
 #include "hd_texture_pack.h"
 #include "png_write.h"
+#include "tex_pack_rect_index.h"
 
 /* Declarations only — STB_IMAGE_IMPLEMENTATION is compiled in
  * psx_window_icon.cpp. Its STBI_NO_STDIO must be matched here or the
@@ -32,8 +33,10 @@
 #include "../third_party/stb_image.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -56,7 +59,12 @@ constexpr size_t MAX_UPLOADS = 8192;
 struct Upload {
     int      x, y, w, h;   /* VRAM halfword coords */
     uint32_t hash;
-    std::vector<uint16_t> pixels;  /* w*h, as uploaded — the hash preimage */
+    /* Full-rect copies can share the exact hash preimage without rehashing. */
+    std::shared_ptr<const std::vector<uint16_t>> pixels;
+};
+
+struct PendingCopy {
+    int x, y, w, h;
 };
 
 /* Memoised CLUT hash. Games re-draw from the same CLUT thousands of times per
@@ -65,6 +73,8 @@ struct PalMemo {
     int      x, y, n;
     uint32_t hash;
 };
+
+using PSXRecomp::TexPackDetail::RectTileIndex;
 
 struct State {
     std::mutex mu;
@@ -80,8 +90,12 @@ struct State {
      * Hashes.ini metadata, exact alias paths, and ambiguity rejection. */
     HdTexturePack *legacy_pack = nullptr;
 
-    std::vector<Upload>  uploads;
+    std::vector<Upload> uploads;
+    std::vector<PendingCopy> pending_copies;
     std::vector<PalMemo> pal_memo;
+    RectTileIndex upload_tiles;
+    RectTileIndex pending_tiles;
+    std::atomic<uint32_t> pending_copy_count {0};
 
     /* Texture hashes the pack must NOT replace, from an optional exclude.txt
      * in the pack directory (one lowercase %x texture hash per line, '#'
@@ -202,6 +216,12 @@ bool rects_overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int b
 
 bool key_set_contains(const std::vector<uint64_t> &s, uint64_t k) {
     return std::binary_search(s.begin(), s.end(), k);
+}
+
+bool key_set_contains_texture(const std::vector<uint64_t> &s, uint32_t hash) {
+    const uint64_t lo = (uint64_t)hash << 32;
+    auto it = std::lower_bound(s.begin(), s.end(), lo);
+    return it != s.end() && (uint32_t)(*it >> 32) == hash;
 }
 
 /* Lowest pack key for this texture hash, or 0.
@@ -344,8 +364,9 @@ void dump_upload(const Upload &up, int depth, int clut_x, int clut_y, uint32_t p
 
     std::vector<uint8_t> rgba((size_t)out_w * out_h * 4);
     size_t bi = 0;
-    for (size_t wi = 0; wi < up.pixels.size(); wi++) {
-        const uint16_t word = up.pixels[wi];
+    if (!up.pixels) return;
+    for (size_t wi = 0; wi < up.pixels->size(); wi++) {
+        const uint16_t word = (*up.pixels)[wi];
         for (int p = 0; p < ppp; p++) {
             const uint16_t sub = (uint16_t)((word >> (p * bpp)) & mask);
             expand_texel(palettised ? clut[sub] : sub, &rgba[bi]);
@@ -385,7 +406,11 @@ extern "C" void tex_pack_init(const char *disc_path, int enable_replace,
     g.replace_on = false;
     g.dump_on    = false;
     g.uploads.clear();
+    g.pending_copies.clear();
     g.pal_memo.clear();
+    g.upload_tiles.clear();
+    g.pending_tiles.clear();
+    g.pending_copy_count.store(0, std::memory_order_relaxed);
     if (g.legacy_pack) {
         hd_texture_pack_destroy(g.legacy_pack);
         g.legacy_pack = nullptr;
@@ -527,7 +552,11 @@ extern "C" void tex_pack_shutdown(void) {
     g.replace_on = false;
     g.dump_on    = false;
     g.uploads.clear();
+    g.pending_copies.clear();
     g.pal_memo.clear();
+    g.upload_tiles.clear();
+    g.pending_tiles.clear();
+    g.pending_copy_count.store(0, std::memory_order_relaxed);
     if (g.legacy_pack) {
         hd_texture_pack_destroy(g.legacy_pack);
         g.legacy_pack = nullptr;
@@ -557,18 +586,78 @@ void invalidate_locked(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
 
     const size_t before = g.uploads.size();
-    g.uploads.erase(std::remove_if(g.uploads.begin(), g.uploads.end(),
-                                   [&](const Upload &u) {
-                                       return rects_overlap(u.x, u.y, u.w, u.h, x, y, w, h);
-                                   }),
-                    g.uploads.end());
+    if (g.upload_tiles.maybe_overlaps(x, y, w, h)) {
+        size_t out = 0;
+        for (size_t i = 0; i < g.uploads.size(); ++i) {
+            Upload &u = g.uploads[i];
+            if (rects_overlap(u.x, u.y, u.w, u.h, x, y, w, h)) {
+                g.upload_tiles.remove(u.x, u.y, u.w, u.h);
+                continue;
+            }
+            if (out != i) g.uploads[out] = std::move(u);
+            ++out;
+        }
+        g.uploads.resize(out);
+    }
     g.n_kills += before - g.uploads.size();
+
+    if (!g.pending_copies.empty() &&
+        g.pending_tiles.maybe_overlaps(x, y, w, h)) {
+        size_t out = 0;
+        for (size_t i = 0; i < g.pending_copies.size(); ++i) {
+            const PendingCopy &c = g.pending_copies[i];
+            if (rects_overlap(c.x, c.y, c.w, c.h, x, y, w, h)) {
+                g.pending_tiles.remove(c.x, c.y, c.w, c.h);
+                continue;
+            }
+            if (out != i) g.pending_copies[out] = c;
+            ++out;
+        }
+        g.pending_copies.resize(out);
+        g.pending_copy_count.store((uint32_t)out, std::memory_order_relaxed);
+    }
 
     g.pal_memo.erase(std::remove_if(g.pal_memo.begin(), g.pal_memo.end(),
                                     [&](const PalMemo &m) {
                                         return rects_overlap(m.x, m.y, m.n, 1, x, y, w, h);
                                     }),
                      g.pal_memo.end());
+}
+
+bool add_upload_record_locked(
+        int x, int y, int w, int h, uint32_t hash,
+        std::shared_ptr<const std::vector<uint16_t>> pixels) {
+    if (g.uploads.size() >= MAX_UPLOADS || !pixels) return false;
+    for (const Upload &u : g.uploads) {
+        if (u.hash == hash && u.w == w && u.h == h &&
+            u.x == x && u.y == y) {
+            g.n_upload_dedup++;
+            return true;
+        }
+    }
+
+    Upload up;
+    up.x = x; up.y = y; up.w = w; up.h = h;
+    up.hash = hash;
+    up.pixels = std::move(pixels);
+    g.uploads.push_back(std::move(up));
+    const Upload &added = g.uploads.back();
+    g.upload_tiles.add(added.x, added.y, added.w, added.h);
+    g.n_uploads++;
+    return true;
+}
+
+bool add_upload_locked(int x, int y, int w, int h, const uint16_t *pixels,
+                       uint32_t hash) {
+    const size_t n = (size_t)w * (size_t)h;
+    auto owned = std::make_shared<std::vector<uint16_t>>(pixels, pixels + n);
+    return add_upload_record_locked(x, y, w, h, hash, std::move(owned));
+}
+
+void clear_pending_locked() {
+    g.pending_copies.clear();
+    g.pending_tiles.clear();
+    g.pending_copy_count.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -624,7 +713,9 @@ extern "C" void tex_pack_state_apply(const uint8_t *p, uint64_t len,
     const uint32_t n = get32();
     if (len < 4ull + (uint64_t)n * 20ull) return;
     g.uploads.clear();
+    clear_pending_locked();
     g.pal_memo.clear();
+    g.upload_tiles.clear();
     size_t kept = 0;
     for (uint32_t i = 0; i < n; i++) {
         const int x = (int)get32(), y = (int)get32();
@@ -632,17 +723,16 @@ extern "C" void tex_pack_state_apply(const uint8_t *p, uint64_t len,
         const uint32_t hash = get32();
         if (w <= 0 || h <= 0 || x < 0 || y < 0 ||
             x + w > FB_WIDTH || y + h > FB_HEIGHT) continue;
-        Upload up;
-        up.x = x; up.y = y; up.w = w; up.h = h; up.hash = hash;
-        up.pixels.resize((size_t)w * (size_t)h);
+        auto pixels = std::make_shared<std::vector<uint16_t>>(
+            (size_t)w * (size_t)h);
         for (int row = 0; row < h; row++)
-            std::memcpy(up.pixels.data() + (size_t)row * w,
+            std::memcpy(pixels->data() + (size_t)row * w,
                         vram + ((size_t)(y + row) * FB_WIDTH + x),
                         (size_t)w * sizeof(uint16_t));
-        if (crc32_compute((const uint8_t *)up.pixels.data(),
-                          up.pixels.size() * sizeof(uint16_t)) != hash)
+        if (crc32_compute((const uint8_t *)pixels->data(),
+                          pixels->size() * sizeof(uint16_t)) != hash)
             continue;   /* VRAM diverged from this rect since it was saved */
-        g.uploads.push_back(std::move(up));
+        add_upload_record_locked(x, y, w, h, hash, std::move(pixels));
         if (++kept >= MAX_UPLOADS) break;
     }
     g.n_restore_kept += kept;
@@ -678,20 +768,26 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
      * position and re-hash lazily from live VRAM, so correctness is unaffected.
      */
     if (w == FB_WIDTH && h == FB_HEIGHT) {
+        clear_pending_locked();
         size_t kept = 0;
         for (size_t i = 0; i < g.uploads.size(); ) {
             const Upload &u = g.uploads[i];
             bool same = (u.x >= 0 && u.y >= 0 &&
                          u.x + u.w <= FB_WIDTH && u.y + u.h <= FB_HEIGHT &&
-                         u.pixels.size() == (size_t)u.w * (size_t)u.h);
+                         u.pixels &&
+                         u.pixels->size() == (size_t)u.w * (size_t)u.h);
             for (int row = 0; same && row < u.h; row++) {
                 const uint16_t *inc = pixels + ((size_t)(u.y + row) * FB_WIDTH + u.x);
-                if (std::memcmp(inc, u.pixels.data() + (size_t)row * u.w,
+                if (std::memcmp(inc, u.pixels->data() + (size_t)row * u.w,
                                 (size_t)u.w * sizeof(uint16_t)) != 0)
                     same = false;
             }
             if (same) { kept++; i++; }
-            else      { g.n_kills++; g.uploads.erase(g.uploads.begin() + (ptrdiff_t)i); }
+            else      {
+                g.upload_tiles.remove(u.x, u.y, u.w, u.h);
+                g.n_kills++;
+                g.uploads.erase(g.uploads.begin() + (ptrdiff_t)i);
+            }
         }
         g.n_restore_kept += kept;
         g.pal_memo.clear();
@@ -700,29 +796,136 @@ extern "C" void tex_pack_on_upload(int x, int y, int w, int h, const uint16_t *p
 
     invalidate_locked(x, y, w, h);
 
-    if (g.uploads.size() >= MAX_UPLOADS) return;
-
     const size_t n = (size_t)w * (size_t)h;
     const uint32_t hash = crc32_compute((const uint8_t *)pixels, n * sizeof(uint16_t));
+    add_upload_locked(x, y, w, h, pixels, hash);
+}
 
-    for (const Upload &u : g.uploads) {
-        /* Dedup only when the POSITION matches too. The game re-uploads some
-         * textures (the UI text strips) at a rect one scanline off from the
-         * first upload; deduping by content alone kept the STALE rect, so the
-         * draw's origin was computed one texel high -- glyph tops cut off,
-         * bottoms duplicated, and under LINEAR sampling that same one-texel
-         * error is the neighbour-bleed seam. Same content at a new position is
-         * a new upload; invalidate_locked above already retired any overlap. */
-        if (u.hash == hash && u.w == w && u.h == h &&
-            u.x == x && u.y == y) { g.n_upload_dedup++; return; }
+extern "C" void tex_pack_on_copy(int src_x, int src_y,
+                                  int dst_x, int dst_y,
+                                  int w, int h, int content_preserved) {
+    if (!tex_pack_active()) return;
+    std::lock_guard<std::mutex> lk(g.mu);
+
+    std::shared_ptr<const std::vector<uint16_t>> propagated;
+    uint32_t propagated_hash = 0;
+    if (content_preserved && w > 0 && h > 0 &&
+        g.upload_tiles.maybe_overlaps(src_x, src_y, w, h)) {
+        for (size_t i = g.uploads.size(); i-- > 0; ) {
+            const Upload &u = g.uploads[i];
+            if (!u.pixels || src_x < u.x || src_y < u.y ||
+                src_x + w > u.x + u.w || src_y + h > u.y + u.h)
+                continue;
+
+            if (src_x == u.x && src_y == u.y && w == u.w && h == u.h) {
+                propagated = u.pixels;
+                propagated_hash = u.hash;
+            } else {
+                auto sub = std::make_shared<std::vector<uint16_t>>(
+                    (size_t)w * (size_t)h);
+                const int ox = src_x - u.x;
+                const int oy = src_y - u.y;
+                for (int row = 0; row < h; ++row) {
+                    std::memcpy(sub->data() + (size_t)row * w,
+                                u.pixels->data() + (size_t)(oy + row) * u.w + ox,
+                                (size_t)w * sizeof(uint16_t));
+                }
+                propagated_hash = crc32_compute(
+                    (const uint8_t *)sub->data(), sub->size() * sizeof(uint16_t));
+                propagated = std::move(sub);
+            }
+            break;
+        }
     }
 
-    Upload up;
-    up.x = x; up.y = y; up.w = w; up.h = h;
-    up.hash = hash;
-    up.pixels.assign(pixels, pixels + n);
-    g.uploads.push_back(std::move(up));
-    g.n_uploads++;
+    /* The destination is invalid before the backend copy starts. */
+    invalidate_locked(dst_x, dst_y, w, h);
+    if (w <= 0 || h <= 0) return;
+    if (!g.dump_on && (!g.replace_on || g.known.empty())) return;
+
+    if (propagated) {
+        if (g.dump_on || key_set_contains_texture(g.known, propagated_hash))
+            add_upload_record_locked(dst_x, dst_y, w, h, propagated_hash,
+                                     std::move(propagated));
+        return;
+    }
+    if (g.pending_copies.size() >= MAX_UPLOADS) return;
+
+    /* Resolve untracked, masked, overlapping, or wrapped copies lazily from
+     * the backend only if a later textured primitive samples the destination. */
+    g.pending_copies.push_back(PendingCopy{dst_x, dst_y, w, h});
+    g.pending_tiles.add(dst_x, dst_y, w, h);
+    g.pending_copy_count.store((uint32_t)g.pending_copies.size(),
+                               std::memory_order_relaxed);
+}
+
+extern "C" int tex_pack_pending_copy_for_prim(const int lim[4],
+                                                uint16_t texpage,
+                                                int out_rect[4]) {
+    if (!lim || !out_rect ||
+        g.pending_copy_count.load(std::memory_order_relaxed) == 0)
+        return 0;
+
+    int depth = (texpage >> 7) & 3;
+    if (depth > 2) depth = 2;
+    const int shift  = (depth == 0) ? 2 : (depth == 1) ? 1 : 0;
+    const int base_x = (texpage & 0xF) * 64;
+    const int base_y = ((texpage >> 4) & 1) * 256;
+
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (g.pending_copies.empty()) return 0;
+    int rx, ry, rw, rh;
+    sampled_vram_rect(lim, base_x, base_y, shift, &rx, &ry, &rw, &rh);
+    if (!g.pending_tiles.maybe_overlaps(rx, ry, rw, rh)) return 0;
+    for (size_t i = g.pending_copies.size(); i-- > 0; ) {
+        const PendingCopy &c = g.pending_copies[i];
+        if (!rects_overlap(c.x, c.y, c.w, c.h, rx, ry, rw, rh)) continue;
+        out_rect[0] = c.x; out_rect[1] = c.y;
+        out_rect[2] = c.w; out_rect[3] = c.h;
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int tex_pack_next_pending_copy(int out_rect[4]) {
+    if (!out_rect ||
+        g.pending_copy_count.load(std::memory_order_relaxed) == 0)
+        return 0;
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (g.pending_copies.empty()) return 0;
+    const PendingCopy &c = g.pending_copies.back();
+    out_rect[0] = c.x; out_rect[1] = c.y;
+    out_rect[2] = c.w; out_rect[3] = c.h;
+    return 1;
+}
+
+extern "C" void tex_pack_resolve_copy(int x, int y, int w, int h,
+                                        const uint16_t *pixels) {
+    if (!tex_pack_active()) return;
+    std::lock_guard<std::mutex> lk(g.mu);
+
+    size_t found = g.pending_copies.size();
+    for (size_t i = g.pending_copies.size(); i-- > 0; ) {
+        const PendingCopy &c = g.pending_copies[i];
+        if (c.x == x && c.y == y && c.w == w && c.h == h) {
+            found = i;
+            break;
+        }
+    }
+    if (found == g.pending_copies.size()) return;
+
+    const PendingCopy c = g.pending_copies[found];
+    g.pending_tiles.remove(c.x, c.y, c.w, c.h);
+    g.pending_copies.erase(g.pending_copies.begin() + (ptrdiff_t)found);
+    g.pending_copy_count.store((uint32_t)g.pending_copies.size(),
+                               std::memory_order_relaxed);
+    if (!pixels || w <= 0 || h <= 0) return;
+
+    const size_t n = (size_t)w * (size_t)h;
+    const uint32_t hash = crc32_compute((const uint8_t *)pixels,
+                                        n * sizeof(uint16_t));
+    if (!g.dump_on && !key_set_contains_texture(g.known, hash)) return;
+    add_upload_locked(x, y, w, h, pixels, hash);
 }
 
 /* Is this replacement a single-colour MASK -- one ink colour plus holes?
@@ -771,8 +974,8 @@ static int mask_ink_index(const State::Repl &r, const Upload &up, int shift) {
     for (int tv = 0; tv < r.src_h; tv++) {
         for (int tu = 0; tu < r.src_w; tu++) {
             const size_t si = (size_t)tv * up.w + (size_t)(tu >> shift);
-            if (si >= up.pixels.size()) continue;
-            const int idx = (up.pixels[si] >> ((tu & (per - 1)) * bpp)) & m;
+            if (!up.pixels || si >= up.pixels->size()) continue;
+            const int idx = ((*up.pixels)[si] >> ((tu & (per - 1)) * bpp)) & m;
             const size_t c = (((size_t)(tv * k + k / 2) * r.w)
                               + (size_t)(tu * k + k / 2)) * 4 + 3;
             if (c < r.pixels.size() && r.pixels[c]) cnt[idx]++;

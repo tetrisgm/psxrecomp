@@ -11149,7 +11149,6 @@ int main(int argc, char** argv) {
             g_hd_texture_dump  = gc.runtime.video_hd_texture_dump ? 1 : 0;
             g_hd_texture_dir   = gc.runtime.video_hd_texture_dir;
             g_hd_texture_pack  = gc.runtime.video_hd_texture_pack;
-            g_bezel_path       = gc.runtime.video_bezel;
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;

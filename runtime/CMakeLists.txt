@@ -108,6 +108,20 @@ if(BUILD_TESTING)
     target_link_libraries(hd_texture_pack_test PRIVATE Threads::Threads)
     add_test(NAME hd_texture_pack_test COMMAND hd_texture_pack_test)
 
+    add_executable(tex_pack_rect_index_test
+        tests/test_tex_pack_rect_index.cpp)
+    target_include_directories(tex_pack_rect_index_test PRIVATE include)
+    add_test(NAME tex_pack_rect_index_test COMMAND tex_pack_rect_index_test)
+
+    add_executable(tex_pack_copy_test
+        tests/test_tex_pack_copy.cpp
+        src/tex_pack.cpp
+        src/hd_texture_pack.cpp
+        src/crc32.c)
+    target_include_directories(tex_pack_copy_test PRIVATE include src)
+    target_link_libraries(tex_pack_copy_test PRIVATE Threads::Threads)
+    add_test(NAME tex_pack_copy_test COMMAND tex_pack_copy_test)
+
     # Registered since before this change, but it did NOT LINK on origin/master:
     # sio.c had grown psx_read_word / psx_get_cycle_count / i_mask /
     # g_debug_last_store_pc references that this test's stub block never gained,
