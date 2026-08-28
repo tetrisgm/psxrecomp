@@ -48,8 +48,7 @@ def main():
     provider_end = main_cpp.index(
         "&g_runtime_perf.provider_poll_ticks);", provider)
     pacer = main_cpp.index(
-        "frame_pacer_wait(&s_frame_pacer, present_frame_period_ms());",
-        provider,
+        "frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);", provider
     )
     if not (begin < diag < capture < provider_begin < provider <
             provider_end < pacer):
