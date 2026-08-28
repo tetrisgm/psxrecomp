@@ -1146,16 +1146,11 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
      * guest-store hook caused unbounded queues and multi-second stalls. CD DMA
      * and periodic coherent capture remain the durable variant boundaries.
      *
-     * The clear is scoped to the WORDS this store actually rewrote. The
-     * invariant only concerns bytes that changed, so a whole-page clear was
-     * far broader than needed: on a page that mixes code and data — exactly
-     * how the mod's 8 MB high-bank payload is laid out, since it is installed
-     * with CPU stores rather than CD DMA — every adjacent data write erased
-     * the executed-PC evidence for code words it never touched. capture_
-     * executed_pages() then saw no evidence there, so the high bank was never
-     * enumerated into a capture and never got a shard (measured on WipEout 3
-     * ntscfull8: 0 of 26 captured regions high-bank, 5 of 655 across all
-     * history, 16 of 1087 shards, ~27M interpreted high-bank insns/race). */
+     * Unrelated data writes on a mixed code/data page preserve execution
+     * evidence. Once a store overwrites any word that was executed in the
+     * current epoch, however, every entry on that page belongs to the outgoing
+     * byte image. Keeping the other bits would splice old entry PCs onto a new
+     * body/data layout and create impossible overlay shards. */
     if ((g_dirty_ram_exec_page_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
         uint32_t page_lo_w = pg * (4096u / 4u);
         uint32_t page_hi_w = page_lo_w + (4096u / 4u) - 1u;
@@ -1167,20 +1162,16 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
         for (uint32_t w = lo_w; w <= hi_w; w++) {
             uint32_t m = 1u << (w & 31u);
             cleared |= g_dirty_ram_exec_pc_bitmap[w >> 5] & m;
-            g_dirty_ram_exec_pc_bitmap[w >> 5] &= ~m;
-            g_dirty_ram_dispatch_pc_bitmap[w >> 5] &= ~m;
         }
-        /* Retire the page gate only once no executed-PC evidence survives.
-         * Scanning only when this store actually removed some keeps the
-         * universal store hook at a few bit ops in the common case (a data
-         * write into a code page clears nothing and skips the scan). */
+        /* A data-only write clears nothing. A code-word replacement retires
+         * the whole page epoch so no surviving entry can pair with new bytes. */
         if (cleared) {
             uint32_t bw0 = pg * (4096u / 4u / 32u);
-            uint32_t any = 0;
-            for (uint32_t b = 0; b < (4096u / 4u / 32u); b++)
-                any |= g_dirty_ram_exec_pc_bitmap[bw0 + b];
-            if (!any)
-                g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+            memset(&g_dirty_ram_exec_pc_bitmap[bw0], 0,
+                   (4096u / 4u / 32u) * sizeof(uint32_t));
+            memset(&g_dirty_ram_dispatch_pc_bitmap[bw0], 0,
+                   (4096u / 4u / 32u) * sizeof(uint32_t));
+            g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
         }
     }
     if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
