@@ -3478,7 +3478,8 @@ static void runtime_perf_section_end(uint64_t start, uint64_t *total) {
 static void runtime_perf_diag_tick() {
     static bool have_last = false;
     static RuntimePerfSnapshot last;
-    static uint64_t last_spu = 0, last_underruns = 0, last_overflows = 0;
+    static uint64_t last_spu = 0, last_cdda = 0, last_cdda_nonzero = 0;
+    static uint64_t last_underruns = 0, last_overflows = 0;
     static uint64_t last_up[6] = {0};
     static uint64_t last_overlay_load_us = 0;
     if (!g_runtime_perf.enabled) return;
@@ -3505,6 +3506,8 @@ static void runtime_perf_diag_tick() {
     if (!have_last) {
         last = current;
         last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+        last_cdda = audio.tap_frames[AUDIO_TAP_CD_IN];
+        last_cdda_nonzero = audio.tap_nonzero[AUDIO_TAP_CD_IN];
         last_underruns = underruns;
         last_overflows = overflows;
         last_overlay_load_us = overlay_load_us;
@@ -3517,6 +3520,7 @@ static void runtime_perf_diag_tick() {
                       (double)g_runtime_perf.frequency;
     std::fprintf(stdout,
         "psxrecomp: runtime cadence: guest=%.2f Hz, spu=%.1f Hz, "
+        "cdda=%.1f Hz nonzero=+%llu, "
         "audio_fill=%.1f ms, underruns=+%llu, overflows=+%llu, corr=%+.5f; "
         "GL upload=%.1f calls/s %.1f rect/s %.2f Mpix/s, "
         "cpu=%.1f tex=%.1f draw=%.1f ms/s; "
@@ -3529,6 +3533,9 @@ static void runtime_perf_diag_tick() {
         "capture triggers=+%u overlays=+%d last_dispatch_delta=%llu\n",
         (double)(current.frame - last.frame) / dt,
         (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
+        (double)(audio.tap_frames[AUDIO_TAP_CD_IN] - last_cdda) / dt,
+        (unsigned long long)(audio.tap_nonzero[AUDIO_TAP_CD_IN] -
+                             last_cdda_nonzero),
         fill_ms, (unsigned long long)(underruns - last_underruns),
         (unsigned long long)(overflows - last_overflows), correction,
         (double)(up[0] - last_up[0]) / dt,
@@ -3565,6 +3572,8 @@ static void runtime_perf_diag_tick() {
     std::fflush(stdout);
     last = current;
     last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+    last_cdda = audio.tap_frames[AUDIO_TAP_CD_IN];
+    last_cdda_nonzero = audio.tap_nonzero[AUDIO_TAP_CD_IN];
     last_underruns = underruns;
     last_overflows = overflows;
     last_overlay_load_us = overlay_load_us;
