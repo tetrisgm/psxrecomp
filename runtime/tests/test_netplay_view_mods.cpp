@@ -61,6 +61,7 @@ int memcard_is_present(int) { return 0; }
 int memcard_read_sector(int, int, uint8_t* buf) { std::memset(buf, 0, 128); return -1; }
 int memcard_write_sector(int, int, const uint8_t*) { return -1; }
 void memcard_flush(int) {}
+int memcard_last_flush_result(int) { return 0; }
 }
 
 /* The guest bus: main RAM, plus the real SIO (sio.c) at 0x1F801040..5F, so

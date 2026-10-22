@@ -43,6 +43,8 @@ static int s_cd_ready = 0;
 static uint32_t s_dma_ready_cycles = 0;
 
 void sio_advance(uint32_t cycles) { (void)cycles; }
+int g_boot_state_cpu_timing_restored = 0; /* boot_state.c, read by psx_cycles.c */
+int psx_mod_host_output_scope(void) { return 0; } /* mod_runtime.cpp */
 
 void cdrom_advance(uint32_t cycles) {
     if (s_cd_ready) return;

@@ -161,6 +161,10 @@ STUB_SECTION(spu, 80u)
 STUB_SECTION(cdrom, 64u)
 STUB_SECTION(sio, 48u)
 STUB_SECTION(mdec, 400u)
+STUB_SECTION(spu_cd, 4u)
+int spu_snapshot_len_ok(uint32_t len) { return len == 80u; }
+int cdrom_snapshot_validate(const uint8_t *p, uint32_t len) { return p && len == 64u; }
+void spu_catch_up(void) {}
 int sio_snapshot_validate(const uint8_t *p, uint32_t len) { return p && len == 48u; }
 int mdec_snapshot_validate(const uint8_t *p, uint32_t len) { return p && len == 400u; }
 

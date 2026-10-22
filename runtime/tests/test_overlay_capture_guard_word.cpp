@@ -18,6 +18,7 @@
  *      kernel run. */
 #include "code_provider.h"
 #include "dirty_ram_interp.h"
+#include "host_span_ring.h"
 #include "overlay_capture.h"
 
 #include "psx_sdl.h"
@@ -145,6 +146,9 @@ extern "C" uint32_t crc32_compute(const uint8_t *data, size_t size) {
     for (size_t i = 0; i < size; ++i) hash = (hash ^ data[i]) * 16777619u;
     return hash ? hash : 1u;
 }
+/* host_span_ring.c: wall-time attribution is not under test here. */
+extern "C" uint64_t host_span_begin(void) { return 0; }
+extern "C" void host_span_end(HostSpanKind, uint64_t, uint32_t) {}
 
 int main() {
     if (psx_sdl_init(0) != 0) {

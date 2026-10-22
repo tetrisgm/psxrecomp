@@ -53,6 +53,14 @@ uint32_t psx_mod_gpu_dma_memory_alloc(uint32_t n,uint32_t a){(void)n;(void)a;ret
 int psx_mod_host_output_scope(void){return 0;}
 uint32_t psx_mod_read_word(uint32_t a){(void)a;return 0;}
 int g_psx_vram_dirty_tracking=0;
+/* Host menu overlay and video telemetry (psx_host_menu.c, video_telemetry.cpp):
+ * none here. */
+int psx_host_menu_overlay_image(const uint32_t **pixels, int *w, int *h){(void)pixels;(void)w;(void)h;return 0;}
+void psx_video_telemetry_present(int result){(void)result;}
+void psx_video_telemetry_compose(int renderer, int scale, int source_w, int source_h,
+                               int drawable_w, int drawable_h, int viewport_w, int viewport_h){
+    (void)renderer;(void)scale;(void)source_w;(void)source_h;(void)drawable_w;(void)drawable_h;
+    (void)viewport_w;(void)viewport_h;}
 uint64_t s_frame_count=0;
 void gpu_vram_dirty_mark_row_impl(uint32_t y){(void)y;}
 void gpu_vram_dirty_mark_rect(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}

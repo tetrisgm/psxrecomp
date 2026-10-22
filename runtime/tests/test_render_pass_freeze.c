@@ -28,6 +28,8 @@ static uint32_t s_cd_phase = 0;
 static uint64_t s_vblank_phase = 0;
 
 void sio_advance(uint32_t cycles) { (void)cycles; }
+int g_boot_state_cpu_timing_restored = 0; /* boot_state.c, read by psx_cycles.c */
+int psx_mod_host_output_scope(void) { return 0; } /* mod_runtime.cpp */
 void cdrom_advance(uint32_t cycles) {
     s_dev_calls++;
     s_dev_cycles += cycles;

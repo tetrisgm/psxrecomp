@@ -45,6 +45,7 @@ int memcard_write_sector(int slot, int sector, const uint8_t *buf) {
     (void)slot; (void)sector; (void)buf; return 0;
 }
 void memcard_flush(int slot) { (void)slot; }
+int memcard_last_flush_result(int slot) { (void)slot; return 0; }
 
 static void check(const char *name, int ok) {
     checks++; if (!ok) failures++;

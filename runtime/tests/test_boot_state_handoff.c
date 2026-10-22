@@ -37,7 +37,11 @@ void timers_set_snapshot(const uint16_t c[3],const uint32_t m[3],const uint16_t 
 #define MODULE(name) uint32_t name##_snapshot_bytes(void){return 4;} \
     void name##_snapshot_write(uint8_t* p){memset(p,0,4);} \
     int name##_snapshot_read(const uint8_t* p,uint32_t n){(void)p;return n==4;}
-MODULE(gpu) MODULE(spu) MODULE(cdrom) MODULE(dma) MODULE(sio) MODULE(mdec)
+MODULE(gpu) MODULE(spu) MODULE(cdrom) MODULE(dma) MODULE(sio) MODULE(mdec) MODULE(spu_cd)
+int spu_snapshot_len_ok(uint32_t n){return n==4;}
+int cdrom_snapshot_validate(const uint8_t* p,uint32_t n){(void)p;return n==4;}
+void psx_devices_service_to_now(void){}
+void spu_catch_up(void){}
 int sio_snapshot_validate(const uint8_t* p,uint32_t n){(void)p;return n==4;}
 int mdec_snapshot_validate(const uint8_t* p,uint32_t n){(void)p;return n==4;}
 uint8_t* spu_get_ram_ptr(void){return spuram;}
@@ -55,6 +59,19 @@ void gr_vram_transfer_in(int x,int y,int w,int h,const uint16_t* p){(void)x;(voi
 void gr_vram_transfer_out(int x,int y,int w,int h,uint16_t* p){(void)x;(void)y;memcpy(p,vram,(size_t)w*h*2);}
 
 static void u32(uint8_t* p,uint32_t n){PstW w;pst_w_init(&w,p,4);assert(pst_w_u32(&w,n));}
+static uint32_t r32(const uint8_t* p){PstR r;uint32_t n=0;pst_r_init(&r,p,4);assert(pst_r_u32(&r,&n));return n;}
+/* Offset of the handoff section's 16-byte header. Sections follow it (CPU
+ * timing, guest clock scale), so walk the table rather than assume order. */
+static size_t handoff_section(const uint8_t* p,size_t len){
+    size_t at=BOOT_STATE_HEADER_WIRE_BYTES;
+    for(uint32_t i=0,n=r32(p+28);i<n;++i){
+        assert(at+16<=len && r32(p+at+12)==0);
+        if(r32(p+at)==BS_SEC_GAME_START){assert(r32(p+at+8)==4);return at;}
+        at+=16+(size_t)r32(p+at+8);
+    }
+    assert(!"no handoff section");
+    return 0;
+}
 int main(void) {
     CPUState cpu={0};
     fntrace_set_game_range(0x801b0000,0);
@@ -64,7 +81,8 @@ int main(void) {
         fntrace_restore_game_started(started);
         assert(compressed ? boot_state_save_buffer(&cpu,123,0x801b0000,&saved,&len)
                           : boot_state_save_buffer_raw(&cpu,123,0x801b0000,&saved,&len));
-        assert(saved[4]==9 && saved[len-4]==started); /* handoff is last */
+        const size_t handoff=handoff_section(saved,len), count=r32(saved+28);
+        assert(saved[4]==9 && saved[handoff+16]==started);
         fntrace_restore_game_started(!started); ram[0x100]=0; cpu.pc=0;
         assert(boot_state_load_buffer(saved,len,123,0x801b0000,&cpu));
         assert(fntrace_is_game_started()==started && ram[0x100]==0xab && cpu.pc==0x80050044);
@@ -87,17 +105,25 @@ int main(void) {
         assert(!boot_state_load_buffer(saved,len,123,0x801b0000,&cpu));
         assert(cpu.pc==0xdeadbeef && ram[0x100]==0x55 && fntrace_is_game_started()==!started);
         u32(saved+32,boot_state_layout_cookie());
-        saved[len-4]=2;
+        saved[handoff+16]=2;
         assert(!boot_state_load_buffer(saved,len,123,0x801b0000,&cpu));
-        saved[len-4]=started;
-        u32(saved+28,16); /* omit the last, required phase section */
-        assert(!boot_state_load_buffer(saved,len-20,123,0x801b0000,&cpu));
-        u32(saved+28,18);
-        uint8_t* duplicate=malloc(len+20); assert(duplicate);
-        memcpy(duplicate,saved,len); memcpy(duplicate+len,saved+len-20,20);
-        assert(!boot_state_load_buffer(duplicate,len+20,123,0x801b0000,&cpu));
+        saved[handoff+16]=started;
+        /* Omit the required handoff section. */
+        uint8_t* edited=malloc(len+20); assert(edited);
+        memcpy(edited,saved,handoff);
+        memcpy(edited+handoff,saved+handoff+20,len-handoff-20);
+        u32(edited+28,(uint32_t)count-1);
+        assert(!boot_state_load_buffer(edited,len-20,123,0x801b0000,&cpu));
         assert(cpu.pc==0xdeadbeef && ram[0x100]==0x55 && fntrace_is_game_started()==!started);
-        free(duplicate); free(saved);
+        /* Repeat it at the end. */
+        memcpy(edited,saved,len); memcpy(edited+len,saved+handoff,20);
+        u32(edited+28,(uint32_t)count+1);
+        assert(!boot_state_load_buffer(edited,len+20,123,0x801b0000,&cpu));
+        assert(cpu.pc==0xdeadbeef && ram[0x100]==0x55 && fntrace_is_game_started()==!started);
+        /* The edits themselves are well formed: the original still loads. */
+        assert(boot_state_load_buffer(saved,len,123,0x801b0000,&cpu));
+        assert(fntrace_is_game_started()==started && cpu.pc==0x80050044);
+        free(edited); free(saved);
     }
     puts("snapshot handoff: cold/warm, BIOS/game, compressed/raw and atomic rejection passed");
     return 0;
