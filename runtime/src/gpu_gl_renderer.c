@@ -469,7 +469,8 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
+    RTH_PASS_BEGIN, RTH_PASS_END
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -679,6 +680,10 @@ static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
                                 int pw, int ph);
 static void pass_apply_promotion(void);
 static int pass_gen_present(uint64_t deadline);
+static int pass_queued_enabled(void);
+static int pass_vblank_locked_rate(void);
+static int pass_queued_presenter(void);
+static int pass_locked_present(void);
 static int stereo_present(int w, int h);
 static int xr_mirror_mode(void);
 static int xr_mirror_active(void);
@@ -7960,6 +7965,20 @@ static void interp_present_source_interval(void) {
             s_interp_phase_lo, s_interp_phase_hi))
         return;
     pass_apply_promotion();
+    if (pass_queued_presenter() && s_rth_on && rt_on_render_thread()) {
+        /* Queued passes: exactly one output for this guest VBlank, now. The
+         * guest's own pacer sets the cadence; the image is the one for this
+         * VBlank's place in the frame (phase k / period), never chosen from a
+         * wall-clock deadline that the render thread's own delay would skew. */
+        uint64_t d = 0;
+        float a = 1.0f;
+        while (frame_interpolation_schedule_next(&s_interp_schedule, now, &d, &a)) { }
+        latency_ring_mark(LAT_SWAP_BEGIN);
+        if (!pass_locked_present())
+            (void)interp_present(a);
+        latency_ring_mark(LAT_SWAP_END);
+        return;
+    }
 
     while (frame_interpolation_schedule_next(
                &s_interp_schedule, SDL_GetPerformanceCounter(),
@@ -8103,6 +8122,60 @@ static uint32_t s_intervals_since_plan = 0;
 static int      s_pass_budget_pct = -1;
 static GLRenderPassPlanDiag s_pass_plan_diag;
 
+/* Queued passes (render thread on). The emulation thread records a pass's
+ * GL begin and end like any other draw call, and the render thread runs the
+ * whole GL side of the transaction (backup, the pass's own draws, capture,
+ * restore) in stream order. The emulation thread then pays only for the
+ * guest's draw code, instead of draining the render queue and rasterizing
+ * the pass itself while it holds the context. Results the guest side used to
+ * read back (begin refusals, out-of-rect leaks) are counted when the render
+ * thread reaches them; a refused begin drops that pass's records. Plans are
+ * locked to VBlanks (one output per guest VBlank, gl_renderer_pass_plan),
+ * so the presenter never sleeps on a wall-clock deadline in the render
+ * thread. PSX_RENDER_PASS_QUEUED=0 restores the synchronous handoff;
+ * PSX_RENDER_PASS_VERIFY=1 implies it (verification reads GL state back). */
+static int      s_pass_queued_env = -1;
+static int      s_pass_dead = 0;                 /* render thread */
+static uint32_t s_pass_leaks_at_begin = 0;       /* render thread */
+static uint32_t s_pgen_interval = 0;             /* render thread */
+static _Atomic uint32_t s_pass_q_leaks, s_pass_q_refused, s_pass_q_shed;
+static _Atomic uint32_t s_pass_q_intervals;
+
+static int pass_queued_enabled(void) {
+    if (s_pass_queued_env < 0) {
+        const char *e = getenv("PSX_RENDER_PASS_QUEUED");
+        const char *v = getenv("PSX_RENDER_PASS_VERIFY");
+        s_pass_queued_env = (e && e[0] == '0') || (v && v[0] && v[0] != '0') ? 0 : 1;
+    }
+    return s_pass_queued_env;
+}
+/* One presented output per guest VBlank: the only cadence queued passes
+ * schedule (an integer multiple would need presenter-side deadlines). */
+static int pass_vblank_locked_rate(void) {
+    return s_interp_source_hz > 0.0 &&
+           fabs(s_interp_target_hz - s_interp_source_hz) < 0.01;
+}
+/* Emulation thread: record this pass instead of taking the context. */
+static int pass_queued(void) {
+    return pass_queued_enabled() && s_rth_on && !rt_on_render_thread() &&
+           !rt_held() && pass_vblank_locked_rate();
+}
+int gl_renderer_pass_queued(void) { return pass_queued(); }
+/* The presenter queued passes need: flip source, hold blend, one output per
+ * guest VBlank. Only it keeps the render thread on with interpolation
+ * enabled; every other interpolation mode still renders on the emulation
+ * thread's context, as before. */
+static int pass_queued_presenter(void) {
+    return pass_queued_enabled() && s_interp_source == 1 && s_interp_hold &&
+           pass_vblank_locked_rate();
+}
+void gl_renderer_pass_queued_counts(uint64_t *backlog_shed, uint64_t *refused,
+                                    uint64_t *leaks) {
+    if (backlog_shed) *backlog_shed = atomic_load(&s_pass_q_shed);
+    if (refused) *refused = atomic_load(&s_pass_q_refused);
+    if (leaks) *leaks = atomic_load(&s_pass_q_leaks);
+}
+
 static int      s_pass_verify = -1;
 static uint8_t *s_pv_hr = NULL, *s_pv_raw = NULL;
 static size_t   s_pv_hr_cap = 0, s_pv_raw_cap = 0;
@@ -8167,7 +8240,10 @@ static void pass_refusal_init(void) {
 }
 
 uint32_t gl_renderer_pass_unavailable(void) {
-    GL_RT_SYNC("pass_unavailable");
+    /* Queued: flags the emulation thread sets, plus the presenter's history
+     * count read without a drain (a stale value is refused at begin on the
+     * render thread). */
+    if (!pass_queued()) GL_RT_SYNC("pass_unavailable");
     pass_refusal_init();
     if (!s_ctx || !s_raster_ok || !s_interp_enabled || s_interp_suspended ||
         s_interp_source != 1 || !(s_interp_source_hz > 0.0))
@@ -8193,7 +8269,7 @@ uint32_t gl_renderer_pass_unavailable(void) {
 }
 
 int gl_renderer_pass_ready(void) {
-    GL_RT_SYNC("pass_ready");
+    if (!pass_queued()) GL_RT_SYNC("pass_ready");
     return gl_renderer_pass_unavailable() == PSX_MOD_RENDER_PASS_READY;
 }
 
@@ -8203,6 +8279,10 @@ static uint32_t pass_slot_cap(int tex_w, int tex_h) {
     uint32_t cap = bytes > 0.0 ? (uint32_t)((256.0 * 1024.0 * 1024.0) / bytes)
                                : PASS_SLOTS;
     if (cap > PASS_SLOTS) cap = PASS_SLOTS;
+    /* Queued passes keep a frame's own image and one in-between image per
+     * generation whatever the size: at 8K that is about 0.8 GiB of textures
+     * (three generations), allocated only when used. */
+    if (cap < 2 && pass_queued_enabled()) cap = 2;
     return cap;
 }
 
@@ -8210,6 +8290,33 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
                                uint32_t shown_after_vblanks,
                                uint32_t *alpha_q16, uint32_t max,
                                uint32_t *wanted) {
+    if (pass_queued()) {
+        /* VBlank-locked: frame N is shown for period_vblanks outputs, one per
+         * VBlank; output k shows phase k / period. Phase 0 is the game's own
+         * image, so passes are wanted at k = 1 .. period - 1. They are shed
+         * while the render thread is two frames behind (one is its normal
+         * pipelined state). */
+        uint32_t n = 0, cap;
+        const int live = atomic_exchange(&s_pass_q_intervals, 0) > 0;
+        if (wanted) *wanted = 0;
+        (void)shown_after_vblanks;
+        if (gl_renderer_pass_unavailable() != PSX_MOD_RENDER_PASS_READY || !live ||
+            !alpha_q16 || max == 0 || period_vblanks < 2)
+            return 0;
+        if (wanted) *wanted = period_vblanks - 1u;
+        if (rt_frames_ahead() >= 2) {
+            atomic_fetch_add(&s_pass_q_shed, 1);
+            return 0;
+        }
+        cap = pass_slot_cap(s_interp_w, s_interp_h);
+        for (uint32_t k = 1; k < period_vblanks && n < max && n + 1u < cap; k++)
+            alpha_q16[n++] = (uint32_t)(((uint64_t)k << 16) / period_vblanks);
+        s_pass_plan_diag.plans++;
+        s_pass_plan_diag.frame = s_frame_count;
+        s_pass_plan_diag.wanted = period_vblanks - 1u;
+        s_pass_plan_diag.planned = n;
+        return n;
+    }
     GL_RT_SYNC("pass_plan");
     RenderPassPlanInput in;
     double freq, sp, spare;
@@ -8295,6 +8402,7 @@ void gl_renderer_pass_plan_diag(GLRenderPassPlanDiag *out) {
 }
 
 void gl_renderer_pass_note_cost(uint64_t ticks) {
+    if (pass_queued()) return;   /* VBlank-locked plans carry no budget */
     GL_RT_SYNC("pass_note_cost");
     if (s_pass_cost_w != s_interp_w || s_pass_cost_h != s_interp_h) {
         memset(&s_pass_cost, 0, sizeof s_pass_cost);
@@ -8310,6 +8418,9 @@ void gl_renderer_pass_note_cost(uint64_t ticks) {
 }
 
 uint32_t gl_renderer_pass_leaks(void) {
+    /* Queued: counted when the render thread ends a pass, so a leak fails a
+     * later pass of the session rather than its own. */
+    if (pass_queued()) return atomic_load(&s_pass_q_leaks);
     GL_RT_SYNC("pass_leaks"); return s_pass_leaks; }
 int gl_renderer_pass_verify_vram(void) {
     GL_RT_SYNC("pass_verify_vram"); return s_pv_ok; }
@@ -8793,17 +8904,31 @@ int gl_renderer_local_view_end(int keep) {
 
 int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
                            uint32_t period, int reuse) {
+    if (pass_queued()) {
+        RTH_REC(RTH_PASS_BEGIN, 0, x, y, w, h, open_gen, (int32_t)period, reuse);
+        return 1;
+    }
     GL_RT_SYNC("pass_begin");
+    s_pass_dead = 0;
     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
 }
 int gl_renderer_stereo_begin(int x, int y, int w, int h, int reuse) {
     GL_RT_SYNC("stereo_begin");
     return transaction_begin(x, y, w, h, 0, 0, reuse, 1);
 }
+static void pass_end_now(uint32_t alpha_q16, int keep);
 void gl_renderer_pass_end(uint32_t alpha_q16, int keep) {
+    if (pass_queued()) {
+        RTH_REC(RTH_PASS_END, 0, (int32_t)alpha_q16, keep);
+        return;
+    }
     GL_RT_SYNC("pass_end");
+    pass_end_now(alpha_q16, keep);
+}
+static void pass_end_now(uint32_t alpha_q16, int keep) {
     int gi = s_pgen_write;
     PassGen *g = &s_pgen[gi];
+    s_pass_dead = 0;   /* however this pass ends, later records run */
     if (!s_pass_active) return;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
     if (keep && alpha_q16 && g->valid && !g->promoted && g->n < PASS_SLOTS &&
@@ -9312,16 +9437,20 @@ static int xr_mirror_active(void) {
 /* Draw two presented images crossfaded (t = weight of b) into the window. */
 static int interp_present_pair(GLuint a, GLuint b, float t, int blend_mode);
 
+static int pass_gen_present_at(double p, int locked);
 static int pass_gen_present(uint64_t deadline) {
+    PassGen *g = &s_pgen[s_pgen_cur];
+    if (!(g->t_len > 0.0)) return 0;
+    return pass_gen_present_at(((double)deadline - g->t_start) / g->t_len, 0);
+}
+static int pass_gen_present_at(double p, int locked) {
     PassGen *g = &s_pgen[s_pgen_cur];
     uint32_t lo = 0, hi = 0;
     float t = 0.0f;
-    double p;
-    if (!g->valid || !g->promoted || !(g->t_len > 0.0)) return 0;
+    if (!g->valid || !g->promoted || (!locked && !(g->t_len > 0.0))) return 0;
     if (g->source_path != s_interp_source_path || g->tex_w != s_interp_w ||
         g->tex_h != s_interp_h)
         return 0;
-    p = ((double)deadline - g->t_start) / g->t_len;
     /* Past phase 1 the next flip is late (a lagging tick): the newest image
      * holds until it comes. Only a game that stops flipping for several
      * frame lengths expires the generation. */
@@ -9342,7 +9471,14 @@ static int pass_gen_present(uint64_t deadline) {
     return 1;
 }
 
+static int pass_locked_present(void) {
+    const PassGen *g = &s_pgen[s_pgen_cur];
+    return g->period > 0 &&
+           pass_gen_present_at((double)s_pgen_interval / (double)g->period, 1);
+}
+
 void gl_renderer_pass_service_presents(void) {
+    if (pass_queued()) return;   /* the render thread presents at VBlanks */
     GL_RT_SYNC("pass_service_presents");
     uint64_t deadline;
     double sp;
@@ -9463,7 +9599,10 @@ static void pass_dump_generation(int gi) {
 
 static void pass_apply_promotion(void) {
     s_intervals_since_plan++;
+    atomic_fetch_add(&s_pass_q_intervals, 1);
+    s_pgen_interval++;
     if (s_pgen_promote<0) return;
+    s_pgen_interval = 0;
     s_pgen[s_pgen_cur].valid = 0;
     s_pgen[s_pgen_cur].promoted = 0;
     s_pgen_cur = s_pgen_promote;
@@ -9880,6 +10019,7 @@ static void pt_end(void) {
 }
 
 /* The swap: direct, or queued to the present thread. */
+static void rthf_gpu_gap(int open);
 static void gl_present_swap(void) {
     if (!s_pt_on) { gl_window_swap(); return; }
     (void)pt_target_fbo();   /* a frame that never bound 0 still has its slot */
@@ -9887,7 +10027,16 @@ static void gl_present_swap(void) {
     glFlush();
     void *done = NULL;
     (void)pt_submit(ready, &done, NULL);
-    if (done) { p_glWaitSync(done, 0, PT_TIMEOUT_IGNORED); p_glDeleteSync(done); }
+    if (done) {
+        /* The GPU waits here for the present thread to finish reading this
+         * slot, which the compositor can hold for up to a refresh when every
+         * VBlank is presented. That is not this frame's render work: keep it
+         * out of dynamic resolution's GPU timer. */
+        rthf_gpu_gap(1);
+        p_glWaitSync(done, 0, PT_TIMEOUT_IGNORED);
+        p_glDeleteSync(done);
+        rthf_gpu_gap(0);
+    }
     /* Whatever is bound as the window now means the new slot. */
     GLint d = 0, r = 0;
     glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &d);
@@ -11289,7 +11438,9 @@ static int gl_rth_eligible(void) {
     extern int psx_netplay_active(void);
     return s_raster_ok && s_ctx && !s_cpu_auth_dual && !s_depth24_skip_up &&
            !(s_hd_native_authority && s_rth_a0_open) &&
-           !gpu_display_is_depth24() && !s_interp_enabled && !s_pass_active &&
+           !gpu_display_is_depth24() &&
+           (!s_interp_enabled || pass_queued_presenter()) &&
+           (!s_pass_active || pass_queued_enabled()) &&
            !psx_netplay_active() && !psx_openxr_session_active() &&
            gr_backend() == GR_BACKEND_OPENGL;
 }
@@ -11515,6 +11666,28 @@ static void rthf_begin(void) {
 /* Frame generation draws between a frame's records: its work is not the
  * frame's. Pause ends the frame's GPU query and starts excluding wall time
  * (and its swaps); resume opens the next query segment. */
+/* Split the frame's GPU query around a wait that is not render work. */
+static int s_rthf_gap = 0;
+static void rthf_gpu_gap(int open) {
+    if (open) {
+        if (!rth_replaying() || !s_rthf_open || s_rthf_paused || !s_rthf_has_q ||
+            !pass_queued_presenter()) return;
+        p_glEndQuery(GL_TIME_ELAPSED);
+        s_rthf_gap = 1;
+        return;
+    }
+    if (!s_rthf_gap) return;
+    s_rthf_gap = 0;
+    {
+        const unsigned i = s_rthf_head % RTHF_Q;
+        if (s_rthf_nseg[i] < RTHF_SEG) {
+            p_glBeginQuery(GL_TIME_ELAPSED, s_rthf_q[i][s_rthf_nseg[i]++]);
+        } else {
+            s_rthf_taint = 1;
+            p_glBeginQuery(GL_TIME_ELAPSED, s_rthf_q[i][RTHF_SEG - 1]);
+        }
+    }
+}
 static void rthf_pause(void) {
     if (!s_rthf_open || s_rthf_paused) return;
     s_rthf_paused = 1;
@@ -14419,6 +14592,12 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
     s_rthx_tagged = (c->flags & RTHF_TAGGED) != 0;
     s_rthx_backdrop = (c->flags >> RTHF_BD_SHIFT) & 3;
+    /* A queued pass whose begin was refused has no backup: drop its draws. */
+    if (s_pass_dead && c->op != RTH_PASS_END && c->op != RTH_FRAME &&
+        c->op != RTH_PRESENT_VRAM && c->op != RTH_PRESENT_WIDE) {
+        s_rthx_prim = 0;
+        return;
+    }
     if (c->op == RTH_FRAME) { rthf_end(); return; }
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
@@ -14511,6 +14690,23 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         memcpy(s_dyn_rth_disp, v + 1, sizeof s_dyn_rth_disp);
         (void)dyn_apply(v[0]);
         s_dyn_rth_disp_valid = 0;
+        break;
+    case RTH_PASS_BEGIN:
+        if (transaction_begin(v[0], v[1], v[2], v[3], v[4], (uint32_t)v[5], v[6], 0)) {
+            s_pass_leaks_at_begin = s_pass_leaks;
+        } else {
+            s_pass_dead = 1;
+            atomic_fetch_add(&s_pass_q_refused, 1);
+        }
+        break;
+    case RTH_PASS_END:
+        if (s_pass_dead) { s_pass_dead = 0; break; }
+        if (s_pass_leaks != s_pass_leaks_at_begin) {
+            atomic_fetch_add(&s_pass_q_leaks, s_pass_leaks - s_pass_leaks_at_begin);
+            pass_end_now(0, 0);
+        } else {
+            pass_end_now((uint32_t)v[0], v[1]);
+        }
         break;
     case RTH_PEEK: {
         uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);

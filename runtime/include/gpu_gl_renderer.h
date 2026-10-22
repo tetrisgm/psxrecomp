@@ -65,6 +65,13 @@ uint32_t gl_renderer_pass_unavailable(void);
  * render_pass_refuse over TCP), as a renderer mode without them would. */
 void     gl_renderer_pass_force_refuse(int on);
 /* Phases the presenter will show for the frame the next flip displays. */
+/* Nonzero while passes are queued on the render thread (the emulation
+ * thread records them instead of taking the GL context). */
+int gl_renderer_pass_queued(void);
+/* Queued-pass counters: plans shed while the render thread was two frames
+ * behind, begins the render thread refused, and out-of-rect writes. */
+void gl_renderer_pass_queued_counts(uint64_t *backlog_shed, uint64_t *refused,
+                                    uint64_t *leaks);
 uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
                                uint32_t shown_after_vblanks,
                                uint32_t *alpha_q16, uint32_t max,

@@ -72,6 +72,10 @@ typedef struct RenderPassStats {
     uint64_t guest_cycles_last; /* guest cycles the last pass executed */
     int      disabled;        /* sticky: passes disabled after repeated faults */
     int      watchdog_flag;   /* internal: the current pass overran */
+    /* Queued passes (gl_renderer_pass_queued): frames whose passes the
+     * emulation-thread budget shed, rests it started, and its pass cost. */
+    uint64_t queued_shed, queued_rests;
+    double   queued_cost_ms;
 } RenderPassStats;
 
 void render_pass_get_stats(RenderPassStats *out);
