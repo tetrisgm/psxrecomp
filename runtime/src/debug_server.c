@@ -8959,6 +8959,8 @@ static void handle_render_pass_stats(int id, const char *json)
     char abort_detail_json[sizeof st.last_abort_detail * 6 + 1];
     DirtyRamSpanFailure sf;
     render_pass_get_stats(&st);
+    uint64_t q_backlog = 0, q_refused = 0, q_leaks = 0;
+    gl_renderer_pass_queued_counts(&q_backlog, &q_refused, &q_leaks);
     dirty_ram_span_last_failure(&sf);
     json_escape_string(abort_detail_json, sizeof abort_detail_json,
                        st.last_abort_detail);
@@ -9026,6 +9028,9 @@ static void handle_render_pass_stats(int id, const char *json)
              "\"spans\":%llu,\"span_failures\":%llu,"
              "\"local_views\":%llu,\"local_attempts\":%llu,"
              "\"local_status\":%u,"
+             "\"queued\":{\"active\":%d,\"budget_shed\":%llu,\"rests\":%llu,"
+             "\"cost_ms\":%.3f,\"backlog_shed\":%llu,\"begin_refused\":%llu,"
+             "\"leaks\":%llu},"
              "\"admission\":%s,\"last_failure\":%s,\"last_abort_detail\":\"%s\","
              "\"span_fail\":{\"reason\":%u,\"pc\":\"0x%08X\",\"start\":\"0x%08X\","
              "\"stop\":\"0x%08X\",\"ra\":\"0x%08X\",\"after\":\"0x%08X\","
@@ -9064,6 +9069,10 @@ static void handle_render_pass_stats(int id, const char *json)
              (unsigned long long)st.local_views,
              (unsigned long long)st.local_attempts,
              psx_mod_render_local_view_status(),
+             gl_renderer_pass_queued(), (unsigned long long)st.queued_shed,
+             (unsigned long long)st.queued_rests, st.queued_cost_ms,
+             (unsigned long long)q_backlog, (unsigned long long)q_refused,
+             (unsigned long long)q_leaks,
              admission_json, failure_json, abort_detail_json,
              (unsigned)sf.reason, (unsigned)sf.pc, (unsigned)sf.start_pc,
              (unsigned)sf.stop_pc, (unsigned)sf.ra, (unsigned)sf.after,
