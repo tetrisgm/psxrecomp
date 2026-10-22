@@ -351,6 +351,45 @@ captures). Their textures are made as the slots fill, never more slots than
 two generations fit in 256 MiB, which limits passes per frame at very high
 internal resolutions; a size change frees the old set.
 
+## Queued passes (render thread)
+
+With the render thread on, the default when the output rate equals the
+guest's VBlank rate (one presented image per VBlank, for example 60 FPS from a
+30 Hz game on any display), passes are queued instead of run with the GL
+context taken from the render thread:
+
+- The emulation thread records a pass's GL begin and end as render-queue
+  records, like any draw. The render thread runs the GL side of the
+  transaction in stream order: rect backup, the pass's own draws, image
+  capture and restore. The emulation thread pays only for the guest's draw
+  code and the machine checkpoint. Previously every pass, and the plan and
+  status queries of every frame, drained the render queue and rasterized the
+  pass on the emulation thread.
+- Plans are locked to VBlanks: a frame shown for `period` VBlanks gets passes
+  at phases `k / period` (k = 1 .. period - 1), and the presenter shows, at
+  each guest VBlank, the image for that VBlank's place in the frame. The
+  render thread never sleeps on a wall-clock output deadline; the guest's
+  own pacer sets the cadence, as for stock frames.
+- Results the emulation thread used to read back arrive later: a begin the
+  render thread refuses drops that pass's records (`queued.begin_refused`),
+  and out-of-rect writes count as faults when the render thread reaches them
+  (`queued.leaks`).
+- Budget: the guest's draw code is most of a game frame's emulation work, so
+  a pass may not fit. The emulation thread's idle time (pacer waits) over each
+  frame with passes decides: three frames in a row with less than 0.3 ms left
+  and passes rest (both VBlanks show the game's own image, as at 30 FPS) for
+  15 frames, doubling up to 480 while retries keep failing and resetting after
+  600 frames of passes that fit (`queued.budget_shed`, `queued.rests`).
+  Passes are also shed while the render thread is two frames behind
+  (`queued.backlog_shed`); dynamic resolution handles render-thread load.
+- Images: a frame's own image and one in-between image per generation are
+  kept whatever the internal resolution (three generations, about 0.8 GiB of
+  textures at 8K, allocated as used).
+
+`PSX_RENDER_PASS_QUEUED=0` restores the synchronous handoff and the
+host-time budget above; `PSX_RENDER_PASS_VERIFY=1` implies it, since
+verification reads GL state back.
+
 ## Verifying a title
 
 - `render_pass_stats` (TCP): passes, shedding, faults, dropped device
