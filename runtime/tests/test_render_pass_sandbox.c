@@ -228,11 +228,19 @@ uint64_t gl_renderer_perf_frequency(void) { return 1000000000u; }
 static void tick_bump(uint64_t ticks) { s_ticks += ticks; }
 static uint32_t s_gl_status = PSX_MOD_RENDER_PASS_READY;
 uint32_t gl_renderer_pass_unavailable(void) { return s_gl_status; }
+/* Queued-pass budget fixture: the GL plan offers one phase, and the test
+ * drives the emulation thread's pacer idle time. */
+static int s_queued, s_plan_one;
+static uint64_t s_pacer_ticks;
+int gl_renderer_pass_queued(void) { return s_queued; }
+uint64_t psx_frame_pacer_wait_ticks(void) { return s_pacer_ticks; }
 uint32_t gl_renderer_pass_plan(uint32_t p, uint32_t s, uint32_t *a,
                                uint32_t max, uint32_t *wanted) {
-    (void)p; (void)s; (void)a; (void)max;
-    if (wanted) *wanted = 0;
-    return 0;
+    (void)p; (void)s;
+    if (wanted) *wanted = s_plan_one ? 1u : 0u;
+    if (!s_plan_one || !a || max == 0) return 0;
+    a[0] = 0x8000u;
+    return 1;
 }
 static int s_open_passes, s_kept, s_begin_ok = 1, s_diag_null;
 void gl_renderer_pass_begin_diag(GLRenderPassBeginDiag *out) {
@@ -1093,6 +1101,45 @@ static void test_isolated_capture(void) {
     CHECK(stats.checkpoint_saves==1 && stats.checkpoint_reuses==1,
           "the pair after a capture captures its own baseline");
 }
+/* Queued passes: three frames in a row that leave the emulation thread
+ * under the margin start a rest of 15 frames without passes; a failed retry
+ * doubles it; frames with room never shed. */
+static void test_queued_budget(void) {
+    uint32_t a[4];
+    RenderPassStats st;
+    int i, zeros = 0;
+    const uint64_t ms = 1000000u;   /* 1 GHz test clock */
+    s_queued = 1;
+    s_plan_one = 1;
+    for (i = 0; i < 20; i++) {      /* room: 5 ms idle per frame */
+        s_pacer_ticks += 5u * ms;
+        if (!psx_mod_render_pass_plan(2, 1, a, 4)) zeros++;
+    }
+    CHECK(zeros == 0, "queued budget: frames with room keep their passes");
+    for (i = 0; i < 3; i++) {       /* three tight frames: 0.1 ms */
+        s_pacer_ticks += ms / 10u;
+        if (!psx_mod_render_pass_plan(2, 1, a, 4)) zeros++;
+    }
+    CHECK(zeros == 1, "queued budget: the third tight frame starts a rest");
+    zeros = 0;
+    for (i = 0; i < 14; i++) {
+        s_pacer_ticks += 10u * ms;
+        if (!psx_mod_render_pass_plan(2, 1, a, 4)) zeros++;
+    }
+    CHECK(zeros == 14, "queued budget: the rest lasts 15 frames");
+    s_pacer_ticks += 10u * ms;
+    CHECK(psx_mod_render_pass_plan(2, 1, a, 4) == 1, "queued budget: retried after the rest");
+    for (i = 0, zeros = 0; i < 3 + 29; i++) {   /* retry fails: rest doubles */
+        s_pacer_ticks += ms / 10u;
+        if (!psx_mod_render_pass_plan(2, 1, a, 4)) zeros++;
+    }
+    CHECK(zeros == 30, "queued budget: a failed retry doubles the rest");
+    render_pass_get_stats(&st);
+    CHECK(st.queued_rests == 2 && st.queued_shed == 45, "queued budget: stats count rests and shed frames");
+    s_queued = 0;
+    s_plan_one = 0;
+}
+
 int main(void) {
     test_store_policy();
     test_pass();
@@ -1103,6 +1150,7 @@ int main(void) {
     test_trace_substages();
     test_local_view();
     test_texture_stream_journal();
+    test_queued_budget();
     CHECK(s_prec_open == 0, "precision checkpoints balanced");
     printf(failures ? "FAILED (%d)\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;

@@ -154,7 +154,7 @@ assert re.search(r"if \(want && s_pass_cost_w == s_interp_w && "
     "and the re-measuring plan must ask for one pass")
 # A frame on screen longer than planned (a lagging tick) must hold its newest
 # pass image, never fall back to the older capture (render_pass_plan_test).
-pgp = definition(gl, "pass_gen_present")
+pgp = definition(gl, "pass_gen_present_at")
 assert "render_pass_gen_select_mode(g->phase, g->n, p, s_interp_hold, &lo, &hi, &t)" in pgp, (
     "pass images must honor HOLD through the tested late-flip selection rule")
 assert "render_pass_select(" not in pgp and "0.5 / (double)g->period" not in pgp, (

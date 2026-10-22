@@ -196,6 +196,8 @@ void gl_renderer_pass_end(uint32_t alpha_q16, int keep) {
     if (keep) s_kept++;
 }
 uint32_t gl_renderer_pass_leaks(void) { return 0; }
+int gl_renderer_pass_queued(void) { return 0; }
+uint64_t psx_frame_pacer_wait_ticks(void) { return 0; }
 int gl_renderer_pass_verify_vram(void) { return 1; }
 void gl_renderer_pass_note_cost(uint64_t t) { (void)t; }
 void gl_renderer_pass_service_presents(void) {}
