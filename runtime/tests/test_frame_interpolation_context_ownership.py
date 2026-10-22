@@ -24,7 +24,10 @@ assert "SDL_CreateThread(" not in RENDERER, (
 assert "SDL_LockMutex(" not in RENDERER, (
     "the GL renderer must not hold an application mutex across driver work"
 )
-assert RENDERER.count("SDL_GL_SwapWindow(") == 1, (
+# gl_window_swap holds the swap once per SDL backend (#if PSX_SDL3 / #else).
+_swap = RENDERER[RENDERER.index("static void gl_window_swap(void)"):]
+_swap = _swap[:_swap.index("\n}\n")]
+assert RENDERER.count("SDL_GL_SwapWindow(") == _swap.count("SDL_GL_SwapWindow(") >= 1, (
     "all OpenGL presentation must converge on one owned swap call"
 )
 assert "gl_renderer_interpolation_owns_cadence" in RENDERER

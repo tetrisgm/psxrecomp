@@ -6,6 +6,7 @@
  * margin the guest sees is the stock 0 everywhere except inside a sandboxed
  * local-view render (gpu_ws_set_local_view_scope), where it is the margin the
  * configured native-wide aspect implies. Off (the default) changes nothing. */
+#define GPU_EXEC_REAL_UI_GROUP
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>

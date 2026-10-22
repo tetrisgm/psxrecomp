@@ -58,6 +58,8 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
 uint32_t boot_state_last_vram_dirty_rows(void) { return 0; }
 int boot_state_last_vram_incremental(void) { return 0; }
 #endif
+/* psx_netplay.c: no session, so no local slot (names the audit file only). */
+int psx_netplay_local_slot(void) { return -1; }
 
 #include "netplay_snap_ring.h"
 #include "../src/netplay_snap_ring.c"

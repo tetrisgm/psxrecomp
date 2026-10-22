@@ -674,6 +674,13 @@ if(BUILD_TESTING)
         endforeach()
         target_compile_definitions(bios_module_fake_bad_abi PRIVATE FAKE_ABI_TAG=0x7fff)
         target_compile_definitions(bios_module_fake_bad_hash PRIVATE FAKE_CODEGEN_HASH=0x1u)
+        # Both sides read PSX_OVERLAY_CODEGEN_HASH from the generated header via
+        # __has_include, which depfiles (and ccache's direct mode) miss when it
+        # is absent: order and recompile them after it, or a parallel first
+        # build bakes in 0 -- and ccache then keeps serving that object.
+        set_source_files_properties(tests/bios_module_fake.c src/psx_bios_module.c
+            PROPERTIES OBJECT_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/overlay_codegen_hash.h")
         add_executable(bios_module_host_test
             tests/test_bios_module_host.c
             src/psx_bios_module.c
@@ -689,6 +696,12 @@ if(BUILD_TESTING)
         target_link_libraries(bios_module_host_test PRIVATE ${CMAKE_DL_LIBS})
         add_dependencies(bios_module_host_test
             bios_module_fake_good bios_module_fake_bad_abi bios_module_fake_bad_hash)
+        if(TARGET psxrecomp_codegen_hash)
+            foreach(_t IN ITEMS bios_module_host_test bios_module_fake_good
+                                bios_module_fake_bad_abi bios_module_fake_bad_hash)
+                add_dependencies(${_t} psxrecomp_codegen_hash)
+            endforeach()
+        endif()
         add_test(NAME bios_module_host_test COMMAND bios_module_host_test)
     endif()
 
@@ -950,6 +963,7 @@ if(BUILD_TESTING)
     foreach(_pgxp_session_test IN ITEMS pgxp_session_test pgxp_session_hooks_test)
         add_executable(${_pgxp_session_test} tests/test_pgxp_session.cpp
             src/pgxp_session.cpp src/mod_builtin_pgxp.c src/pgxp.cpp
+            src/mod_immediate.c
             src/psx_ram_geometry.c
             src/mod_runtime.cpp
             src/mod_packages.cpp
@@ -1432,6 +1446,11 @@ if(BUILD_TESTING)
     add_test(NAME mod_netplay_missing_renderer_test COMMAND mod_runtime_test --missing-renderer)
     add_test(NAME mod_netplay_profile_options_test COMMAND mod_runtime_test --profile-options)
     add_test(NAME mod_netplay_option_renderer_missing_test COMMAND mod_runtime_test --option-renderer-missing)
+    # Every mode rebuilds the same temp tree (psxrecomp-mod-runtime-test).
+    set_tests_properties(mod_runtime_test mod_netplay_missing_plugin_test
+        mod_netplay_missing_renderer_test mod_netplay_profile_options_test
+        mod_netplay_option_renderer_missing_test
+        PROPERTIES RESOURCE_LOCK psxrecomp_mod_runtime_test_tree)
 
     add_executable(neversoft_helpers_test tests/test_neversoft_helpers.cpp)
     target_include_directories(neversoft_helpers_test PRIVATE include)
@@ -1449,6 +1468,7 @@ if(BUILD_TESTING)
     add_test(NAME resident_sector_test COMMAND resident_sector_test)
     add_executable(netplay_view_mods_test
         tests/test_netplay_view_mods.cpp
+        src/mod_immediate.c
         src/iso_reader_c.cpp
         src/host_span_ring.c
         src/mod_runtime.cpp
@@ -1494,6 +1514,7 @@ if(BUILD_TESTING)
 
     add_executable(mod_resident_test
         tests/test_mod_resident.cpp
+        src/mod_immediate.c
         src/mod_resident.cpp
         src/mod_runtime.cpp
         src/mod_netplay.c

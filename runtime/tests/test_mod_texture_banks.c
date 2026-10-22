@@ -14,6 +14,7 @@ uint32_t psx_mod_read_word(uint32_t address) {
     uint32_t offset=(address&0x1fffffffu)-PSX_MOD_GPU_DMA_APERTURE_BASE;
     if(offset>sizeof memory-4)abort(); ++reads;return memory[offset/4];
 }
+int psx_mod_host_output_scope(void){return 0;} /* mod_runtime.cpp */
 static void check(int ok,const char* text){if(!ok){fprintf(stderr,"FAIL %s\n",text);exit(1);}}
 static int resolve(uint16_t id){uint16_t data=0x4567;++resolves;return psx_mod_define_texture_bank(id,1,1,&data);}
 static uint32_t bits(float f){uint32_t n;memcpy(&n,&f,4);return n;}
