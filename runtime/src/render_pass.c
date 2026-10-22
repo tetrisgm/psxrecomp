@@ -297,6 +297,8 @@ static uint32_t s_q_rest, s_q_backoff = RP_QUEUED_REST_MIN, s_q_good;
 static uint64_t s_q_shed, s_q_rests;
 static int queued_budget_allows(void) {
     const uint64_t w = psx_frame_pacer_wait_ticks();
+    if (s_ms_per_tick <= 0.0)
+        s_ms_per_tick = 1000.0 / (double)gl_renderer_perf_frequency();
     const double idle_ms = s_ms_per_tick > 0.0 ? (double)(w - s_q_wait_mark) * s_ms_per_tick : 1e9;
     s_q_wait_mark = w;
     if (s_q_ran_last) {
