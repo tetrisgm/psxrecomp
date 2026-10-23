@@ -29,6 +29,7 @@ static struct {
     int on;
     int live;           /* live machine is the draw context */
     int split;          /* a span was split by an interrupt */
+    int suspended;      /* explicit main-context side effect */
     uint32_t flags;
     uint32_t ram_size;
     uint64_t poison;
@@ -246,7 +247,7 @@ int psx_draw_iso_enabled(void) { return S.on; }
 int psx_draw_iso_live(void) { return S.live; }
 
 int psx_draw_iso_enter(struct CPUState *cpu) {
-    if (!S.on || S.live || S.split || cpu != S.cpu) return 0;
+    if (!S.on || S.live || S.split || S.suspended || cpu != S.cpu) return 0;
     if (psx_ram_live_bytes() != S.ram_size) { psx_draw_iso_end(); return 0; }
     for (uint32_t i = 0; i < PSX_DRAW_ISO_SEGS; i++) {
         memset(S.seg[i].span, 0, S.seg[i].size);
@@ -285,6 +286,21 @@ void psx_draw_iso_sync(void) {
         }
         S.st.logic_overwrites[i] += overwrites;
     }
+}
+
+int psx_draw_iso_suspend(struct CPUState *cpu) {
+    if (!S.on || !S.live || S.split || S.suspended || cpu != S.cpu) return 0;
+    for (uint32_t i = 0; i < PSX_DRAW_ISO_SEGS; i++) seg_leave(i);
+    S.live = 0;
+    S.suspended = 1;
+    return 1;
+}
+
+void psx_draw_iso_resume(struct CPUState *cpu) {
+    if (!S.on || !S.suspended || cpu != S.cpu) return;
+    for (uint32_t i = 0; i < PSX_DRAW_ISO_SEGS; i++) seg_enter(i);
+    S.suspended = 0;
+    S.live = 1;
 }
 
 static int locate(uint32_t addr, uint32_t *seg, uint32_t *off) {

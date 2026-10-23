@@ -87,6 +87,12 @@ int  psx_draw_iso_live(void);
 int  psx_draw_iso_enter(struct CPUState *cpu);
 void psx_draw_iso_leave(struct CPUState *cpu);
 
+/* Temporarily execute a synchronous side effect on main, retaining the
+ * current span's write map. GPR arguments/results stay live; pointers must
+ * refer to main-owned data. Resume after the main call returns. */
+int psx_draw_iso_suspend(struct CPUState *cpu);
+void psx_draw_iso_resume(struct CPUState *cpu);
+
 /* Fold the main context's stores since the last span into the ownership
  * map (a byte main wrote is main's again). Call before handoff, merged reads,
  * hashes and range queries once main code has run since the last span. */
