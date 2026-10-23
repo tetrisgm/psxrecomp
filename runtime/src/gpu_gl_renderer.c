@@ -526,7 +526,7 @@ enum {
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
-    RTH_PASS_BEGIN, RTH_PASS_END
+    RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -8341,7 +8341,7 @@ static void interp_present_source_interval(void) {
 typedef struct PassGen {
     int      valid;
     int      promoted;
-    uint64_t order,created_cycle;
+    uint64_t order,created_cycle,async_id,async_epoch;
     int      x, y, w, h;          /* captured VRAM rect (what is presented) */
     int      rx, ry, rw, rh;      /* the plugin's pass rect (backed up)     */
     int      tex_w, tex_h;        /* slot size (hr pixels; wide band if wide) */
@@ -8355,6 +8355,10 @@ typedef struct PassGen {
 static int      s_pass_flip_shown = 0;
 static PassGen  s_pgen[PASS_GENERATIONS];
 static uint64_t s_pgen_order;
+static RenderPassOutputTimeline s_async_timeline;
+static uint64_t s_async_id, s_async_last_index;
+static int s_async_rate, s_async_exec, s_async_previous_write, s_async_has_index;
+static GLRenderAsyncToken s_async_recording;
 /* Double-buffer complete pairs: the unpublished set may be overwritten while
  * the last complete pair remains visible. No temporal phases or generation. */
 typedef struct StereoPair {
@@ -8463,7 +8467,7 @@ static int pass_vblank_locked_rate(void) {
 /* Emulation thread: record this pass instead of taking the context. */
 static int pass_queued(void) {
     return pass_queued_enabled() && s_rth_on && !rt_on_render_thread() &&
-           !rt_held() && pass_vblank_locked_rate();
+           !rt_held() && (pass_vblank_locked_rate() || s_pt_on);
 }
 int gl_renderer_pass_queued(void) { return pass_queued(); }
 /* The presenter queued passes need: flip source, hold blend, one output per
@@ -9049,7 +9053,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         g->phase[0] = 0;
         g->n = 1;
         g->valid = 1;
-    } else if (!g->valid || g->promoted || g->rx != x || g->ry != y ||
+    } else if (!g->valid || (g->promoted && !s_async_exec) || g->rx != x || g->ry != y ||
                g->rw != w || g->rh != h) {
         return pass_begin_refuse("generation_state");
     }
@@ -9219,6 +9223,64 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
     s_pass_dead = 0;
     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
 }
+static int async_record(uint16_t op,const GLRenderAsyncToken *token) {
+    void *p=rt_cmd_begin(op,0,sizeof(*token));
+    if (!p) return 0;
+    memcpy(p,token,sizeof(*token)); rt_cmd_commit(); return 1;
+}
+uint32_t gl_renderer_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t end,
+    uint16_t x,uint16_t y,uint16_t w,uint16_t h,GLRenderAsyncToken *tokens,uint32_t max) {
+    if (!tokens || !max || !period || !w || !h || x+w>VRAM_W || y+h>VRAM_H ||
+        !pass_queued() || !s_pt_on || rt_batch_active()) return 0;
+    uint64_t epoch=gl_renderer_present_epoch();
+    int rate=(int)llround(s_interp_target_hz*1000.0);
+    if (rate<=0) return 0;
+    if (s_async_timeline.epoch!=epoch || s_async_rate!=rate) {
+        if (!render_pass_output_init(&s_async_timeline,1000000000u,(uint32_t)rate,1000,begin,epoch)) return 0;
+        s_async_rate=rate;
+    }
+    RenderPassOutputTimeline next=s_async_timeline;
+    RenderPassOutput outputs[RENDER_PASS_MAX_PHASES];
+    if (max>RENDER_PASS_MAX_PHASES) max=RENDER_PASS_MAX_PHASES;
+    int n=render_pass_output_plan(&next,begin,end,pt_clock_ns(),s_async_id+1,outputs,max);
+    if (n<=0 || !rt_batch_begin()) return 0;
+    GLRenderAsyncToken base={outputs[0],x,y,w,h,period};
+    base.output.expires=end; /* generation remains useful after its first output */
+    if (!async_record(RTH_ASYNC_RESERVE,&base) || !rt_batch_try_commit()) {
+        rt_batch_discard(); return 0;
+    }
+    s_async_id++; s_async_last_index=0; s_async_has_index=0; s_async_timeline=next;
+    for (int i=0;i<n;++i) tokens[i]=(GLRenderAsyncToken){outputs[i],x,y,w,h,period};
+    return (uint32_t)n;
+}
+int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
+    if (!token || !pass_queued() || !s_pt_on || rt_batch_active() ||
+        token->output.epoch!=gl_renderer_present_epoch() ||
+        !render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns()) ||
+        (s_async_has_index && token->output.index<=s_async_last_index)) return 0;
+    if (!rt_batch_begin()) return 0;
+    s_async_recording=*token;
+    if (!async_record(RTH_ASYNC_BEGIN,token)) { rt_batch_discard(); return 0; }
+    return 1;
+}
+int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
+    if (!rt_batch_active()) return 0;
+    if (!token || token->output.epoch!=s_async_recording.output.epoch ||
+        token->output.generation!=s_async_recording.output.generation ||
+        token->output.index!=s_async_recording.output.index ||
+        token->output.deadline!=s_async_recording.output.deadline ||
+        token->output.alpha_q16!=s_async_recording.output.alpha_q16) {
+        rt_batch_discard(); return 0;
+    }
+    RTH_REC(RTH_PASS_END,0,(int32_t)token->output.alpha_q16,keep);
+    if (!keep || token->output.epoch!=gl_renderer_present_epoch() ||
+        !render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns())) {
+        rt_batch_discard(); return 0;
+    }
+    int ok=rt_batch_try_commit();
+    if (ok) { s_async_last_index=token->output.index; s_async_has_index=1; }
+    return ok;
+}
 int gl_renderer_stereo_begin(int x, int y, int w, int h, int reuse) {
     GL_RT_SYNC("stereo_begin");
     return transaction_begin(x, y, w, h, 0, 0, reuse, 1);
@@ -9238,7 +9300,7 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
     s_pass_dead = 0;   /* however this pass ends, later records run */
     if (!s_pass_active) return;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
-    if (keep && alpha_q16 && g->valid && !g->promoted && g->n < PASS_SLOTS &&
+    if (keep && alpha_q16 && g->valid && (!g->promoted || s_async_exec) && g->n < PASS_SLOTS &&
         g->n < pass_slot_cap(g->tex_w, g->tex_h) &&
         pass_gen_reserve(gi, g->n + 1u, g->tex_w, g->tex_h)) {
         uint32_t slot = g->n, at = g->n;
@@ -15017,6 +15079,30 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         (void)dyn_apply(v[0]);
         s_dyn_rth_disp_valid = 0;
         break;
+    case RTH_ASYNC_RESERVE: {
+        GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
+        if (token.output.epoch!=gl_renderer_present_epoch() || pt_clock_ns()>token.output.expires) break;
+        if (transaction_begin(token.x,token.y,token.w,token.h,1,token.period_vblanks,0,0)) {
+            s_pgen[s_pgen_write].async_id=token.output.generation;
+            s_pgen[s_pgen_write].async_epoch=token.output.epoch;
+            pass_end_now(0,0);
+        }
+        break;
+    }
+    case RTH_ASYNC_BEGIN: {
+        GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
+        int gi=-1;
+        for (int k=0;k<PASS_GENERATIONS;++k)
+            if (s_pgen[k].valid && s_pgen[k].async_id==token.output.generation &&
+                s_pgen[k].async_epoch==token.output.epoch) gi=k;
+        if (gi<0 || token.output.epoch!=gl_renderer_present_epoch() ||
+            pt_clock_ns()>token.output.deadline) { s_pass_dead=1; break; }
+        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1;
+        if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
+            s_pass_leaks_at_begin=s_pass_leaks;
+        } else { s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
+        break;
+    }
     case RTH_PASS_BEGIN:
         if (transaction_begin(v[0], v[1], v[2], v[3], v[4], (uint32_t)v[5], v[6], 0)) {
             s_pass_leaks_at_begin = s_pass_leaks;
@@ -15033,6 +15119,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         } else {
             pass_end_now((uint32_t)v[0], v[1]);
         }
+        if (s_async_exec) { s_async_exec=0; s_pgen_write=s_async_previous_write; }
         break;
     case RTH_PEEK: {
         uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);

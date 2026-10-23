@@ -1386,3 +1386,20 @@ int psx_mod_render_capture_rgba_pair(CPUState *cpu,const PSXModRenderPass *rect,
                         trace_ticks_to_us(gl_renderer_perf_ticks()-trace_t0));
     return ok;
 }
+
+uint32_t render_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t end,
+    uint16_t x,uint16_t y,uint16_t w,uint16_t h,RenderPassAsyncToken *tokens,uint32_t max) {
+    if (!passes_allowed() || g_psx_render_pass_active) return 0;
+    return gl_renderer_pass_async_reserve(period,begin,end,x,y,w,h,tokens,max);
+}
+int render_pass_async_admit(const RenderPassAsyncToken *token,
+    const GpuReplayState *state,const GpuReplayProvider *provider) {
+    if (!passes_allowed() || g_psx_render_pass_active || !state || !provider) return 0;
+    if (!gl_renderer_pass_async_begin(token)) return 0;
+    if (!gpu_pass_checkpoint_save()) { gl_renderer_pass_async_end(token,0); return 0; }
+    g_psx_render_pass_active = 1;
+    int ok = gpu_replay_execute(state,provider);
+    gpu_pass_checkpoint_restore();
+    g_psx_render_pass_active = 0;
+    return gl_renderer_pass_async_end(token,ok);
+}
