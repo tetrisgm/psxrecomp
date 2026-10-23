@@ -41,7 +41,7 @@ static int test_hd_active, test_hd_overlap;
 static uint64_t test_hd_tracking;
 uint64_t gpu_hd_textures_tracking_generation(void){return test_hd_tracking;}
 int gpu_hd_textures_invalidation_changes(int x,int y,int w,int h){
-    (void)x;(void)y;(void)w;(void)h;return test_hd_overlap;}
+    (void)x;(void)y;(void)w;(void)h;return test_hd_overlap==1 || (test_hd_overlap==2 && x==256);}
 int gpu_hd_textures_active(void){return test_hd_active;}
 int gpu_hd_textures_dump_enabled(void){return 0;}
 void gpu_hd_textures_observe_draw(uint16_t tp,uint16_t cx,uint16_t cy,const int l[4],

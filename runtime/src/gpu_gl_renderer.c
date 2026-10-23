@@ -8393,7 +8393,7 @@ static AsyncVram s_async_vram[PASS_GENERATIONS],s_async_work;
 static _Atomic uint64_t s_async_resource_epoch=1;
 static GLuint s_async_live_raw_tex,s_async_live_raw_fbo;
 static uint16_t *s_async_live_cpu;
-static int s_async_vram_bound,s_async_invalid;
+static int s_async_vram_bound,s_async_invalid,s_async_hd_copy;
 static void async_vram_release(int gi);
 static int async_vram_capture(int gi);
 static int async_vram_enter(int gi);
@@ -15227,10 +15227,18 @@ static void hd_note_exec(int op, int x, int y, int w, int h, int sx, int sy) {
     /* Generated draws own their VRAM, not the live upload provenance. Refuse
      * before touching shared metadata; ordinary framebuffer writes are no-ops. */
     if (s_async_exec && gpu_hd_textures_active()) {
-        if ((op != GR_HD_NOTE_INVALIDATE && op != GR_HD_NOTE_BEGIN_UPLOAD) ||
-            gpu_hd_textures_invalidation_changes(x,y,w,h)) {
-            ASYNC_COUNT(unsupported); s_async_invalid=1;
-        }
+        if (op == GR_HD_NOTE_BEGIN_COPY) {
+            if (!s_async_hd_copy && w > 0 && w <= VRAM_W && h > 0 && h <= VRAM_H &&
+                !gpu_hd_textures_invalidation_changes(sx,sy,w,h) &&
+                !gpu_hd_textures_invalidation_changes(x,y,w,h)) {
+                s_async_hd_copy=1;
+                return;
+            }
+        } else if (op == GR_HD_NOTE_END_COPY) {
+            if (s_async_hd_copy) { s_async_hd_copy=0; return; }
+        } else if ((op == GR_HD_NOTE_INVALIDATE || op == GR_HD_NOTE_BEGIN_UPLOAD) &&
+                   !gpu_hd_textures_invalidation_changes(x,y,w,h)) return;
+        ASYNC_COUNT(unsupported); s_async_invalid=1;
         return;
     }
     const uint64_t before = gpu_hd_textures_tracking_generation();
@@ -15563,7 +15571,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
             ASYNC_COUNT(render_stale); s_pass_dead=1; break;
         }
         if (pt_clock_ns()>token.output.deadline) { ASYNC_COUNT(render_late); s_pass_dead=1; break; }
-        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0;
+        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0; s_async_hd_copy=0;
         if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
             s_pass_leaks_at_begin=s_pass_leaks;
             if(!async_vram_enter(gi)) {
@@ -15585,6 +15593,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         break;
     case RTH_PASS_END:
         if (s_pass_dead) { s_pass_dead = 0; break; }
+        if (s_async_exec && s_async_hd_copy) { ASYNC_COUNT(unsupported); s_async_invalid=1; }
         if (s_async_invalid || s_pass_leaks != s_pass_leaks_at_begin) {
             atomic_fetch_add(&s_pass_q_leaks, s_pass_leaks - s_pass_leaks_at_begin);
             pass_end_now(0, 0);
@@ -15599,7 +15608,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
                         async_present_slot(s_pgen_write,k,&s_async_executing.output);
             }
             gpu_hd_textures_suppress_dumps(0);
-            s_async_exec=0; s_async_invalid=0; s_pgen_write=s_async_previous_write;
+            s_async_exec=0; s_async_invalid=0; s_async_hd_copy=0; s_pgen_write=s_async_previous_write;
         }
         break;
     case RTH_PEEK: {
