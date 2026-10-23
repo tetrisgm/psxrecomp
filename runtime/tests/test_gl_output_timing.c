@@ -15,8 +15,6 @@ static void timed_pixel_probe(int slot) {
         if(pixels[i*4]>200 && pixels[i*4+1]<20) ++timed_red_pixels;
 }
 
-void host_sampler_retarget_current(const char *thread) { (void)thread; }
-
 int main(void) {
 #ifdef _WIN32
     _putenv_s("PSX_PRESENT_TRACE","present-trace.csv");
