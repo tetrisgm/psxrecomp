@@ -19,6 +19,7 @@ int main(void) {
     CPUState cpu = {0};
     uint32_t tags[1024];
     psx_icache_reset();
+    g_psx_icache_active = 1;
     memcpy(tags, g_psx_icache_tv, sizeof tags);
     /* Every refill offset: later words valid, earlier words still invalid. */
     for (uint32_t first = 0; first < 4; ++first) {
@@ -29,6 +30,7 @@ int main(void) {
         assert(psx_icache_state_fetch(tags, 0x80010000u + first * 4) == 0);
     }
     psx_icache_reset();
+    g_psx_icache_active = 1;
     memcpy(tags, g_psx_icache_tv, sizeof tags);
     uint64_t expected = 0;
     for (unsigned iteration = 0; iteration < 30000; ++iteration) {
