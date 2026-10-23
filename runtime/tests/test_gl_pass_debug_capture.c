@@ -123,7 +123,16 @@ int main(void) {
     check(fabsf(test_depth_read(s_hr_fbo)-0.25f)<0.00001f &&
           fabsf(test_depth_read(pass_wide_fbo_for(0))-0.375f)<0.00001f,
           "transferred canonical and wide depth attachments retain pixels");
+    /* Outside-rect replay journals contain old private pixels, not the
+     * newer main image. Rollback may restore only the shared HR attachment. */
+    const size_t outside=300u*VRAM_W+700u;
+    s_async_live_cpu[outside]=0x1234; s_vram[outside]=0x5678;
+    check(pass_journal_protect(700,300,1,1),"private outside-rect journal captured");
+    s_vram[outside]=0x4321;
+    s_async_exec=1;
     async_vram_leave(); transaction_restore();
+    check(s_vram[outside]==0x1234,"async private journal cannot overwrite live CPU pixels");
+    s_async_exec=0;
     check(glGetError()==GL_NO_ERROR,"capture leaves clean GL state");
     gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
     printf("checks=%d failures=%d\n",checks,failures);
