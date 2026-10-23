@@ -9,6 +9,7 @@
 
 #include "psx_exec_ctx.h"
 #include "psx_dctx_mem.h"
+#include "psx_dctx_bios.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -345,6 +346,10 @@ static void ctx_run(PsxExecCtx *x, uint32_t pc, uint32_t stop, uint32_t sp) {
             psx_dctx_fault(cpu, PSX_CTX_FAULT_MISS, 0u, "transfer to PC 0");
         }
         size_t index = 0;
+        if (psx_dctx_bios_call(cpu, pc)) {
+            pc = cpu->pc;
+            continue;
+        }
         const PsxDctxRow *row = dctx_find(pc, &index);
         if (!row) psx_dctx_fault(cpu, PSX_CTX_FAULT_MISS, pc, "no draw clone");
         if (!row_text_ok(x, row, index))

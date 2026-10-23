@@ -468,6 +468,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp
     ${PSXRECOMP_ROOT}/runtime/src/pgxp_ctx.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_exec_ctx.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_dctx_bios.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_exec_ctx_bench.c
     ${PSXRECOMP_ROOT}/runtime/src/pgxp_session.cpp
     ${PSXRECOMP_ROOT}/runtime/src/nd_intro_ot.c
