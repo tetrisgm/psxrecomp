@@ -16,6 +16,7 @@
 #include <cstring>
 #include <new>
 #include <unordered_map>
+#include <vector>
 extern "C" int psx_netplay_active(void);
 
 extern "C" uint32_t psx_read_word(uint32_t addr);
@@ -292,6 +293,18 @@ struct GeomVertex {
 static GeomVertex *s_geom_cache = nullptr;
 static uint32_t s_geom_generation = 1;
 static int s_geom_enabled = 0;
+/* Initialized lazily by the first context snapshot. The faithful main-only
+ * path pays no allocation or index maintenance until contexts are requested. */
+static std::vector<uint32_t> s_geom_live;
+static bool s_geom_live_valid = false;
+static bool s_geom_live_checkpoint = false;
+static size_t s_geom_live_saved_size = 0;
+static bool s_geom_live_saved_valid = false;
+static inline void geom_live_note(uint32_t slot) {
+    if (!s_geom_live_valid) return;
+    try { s_geom_live.push_back(slot); }
+    catch (const std::bad_alloc &) { s_geom_live_valid = false; }
+}
 static uint32_t s_geom_hits = 0;
 /* Lookup outcome census — this is what says whether coverage is limited by the
  * cache or by projections never reaching the packet in a matchable form. */
@@ -312,6 +325,8 @@ static int s_speculative_timeline_invalidated = 0;
 static void gte_nclip_precision_invalidate();
 static void gte_geom_generation_advance(void) {
     gte_nclip_precision_invalidate();
+    /* During a checkpoint retain its baseline prefix across generation changes. */
+    if (!s_geom_live_checkpoint) s_geom_live.clear();
     if (++s_geom_generation == 0) {
         if (s_geom_cache)
             std::memset(s_geom_cache, 0, GEOM_CACHE_SIZE * sizeof(GeomVertex));
@@ -617,6 +632,9 @@ static inline void geom_ck_note(GeomVertex *slot) {
 extern "C" void gte_precision_checkpoint_begin(void) {
     pgxp_checkpoint_begin();
     if (s_gck_depth++ != 0) return;
+    s_geom_live_checkpoint = true;
+    s_geom_live_saved_size = s_geom_live.size();
+    s_geom_live_saved_valid = s_geom_live_valid;
     if (s_geom_cache && !s_gck_bits)
         s_gck_bits = (uint8_t *)std::calloc(GEOM_CACHE_SIZE / 8u, 1);
     s_gck_n = 0;
@@ -628,6 +646,11 @@ extern "C" void gte_precision_checkpoint_begin(void) {
 
 extern "C" void gte_precision_checkpoint_rollback(void) {
     if (s_gck_depth != 0 && --s_gck_depth == 0) {
+        s_geom_live_checkpoint = false;
+        /* An index first built inside the checkpoint has no baseline prefix. */
+        if (s_geom_live_saved_valid && s_geom_live.size() >= s_geom_live_saved_size)
+            s_geom_live.resize(s_geom_live_saved_size);
+        s_geom_live_valid = s_geom_live_saved_valid;
         for (size_t i = s_gck_n; i-- > 0;) {
             GeomVertex *slot = s_gck_log[i].slot;
             *slot = s_gck_log[i].old;
@@ -669,6 +692,7 @@ static inline void geom_note(uint32_t packed, int64_t x16, int64_t y16) {
             entry.ambiguous = 1;
         return;                      /* first writer wins, as in the references */
     }
+    geom_live_note((uint32_t)slot);
     entry.x16 = (int32_t)x16;
     entry.y16 = (int32_t)y16;
     entry.ambiguous = 0;
@@ -2800,6 +2824,7 @@ extern "C" void gte_test_set_timeline_generations(uint32_t precision,
                                                     uint32_t geometry) {
     pgxp_test_set_generation(precision);
     PSXRecomp::GTE::s_geom_generation = geometry;
+    PSXRecomp::GTE::s_geom_live_valid = false;
 }
 
 extern "C" uint32_t gte_test_get_precision_generation(void) {
@@ -2840,6 +2865,9 @@ extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
     int64_t slot = PSXRecomp::GTE::geom_slot(packed);
     if (slot < 0) return;
     auto &entry = PSXRecomp::GTE::s_geom_cache[slot];
+    PSXRecomp::GTE::geom_ck_note(&entry);
+    if (entry.generation != PSXRecomp::GTE::s_geom_generation)
+        PSXRecomp::GTE::geom_live_note((uint32_t)slot);
     entry.x16 = x16;
     entry.y16 = y16;
     entry.ambiguous = 0;
@@ -2885,7 +2913,21 @@ extern "C" int gte_ctx_snapshot_main(PsxGteCtx* out) {
         s_geom_enabled && s_geom_cache && pgxp_position_fallback();
     if (!s_speculative_depth && s_geom_enabled && s_geom_cache) {
         try {
-            for (uint32_t i = 0; i < GEOM_CACHE_SIZE; ++i) {
+            static const bool use_index = [] {
+                const char *opt = std::getenv("PSX_CTX_GEOMETRY_INDEX");
+                return !opt || std::strcmp(opt, "0") != 0;
+            }();
+            if (use_index && !s_geom_live_valid) {
+                if (s_geom_live_checkpoint) s_geom_live_saved_valid = false;
+                /* Recovery from an allocation failure or a first snapshot. */
+                s_geom_live.clear();
+                for (uint32_t i = 0; i < GEOM_CACHE_SIZE; ++i)
+                    if (s_geom_cache[i].generation == s_geom_generation) s_geom_live.push_back(i);
+                s_geom_live_valid = true;
+            }
+            const size_t count = use_index ? s_geom_live.size() : GEOM_CACHE_SIZE;
+            for (size_t n = 0; n < count; ++n) {
+                const uint32_t i = use_index ? s_geom_live[n] : (uint32_t)n;
                 const auto &v = s_geom_cache[i];
                 if (v.generation != s_geom_generation) continue;
                 /* geom_slot indexes y first, then x. */
