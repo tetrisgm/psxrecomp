@@ -89,6 +89,17 @@ extern "C" int draw_worker_poll(DrawWorkerPool *p, DrawWorkerResult *out) {
     if (best == p->slots.size()) return 0;
     auto &s = p->slots[best];
     const int stale = invalid(p, s.job);
+    /* Do not publish a later image while an earlier live job can still make
+     * its deadline. Returning zero leaves main free to run and poll again;
+     * an expired or cancelled predecessor never holds subsequent work. */
+    if (!stale && !s.status) {
+        const uint64_t now = p->clock(p->user);
+        for (const auto &earlier : p->slots)
+            if ((earlier.state == QUEUED || earlier.state == RUNNING) &&
+                earlier.job.epoch == p->epoch &&
+                earlier.job.deadline < s.job.deadline &&
+                now < earlier.job.deadline) return 0;
+    }
     if (stale) s.status = stale;
     s.state = CLAIMED;
     *out = {s.ticket, best, s.status, s.job, s.executed, s.execution_status};

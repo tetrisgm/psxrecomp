@@ -35,7 +35,56 @@ template<class P> static void until(P predicate) {
 static DrawWorkerJob job(State &s, unsigned i, uint64_t epoch = 1) {
     return {epoch, 7, i, 200 + i, 300, new Payload{&s, 0}, dispose};
 }
+struct OrderedState {
+    std::atomic<uint64_t> now{100};
+    std::atomic<unsigned> started{0}, later_done{0};
+    std::atomic<bool> release_early{false};
+};
+static uint64_t ordered_clock(void *p) { return ((OrderedState *)p)->now.load(); }
+static int ordered_execute(void *p, unsigned, void *payload) {
+    auto *s=(OrderedState *)p;
+    ++s->started;
+    if (*(int *)payload==0)
+        while (!s->release_early.load()) std::this_thread::yield();
+    else ++s->later_done;
+    return 0;
+}
+static void test_completion_order() {
+    // Later finishes first. Hold it without blocking main, until the earlier
+    // result arrives, its deadline passes, or its epoch is cancelled.
+    for (int mode=0;mode<3;++mode) {
+        OrderedState s; int first=0,second=1;
+        auto *p=draw_worker_create(2,1,ordered_clock,ordered_execute,&s);
+        assert(p);
+        DrawWorkerJob a{1,1,0,200,400,&first,nullptr};
+        DrawWorkerJob b{1,1,1,300,400,&second,nullptr};
+        assert(draw_worker_submit(p,&a) && draw_worker_submit(p,&b));
+        until([&]{return s.started==2 && s.later_done==1;});
+        DrawWorkerResult r{};
+        auto end=std::chrono::steady_clock::now()+std::chrono::milliseconds(20);
+        do { assert(!draw_worker_poll(p,&r)); std::this_thread::yield(); }
+        while (std::chrono::steady_clock::now()<end);
+        if (mode==0) {
+            s.release_early=true;
+            until([&]{return draw_worker_poll(p,&r);});
+            assert(r.job.index==0 && !r.status);
+            assert(draw_worker_release(p,&r));
+            until([&]{return draw_worker_poll(p,&r);});
+            assert(r.job.index==1 && !r.status);
+        } else {
+            if (mode==1) s.now=200; // exact earlier deadline releases later job
+            else draw_worker_set_epoch(p,2);
+            until([&]{return draw_worker_poll(p,&r);});
+            assert(r.job.index==1);
+            assert(r.status==(mode==1?DRAW_WORKER_COMPLETE:DRAW_WORKER_CANCELLED));
+            s.release_early=true;
+        }
+        assert(draw_worker_release(p,&r));
+        draw_worker_destroy(p);
+    }
+}
 int main() {
+    test_completion_order();
     State s;
     assert(!draw_worker_create(0, 1, clock_ns, execute, &s));
     auto *pool = draw_worker_create(4, 1, clock_ns, execute, &s);

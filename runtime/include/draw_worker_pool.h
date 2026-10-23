@@ -34,7 +34,9 @@ DrawWorkerPool *draw_worker_create(unsigned workers, uint64_t epoch,
 /* Success transfers job payload ownership to pool. Failure leaves it with
  * caller. Full pools and invalid/expired jobs return immediately. */
 int draw_worker_submit(DrawWorkerPool *, const DrawWorkerJob *);
-/* Claim one ready result, earliest deadline first. Zero means none ready. */
+/* Claim one ready result, earliest deadline first. A later successful result
+ * stays private while an earlier live job can still meet its deadline. Zero
+ * means none eligible yet; polling never waits for another worker. */
 int draw_worker_poll(DrawWorkerPool *, DrawWorkerResult *);
 /* Recheck after any time spent consuming other results; stale output must
  * never enter a later presentation generation. */
