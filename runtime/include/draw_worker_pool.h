@@ -25,6 +25,8 @@ typedef struct DrawWorkerResult {
     unsigned slot;
     int status; /* callback result, or EXPIRED/CANCELLED */
     DrawWorkerJob job;
+    int executed; /* callback ran, even if its output later became stale */
+    int execution_status; /* unchanged callback result when executed */
 } DrawWorkerResult;
 
 DrawWorkerPool *draw_worker_create(unsigned workers, uint64_t epoch,
