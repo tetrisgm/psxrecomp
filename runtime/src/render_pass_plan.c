@@ -61,12 +61,17 @@ int render_pass_output_plan(RenderPassOutputTimeline *timeline,
                        timeline->period_numerator, 1, &first)) return -1;
     index = first > timeline->next_index ? first : timeline->next_index;
     while (count < capacity) {
-        uint64_t offset, deadline, phase;
+        uint64_t offset, deadline, expires, phase;
         if (!output_muldiv(index, timeline->period_numerator,
                            timeline->rate_numerator, 0, &offset) ||
             offset > UINT64_MAX - timeline->origin) return -1;
         deadline = timeline->origin + offset;
         if (deadline >= window_end) break;
+        if (index == UINT64_MAX ||
+            !output_muldiv(index + 1, timeline->period_numerator,
+                           timeline->rate_numerator, 0, &offset) ||
+            offset > UINT64_MAX - timeline->origin) return -1;
+        expires = timeline->origin + offset;
         if (!output_muldiv(deadline - window_begin, 65536u,
                            window_end - window_begin, 0, &phase) ||
             index == UINT64_MAX) return -1;
@@ -74,6 +79,7 @@ int render_pass_output_plan(RenderPassOutputTimeline *timeline,
         staged[count].generation = generation;
         staged[count].index = index++;
         staged[count].deadline = deadline;
+        staged[count].expires = expires;
         staged[count++].alpha_q16 = (uint32_t)phase;
     }
     memcpy(outputs, staged, count * sizeof *outputs);

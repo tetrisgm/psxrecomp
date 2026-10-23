@@ -42,6 +42,8 @@ static void test_output_timestamps(void) {
                 CHECK(o->index == total, "no skipped or duplicate output index");
                 CHECK(o->deadline == origin + total * frequency / rates[r],
                       "every output lands on the persistent rational clock");
+                CHECK(o->expires == origin + (total + 1) * frequency / rates[r],
+                      "presentation validity ends at the next output deadline");
                 CHECK(o->deadline >= begin && o->deadline < end,
                       "half-open windows assign boundaries exactly once");
                 CHECK(o->alpha_q16 == (o->deadline - begin) * 65536u / (end - begin),

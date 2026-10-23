@@ -38,7 +38,7 @@ typedef struct RenderPassOutputTimeline {
 } RenderPassOutputTimeline;
 
 typedef struct RenderPassOutput {
-    uint64_t epoch, generation, index, deadline;
+    uint64_t epoch, generation, index, deadline, expires;
     uint32_t alpha_q16;
 } RenderPassOutput;
 
@@ -54,7 +54,9 @@ int render_pass_output_init(RenderPassOutputTimeline *timeline,
  * phase is discarded. A bounded pool may request at most capacity outputs;
  * subsequent calls resume at the next deadline. No sleeps or guest time.
  * Returns count, or -1 on invalid/unrepresentable input (timeline unchanged).
- * Generation identifies the immutable snapshot pair backing these outputs. */
+ * Generation identifies the immutable snapshot pair backing these outputs.
+ * expires is the next clock deadline: completed work must arrive by deadline,
+ * while a presenter admitted before then may show it until expires. */
 int render_pass_output_plan(RenderPassOutputTimeline *timeline,
                             uint64_t window_begin, uint64_t window_end,
                             uint64_t now, uint64_t generation,
