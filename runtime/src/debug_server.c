@@ -8988,7 +8988,7 @@ static void handle_render_pass_stats(int id, const char *json)
     uint64_t gd[10], image_bytes = 0;
     uint32_t image_textures;
     char failure_json[2048];
-    char admission_json[768], async_json[1024];
+    char admission_json[768], async_json[1536];
     char abort_detail_json[sizeof st.last_abort_detail * 6 + 1];
     DirtyRamSpanFailure sf;
     render_pass_get_stats(&st);
@@ -9037,8 +9037,8 @@ static void handle_render_pass_stats(int id, const char *json)
              admission.present_reserve_ms, admission.spare_ms, admission.frame_ms,
              admission.cost_ms, admission.budget_ms, admission.wanted, admission.planned);
     GLRenderAsyncStats ast; gl_renderer_pass_async_stats(&ast);
-    snprintf(async_json,sizeof async_json,"{\"attempts\":%llu,\"admitted\":%llu,\"status_refused\":%llu,\"checkpoint_refused\":%llu,\"replay_refused\":%llu,\"unavailable\":%llu,\"stale\":%llu,\"late\":%llu,\"duplicate\":%llu,\"ring_full\":%llu,\"render_stale\":%llu,\"render_late\":%llu,\"resource\":%llu,\"unsupported\":%llu,\"capture\":%llu,\"submitted\":%llu,\"presented_to_queue\":%llu,\"last_replay_error\":%d}",
-             (unsigned long long)st.async_attempts,(unsigned long long)st.async_admitted,(unsigned long long)st.async_status_refused,(unsigned long long)st.async_checkpoint_refused,(unsigned long long)st.async_replay_refused,(unsigned long long)ast.unavailable,(unsigned long long)ast.stale,(unsigned long long)ast.late,(unsigned long long)ast.duplicate,(unsigned long long)ast.ring_full,(unsigned long long)ast.render_stale,(unsigned long long)ast.render_late,(unsigned long long)ast.resource,(unsigned long long)ast.unsupported,(unsigned long long)ast.capture,(unsigned long long)ast.submitted,(unsigned long long)ast.presented_to_queue,st.async_last_replay_error);
+    snprintf(async_json,sizeof async_json,"{\"attempts\":%llu,\"admitted\":%llu,\"status_refused\":%llu,\"checkpoint_refused\":%llu,\"replay_refused\":%llu,\"unavailable\":%llu,\"stale\":%llu,\"late\":%llu,\"duplicate\":%llu,\"ring_full\":%llu,\"render_stale\":%llu,\"render_late\":%llu,\"resource\":%llu,\"unsupported\":%llu,\"capture\":%llu,\"submitted\":%llu,\"presented_to_queue\":%llu,\"resource_scale\":%llu,\"resource_epoch\":%llu,\"resource_wide\":%llu,\"resource_alloc\":%llu,\"resource_acquire\":%llu,\"resource_hd\":%llu,\"epoch_acquire\":%llu,\"epoch_hd\":%llu,\"last_replay_error\":%d}",
+             (unsigned long long)st.async_attempts,(unsigned long long)st.async_admitted,(unsigned long long)st.async_status_refused,(unsigned long long)st.async_checkpoint_refused,(unsigned long long)st.async_replay_refused,(unsigned long long)ast.unavailable,(unsigned long long)ast.stale,(unsigned long long)ast.late,(unsigned long long)ast.duplicate,(unsigned long long)ast.ring_full,(unsigned long long)ast.render_stale,(unsigned long long)ast.render_late,(unsigned long long)ast.resource,(unsigned long long)ast.unsupported,(unsigned long long)ast.capture,(unsigned long long)ast.submitted,(unsigned long long)ast.presented_to_queue,(unsigned long long)ast.resource_scale,(unsigned long long)ast.resource_epoch,(unsigned long long)ast.resource_wide,(unsigned long long)ast.resource_alloc,(unsigned long long)ast.resource_acquire,(unsigned long long)ast.resource_hd,(unsigned long long)ast.epoch_acquire,(unsigned long long)ast.epoch_hd,st.async_last_replay_error);
     image_textures = gl_renderer_pass_image_textures(&image_bytes);
     send_fmt("{\"id\":%d,\"ok\":true,\"plans\":%llu,\"planned\":%llu,"
              "\"wanted\":%llu,\"refused\":%llu,\"passes\":%llu,"

@@ -6040,7 +6040,13 @@ void gl_renderer_set_fmv_chroma_smoothing(int on) {
 }
 int gl_renderer_fmv_chroma_smoothing(void) { return s_fmv_chroma; }
 uint64_t gl_renderer_fmv_chroma_frames(void) { GL_RT_SYNC("fmv_chroma_stats"); return s_fmv_chroma_frames; }
-void gl_renderer_note_present_depth24(int d24) { GL_RT_SYNC("present_d24"); s_present_d24 = d24 ? 1 : 0; }
+void gl_renderer_note_present_depth24(int d24) {
+    d24 = !!d24;
+    /* Sole main-thread writer: unchanged per-frame notification needs no GL
+     * ownership transfer. Actual mode changes still drain before mutation. */
+    if (s_present_d24 == d24) return;
+    GL_RT_SYNC("present_d24"); s_present_d24 = d24;
+}
 
 void gl_renderer_set_fmv_filter(int cfg_value) {
     GL_RT_SYNC("set_fmv_filter");
@@ -8369,7 +8375,7 @@ typedef struct AsyncVram {
     GLuint raw_tex,raw_fbo,hr_tex,hr_rb,hr_fbo,wide_tex,wide_rb,wide_fbo;
     int raw_w,raw_h,hr_w,hr_h,wide_w,wide_h,scale;
     uint16_t *cpu;
-    uint64_t resource_epoch;
+    uint64_t resource_epoch, acquire_epoch, hd_epoch;
     int depth_need, depth_used, depth_reason;
     float depth_avg;
     PgxpSnap *snap;
@@ -9361,7 +9367,9 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
 }
 #define ASYNC_COUNTERS(X) X(unavailable) X(stale) X(late) X(duplicate) X(ring_full) \
-    X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue)
+    X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue) \
+    X(resource_scale) X(resource_epoch) X(resource_wide) X(resource_alloc) \
+    X(resource_acquire) X(resource_hd) X(epoch_acquire) X(epoch_hd)
 #define ASYNC_DECLARE(n) static _Atomic uint64_t s_async_count_##n;
 ASYNC_COUNTERS(ASYNC_DECLARE)
 #undef ASYNC_DECLARE
@@ -9530,6 +9538,8 @@ static int async_vram_capture(int gi) {
                                GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
     memcpy(v->cpu,s_vram,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
     v->scale=s_hr_scale; v->resource_epoch=atomic_load(&s_async_resource_epoch);
+    v->acquire_epoch=atomic_load(&s_async_count_epoch_acquire);
+    v->hd_epoch=atomic_load(&s_async_count_epoch_hd);
     v->depth_need=s_pb_depth_need; v->depth_used=s_pb_depth_used;
     v->depth_reason=s_pb_depth_reason; v->depth_avg=s_pb_depth_avg;
     if(!pass_snap_capture(&v->snap,&v->snap_present,s_pb_snap_present?s_pb_snap:NULL)) return 0;
@@ -9538,9 +9548,18 @@ static int async_vram_capture(int gi) {
 }
 static int async_vram_enter(int gi) {
     AsyncVram *v=&s_async_vram[gi];
-    if(!v->raw_fbo || v->scale!=s_hr_scale ||
-        v->resource_epoch!=atomic_load(&s_async_resource_epoch) || !async_raw_allocate(&s_async_work)) return 0;
-    if(s_pb_wide_src && (!v->wide_fbo || v->wide_w!=s_pb_wide_w || v->wide_h!=s_pb_wide_h)) return 0;
+    if(!v->raw_fbo) { ASYNC_COUNT(resource_alloc); return 0; }
+    if(v->scale!=s_hr_scale) { ASYNC_COUNT(resource_scale); return 0; }
+    if(v->resource_epoch!=atomic_load(&s_async_resource_epoch)) {
+        ASYNC_COUNT(resource_epoch);
+        if(v->acquire_epoch!=atomic_load(&s_async_count_epoch_acquire)) ASYNC_COUNT(resource_acquire);
+        if(v->hd_epoch!=atomic_load(&s_async_count_epoch_hd)) ASYNC_COUNT(resource_hd);
+        return 0;
+    }
+    if(!async_raw_allocate(&s_async_work)) { ASYNC_COUNT(resource_alloc); return 0; }
+    if(s_pb_wide_src && (!v->wide_fbo || v->wide_w!=s_pb_wide_w || v->wide_h!=s_pb_wide_h)) {
+        ASYNC_COUNT(resource_wide); return 0;
+    }
     pass_blit(v->raw_fbo,s_async_work.raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
     pass_blit(v->hr_fbo,s_hr_fbo,0,0,s_pass_x*s_hr_scale,s_pass_y*s_hr_scale,
               v->hr_w,v->hr_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
@@ -12136,6 +12155,7 @@ static void gl_rth_acquire(const char *reason) {
     if (!s_rth_on || rt_on_render_thread() || rt_held()) return;
     rth_group_flush();
     rt_acquire(reason);
+    ASYNC_COUNT(epoch_acquire);
     atomic_fetch_add(&s_async_resource_epoch,1); /* direct GL/config/resource changes */
     rth_hd_publish_private();
     s_vram = s_rth_vram_pub;
@@ -15317,8 +15337,10 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
     if (s_fg_on) fg_capture(c, payload);
-    if(!s_async_exec && c->op==RTH_HD_NOTE && gpu_hd_textures_active())
+    if(!s_async_exec && c->op==RTH_HD_NOTE && gpu_hd_textures_active()) {
+        ASYNC_COUNT(epoch_hd);
         atomic_fetch_add(&s_async_resource_epoch,1);
+    }
     if(s_async_exec && c->op==RTH_COPY) {
         if(v[0]==v[2] && v[1]==v[3] && !s_mask_set) return; /* identity copy */
         if(v[0]<s_pass_x || v[1]<s_pass_y || v[0]+v[4]>s_pass_x+s_pass_w ||

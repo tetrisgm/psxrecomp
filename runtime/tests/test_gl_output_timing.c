@@ -67,6 +67,10 @@ int main(void) {
     s_interp_source=1; s_interp_source_hz=60; s_interp_target_hz=100;
     gr_fill_rect(384,0,16,16,0x1F); /* red texture at snapshot time */
     rt_release();
+    uint64_t lease=atomic_load(&s_async_resource_epoch);
+    gl_renderer_note_present_depth24(0);
+    check(!rt_held() && atomic_load(&s_async_resource_epoch)==lease,
+          "unchanged display depth preserves asynchronous lease and thread ownership");
     GLRenderAsyncToken tokens[8];
     now=pt_clock_ns();
     uint32_t count=gl_renderer_pass_async_reserve(2,now+100000000u,now+133333333u,
