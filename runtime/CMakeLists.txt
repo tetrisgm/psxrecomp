@@ -43,6 +43,35 @@ if(BUILD_TESTING)
     add_executable(debug_socket_shutdown_test tests/test_debug_socket_shutdown.cpp)
     target_include_directories(debug_socket_shutdown_test PRIVATE src)
     find_package(Threads REQUIRED)
+    add_executable(draw_call_gate_test tests/test_draw_call_gate.cpp src/draw_call_gate.cpp)
+    target_include_directories(draw_call_gate_test PRIVATE include)
+    target_link_libraries(draw_call_gate_test PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(draw_call_gate_test PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(draw_call_gate_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME draw_call_gate_test COMMAND draw_call_gate_test)
+    set_tests_properties(draw_call_gate_test PROPERTIES TIMEOUT 15)
+    add_executable(draw_worker_pool_test tests/test_draw_worker_pool.cpp src/draw_worker_pool.cpp)
+    target_include_directories(draw_worker_pool_test PRIVATE include)
+    target_link_libraries(draw_worker_pool_test PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(draw_worker_pool_test PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(draw_worker_pool_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME draw_worker_pool_test COMMAND draw_worker_pool_test)
+    set_tests_properties(draw_worker_pool_test PROPERTIES TIMEOUT 15)
+    add_executable(draw_service_test tests/test_draw_service.cpp src/draw_service.c)
+    target_include_directories(draw_service_test PRIVATE include)
+    target_link_libraries(draw_service_test PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(draw_service_test PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(draw_service_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME draw_service_test COMMAND draw_service_test)
     target_link_libraries(debug_socket_shutdown_test PRIVATE Threads::Threads)
     if(WIN32)
         target_link_libraries(debug_socket_shutdown_test PRIVATE ws2_32)
@@ -921,8 +950,10 @@ if(BUILD_TESTING)
 
     add_executable(gte_register_access_test
         tests/test_gte_register_access.cpp
+        tests/pgxp_test_mod_memory.cpp
         src/gte.cpp
         src/pgxp.cpp
+        src/pgxp_ctx.cpp
         src/psx_ram_geometry.c
     )
     target_include_directories(gte_register_access_test PRIVATE include)
@@ -933,7 +964,9 @@ if(BUILD_TESTING)
     add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
     # Same ABI/result corpus for the native operation entry and the reference.
     add_executable(gte_hle_contract_test
-        tests/test_gte_register_access.cpp src/gte.cpp src/pgxp.cpp src/psx_ram_geometry.c)
+        tests/test_gte_register_access.cpp tests/pgxp_test_mod_memory.cpp
+        src/gte.cpp src/pgxp.cpp src/pgxp_ctx.cpp
+        src/psx_ram_geometry.c)
     target_include_directories(gte_hle_contract_test PRIVATE include)
     target_compile_definitions(gte_hle_contract_test PRIVATE
         PSX_NO_DEBUG_TOOLS=1 PSX_GTE_REGISTER_TEST=1 PSX_ENABLE_BLOCK_CYCLES=1)
@@ -1125,6 +1158,21 @@ if(BUILD_TESTING)
     add_executable(native_wide_projection_test tests/test_native_wide_projection.c
         src/psx_video_timing.c
         src/gpu_timeline.c)
+    add_executable(ctx_gpu_receipts_test tests/test_ctx_gpu_receipts.c)
+    target_include_directories(ctx_gpu_receipts_test PRIVATE include src)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(ctx_gpu_receipts_test PRIVATE -ffunction-sections -fdata-sections)
+        if(APPLE)
+            target_link_options(ctx_gpu_receipts_test PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(ctx_gpu_receipts_test PRIVATE -Wl,--gc-sections)
+        endif()
+        if(MINGW)
+            target_compile_options(ctx_gpu_receipts_test PRIVATE -flto)
+            target_link_options(ctx_gpu_receipts_test PRIVATE -flto)
+        endif()
+    endif()
+    add_test(NAME ctx_gpu_receipts_test COMMAND ctx_gpu_receipts_test)
     add_executable(gpu_render_pass_provenance_test tests/test_gpu_render_pass_provenance.c
         src/ws_ui_group.c
         src/psx_video_timing.c

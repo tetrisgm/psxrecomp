@@ -221,6 +221,15 @@ on a fixed region -> next.
   R4 performance/visual acceptance remains open; see its
   `analysis/render-60fps/REPORT.md`.
 
+### 2026-10-22: Private draw-context BIOS qualification
+
+`docs/THREADED_CONTEXTS.md` records the ongoing context work. A0 memcpy is
+qualified against live code bytes and tested against the recompiled OpenBIOS
+body (memory/registers and PGXP hook stream); main BIOS/timing code is
+unchanged. Four-context equality is not a replacement for the draw-isolation
+gate or stock frame identity. Guest logic remains sequential at 30 Hz;
+draw/output workers must not change its cadence.
+
 - **2026-10-07 — DuckStation texture authoring fidelity (beads-qi66).**
   The early Tomba capture report exposed per-draw crops and automatic page
   fallback in the opt-in HD texture enhancement. An independent synthetic

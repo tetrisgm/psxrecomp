@@ -110,6 +110,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/config_loader.cpp
     src/recompiler_patch.cpp
     src/game_dispatch_emitter.cpp
+    src/draw_ctx_emitter.cpp
     src/segment_variants.cpp
     src/main_psx.cpp
 )
@@ -753,6 +754,20 @@ if(BUILD_TESTING)
     target_link_libraries(emitter_runtime_pc_test PRIVATE fmt rabbitizer)
     add_test(NAME emitter_runtime_pc_test
              COMMAND emitter_runtime_pc_test)
+    get_target_property(_draw_test_sources emitter_runtime_pc_test SOURCES)
+    list(FILTER _draw_test_sources EXCLUDE REGEX "tests/")
+    add_executable(draw_ctx_emitter_test tests/draw_ctx_emitter_test.cpp
+        src/draw_ctx_emitter.cpp ${_draw_test_sources})
+    target_include_directories(draw_ctx_emitter_test PRIVATE include src
+        lib/rabbitizer/include lib/rabbitizer/cplusplus/include lib/fmt/include
+        lib/toml11 lib/ELFIO)
+    target_link_libraries(draw_ctx_emitter_test PRIVATE fmt rabbitizer)
+    add_test(NAME draw_ctx_emitter_test COMMAND draw_ctx_emitter_test)
+    # test_dctx_bios.c is the fixture compiled by this driver against the
+    # current generated BIOS body, avoiding a duplicated C reference.
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME dctx_bios_contract_test COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_dctx_bios.py --cc ${CMAKE_C_COMPILER})
     # The BIOS translator latches PSX_CPS at start-up; this run covers its
     # legacy (non-CPS) syscall form.
     add_test(NAME emitter_runtime_pc_test_legacy

@@ -3,6 +3,10 @@
 #include <cstdint>
 #include <cstring>
 
+/* Per-draw-context GTE side state (gte.cpp, docs/THREADED_CONTEXTS.md).
+ * NULL in a GTEState the main guest context runs. */
+struct PsxGteCtx;
+
 namespace PSXRecomp {
 namespace GTE {
 
@@ -61,6 +65,10 @@ struct GTEState {
 
     // === Flag Register ===
     uint32_t FLAG;
+
+    // === Host-only: the draw context executing this command, or nullptr on
+    // the main context (docs/THREADED_CONTEXTS.md). Never guest-visible.
+    PsxGteCtx* ctx;
 
     GTEState() { std::memset(this, 0, sizeof(GTEState)); }
 
