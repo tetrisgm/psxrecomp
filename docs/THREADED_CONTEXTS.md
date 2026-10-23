@@ -259,3 +259,18 @@ proofs establish ordering only; they do not establish overlap or speedup. The
 standalone test covers ordered replies, live stack lifetime past the claim
 deadline, busy/owner/recursive refusals, timeout, exception and close paths on
 Windows and macOS in under a second.
+
+### Qualified private OpenBIOS random state
+
+A0 service `2F` executes the verified OpenBIOS `rand` body at `BFC060E4`,
+including its signed multiply HI/LO results, caller-saved registers and PGXP
+hooks. As with memcpy/memset, the live vector, dispatcher and selected routine
+bytes must match before any effect occurs. The seed at `8548` belongs to the
+private snapshot; this does not authorize replacing real-frame main-thread
+random calls or publishing the private seed back to game logic.
+
+`tools/test_dctx_bios.py` extracts the actual generated BIOS reference and
+compares 100 successive calls for each of six signed-boundary seeds, including
+RAM, registers, HI/LO and every PGXP event, serially and on four threads. A
+changed routine target refuses without CPU changes. Windows GCC and macOS
+Clang pass this corpus together with the existing memory-service cases.
