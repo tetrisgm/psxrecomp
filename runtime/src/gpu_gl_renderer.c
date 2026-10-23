@@ -9369,7 +9369,8 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
 #define ASYNC_COUNTERS(X) X(unavailable) X(stale) X(late) X(duplicate) X(ring_full) \
     X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue) \
     X(resource_scale) X(resource_epoch) X(resource_wide) X(resource_alloc) \
-    X(resource_acquire) X(resource_hd) X(epoch_acquire) X(epoch_hd)
+    X(resource_acquire) X(resource_hd) X(epoch_acquire) X(epoch_hd) \
+    X(present_calls) X(present_invalid) X(present_expired) X(present_mismatch) X(present_unready) X(present_refused)
 #define ASYNC_DECLARE(n) static _Atomic uint64_t s_async_count_##n;
 ASYNC_COUNTERS(ASYNC_DECLARE)
 #undef ASYNC_DECLARE
@@ -15299,16 +15300,23 @@ static int async_display_active(void) {
 }
 static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *output) {
     PassGen *g=&s_pgen[gi];
-    if (!g->valid || slot>=g->n || output->epoch!=gl_renderer_present_epoch() ||
-        pt_clock_ns()>=output->expires || g->source_path!=s_interp_source_path ||
-        g->tex_w!=s_interp_w || g->tex_h!=s_interp_h) return;
+    ASYNC_COUNT(present_calls);
+    if (!g->valid || slot>=g->n || output->epoch!=gl_renderer_present_epoch()) {
+        ASYNC_COUNT(present_invalid); return;
+    }
+    if (pt_clock_ns()>=output->expires) { ASYNC_COUNT(present_expired); return; }
+    if (g->source_path!=s_interp_source_path || g->tex_w!=s_interp_w || g->tex_h!=s_interp_h) {
+        ASYNC_COUNT(present_mismatch); return;
+    }
     PtTiming timing={output->epoch,output->deadline,output->expires};
     if (gl_renderer_set_present_timing(&timing)) {
         PtStats before,after; pt_get_stats(&before);
-        (void)interp_present_pair(s_pgen_tex[gi][slot],s_pgen_tex[gi][slot],0.0f,s_interp_blend_mode);
+        int drew=interp_present_pair(s_pgen_tex[gi][slot],s_pgen_tex[gi][slot],0.0f,s_interp_blend_mode);
         pt_get_stats(&after);
         if(after.submits>before.submits) ASYNC_COUNT(presented_to_queue);
-    }
+        else if(!drew) ASYNC_COUNT(present_unready);
+        else ASYNC_COUNT(present_refused);
+    } else ASYNC_COUNT(present_refused);
     memset(&s_pt_next_timing,0,sizeof s_pt_next_timing);
 }
 
