@@ -86,6 +86,7 @@ struct PsxExecCtx {
     uint8_t *ram;                /* private RAM, live size */
     uint32_t ram_mask;           /* g_psx_ram_mask of the snapshot */
     int32_t  ws_x_margin;        /* psx_ws_x_margin() of the snapshot */
+    int      draw_distance_clamp; /* immutable generated-cull option */
     int      pgxp_active;
     int      entry_hooks;        /* registered draw-context entry hooks */
     uint64_t block_budget;       /* clone blocks left in this call */

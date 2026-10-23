@@ -101,6 +101,7 @@
 #define psx_mod_memory_address(c, pc, instr, ea) (psx_dctx_note_stripped_hook((CPUState *)(c)), (ea))
 
 /* ---- widescreen cull terms: the snapshot's margin ----------------------- */
+#define g_psx_draw_distance_clamp             (cpu->ctx->draw_distance_clamp)
 #define psx_ws_x_margin()                    (cpu->ctx->ws_x_margin)
 #define psx_ws_cull_slti(sx, imm) \
     (((int32_t)(sx) < (int32_t)(imm) + psx_ws_x_margin()) ? 1 : 0)
