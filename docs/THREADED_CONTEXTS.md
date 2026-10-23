@@ -214,7 +214,30 @@ Draw snapshots retain the current main geometry-cache entries and frozen PGXP
 position-fallback setting. Each context copies these into its private sparse
 cache and records RTPS/RTPT projections with the same first-writer, ambiguity,
 and saturation rules as main. Main render-pass checkpoints preserve fallback,
-so disabling it in workers would change precision. Capture currently scans the
-main direct table; measuring and reducing that cost remains pending. Allocation
+so disabling it in workers would change precision. The first capture scans the main table to initialize a live-slot index; later
+captures visit only that index. Index allocation loss falls back to a full scan.
+Checkpoint rollback restores its baseline index prefix, including generation
+changes, so speculative projections cannot escape into later snapshots.
+`PSX_CTX_GEOMETRY_INDEX=0` retains the full-scan comparison path. A Windows
+synthetic corpus with 4,096 live entries and 100 captures measured 2.472 ms
+per capture before indexing and 0.600 ms after (including the first scan);
+these are cache microbenchmarks, not frame-rate claims. Allocation
 failures reject the snapshot or draw pass. The four-thread GTE fixture checks
 fallback while main mutates its cache, new projections, ambiguity, and reset.
+
+### Candidate course-draw partition (not implemented)
+
+For R4, local disassembly shows `0x8006F00C` is a 100-byte wrapper.
+`0x8006EB58` builds count/block pointers at `0x8010E3C0` (pointer at
+`0x8010E7C0`, block stride 80 from `0x800F3064`); setup then configures
+scratch/GTE before `0x80060F94` consumes the list. That post-setup boundary
+is a candidate for private list slices, not a proven independent partition.
+The renderer chain uses `0x800A2454`/`0x800A2478`, iterates primitive type
+first and blocks second, and mutates shared scratch, GTE, packet cursor and
+OT heads (e.g. `0x80061494..0x800614AC`). Workers require private output
+arenas and a stable type/block/primitive merge, not concatenated block output.
+Position-fallback ambiguity spans the complete serial draw: separately valid
+worker cache entries can become ambiguous together. An ordered geometry-event
+reduction or equivalent two-phase design must preserve first-writer semantics.
+No partition should be enabled before complete receipt equality, including
+precision and OT ordering, is demonstrated.

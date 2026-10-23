@@ -1501,7 +1501,36 @@ int test_draw_context_geometry_fallback() {
     CHECK(failures == 0); return 0;
 }
 
+extern "C" void gte_precision_checkpoint_begin(void);
+extern "C" void gte_precision_checkpoint_rollback(void);
+int test_draw_context_geometry_index_rollback() {
+    const uint32_t baseline = (40u << 16) | 80u, transient = (41u << 16) | 81u;
+    gte_geometry_correction_set(1); pgxp_set_position_fallback(1);
+    gte_test_seed_geometry(baseline, 100, 200);
+    auto *snapshot = gte_ctx_create(nullptr); CHECK(snapshot);
+    CHECK(gte_ctx_snapshot_main(snapshot));
+    for (int advance = 0; advance < 2; ++advance) {
+        gte_precision_checkpoint_begin();
+        gte_precision_checkpoint_begin();
+        if (advance) gte_precision_timeline_invalidate();
+        gte_test_seed_geometry(transient, 300, 400);
+        CHECK(gte_ctx_snapshot_main(snapshot));
+        CHECK(gte_ctx_geometry_lookup(snapshot, transient, nullptr, nullptr));
+        gte_precision_checkpoint_rollback();
+        gte_precision_checkpoint_rollback();
+        CHECK(gte_ctx_snapshot_main(snapshot));
+        int32_t x = 0, y = 0;
+        CHECK(gte_ctx_geometry_lookup(snapshot, baseline, &x, &y) && x == 100 && y == 200);
+        CHECK(!gte_ctx_geometry_lookup(snapshot, transient, nullptr, nullptr));
+    }
+    gte_precision_timeline_invalidate();
+    CHECK(gte_ctx_snapshot_main(snapshot));
+    CHECK(!gte_ctx_geometry_lookup(snapshot, baseline, nullptr, nullptr));
+    gte_ctx_destroy(snapshot); gte_geometry_correction_set(0); return 0;
+}
+
 int main() {
+    if (int rc = test_draw_context_geometry_index_rollback()) return rc;
     if (int rc = test_draw_context_geometry_fallback()) return rc;
     if (int rc = test_draw_context_ram_precision_snapshot()) return rc;
     if (int rc = test_draw_context_frozen_configuration()) return rc;
