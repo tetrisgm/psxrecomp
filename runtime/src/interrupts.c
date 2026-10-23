@@ -752,6 +752,9 @@ static int same_guest_pc(uint32_t a, uint32_t b) {
 }
 
 int psx_get_in_exception(void) { return in_exception; }
+/* Draw-isolation gate (draw_isolation.c): outermost exception entry (1) and
+ * exit (0). NULL unless isolating. */
+void (*g_psx_exception_edge_observer)(int entering);
 
 /* Co-sim (COSIM_ORACLE.md): fold the GENUINE guest-timing interrupt statics into the
  * state hash. Deliberately EXCLUDES total_checks / dispatch_count / post_exception_
@@ -1570,6 +1573,8 @@ irq_deliver_eval:
      * of clearing it (a nested level-2 exit must leave level-1 flagged). */
     int prev_in_exception = in_exception;
     in_exception = 1;
+    if (!prev_in_exception && g_psx_exception_edge_observer)
+        g_psx_exception_edge_observer(1);   /* draw_isolation.c */
     exception_nest_depth++;
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
@@ -2067,6 +2072,8 @@ irq_deliver_eval:
         cpu->cop0[COP0_SR] = (sr2 & 0xFFFFFFC0u) | ((sr2 >> 2) & 0x0Fu);
     }
 
+    if (!prev_in_exception && g_psx_exception_edge_observer)
+        g_psx_exception_edge_observer(0);
     /* Nested delivery: a level-2 exit must leave level-1 flagged. */
     in_exception = prev_in_exception;
     if (exception_nest_depth > 0) exception_nest_depth--;
