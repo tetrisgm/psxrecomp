@@ -108,12 +108,93 @@ static void run(int slots, long us, int expect_waits) {
     check(!pt_running() && pt_submit(NULL, NULL, NULL) == -1, "stopped");
 }
 
+static uint64_t timed_presented_at;
+static long timed_pause_us;
+static void *timed_present(void *u, int slot, void *ready) {
+    (void)u; (void)slot;
+    timed_presented_at = pt_clock_ns();
+    int i = atomic_fetch_add(&n_presented, 1);
+    if (i < N_FRAMES + 8) presented[i] = (uintptr_t)ready;
+    if (timed_pause_us) sleep_us(timed_pause_us);
+    return ready;
+}
+
+static void run_timed(void) {
+    reset();
+    PtConfig c = {3, fake_ctx, timed_present, fake_dispose, NULL};
+    check(pt_start(&c), "timed presenter starts");
+    pt_set_epoch(1);
+    uint64_t begin = pt_clock_ns();
+    PtTiming t = {1, begin + 20000000u, begin + 1000000000u};
+    void *done = NULL;
+    check(pt_try_submit_at((void *)1, &t, &done) >= 0,
+          "future output queues without waiting for deadline");
+    pt_drain();
+    check(atomic_load(&n_presented) == 1 && timed_presented_at >= t.not_before_ns,
+          "present thread observes not-before deadline");
+    PtStats st;
+    pt_get_stats(&st);
+    check(st.waits == 0, "timed producer never blocks");
+    pt_stop();
+
+    reset();
+    c.slots = 2;
+    check(pt_start(&c), "bounded timed presenter starts");
+    pt_set_epoch(2);
+    begin = pt_clock_ns();
+    t = (PtTiming){2, begin + 5000000000ull, begin + 6000000000ull};
+    check(pt_try_submit_at((void *)11, &t, &done) == 1,
+          "timed queue keeps a composing slot");
+    check(pt_try_submit_at((void *)12, &t, &done) == -2 &&
+          pt_current() == 1 && done == NULL,
+          "full queue refuses without consuming slot or fence");
+    pt_set_epoch(3);
+    pt_drain();
+    check(atomic_load(&n_presented) == 0, "epoch reset wakes and drops pending output");
+    check(pt_clock_ns() - begin < 1000000000u, "reset does not wait for old deadline");
+    check(pt_try_submit_at((void *)13, &t, &done) == -2,
+          "old epoch submission rejected");
+    t.epoch = 3;
+    check(pt_try_submit_at((void *)14, &t, &done) == 0 && done == (void *)11,
+          "dropped ready fence returned for safe slot reuse");
+    begin = pt_clock_ns();
+    pt_stop();
+    check(pt_clock_ns() - begin < 1000000000u,
+          "shutdown cancels future timed output promptly");
+    check(atomic_load(&n_presented) == 0, "shutdown never presents cancelled timed output");
+    pt_get_stats(&st);
+    check(st.timed_dropped == 2 && st.timed_refused == 2 && st.waits == 0,
+          "timed drops/refusals counted separately from presents and waits");
+
+    reset();
+    c.slots = 3;
+    check(pt_start(&c), "late-output presenter starts");
+    pt_set_epoch(4);
+    timed_pause_us = 200000;
+    begin = pt_clock_ns();
+    t = (PtTiming){4, begin, begin + 1000000000u};
+    check(pt_try_submit_at((void *)21, &t, &done) >= 0, "first slow output accepted");
+    t.expires_ns = begin + 100000000u;
+    check(pt_try_submit_at((void *)22, &t, &done) >= 0, "next output queued before expiry");
+    pt_drain();
+    check(atomic_load(&n_presented) == 1 && presented[0] == 21,
+          "output expired behind slow swap drops without presenting out of order");
+    pt_get_stats(&st);
+    check(st.timed_dropped == 1 && st.waits == 0, "consumer rechecks expiry");
+    timed_pause_us = 0;
+    t.not_before_ns = 1; t.expires_ns = 2;
+    check(pt_try_submit_at((void *)23, &t, &done) == -2,
+          "already expired output refused at admission");
+    pt_stop();
+}
+
 int main(void) {
     srand(7);
     run(3, 0, 0);
     run(3, 1500, 1);
     run(2, 800, 1);
     run(4, 300, -1);   /* may or may not wait: invariants only */
+    run_timed();
     /* context failure */
     reset();
     ctx_ok = 0;

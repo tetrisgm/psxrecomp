@@ -16,6 +16,100 @@ static int failures;
 /* One 30 Hz game frame (2 VBlanks at 59.94 Hz) in nanosecond ticks. */
 static const double kFrame = 2.0 * 1e9 / 59.94;
 
+static void test_output_timestamps(void) {
+    const uint32_t rates[] = {60, 90, 100, 120, 144};
+    const uint64_t frequency = 1000000000u, origin = 9000000000000u;
+    for (unsigned r = 0; r < sizeof rates / sizeof rates[0]; ++r) {
+        RenderPassOutputTimeline timeline;
+        uint64_t total = 0;
+        unsigned min_count = 99, max_count = 0;
+        CHECK(render_pass_output_init(&timeline, frequency, rates[r], 1,
+                                      origin, 1), "initialize output clock");
+        /* Thirty logic steps describe exactly one second at every rate.
+         * Integer timestamp rounding is shared with the producer. */
+        for (uint64_t tick = 0; tick < 30; ++tick) {
+            const uint64_t begin = origin + tick * frequency / 30;
+            const uint64_t end = origin + (tick + 1) * frequency / 30;
+            RenderPassOutput outputs[16];
+            int n = render_pass_output_plan(&timeline, begin, end, begin,
+                                             tick, outputs, 16);
+            CHECK(n >= 0 && n <= 5, "bounded outputs per simulation tick");
+            if (n < 0) continue;
+            if ((unsigned)n < min_count) min_count = (unsigned)n;
+            if ((unsigned)n > max_count) max_count = (unsigned)n;
+            for (int i = 0; i < n; ++i) {
+                const RenderPassOutput *o = &outputs[i];
+                CHECK(o->index == total, "no skipped or duplicate output index");
+                CHECK(o->deadline == origin + total * frequency / rates[r],
+                      "every output lands on the persistent rational clock");
+                CHECK(o->expires == origin + (total + 1) * frequency / rates[r],
+                      "presentation validity ends at the next output deadline");
+                CHECK(o->deadline >= begin && o->deadline < end,
+                      "half-open windows assign boundaries exactly once");
+                CHECK(o->alpha_q16 == (o->deadline - begin) * 65536u / (end - begin),
+                      "interpolation follows timestamp within snapshot pair");
+                CHECK(o->generation == tick && o->epoch == 1,
+                      "output retains snapshot generation and session epoch");
+                total++;
+            }
+        }
+        CHECK(total == rates[r], "one second has exactly the requested outputs");
+        if (rates[r] == 100 || rates[r] == 144)
+            CHECK(min_count != max_count, "noninteger ratio varies outputs per tick");
+        else
+            CHECK(min_count == max_count, "integer ratio has stable output count");
+    }
+}
+
+static void test_output_lifetime_and_lateness(void) {
+    RenderPassOutputTimeline timeline, saved;
+    RenderPassOutput o[16], old;
+    CHECK(render_pass_output_init(&timeline, 1000000, 100, 1, 1000, 7),
+          "100 Hz output clock");
+    CHECK(render_pass_output_plan(&timeline, 1000, 34333, 1000, 20, o, 1) == 1 &&
+          o[0].deadline == 1000 && o[0].alpha_q16 == 0,
+          "base output included in bounded plan");
+    CHECK(render_pass_output_plan(&timeline, 1000, 34333, 1000, 20, o, 1) == 1 &&
+          o[0].deadline == 11000, "capacity resumes without losing outputs");
+    old = o[0];
+    CHECK(render_pass_output_current(&timeline, &old, 20, 11000),
+          "ready result accepted at its deadline");
+    CHECK(!render_pass_output_current(&timeline, &old, 20, 11001),
+          "late result dropped without waiting");
+    CHECK(!render_pass_output_current(&timeline, &old, 21, 1000),
+          "retired generation rejected");
+    CHECK(render_pass_output_plan(&timeline, 1000, 34333, 25000, 20, o, 16) == 1 &&
+          o[0].deadline == 31000, "missed output deadlines skipped");
+    CHECK(render_pass_output_plan(&timeline, 1000, 34333, 25000, 20, o, 16) == 0,
+          "same window cannot replay consumed outputs");
+    CHECK(render_pass_output_init(&timeline, 1000000, 144, 1, 25000, 8),
+          "rate change starts explicitly new epoch");
+    CHECK(!render_pass_output_current(&timeline, &old, 20, 1000),
+          "old rate/session result rejected");
+    saved = timeline;
+    CHECK(!render_pass_output_init(&timeline, 0, 60, 1, 0, 9) &&
+          !memcmp(&timeline, &saved, sizeof timeline), "bad rate leaves timeline intact");
+    CHECK(render_pass_output_plan(&timeline, 5, 5, 5, 0, o, 16) == -1 &&
+          !memcmp(&timeline, &saved, sizeof timeline), "invalid window is atomic");
+    CHECK(!render_pass_output_init(&timeline, 100, 144, 1, 0, 9),
+          "sub-clock output periods rejected");
+    CHECK(!render_pass_output_init(&timeline, UINT64_MAX, 60, 2, 0, 9),
+          "unrepresentable rational period rejected");
+    CHECK(render_pass_output_init(&timeline, 1000000000, 60000, 1001, 0, 9),
+          "fractional output Hz supported");
+    CHECK(render_pass_output_plan(&timeline, 3600000000000ull,
+                                   3600033333333ull, 3600000000000ull,
+                                   30, o, 16) > 0, "jump ahead an hour without a loop");
+    CHECK(o[0].deadline == o[0].index * 1001000000000ull / 60000,
+          "rational clock does not accumulate drift");
+    CHECK(render_pass_output_init(&timeline, 1000, 60, 1, UINT64_MAX - 1, 10),
+          "near-clock-limit setup");
+    saved = timeline;
+    CHECK(render_pass_output_plan(&timeline, UINT64_MAX - 1, UINT64_MAX,
+                                   UINT64_MAX - 1, 0, o, 16) == -1 &&
+          !memcmp(&timeline, &saved, sizeof timeline), "clock overflow does not partially commit");
+}
+
 static void test_counts_per_rate(void) {
     static const struct { double hz; uint32_t lo, hi; } rates[] = {
         {60.0, 1, 2}, {100.0, 3, 4}, {120.0, 3, 4}, {200.0, 6, 7},
@@ -444,6 +538,8 @@ int main(void) {
     test_stereo_pair_fresh();
     test_store_policy();
     test_counts_per_rate();
+    test_output_timestamps();
+    test_output_lifetime_and_lateness();
     test_shedding();
     test_select();
     test_gen_select_late();

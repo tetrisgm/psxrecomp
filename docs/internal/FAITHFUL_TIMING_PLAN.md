@@ -213,7 +213,6 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
-<<<<<<< HEAD
 - **2026-10-21 (`feat/render-60fps`):** Admit opt-in render passes with HD
   CPU-authoritative textures and give opted-in netplay temporal passes the
   restored own-view scope. Sandbox tests and hidden GL pass fixture pass.
@@ -221,7 +220,6 @@ on a fixed region -> next.
   on one peer; 14 temporal passes, no restore mismatches or dispatch misses.
   R4 performance/visual acceptance remains open; see its
   `analysis/render-60fps/REPORT.md`.
-=======
 ### 2026-10-22: Private draw-context BIOS qualification
 
 `docs/THREADED_CONTEXTS.md` records the ongoing context work. A0 memcpy is
@@ -230,7 +228,6 @@ body (memory/registers and PGXP hook stream); main BIOS/timing code is
 unchanged. Four-context equality is not a replacement for the draw-isolation
 gate or stock frame identity. Guest logic remains sequential at 30 Hz;
 draw/output workers must not change its cadence.
->>>>>>> 5cf37fc37e624ffee25e9cb356866d8123601b83
 
 - **2026-10-07 — DuckStation texture authoring fidelity (beads-qi66).**
   The early Tomba capture report exposed per-draw crops and automatic page
