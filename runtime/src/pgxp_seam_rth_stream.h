@@ -12,6 +12,7 @@ typedef enum {
     PGXP_RTH_PRECISE,
     PGXP_RTH_DEPTH,
     PGXP_RTH_SEMI,
+    PGXP_RTH_AREA,
     PGXP_RTH_FLAT_TRI,
     PGXP_RTH_GOURAUD_TRI,
     PGXP_RTH_TEX_TRI,
@@ -20,8 +21,15 @@ typedef enum {
 } PgxpRthSeamEvent;
 
 typedef struct {
+    size_t ordinal;
+    int32_t area[4];
+} PgxpRthSeamArea;
+
+typedef struct {
     PgxpSnapBatchInput *input;
     size_t count, capacity;
+    PgxpRthSeamArea *areas;
+    size_t area_count, area_capacity;
     float z[3];
     int32_t precise[6];
     float depth_near;
@@ -42,6 +50,7 @@ static inline void pgxp_rth_seam_stream_init(PgxpRthSeamStream *s,
 
 static inline void pgxp_rth_seam_stream_release(PgxpRthSeamStream *s) {
     free(s->input);
+    free(s->areas);
     memset(s, 0, sizeof *s);
 }
 
@@ -68,6 +77,22 @@ static inline int pgxp_rth_seam_stream_feed(PgxpRthSeamStream *s,
     if (event == PGXP_RTH_SEMI) {
         if (n != 2) return s->valid = 0;
         s->semi_enabled = v[0] != 0;
+        return 1;
+    }
+    if (event == PGXP_RTH_AREA) {
+        if (n != 4) return s->valid = 0;
+        if (s->area_count == s->area_capacity) {
+            if (s->area_capacity > SIZE_MAX / 2 / sizeof *s->areas)
+                return s->valid = 0;
+            size_t capacity = s->area_capacity ? s->area_capacity * 2 : 8;
+            PgxpRthSeamArea *next = (PgxpRthSeamArea *)realloc(s->areas,
+                                             capacity * sizeof *next);
+            if (!next) return s->valid = 0;
+            s->areas = next; s->area_capacity = capacity;
+        }
+        PgxpRthSeamArea *area = &s->areas[s->area_count++];
+        area->ordinal = s->count;
+        memcpy(area->area, v, sizeof area->area);
         return 1;
     }
     size_t x[3], y[3];
@@ -104,6 +129,29 @@ static inline int pgxp_rth_seam_stream_feed(PgxpRthSeamStream *s,
         }
     }
     s->precise_valid = s->depth_valid = 0; /* one triangle only */
+    return 1;
+}
+
+/* The reserve publishes the true initial drawing area later than command
+ * recording. Resolve every reset against it before running the batch. */
+static inline int pgxp_rth_seam_stream_mark_resets(PgxpRthSeamStream *s,
+                                                    const int32_t initial_area[4]) {
+    if (!s || !s->valid || !initial_area) return 0;
+    int32_t current[4];
+    memcpy(current, initial_area, sizeof current);
+    size_t area_at = 0;
+    int pending = 0;
+    for (size_t i = 0; i < s->count; i++) {
+        while (area_at < s->area_count && s->areas[area_at].ordinal <= i) {
+            if (memcmp(current, s->areas[area_at].area, sizeof current) != 0) {
+                pending = 1;
+                memcpy(current, s->areas[area_at].area, sizeof current);
+            }
+            area_at++;
+        }
+        s->input[i].reset_before = (uint32_t)pending;
+        pending = 0;
+    }
     return 1;
 }
 

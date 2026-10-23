@@ -14,6 +14,7 @@ typedef struct {
     int32_t ix[3], iy[3], fx[3], fy[3];
     float z[3];
     uint32_t word[3];
+    uint32_t reset_before;
 } PgxpSnapBatchInput;
 
 typedef struct {
@@ -45,7 +46,8 @@ static inline uint64_t pgxp_snap_batch_input_checksum(const PgxpSnapBatchInput *
     h = pgxp_snap_batch_bytes(h, in->fx, sizeof in->fx);
     h = pgxp_snap_batch_bytes(h, in->fy, sizeof in->fy);
     h = pgxp_snap_batch_bytes(h, in->z, sizeof in->z);
-    return pgxp_snap_batch_bytes(h, in->word, sizeof in->word);
+    h = pgxp_snap_batch_bytes(h, in->word, sizeof in->word);
+    return pgxp_snap_batch_bytes(h, &in->reset_before, sizeof in->reset_before);
 }
 
 static inline int pgxp_snap_batch_input_equal(const PgxpSnapBatchInput *a,
@@ -55,7 +57,8 @@ static inline int pgxp_snap_batch_input_equal(const PgxpSnapBatchInput *a,
            memcmp(a->fx, b->fx, sizeof a->fx) == 0 &&
            memcmp(a->fy, b->fy, sizeof a->fy) == 0 &&
            memcmp(a->z, b->z, sizeof a->z) == 0 &&
-           memcmp(a->word, b->word, sizeof a->word) == 0;
+           memcmp(a->word, b->word, sizeof a->word) == 0 &&
+           a->reset_before == b->reset_before;
 }
 
 /* Counters do not affect gap results. Hash the complete live index, including
@@ -111,6 +114,9 @@ static inline int pgxp_snap_batch_prepare(PgxpSnapBatch *b, const PgxpSnap *base
         PgxpSnapBatchEntry *e = &b->entries[i];
         e->input = input[i]; e->ordinal = i;
         e->checksum = pgxp_snap_batch_input_checksum(&input[i]);
+        if (input[i].reset_before || b->index->n_edges > PGXP_SNAP_MAX_EDGES - 3 ||
+            b->index->n_links > PGXP_SNAP_MAX_LINKS - 4096)
+            pgxp_snap_reset(b->index);
         e->count = pgxp_snap_triangle(b->index, input[i].ix, input[i].iy,
                                       input[i].fx, input[i].fy, input[i].z,
                                       input[i].word, e->gap);

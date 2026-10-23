@@ -81,6 +81,7 @@
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
 #include "pgxp_seam_snap.h"
+#include "pgxp_seam_rth_stream.h"
 #include "video_telemetry.h"
 #include "gpu_hd_textures.h"
 #include "mod_texture_banks.h"
@@ -528,6 +529,25 @@ enum {
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
     RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_GROUP
 };
+/* Producer-side geometry publication for an optional seam-prepared pass.
+ * Collection never reads the render owner's mutable snap index. */
+static PgxpRthSeamStream s_async_seam_stream;
+static int s_async_seam_collecting;
+static PgxpRthSeamEvent async_seam_event(uint16_t op) {
+    switch (op) {
+    case RTH_PRECISE: return PGXP_RTH_PRECISE;
+    case RTH_DEPTH: return PGXP_RTH_DEPTH;
+    case RTH_SEMI: return PGXP_RTH_SEMI;
+    case RTH_FLAT_TRI: return PGXP_RTH_FLAT_TRI;
+    case RTH_GOURAUD_TRI: return PGXP_RTH_GOURAUD_TRI;
+    case RTH_TEX_TRI: return PGXP_RTH_TEX_TRI;
+    case RTH_SHADED_TEX_TRI: return PGXP_RTH_SHADED_TEX_TRI;
+    case RTH_AREA: return PGXP_RTH_AREA;
+    case RTH_FRAME: case RTH_PROJ_TRI:
+        return PGXP_RTH_UNSUPPORTED;
+    default: return PGXP_RTH_IGNORE;
+    }
+}
 /* Optional diagnostic, measured on the render owner without suspending GL.
  * Costs include driver waits; use only to locate work, not benchmark FPS. */
 static _Atomic int s_op_profile=-1;
@@ -864,6 +884,23 @@ static float   s_pz[3];
  * edge (k -> k+1) of the triangle being drawn and an earlier neighbour,
  * filled by snap strips (snap_strip_tris). */
 static float   s_snap_e[3];
+typedef struct AsyncSeamPrepared {
+    PgxpSnapBatch batch;
+    PgxpRthSeamStream stream;
+    PgxpSnap *baseline;
+    uint64_t epoch, generation, index, deadline;
+    int baseline_present, ready;
+    struct AsyncSeamPrepared *next;
+} AsyncSeamPrepared;
+static AsyncSeamPrepared *s_async_seam_ready, *s_async_seam_active;
+static atomic_flag s_async_seam_ready_guard = ATOMIC_FLAG_INIT;
+static int s_async_seam_failed;
+static int s_async_seam_reset_pending;
+static _Atomic uint64_t s_async_seam_prepared_count, s_async_seam_used_count;
+static _Atomic uint64_t s_async_seam_mismatch_count, s_async_seam_fallback_count;
+static _Atomic uint64_t s_async_seam_collect_count, s_async_seam_candidate_count;
+static _Atomic uint64_t s_async_seam_invalid_count, s_async_seam_triangle_count;
+static _Atomic int s_async_seam_first_invalid_op;
 /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
  * and the seam expansion of opaque 3D polygons (0 off, 1 = 1 output px
@@ -4743,15 +4780,6 @@ uint64_t gl_renderer_seam_snap_us(void) {
 static int seam_snap_measure(const int *xs, const int *ys) {
     s_snap_e[0] = s_snap_e[1] = s_snap_e[2] = 0.0f;
     if (!seam_snap_enabled() || !s_pc_valid || !s_pz_valid) return 0;
-    if (!s_snap) {
-        s_snap = (PgxpSnap *)calloc(1, sizeof *s_snap);
-        if (!s_snap) return 0;
-        pgxp_snap_reset(s_snap);
-    }
-    /* A frame that never changes its drawing area nor presents (a hidden
-     * context) still starts over once the index is full. */
-    if (s_snap->n_edges > PGXP_SNAP_MAX_EDGES - 3 || s_snap->n_links > PGXP_SNAP_MAX_LINKS - 4096)
-        pgxp_snap_reset(s_snap);
     int32_t ix[3], iy[3], fx[3], fy[3];
     const uint32_t word[3] = { 0, 0, 0 };
     for (int i = 0; i < 3; i++) {
@@ -4759,9 +4787,36 @@ static int seam_snap_measure(const int *xs, const int *ys) {
         fx[i] = (int32_t)lrintf(s_pc_x[i] * 65536.0f);
         fy[i] = (int32_t)lrintf(s_pc_y[i] * 65536.0f);
     }
-    const uint64_t t0 = SDL_GetPerformanceCounter();
-    int n = pgxp_snap_triangle(s_snap, ix, iy, fx, fy, s_pz, word, s_snap_e);
-    s_snap_ticks += SDL_GetPerformanceCounter() - t0;
+    int n;
+    if (s_async_seam_active) {
+        if (s_async_seam_failed) return 0;
+        PgxpSnapBatchInput input = {0};
+        memcpy(input.ix, ix, sizeof ix); memcpy(input.iy, iy, sizeof iy);
+        memcpy(input.fx, fx, sizeof fx); memcpy(input.fy, fy, sizeof fy);
+        memcpy(input.z, s_pz, sizeof s_pz);
+        memcpy(input.word, word, sizeof word);
+        input.reset_before = (uint32_t)s_async_seam_reset_pending;
+        s_async_seam_reset_pending = 0;
+        if (!pgxp_snap_batch_next(&s_async_seam_active->batch,
+                s_async_seam_active->batch.consumed, &input, s_snap_e, &n)) {
+            s_async_seam_failed = 1;
+            atomic_fetch_add(&s_async_seam_mismatch_count, 1);
+            return 0;
+        }
+    } else {
+        if (!s_snap) {
+            s_snap = (PgxpSnap *)calloc(1, sizeof *s_snap);
+            if (!s_snap) return 0;
+            pgxp_snap_reset(s_snap);
+        }
+        /* A hidden context still starts over once the index is full. */
+        if (s_snap->n_edges > PGXP_SNAP_MAX_EDGES - 3 ||
+            s_snap->n_links > PGXP_SNAP_MAX_LINKS - 4096)
+            pgxp_snap_reset(s_snap);
+        const uint64_t t0 = SDL_GetPerformanceCounter();
+        n = pgxp_snap_triangle(s_snap, ix, iy, fx, fy, s_pz, word, s_snap_e);
+        s_snap_ticks += SDL_GetPerformanceCounter() - t0;
+    }
     /* A gap no wider than seam expansion's own reach is already closed by
      * it: no strip. */
     const float w = pgxp_seam_width();
@@ -5612,6 +5667,9 @@ static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
 }
 static void glb_set_draw_area(int x1,int y1,int x2,int y2) {
     /* Seam snapping: a new drawing area is a new frame (or surface). */
+    if (s_async_seam_active &&
+        (x1 != s_area_x1 || y1 != s_area_y1 || x2 != s_area_x2 || y2 != s_area_y2))
+        s_async_seam_reset_pending = 1;
     if (s_snap && (x1 != s_area_x1 || y1 != s_area_y1 || x2 != s_area_x2 || y2 != s_area_y2))
         pgxp_snap_reset(s_snap);
     if (s_depth_used && (x1 != s_area_x1 || y1 != s_area_y1 || x2 != s_area_x2 || y2 != s_area_y2))
@@ -5658,6 +5716,14 @@ int gl_renderer_projective_supported(void) {
 void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
     uint16_t texpage, uint16_t cx, uint16_t cy, int raw, int semi, int perspective) {
     if (rth_record_mode()) {
+        if (s_async_seam_collecting)
+            (void)pgxp_rth_seam_stream_feed(&s_async_seam_stream,
+                                           PGXP_RTH_UNSUPPORTED, NULL, 0);
+        if (s_async_seam_collecting) {
+            int zero = 0;
+            (void)atomic_compare_exchange_strong(&s_async_seam_first_invalid_op,
+                                                 &zero, RTH_PROJ_TRI);
+        }
         rth_group_flush();
         uint8_t *p = (uint8_t *)rt_cmd_begin(RTH_PROJ_TRI, rth_prim_flags(),
                                              3u * sizeof(PSXProjectedVertex) + 24u);
@@ -8401,6 +8467,29 @@ typedef struct AsyncVram {
     int area[4];
 } AsyncVram;
 static AsyncVram s_async_vram[PASS_GENERATIONS],s_async_work;
+/* The reserve runs on the render owner. Publish a separate immutable seam
+ * baseline for CPU preparation without acquiring the GL context (an acquire
+ * would change the resource epoch and invalidate the reserved pass). The
+ * short lock covers only CPU index copies, never GL work or a worker wait. */
+typedef struct AsyncSeamBaseline {
+    PgxpSnap *snap;
+    uint64_t epoch, generation;
+    int present;
+    int32_t area[4];
+} AsyncSeamBaseline;
+static AsyncSeamBaseline s_async_seam_baseline[PASS_GENERATIONS];
+static atomic_flag s_async_seam_lock = ATOMIC_FLAG_INIT;
+static SDL_Thread *s_async_seam_worker;
+static SDL_mutex *s_async_seam_work_mutex;
+static SDL_cond *s_async_seam_work_cv, *s_async_seam_done_cv;
+static AsyncSeamPrepared *s_async_seam_work;
+static int s_async_seam_work_stop;
+static void async_seam_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&s_async_seam_lock, memory_order_acquire)) {}
+}
+static void async_seam_unlock(void) {
+    atomic_flag_clear_explicit(&s_async_seam_lock, memory_order_release);
+}
 static _Atomic uint64_t s_async_resource_epoch=1;
 static GLuint s_async_live_raw_tex,s_async_live_raw_fbo;
 static uint16_t *s_async_live_cpu;
@@ -8481,6 +8570,158 @@ static void pass_snap_copy(PgxpSnap *dst, const PgxpSnap *src) {
     memcpy(dst->links,src->links,(size_t)src->n_links*sizeof src->links[0]);
     memcpy(dst->edges,src->edges,(size_t)src->n_edges*sizeof src->edges[0]);
     memcpy(dst->stamp,src->stamp,(size_t)src->n_edges*sizeof src->stamp[0]);
+}
+/* Reuse one published slot per generation. The lock protects the copy, so a
+ * worker never observes a partially replaced baseline. It immediately takes
+ * its own copy and releases the lock before running seam preparation. */
+static void async_seam_baseline_publish(int gi, uint64_t epoch, uint64_t generation,
+                                         const PgxpSnap *src, const int area[4]) {
+    if (gi < 0 || gi >= PASS_GENERATIONS) return;
+    async_seam_lock();
+    AsyncSeamBaseline *slot = &s_async_seam_baseline[gi];
+    slot->epoch = slot->generation = 0;
+    if (!slot->snap) slot->snap = (PgxpSnap *)calloc(1, sizeof *slot->snap);
+    if (slot->snap) {
+        if (src) pass_snap_copy(slot->snap, src);
+        else pgxp_snap_reset(slot->snap);
+        slot->epoch = epoch;
+        slot->generation = generation;
+        memcpy(slot->area, area, sizeof slot->area);
+    }
+    slot->present = src != NULL;
+    async_seam_unlock();
+}
+/* The caller owns dst. A zero result means reserve is not published yet,
+ * expired, or allocation failed; it must not use any partial copy. */
+static int async_seam_baseline_copy(uint64_t epoch, uint64_t generation,
+                                    PgxpSnap *dst, int *present, int32_t area[4]) {
+    if (!dst || !epoch || !generation) return 0;
+    int found = 0;
+    async_seam_lock();
+    for (int gi = 0; gi < PASS_GENERATIONS; ++gi) {
+        const AsyncSeamBaseline *slot = &s_async_seam_baseline[gi];
+        if (slot->snap && slot->epoch == epoch && slot->generation == generation) {
+            pass_snap_copy(dst, slot->snap);
+            if (present) *present = slot->present;
+            if (area) memcpy(area, slot->area, sizeof slot->area);
+            found = 1;
+            break;
+        }
+    }
+    async_seam_unlock();
+    return found;
+}
+static void async_seam_prepared_free(AsyncSeamPrepared *p) {
+    if (!p) return;
+    pgxp_snap_batch_release(&p->batch);
+    pgxp_rth_seam_stream_release(&p->stream);
+    free(p->baseline);
+    free(p);
+}
+static void async_seam_prepare_one(AsyncSeamPrepared *p) {
+    p->baseline = (PgxpSnap *)calloc(1, sizeof *p->baseline);
+    if (!p->baseline) return;
+    while (pt_clock_ns() < p->deadline) {
+        int32_t area[4];
+        if (async_seam_baseline_copy(p->epoch, p->generation,
+                                     p->baseline, &p->baseline_present, area)) {
+            p->ready = pgxp_rth_seam_stream_mark_resets(&p->stream, area) &&
+                       pgxp_snap_batch_prepare(&p->batch, p->baseline,
+                                                p->generation, p->stream.input,
+                                                p->stream.count);
+            return;
+        }
+        SDL_Delay(0);
+    }
+}
+static int async_seam_prepare_thread(void *arg) {
+    (void)arg;
+    SDL_LockMutex(s_async_seam_work_mutex);
+    for (;;) {
+        while (!s_async_seam_work && !s_async_seam_work_stop)
+            SDL_CondWait(s_async_seam_work_cv, s_async_seam_work_mutex);
+        if (s_async_seam_work_stop) break;
+        AsyncSeamPrepared *p = s_async_seam_work;
+        SDL_UnlockMutex(s_async_seam_work_mutex);
+        async_seam_prepare_one(p);
+        SDL_LockMutex(s_async_seam_work_mutex);
+        s_async_seam_work = NULL;
+        SDL_CondSignal(s_async_seam_done_cv);
+    }
+    SDL_UnlockMutex(s_async_seam_work_mutex);
+    return 0;
+}
+static int async_seam_worker_prepare(AsyncSeamPrepared *p) {
+    if (!s_async_seam_worker) {
+        if (!s_async_seam_work_mutex) s_async_seam_work_mutex = SDL_CreateMutex();
+        if (!s_async_seam_work_cv) s_async_seam_work_cv = SDL_CreateCond();
+        if (!s_async_seam_done_cv) s_async_seam_done_cv = SDL_CreateCond();
+        if (!s_async_seam_work_mutex || !s_async_seam_work_cv || !s_async_seam_done_cv)
+            return 0;
+        s_async_seam_work_stop = 0;
+        s_async_seam_worker = SDL_CreateThread(async_seam_prepare_thread,
+                                               "seam-prep", NULL);
+        if (!s_async_seam_worker) return 0;
+    }
+    SDL_LockMutex(s_async_seam_work_mutex);
+    s_async_seam_work = p;
+    SDL_CondSignal(s_async_seam_work_cv);
+    while (s_async_seam_work)
+        SDL_CondWait(s_async_seam_done_cv, s_async_seam_work_mutex);
+    SDL_UnlockMutex(s_async_seam_work_mutex);
+    return p->ready;
+}
+static void async_seam_worker_stop(void) {
+    if (s_async_seam_worker) {
+        SDL_LockMutex(s_async_seam_work_mutex);
+        s_async_seam_work_stop = 1;
+        SDL_CondSignal(s_async_seam_work_cv);
+        SDL_UnlockMutex(s_async_seam_work_mutex);
+        SDL_WaitThread(s_async_seam_worker, NULL);
+        s_async_seam_worker = NULL;
+    }
+    if (s_async_seam_work_cv) SDL_DestroyCond(s_async_seam_work_cv);
+    if (s_async_seam_done_cv) SDL_DestroyCond(s_async_seam_done_cv);
+    if (s_async_seam_work_mutex) SDL_DestroyMutex(s_async_seam_work_mutex);
+    s_async_seam_work_cv = s_async_seam_done_cv = NULL;
+    s_async_seam_work_mutex = NULL;
+    s_async_seam_work = NULL;
+}
+static void async_seam_ready_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&s_async_seam_ready_guard, memory_order_acquire)) {}
+}
+static void async_seam_ready_unlock(void) {
+    atomic_flag_clear_explicit(&s_async_seam_ready_guard, memory_order_release);
+}
+static void async_seam_ready_insert(AsyncSeamPrepared *p) {
+    async_seam_ready_lock();
+    p->next = s_async_seam_ready;
+    s_async_seam_ready = p;
+    async_seam_ready_unlock();
+}
+static AsyncSeamPrepared *async_seam_ready_take(uint64_t epoch, uint64_t generation,
+                                                uint64_t index) {
+    AsyncSeamPrepared *found = NULL;
+    async_seam_ready_lock();
+    for (AsyncSeamPrepared **at = &s_async_seam_ready; *at; at = &(*at)->next) {
+        if ((*at)->epoch == epoch && (*at)->generation == generation &&
+            (*at)->index == index) {
+            found = *at; *at = found->next; found->next = NULL; break;
+        }
+    }
+    async_seam_ready_unlock();
+    return found;
+}
+static void async_seam_ready_clear(void) {
+    async_seam_ready_lock();
+    AsyncSeamPrepared *p = s_async_seam_ready;
+    s_async_seam_ready = NULL;
+    async_seam_ready_unlock();
+    while (p) {
+        AsyncSeamPrepared *next = p->next;
+        async_seam_prepared_free(p);
+        p = next;
+    }
 }
 static int pass_snap_capture(PgxpSnap **dst, int *present, const PgxpSnap *src) {
     *present=src!=NULL;
@@ -9063,7 +9304,15 @@ static void pass_resources_release(void) {
     s_xr_color_prog=s_xr_native_tex=0;
     pass_free_color_fbo(&s_capture_read_tex,NULL,&s_capture_read_fbo,&s_capture_read_w,&s_capture_read_h);
     stereo_resources_release();
+    async_seam_worker_stop();
+    async_seam_ready_clear();
+    async_seam_prepared_free(s_async_seam_active);
+    s_async_seam_active = NULL;
     for(int gi=0;gi<PASS_GENERATIONS;++gi)pass_gen_release(gi);
+    for (int gi=0; gi<PASS_GENERATIONS; ++gi) {
+        free(s_async_seam_baseline[gi].snap);
+        memset(&s_async_seam_baseline[gi], 0, sizeof s_async_seam_baseline[gi]);
+    }
     pass_gens_invalidate();
     pass_free_color_fbo(&s_pb_hr_tex, &s_pb_hr_rb, &s_pb_hr_fbo,
                         &s_pb_hr_w, &s_pb_hr_h);
@@ -9403,6 +9652,17 @@ void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
     /* Counters are independently atomic: diagnostic reads neither drain the
      * render queue nor invalidate in-flight presentation generations. */
     rth_op_report();
+    if (getenv("PSX_SEAM_PREP_STATS"))
+        fprintf(stderr, "seam_prep collect=%llu tris=%llu invalid=%llu first_op=%d candidates=%llu prepared=%llu used=%llu mismatch=%llu fallback=%llu\n",
+            (unsigned long long)atomic_load(&s_async_seam_collect_count),
+            (unsigned long long)atomic_load(&s_async_seam_triangle_count),
+            (unsigned long long)atomic_load(&s_async_seam_invalid_count),
+            atomic_load(&s_async_seam_first_invalid_op),
+            (unsigned long long)atomic_load(&s_async_seam_candidate_count),
+            (unsigned long long)atomic_load(&s_async_seam_prepared_count),
+            (unsigned long long)atomic_load(&s_async_seam_used_count),
+            (unsigned long long)atomic_load(&s_async_seam_mismatch_count),
+            (unsigned long long)atomic_load(&s_async_seam_fallback_count));
 #define ASYNC_LOAD(n) out->n=atomic_load(&s_async_count_##n);
     ASYNC_COUNTERS(ASYNC_LOAD)
 #undef ASYNC_LOAD
@@ -9462,16 +9722,31 @@ int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
     }
     if (!rth_group_flush() || !rt_batch_begin()) { ASYNC_COUNT(ring_full); return 0; }
     s_async_recording=*token;
-    if (!async_record(RTH_ASYNC_BEGIN,token)) { ASYNC_COUNT(ring_full); rth_group_flush(); rt_batch_discard(); return 0; }
+    pgxp_rth_seam_stream_release(&s_async_seam_stream);
+    const char *prep_env = getenv("PSX_SEAM_PREP");
+    s_async_seam_collecting = s_pgxp_depth && s_pgxp_seam &&
+                              !(prep_env && !strcmp(prep_env, "0"));
+    if (s_async_seam_collecting)
+        pgxp_rth_seam_stream_init(&s_async_seam_stream, s_pgxp_depth,
+            s_pgxp_seam, s_pgxp_depth_near < 0.0f ? 1024.0f : s_pgxp_depth_near,
+            1 /* conservative until an explicit semi state arrives */);
+    if (s_async_seam_collecting) atomic_fetch_add(&s_async_seam_collect_count, 1);
+    if (!async_record(RTH_ASYNC_BEGIN,token)) {
+        ASYNC_COUNT(ring_full); s_async_seam_collecting = 0;
+        pgxp_rth_seam_stream_release(&s_async_seam_stream);
+        rth_group_flush(); rt_batch_discard(); return 0;
+    }
     return 1;
 }
 int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
     if (!rt_batch_active()) return 0;
+    s_async_seam_collecting = 0;
     if (!token || token->output.epoch!=s_async_recording.output.epoch ||
         token->output.generation!=s_async_recording.output.generation ||
         token->output.index!=s_async_recording.output.index ||
         token->output.deadline!=s_async_recording.output.deadline ||
         token->output.alpha_q16!=s_async_recording.output.alpha_q16) {
+        pgxp_rth_seam_stream_release(&s_async_seam_stream);
         rth_group_flush(); rt_batch_discard(); return 0;
     }
     RTH_REC(RTH_PASS_END,0,(int32_t)token->output.alpha_q16,keep);
@@ -9481,9 +9756,38 @@ int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
             if(token->output.epoch!=gl_renderer_present_epoch()) ASYNC_COUNT(stale);
             else ASYNC_COUNT(late);
         }
+        pgxp_rth_seam_stream_release(&s_async_seam_stream);
         rth_group_flush(); rt_batch_discard(); return 0;
     }
+    AsyncSeamPrepared *prepared = NULL;
+    if (!s_async_seam_stream.valid)
+        atomic_fetch_add(&s_async_seam_invalid_count, 1);
+    if (s_async_seam_stream.count)
+        atomic_fetch_add(&s_async_seam_candidate_count, s_async_seam_stream.count);
+    if (s_async_seam_stream.valid && s_async_seam_stream.count) {
+        prepared = (AsyncSeamPrepared *)calloc(1, sizeof *prepared);
+        if (prepared) {
+            prepared->stream = s_async_seam_stream;
+            memset(&s_async_seam_stream, 0, sizeof s_async_seam_stream);
+            prepared->epoch = token->output.epoch;
+            prepared->generation = token->output.generation;
+            prepared->index = token->output.index;
+            uint64_t now = pt_clock_ns();
+            prepared->deadline = now + 2000000ull;
+            if (prepared->deadline > token->output.deadline)
+                prepared->deadline = token->output.deadline;
+            if (!async_seam_worker_prepare(prepared)) {
+                atomic_fetch_add(&s_async_seam_fallback_count, 1);
+                async_seam_prepared_free(prepared); prepared = NULL;
+            } else atomic_fetch_add(&s_async_seam_prepared_count, 1);
+        }
+    }
+    pgxp_rth_seam_stream_release(&s_async_seam_stream);
+    if (prepared) async_seam_ready_insert(prepared);
     int ok=rt_batch_try_commit();
+    if (!ok && prepared)
+        async_seam_prepared_free(async_seam_ready_take(prepared->epoch,
+                                 prepared->generation, prepared->index));
     if (ok) { ASYNC_COUNT(submitted); s_async_last_index=token->output.index; s_async_has_index=1; }
     else ASYNC_COUNT(ring_full);
     return ok;
@@ -12220,6 +12524,18 @@ static int rth_group_flush(void) {
     return rth_rec_raw(RTH_GROUP,0,(int)n,s_rth_group);
 }
 static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
+    if (s_async_seam_collecting) {
+        if (op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI || op==RTH_TEX_TRI ||
+            op==RTH_SHADED_TEX_TRI)
+            atomic_fetch_add(&s_async_seam_triangle_count, 1);
+        int was_valid = s_async_seam_stream.valid;
+        (void)pgxp_rth_seam_stream_feed(&s_async_seam_stream,
+                                        async_seam_event(op), v, (size_t)n);
+        if (was_valid && !s_async_seam_stream.valid) {
+            int zero = 0;
+            (void)atomic_compare_exchange_strong(&s_async_seam_first_invalid_op, &zero, op);
+        }
+    }
     int setup=op==RTH_SEMI || op==RTH_MASK || op==RTH_TWIN || op==RTH_MOD ||
         op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC;
     int triangle=op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI ||
@@ -15625,6 +15941,10 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             }
             s_pgen[s_pgen_write].async_id=token.output.generation;
             s_pgen[s_pgen_write].async_epoch=token.output.epoch;
+            async_seam_baseline_publish(s_pgen_write, token.output.epoch,
+                token.output.generation, s_async_vram[s_pgen_write].snap_present ?
+                s_async_vram[s_pgen_write].snap : NULL,
+                s_async_vram[s_pgen_write].area);
             pass_end_now(0,0);
             async_vram_take_backup(s_pgen_write);
             s_async_display_epoch=token.output.epoch;
@@ -15639,14 +15959,20 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
     case RTH_ASYNC_BEGIN: {
         uint64_t stage_start=pt_clock_ns();
         GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
+        AsyncSeamPrepared *prepared = async_seam_ready_take(token.output.epoch,
+            token.output.generation, token.output.index);
         int gi=-1;
         for (int k=0;k<PASS_GENERATIONS;++k)
             if (s_pgen[k].valid && s_pgen[k].async_id==token.output.generation &&
                 s_pgen[k].async_epoch==token.output.epoch) gi=k;
         if (gi<0 || token.output.epoch!=gl_renderer_present_epoch()) {
+            async_seam_prepared_free(prepared);
             ASYNC_COUNT(render_stale); s_pass_dead=1; break;
         }
-        if (pt_clock_ns()>token.output.deadline) { ASYNC_COUNT(render_late); s_pass_dead=1; break; }
+        if (pt_clock_ns()>token.output.deadline) {
+            async_seam_prepared_free(prepared);
+            ASYNC_COUNT(render_late); s_pass_dead=1; break;
+        }
         s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0; s_async_hd_copy=0;
         if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
             s_pass_leaks_at_begin=s_pass_leaks;
@@ -15654,8 +15980,22 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
                 ASYNC_COUNT(resource);
                 pass_end_now(0,0); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write;
                 atomic_fetch_add(&s_pass_q_refused,1);
-            } else gpu_hd_textures_suppress_dumps(1);
+            } else {
+                gpu_hd_textures_suppress_dumps(1);
+                const PgxpSnap *live = s_snap ? s_snap :
+                    (prepared && !prepared->baseline_present ? prepared->baseline : NULL);
+                if (prepared && pgxp_snap_batch_preflight(&prepared->batch,
+                        live, token.output.generation, prepared->stream.input,
+                        prepared->stream.count)) {
+                    s_async_seam_active = prepared;
+                    s_async_seam_failed = 0;
+                    s_async_seam_reset_pending = 0;
+                    atomic_fetch_add(&s_async_seam_used_count, 1);
+                    prepared = NULL;
+                } else if (prepared) atomic_fetch_add(&s_async_seam_fallback_count, 1);
+            }
         } else { ASYNC_COUNT(capture); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
+        async_seam_prepared_free(prepared);
         s_async_replay_started=pt_clock_ns();
         atomic_fetch_add(&s_async_count_enter_ns,s_async_replay_started-stage_start);
         break;
@@ -15671,6 +16011,10 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         break;
     case RTH_PASS_END: {
         uint64_t stage_start=pt_clock_ns();
+        if (s_async_seam_active &&
+            (s_async_seam_failed ||
+             s_async_seam_active->batch.consumed != s_async_seam_active->batch.count))
+            s_async_invalid = 1;
         if (s_async_exec) { ASYNC_COUNT(replay_count); atomic_fetch_add(&s_async_count_replay_ns,stage_start-s_async_replay_started); }
         if (s_pass_dead) { s_pass_dead = 0; break; }
         if (s_async_exec && s_async_hd_copy) { ASYNC_COUNT(unsupported); s_async_invalid=1; }
@@ -15691,6 +16035,10 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             s_async_exec=0; s_async_invalid=0; s_async_hd_copy=0; s_pgen_write=s_async_previous_write;
             atomic_fetch_add(&s_async_count_finish_ns,pt_clock_ns()-stage_start);
         }
+        async_seam_prepared_free(s_async_seam_active);
+        s_async_seam_active = NULL;
+        s_async_seam_failed = 0;
+        s_async_seam_reset_pending = 0;
         break;
     }
     case RTH_PEEK: {

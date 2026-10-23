@@ -3,7 +3,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-static PgxpSnap baseline, serial, mutated;
+static PgxpSnap baseline, serial, mutated, reset_serial;
 static PgxpSnapBatch batch[4];
 
 static PgxpRthSeamEvent test_map(uint16_t op) {
@@ -34,6 +34,7 @@ int main(void) {
         make_tri(xc, yc), make_tri(xd, yd)
     };
     PgxpRthSeamStream stream;
+    float gap[3];
     pgxp_rth_seam_stream_init(&stream, 1, 1, 100.0f, 0);
     for (int i = 0; i < 4; i++) {
         int32_t precise[7] = {1};
@@ -105,8 +106,41 @@ int main(void) {
     assert(!pgxp_rth_seam_stream_feed_group(&stream, grouped,
                                             sizeof grouped / sizeof grouped[0] - 1, test_map));
     pgxp_rth_seam_stream_release(&stream);
+    pgxp_rth_seam_stream_init(&stream, 1, 1, 100.0f, 0);
+    memcpy(depth + 1, input[0].z, sizeof input[0].z);
+    int32_t initial_area[4] = {0, 0, 1023, 511};
+    int32_t changed_area[4] = {0, 0, 511, 255};
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_PRECISE, precise, 7));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_DEPTH, depth, 4));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_FLAT_TRI, tri, 7));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_AREA, initial_area, 4));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_AREA, changed_area, 4));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_PRECISE, precise, 7));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_DEPTH, depth, 4));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_FLAT_TRI, tri, 7));
+    assert(pgxp_rth_seam_stream_mark_resets(&stream, initial_area));
+    assert(stream.count == 2 && !stream.input[0].reset_before &&
+           stream.input[1].reset_before);
+    PgxpSnapBatch reset_batch = {0};
+    assert(pgxp_snap_batch_prepare(&reset_batch, &baseline, 43,
+                                   stream.input, stream.count));
+    assert(pgxp_snap_batch_preflight(&reset_batch, &baseline, 43,
+                                     stream.input, stream.count));
+    pgxp_snap_batch_copy_index(&reset_serial, &baseline);
+    for (size_t i = 0; i < stream.count; i++) {
+        if (stream.input[i].reset_before) pgxp_snap_reset(&reset_serial);
+        int reference = pgxp_snap_triangle(&reset_serial, stream.input[i].ix,
+            stream.input[i].iy, stream.input[i].fx, stream.input[i].fy,
+            stream.input[i].z, stream.input[i].word, gap);
+        float prepared_gap[3]; int prepared_count;
+        assert(pgxp_snap_batch_next(&reset_batch, i, &stream.input[i],
+                                    prepared_gap, &prepared_count));
+        assert(prepared_count == reference &&
+               memcmp(prepared_gap, gap, sizeof gap) == 0);
+    }
+    pgxp_snap_batch_release(&reset_batch);
+    pgxp_rth_seam_stream_release(&stream);
     float expected[4][3];
-    float gap[3];
     int expected_count[4];
     pgxp_snap_reset(&baseline);
     pgxp_snap_batch_copy_index(&serial, &baseline);
