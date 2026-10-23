@@ -91,6 +91,11 @@ int main(void) {
         for(int i=0;i<PASS_GENERATIONS;++i)
             if(s_pgen[i].async_id==tokens[1].output.generation && s_pgen[i].n==2) found++;
         check(found==1,"completed output appended to original generation");
+        pass_note_new_frame(999,499,GL_PRES_VRAM,320,240);
+        found=0;
+        for(int i=0;i<PASS_GENERATIONS;++i)
+            if(s_pgen[i].async_id==tokens[1].output.generation && s_pgen[i].valid) found++;
+        check(found==1,"unmatched legacy flip cannot retire an asynchronous generation");
         unsigned char *pixels=malloc(320u*240u*4u);
         int red=0;
         for(int i=0;i<PASS_GENERATIONS;++i) if(s_pgen[i].async_id==tokens[1].output.generation) {
