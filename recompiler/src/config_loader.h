@@ -697,8 +697,9 @@ struct RuntimeConfig {
     // does the copy and the swap, so the window compositor's wait does not
     // block rendering (docs/RENDER_THREAD.md "Present thread"). Same pixels.
     // Off by default; PSX_PRESENT_THREAD=0/1 overrides,
-    // PSX_PRESENT_THREAD_SLOTS=2..4 (default 3).
+    // PSX_PRESENT_THREAD_SLOTS overrides the configured 2..8 slots.
     bool                  video_present_thread = false;
+    int                   video_present_thread_slots = 3;
 
     // low_latency_input: re-sample the pad after the wall-clock pacer (just
     // before present) so the next CPU frame reads near-fresh input instead of

@@ -983,6 +983,12 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("present_thread")) {
             rt.video_present_thread = toml::find<bool>(video, "present_thread");
         }
+        if (video.contains("present_thread_slots")) {
+            const int slots = toml::find<int>(video, "present_thread_slots");
+            if (slots < 2 || slots > 8)
+                throw std::runtime_error("[video] present_thread_slots must be 2..8");
+            rt.video_present_thread_slots = slots;
+        }
         if (video.contains("frame_generation")) {
             rt.video_frame_generation = toml::find<bool>(video, "frame_generation");
         }

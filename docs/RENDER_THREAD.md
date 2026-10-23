@@ -201,7 +201,8 @@ resolution (below), not of this layer.
 ## Present thread (`[video] present_thread`)
 
 Opt-in, under the render thread, off by default (`present_thread = true`;
-`PSX_PRESENT_THREAD=0/1`, `PSX_PRESENT_THREAD_SLOTS=2..8`, default 3). On
+`PSX_PRESENT_THREAD=0/1`, `[video] present_thread_slots = 2..8`,
+default 3; `PSX_PRESENT_THREAD_SLOTS` overrides it). On
 macOS a swap on the render thread cost 6-9 ms of waiting on the window
 compositor (`[NSOpenGLContext flushBuffer]` on GL-on-Metal) in every frame,
 real or generated; with this it costs a fence and a hand-off.

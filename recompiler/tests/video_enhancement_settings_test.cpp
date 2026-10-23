@@ -420,13 +420,16 @@ static void test_present_thread() {
     fs::path p = write_game_toml("psxrecomp_pt_default.toml", "");
     auto gc = PSXRecompV4::load_game_config(p);
     check(!gc.runtime.video_present_thread, "present_thread defaults OFF");
+    check(gc.runtime.video_present_thread_slots == 3, "present_thread defaults to three slots");
     fs::remove(p);
     fs::path q = write_game_toml("psxrecomp_pt_on.toml",
         "[video]\n"
         "render_thread = true\n"
-        "present_thread = true\n");
+        "present_thread = true\n"
+        "present_thread_slots = 8\n");
     auto gq = PSXRecompV4::load_game_config(q);
     check(gq.runtime.video_present_thread, "[video] present_thread = true is honoured");
+    check(gq.runtime.video_present_thread_slots == 8, "configured presenter slots are honoured");
     fs::remove(q);
 }
 
