@@ -9102,9 +9102,12 @@ static void pass_journal_rollback(void) {
         int w = s_pj_cpu.w[i], h = s_pj_cpu.h[i];
         pass_blit(j->hr_fbo, s_hr_fbo, 0, 0, x * S, y * S, w * S, h * S,
                   GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
-        pass_blit(j->raw_fbo, s_raw_fbo, 0, 0, x, y, w, h, GL_COLOR_BUFFER_BIT);
+        if (!s_async_exec) pass_blit(j->raw_fbo, s_raw_fbo, 0, 0, x, y, w, h, GL_COLOR_BUFFER_BIT);
     }
-    render_pass_journal_rollback(&s_pj_cpu, s_vram, VRAM_W);
+    /* Async raw/CPU journals belong to the private replay image. The live
+     * pointers have already been rebound; never replay old private pixels
+     * into the newer live frame. HR attachments are shared and still restore. */
+    if (!s_async_exec) render_pass_journal_rollback(&s_pj_cpu, s_vram, VRAM_W);
 }
 
 /* kind: 0 temporal pass, 1 stereo eye, 2 netplay local view. */
@@ -9283,7 +9286,7 @@ static void transaction_restore_ex(int keep_color) {
     pass_journal_rollback();
     pass_blit(s_pb_hr_fbo, s_hr_fbo, 0, 0, s_pass_x * S, s_pass_y * S,
               s_pass_w * S, s_pass_h * S, hr_bits);
-    pass_blit(s_pb_raw_fbo, s_raw_fbo, 0, 0, s_pass_x, s_pass_y, s_pass_w,
+    if (!s_async_exec) pass_blit(s_pb_raw_fbo, s_raw_fbo, 0, 0, s_pass_x, s_pass_y, s_pass_w,
               s_pass_h, GL_COLOR_BUFFER_BIT);
     if (s_pb_wide_src && s_pb_wide_src == pass_wide_fbo_for(s_pass_x)) {
         pass_blit(s_pb_wide_fbo, s_pb_wide_src, 0, 0, 0, s_pass_y * S,
@@ -9291,7 +9294,7 @@ static void transaction_restore_ex(int keep_color) {
         /* The backed-up stencil may predate a rebuild inside the pass. */
         wst_add(wide_index(s_pb_wide_src), 0, s_pass_y, g_wide_w, s_pass_y + s_pass_h);
     }
-    for (int row = 0; row < s_pass_h; row++)
+    for (int row = 0; !s_async_exec && row < s_pass_h; row++)
         memcpy(s_vram + (size_t)(s_pass_y + row) * VRAM_W + s_pass_x,
                s_pb_cpu + (size_t)row * s_pass_w,
                (size_t)s_pass_w * sizeof(uint16_t));
