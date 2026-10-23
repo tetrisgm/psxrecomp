@@ -33,7 +33,7 @@ int psx_dctx_bios_call(CPUState *cpu, uint32_t pc) {
         0x03E00008u, 0u, 0x90870000u, 0x00432021u,
         0xA0870000u, 0x1000FFF8u, 0x24630001u
     };
-    if ((pc & 0x1FFFFFFFu) != 0xA0u || cpu->gpr[9] != 0x2Au ||
+    if (pc >= 0xC0000000u || (pc & 0x1FFFFFFFu) != 0xA0u || cpu->gpr[9] != 0x2Au ||
         !words_match(cpu, 0xA0u, vector, 3) ||
         !words_match(cpu, 0x2A80u, dispatch, 8)) return 0;
     const uint32_t target = psx_dctx_lw(cpu, 0x2A8u);
