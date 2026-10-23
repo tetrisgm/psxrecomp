@@ -434,9 +434,9 @@ work, absent-receipt and noise cases pass on Windows and macOS. This is a
 controller correction, not a claim that a particular output rate is sustained.
 ### Presenter capacity
 
-Presenter capacity is bounded by `PSX_PRESENT_BUDGET_MIB` (32–8192 MiB,
+Presenter capacity is bounded by `PSX_PRESENT_BUDGET_MIB` (32-8192 MiB,
 default 2048). Startup reduces the requested slot count to fit conservative
-8-byte-per-pixel color/depth attachments; eight 7680×4320 slots use about
+8-byte-per-pixel color/depth attachments; eight 7680Ã—4320 slots use about
 2025 MiB. Failed allocation or a resize exceeding the budget drains and
 disables the presenter, returning to direct swaps. Normal timed submission
 remains nonblocking; extra capacity does not change timestamp ordering.
