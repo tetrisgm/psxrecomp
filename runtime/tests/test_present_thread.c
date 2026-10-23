@@ -209,6 +209,12 @@ int main(void) {
     run(3, 1500, 1);
     run(2, 800, 1);
     run(4, 300, -1);   /* may or may not wait: invariants only */
+    run(6, 100, -1);
+    run(8, 100, -1);
+    check(pt_budget_slots(8,7680,4320,8,2048ull<<20)==8, "8K eight slots fit 2 GiB");
+    check(pt_budget_slots(8,7680,4320,8,1024ull<<20)==4, "8K clamps to four at 1 GiB");
+    check(pt_budget_slots(8,7680,4320,8,128ull<<20)==0, "insufficient budget refuses");
+    check(pt_budget_slots(8,UINT32_MAX,UINT32_MAX,8,UINT64_MAX)==0, "overflow refused");
     run_timed();
     /* context failure */
     reset();
@@ -219,6 +225,8 @@ int main(void) {
     ctx_ok = 1;
     PtConfig bad = cfg(1);
     check(!pt_start(&bad), "one slot refused");
+    bad = cfg(PT_MAX_SLOTS + 1);
+    check(!pt_start(&bad), "above maximum refused");
     printf("present_thread_test: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -8,6 +8,17 @@
 
 #include <string.h>
 
+int pt_budget_slots(int requested, uint32_t width, uint32_t height,
+                    uint32_t bytes_per_pixel, uint64_t budget_bytes) {
+    if (!width || !height || !bytes_per_pixel) return 0;
+    uint64_t pixels = (uint64_t)width * height;
+    if (pixels > UINT64_MAX / bytes_per_pixel) return 0;
+    uint64_t fit = budget_bytes / (pixels * bytes_per_pixel);
+    if (requested > PT_MAX_SLOTS) requested = PT_MAX_SLOTS;
+    if (requested < 2 || fit < 2) return 0;
+    return fit < (uint64_t)requested ? (int)fit : requested;
+}
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>

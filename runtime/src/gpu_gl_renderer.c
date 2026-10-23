@@ -10518,6 +10518,8 @@ static uint64_t s_swaps_total = 0;   /* every swap, real or generated (diagnosti
 #define PT_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define PT_TIMEOUT_IGNORED 0xFFFFFFFFFFFFFFFFull
 static int           s_pt_slots = 3;
+static uint64_t      s_pt_budget = 2048ull * 1024 * 1024;
+static void pt_end(void);
 static GLenum        s_pt_format = GL_RGBA8;   /* the window's: no alpha -> GL_RGB8 */
 static SDL_GLContext s_pt_ctx = NULL;
 static GLuint        s_pts_tex[PT_MAX_SLOTS], s_pts_rb[PT_MAX_SLOTS], s_pts_fbo[PT_MAX_SLOTS];
@@ -10543,6 +10545,15 @@ static GLuint pt_target_fbo(void) {
     if (ww < 1) ww = 1;
     if (wh < 1) wh = 1;
     if (s_pts_fbo[i] && s_pts_w[i] == ww && s_pts_h[i] == wh) return s_pts_fbo[i];
+    /* Include old-size slots during resize, not just the replacement. */
+    uint64_t bytes = (uint64_t)ww * wh * 8;
+    for (int j = 0; j < PT_MAX_SLOTS; ++j)
+        if (j != i) bytes += (uint64_t)s_pts_w[j] * s_pts_h[j] * 8;
+    if (bytes > s_pt_budget) {
+        fprintf(stderr, "psxrecomp: presenter attachment budget exceeded; direct swaps\n");
+        pt_end();
+        return 0;
+    }
     GLint tex_prev = 0, rb_prev = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex_prev);
     glGetIntegerv(0x8CA7 /* GL_RENDERBUFFER_BINDING */, &rb_prev);
@@ -10561,10 +10572,11 @@ static GLuint pt_target_fbo(void) {
     p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_pts_tex[i], 0);
     p_glFramebufferRenderbuffer(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT,
                                 PSXGL_RENDERBUFFER, s_pts_rb[i]);
-    if (p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER) != PSXGL_FRAMEBUFFER_COMPLETE)
-        fprintf(stdout, "psxrecomp: present thread: slot FBO incomplete\n");
+    const int complete = p_glCheckFramebufferStatus(PSXGL_FRAMEBUFFER) == PSXGL_FRAMEBUFFER_COMPLETE;
+    if (!complete) fprintf(stderr, "psxrecomp: presenter allocation failed; direct swaps\n");
     glBindTexture(GL_TEXTURE_2D, (GLuint)tex_prev);
     p_glBindRenderbuffer(PSXGL_RENDERBUFFER, (GLuint)rb_prev);
+    if (!complete) { pt_end(); return 0; }
     s_pts_w[i] = ww; s_pts_h[i] = wh;
     s_pts_gen[i]++;
     return s_pts_fbo[i];
@@ -10726,6 +10738,17 @@ static int pt_begin(void) {
         if (glGetError() != GL_NO_ERROR) a = 8;
         s_pt_format = a > 0 ? GL_RGBA8 : GL_RGB8;
     }
+    const char *budget_env = getenv("PSX_PRESENT_BUDGET_MIB");
+    unsigned long budget_mib = budget_env ? strtoul(budget_env, NULL, 10) : 2048;
+    if (budget_mib < 32 || budget_mib > 8192) budget_mib = 2048;
+    s_pt_budget = (uint64_t)budget_mib * 1024 * 1024;
+    int ww = 0, wh = 0;
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int slots = pt_budget_slots(s_pt_slots, ww > 0 ? ww : 1, wh > 0 ? wh : 1, 8, s_pt_budget);
+    if (!slots) {
+        fprintf(stderr, "psxrecomp: presenter budget cannot fit two slots; direct swaps\n");
+        return 0;
+    }
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
     s_pt_ctx = SDL_GL_CreateContext(s_win);
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
@@ -10739,7 +10762,7 @@ static int pt_begin(void) {
     SDL_GL_MakeCurrent(s_win, s_ctx);
     memset(s_pts_fbo, 0, sizeof s_pts_fbo);
     memset(s_ptp_fbo, 0, sizeof s_ptp_fbo);
-    PtConfig c = { s_pt_slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL };
+    PtConfig c = { slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL };
     if (!pt_start(&c)) {
         fprintf(stdout, "psxrecomp: present thread: start failed; swaps stay on the render thread\n");
         SDL_GL_DeleteContext(s_pt_ctx);
@@ -10749,7 +10772,7 @@ static int pt_begin(void) {
     }
     s_pt_on = 1;
     pt_set_epoch(atomic_load(&s_pt_epoch));
-    fprintf(stdout, "psxrecomp: present thread on (%d slots)\n", s_pt_slots);
+    fprintf(stdout, "psxrecomp: present thread on (%d slots, %lu MiB budget)\n", slots, budget_mib);
     return 1;
 }
 
@@ -10780,6 +10803,7 @@ static void rthf_gpu_gap(int open);
 static void gl_present_swap(void) {
     if (!s_pt_on) { gl_window_swap(); return; }
     (void)pt_target_fbo();   /* a frame that never bound 0 still has its slot */
+    if (!s_pt_on) { gl_window_swap(); return; }
     void *ready = p_glFenceSync(PT_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
     void *done = NULL;

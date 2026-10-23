@@ -201,7 +201,7 @@ resolution (below), not of this layer.
 ## Present thread (`[video] present_thread`)
 
 Opt-in, under the render thread, off by default (`present_thread = true`;
-`PSX_PRESENT_THREAD=0/1`, `PSX_PRESENT_THREAD_SLOTS=2..4`, default 3). On
+`PSX_PRESENT_THREAD=0/1`, `PSX_PRESENT_THREAD_SLOTS=2..8`, default 3). On
 macOS a swap on the render thread cost 6-9 ms of waiting on the window
 compositor (`[NSOpenGLContext flushBuffer]` on GL-on-Metal) in every frame,
 real or generated; with this it costs a fence and a hand-off.
@@ -431,3 +431,11 @@ diagnostic exposes `output_hz` and `output_valid`. Set
 and over-budget admission rules are unchanged. Synthetic variable-work, flat
 work, absent-receipt and noise cases pass on Windows and macOS. This is a
 controller correction, not a claim that a particular output rate is sustained.
+### Presenter capacity
+
+Presenter capacity is bounded by `PSX_PRESENT_BUDGET_MIB` (32–8192 MiB,
+default 2048). Startup reduces the requested slot count to fit conservative
+8-byte-per-pixel color/depth attachments; eight 7680×4320 slots use about
+2025 MiB. Failed allocation or a resize exceeding the budget drains and
+disables the presenter, returning to direct swaps. Normal timed submission
+remains nonblocking; extra capacity does not change timestamp ordering.

@@ -29,7 +29,11 @@
 extern "C" {
 #endif
 
-#define PT_MAX_SLOTS 4
+#define PT_MAX_SLOTS 8
+
+/* Conservative color+depth attachment budget. Returns 0 if two slots do not fit. */
+int pt_budget_slots(int requested, uint32_t width, uint32_t height,
+                    uint32_t bytes_per_pixel, uint64_t budget_bytes);
 
 /* Present thread: make the present context current (current != 0, return 0 on
  * failure: pt_start then fails) or release it (current == 0). */
