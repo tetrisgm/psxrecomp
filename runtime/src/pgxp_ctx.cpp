@@ -151,12 +151,7 @@ extern "C" void pgxp_ctx_capture_vertex(PgxpCtxEngine *e, uint32_t addr,
     out->raw_valid = e->pgxp_load_precise_word(addr, word,
                                                &out->raw_x16, &out->raw_y16, &out->raw_sz);
     out->unclamped_depth = e->pgxp_get_unclamped_depth(addr, word);
-    const PGXPValue *pv = e->pgxp_ptr(addr);
-    if (pv && pv->gen == e->s_gen && pv->value == word &&
-        (pv->flags & PGXP_F_PROJECTION)) {
-        out->projection_valid = 1;
-        out->projection = pv->projection;
-    }
+    out->projection_valid = e->pgxp_load_projection(addr, word, &out->projection);
 }
 
 extern "C" void pgxp_ctx_load(PgxpCtxEngine *e, CPUState *cpu, uint32_t instr,
