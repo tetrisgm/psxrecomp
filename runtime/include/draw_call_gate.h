@@ -27,7 +27,9 @@ int draw_call_gate_request(DrawCallGate *, void *payload, uint32_t timeout_ms,
                           int *reply);
 /* Owner only, nonblocking if no pending request. Executes one callback on the
  * owner thread. Returns 1 serviced, 0 none, or a negative refusal. Recursive
- * service/close/destroy from the callback is refused. */
+ * service/close/destroy from the callback is refused. Callbacks must return
+ * normally: an escaping longjmp cannot publish completion and is unsupported.
+ * Use a guarded guest-call API that returns a fault to this callback. */
 int draw_call_gate_service(DrawCallGate *, DrawCallServe, void *user);
 /* Owner only. Close refuses new requests and wakes an unclaimed requester.
  * Destroy also waits for that requester to leave before freeing the gate.
