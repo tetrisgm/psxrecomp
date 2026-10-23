@@ -394,6 +394,14 @@ fixture checks canonical/wide depth, clear history and asynchronous restoration
 on Windows and macOS. `PSX_RENDER_PASS_DEPTH_CHECKPOINT=0` disables depth
 restoration for diagnosing comparisons with the previous behavior.
 
+The seam-snap edge index also belongs to the checkpoint. Synthetic draws
+must start from the same ordered edge history, including when an asynchronous
+job replays after main has advanced. Snapshots copy only populated edge/link
+prefixes and the lookup heads; allocation failure refuses the pass. The
+renderer restores drawing-area state before seam/depth history so the later
+GPU register resync cannot erase the restored index. Repeated-full and
+asynchronous seam-gap tests run in the hidden GL capture fixture.
+
 `PSX_RENDER_PASS_QUEUED=0` restores the synchronous handoff and the
 host-time budget above; `PSX_RENDER_PASS_VERIFY=1` implies it, since
 verification reads GL state back.

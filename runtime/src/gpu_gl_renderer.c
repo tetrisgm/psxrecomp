@@ -8372,6 +8372,9 @@ typedef struct AsyncVram {
     uint64_t resource_epoch;
     int depth_need, depth_used, depth_reason;
     float depth_avg;
+    PgxpSnap *snap;
+    int snap_present;
+    int area[4];
 } AsyncVram;
 static AsyncVram s_async_vram[PASS_GENERATIONS],s_async_work;
 static _Atomic uint64_t s_async_resource_epoch=1;
@@ -8442,6 +8445,33 @@ static int      s_pb_force_present = 0, s_pb_last_path = -1;
 static int      s_pb_last_dx = 0, s_pb_last_dy = 0, s_pb_last_dw = 0, s_pb_last_dh = 0;
 static int s_pb_depth_need, s_pb_depth_used, s_pb_depth_reason;
 static float s_pb_depth_avg;
+static PgxpSnap *s_pb_snap;
+static int s_pb_snap_present;
+static int s_pb_area[4];
+/* Copy only live prefixes; the fixed index is several MiB but most frames
+ * use a fraction of it. Counters remain cumulative across discarded draws. */
+static void pass_snap_copy(PgxpSnap *dst, const PgxpSnap *src) {
+    dst->n_edges=src->n_edges; dst->n_links=src->n_links;
+    dst->stamp_gen=src->stamp_gen;
+    memcpy(dst->head,src->head,sizeof src->head);
+    memcpy(dst->links,src->links,(size_t)src->n_links*sizeof src->links[0]);
+    memcpy(dst->edges,src->edges,(size_t)src->n_edges*sizeof src->edges[0]);
+    memcpy(dst->stamp,src->stamp,(size_t)src->n_edges*sizeof src->stamp[0]);
+}
+static int pass_snap_capture(PgxpSnap **dst, int *present, const PgxpSnap *src) {
+    *present=src!=NULL;
+    if(!src) return 1;
+    if(!*dst) *dst=calloc(1,sizeof **dst);
+    if(!*dst) return 0;
+    pass_snap_copy(*dst,src); return 1;
+}
+static void pass_snap_restore(const PgxpSnap *src, int present) {
+    /* A present baseline implies s_snap was allocated before the transaction.
+     * A first allocation inside a pass may stay allocated, but no edges leak. */
+    if(present) pass_snap_copy(s_snap,src);
+    else if(s_snap) pgxp_snap_reset(s_snap);
+    memset(s_snap_e,0,sizeof s_snap_e);
+}
 static GLbitfield pass_depth_bit(void) {
     const char *off = getenv("PSX_RENDER_PASS_DEPTH_CHECKPOINT");
     return off && !strcmp(off, "0") ? 0 : GL_DEPTH_BUFFER_BIT;
@@ -9023,6 +9053,7 @@ static void pass_resources_release(void) {
         pass_free_color_fbo(&e->raw_tex, NULL, &e->raw_fbo, &e->raw_w, &e->raw_h);
     }
     render_pass_journal_free(&s_pj_cpu);
+    free(s_pb_snap); s_pb_snap=NULL; s_pb_snap_present=0;
     s_pb_valid = 0;
 }
 
@@ -9159,6 +9190,10 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         goto backed_up;
     }
     s_pb_valid = 0;
+    if(!pass_snap_capture(&s_pb_snap,&s_pb_snap_present,s_snap))
+        return pass_begin_refuse("backup_seam_index");
+    s_pb_area[0]=s_area_x1; s_pb_area[1]=s_area_y1;
+    s_pb_area[2]=s_area_x2; s_pb_area[3]=s_area_y2;
     /* Back up the rect: hr color + stencil, raw mirror, wide band, CPU rows. */
     s_pass_begin_diag.resource = "backup_hr";
     if (!pass_make_color_fbo(&s_pb_hr_tex, &s_pb_hr_rb, &s_pb_hr_fbo,
@@ -9258,10 +9293,14 @@ static void transaction_restore_ex(int keep_color) {
     s_last_present_path = s_pb_last_path;
     s_last_dx = s_pb_last_dx; s_last_dy = s_pb_last_dy;
     s_last_dw = s_pb_last_dw; s_last_dh = s_pb_last_dh;
+    /* Restore the area before its history: the later GPU register resync
+     * must not interpret rollback as a new surface and erase this baseline. */
+    glb_set_draw_area(s_pb_area[0],s_pb_area[1],s_pb_area[2],s_pb_area[3]);
     if (pass_depth_bit()) {
         s_depth_need_clear = s_pb_depth_need; s_depth_used = s_pb_depth_used;
         s_depth_need_reason = s_pb_depth_reason; s_depth_last_avg = s_pb_depth_avg;
     }
+    pass_snap_restore(s_pb_snap,s_pb_snap_present);
     s_pass_active = 0;
     s_pass_local = 0;
     s_pb_valid = !keep_color;
@@ -9462,7 +9501,7 @@ static void async_vram_free(AsyncVram *v) {
         GLuint rb[2]={v->hr_rb,v->wide_rb};
         glDeleteTextures(3,tex); p_glDeleteFramebuffers(3,fbo); p_glDeleteRenderbuffers(2,rb);
     }
-    free(v->cpu); memset(v,0,sizeof(*v));
+    free(v->cpu); free(v->snap); memset(v,0,sizeof(*v));
 }
 static void async_vram_release(int gi) {
     async_vram_free(&s_async_vram[gi]);
@@ -9493,6 +9532,8 @@ static int async_vram_capture(int gi) {
     v->scale=s_hr_scale; v->resource_epoch=atomic_load(&s_async_resource_epoch);
     v->depth_need=s_pb_depth_need; v->depth_used=s_pb_depth_used;
     v->depth_reason=s_pb_depth_reason; v->depth_avg=s_pb_depth_avg;
+    if(!pass_snap_capture(&v->snap,&v->snap_present,s_pb_snap_present?s_pb_snap:NULL)) return 0;
+    memcpy(v->area,s_pb_area,sizeof v->area);
     return 1;
 }
 static int async_vram_enter(int gi) {
@@ -9512,10 +9553,12 @@ static int async_vram_enter(int gi) {
     s_vram=s_async_work.cpu; s_raw_tex=s_async_work.raw_tex; s_raw_fbo=s_async_work.raw_fbo;
     rth_rebind_vram(s_vram); s_async_vram_bound=1;
     rect_clear(&s_cpu_dirty); rect_clear(&s_pack_dirty); s_gpu_dirty=0; s_up_nrects=0;
+    glb_set_draw_area(v->area[0],v->area[1],v->area[2],v->area[3]);
     if (pass_depth_bit()) {
         s_depth_need_clear=v->depth_need; s_depth_used=v->depth_used;
         s_depth_need_reason=v->depth_reason; s_depth_last_avg=v->depth_avg;
     }
+    pass_snap_restore(v->snap,v->snap_present);
     return 1;
 }
 static void async_vram_leave(void) {
