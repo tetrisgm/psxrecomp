@@ -64,6 +64,12 @@ typedef struct CPUState {
     uint8_t  read_fudge;        /* ReadFudge: last committed load's dest reg, or 0x20 = none */
     uint8_t  ld_which_t;        /* LDWhich (timing): pending load dest reg, 0x20 = none */
     uint32_t ld_absorb;         /* LDAbsorb: pending load's give-back (region+completion) */
+
+    /* The draw context this CPUState belongs to (psx_exec_ctx.h), or NULL for
+     * the main guest context. Only the lean draw clones and the context
+     * runtime read it; the main context's code never does
+     * (docs/THREADED_CONTEXTS.md). Appended at END like the fields above. */
+    struct PsxExecCtx *ctx;
 } CPUState;
 
 /* Overlay DLLs batch per-instruction cycle charges in a DLL-local accumulator.

@@ -708,6 +708,30 @@ int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
     return dirty_ram_text_native_ok_ranges_from(lo_len_pairs, count, 0u);
 }
 
+/* Draw contexts (psx_exec_ctx.c, docs/THREADED_CONTEXTS.md): whether the
+ * compiled image's bytes for these instruction ranges are the bytes a
+ * context's private RAM holds. Exact compare, no page heuristics and no
+ * shared state written, so any thread may call it. The reference image is
+ * written only by the main context (dirty_ram_text_bless), never while a
+ * context runs. */
+int psx_text_ref_ranges_match(const uint8_t *ctx_ram, uint32_t ram_mask,
+                              const uint32_t *lo_len_pairs, uint32_t count) {
+    if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
+        uint32_t len = lo_len_pairs[i * 2u + 1u];
+        if (len == 0 || phys < text_ref_lo || phys >= text_ref_hi ||
+            len > text_ref_hi - phys || (phys & ~ram_mask) ||
+            ((phys + len - 1u) & ~ram_mask))
+            return 0;
+        if (memcmp(ctx_ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+const uint8_t *memory_get_bios_rom_ptr(void) { return bios_rom; }
+
 void dirty_ram_text_exact_mismatch_stats(uint64_t *count,
                                          uint32_t out[5]) {
     if (count) *count = g_text_exact_mismatches;

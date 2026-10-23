@@ -1347,6 +1347,15 @@ void dma_init(void) {
     dma_debug_clear_cdrom_history();
 }
 
+/* Register values without a read's side effects (draw-context snapshots,
+ * psx_exec_ctx.c). */
+void dma_peek_channel(int ch, uint32_t *madr, uint32_t *bcr, uint32_t *chcr) {
+    if (ch < 0 || ch > 6) { *madr = *bcr = *chcr = 0; return; }
+    *madr = channels[ch].madr;
+    *bcr = channels[ch].bcr;
+    *chcr = channels[ch].chcr;
+}
+
 uint32_t dma_read(uint32_t addr) {
     /* DPCR */
     if (addr == 0x1F8010F0u) return dpcr;

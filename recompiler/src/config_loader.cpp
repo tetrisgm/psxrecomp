@@ -2961,6 +2961,27 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     loaded.ws_cull_masked_reject_sites = std::move(ws_cull_masked_reject_sites);
     loaded.draw_distance_clamp_sites =
         parse_draw_distance_clamps(cfg, config_path);
+    if (cfg.contains("threaded_draw")) {
+        const toml::value& td = toml::find(cfg, "threaded_draw");
+        auto words = [&](const char* key, std::vector<uint32_t>& out) {
+            if (!td.contains(key)) return;
+            for (const auto& v : toml::find<toml::array>(td, key)) {
+                const uint32_t a = v.is_string()
+                    ? parse_hex(v.as_string(), fmt::format("threaded_draw.{}", key))
+                    : static_cast<uint32_t>(v.as_integer());
+                if (a & 3u)
+                    throw std::runtime_error(fmt::format(
+                        "{}: threaded_draw.{} 0x{:08X} is not instruction-aligned",
+                        config_path.string(), key, a));
+                out.push_back(a);
+            }
+        };
+        words("roots", loaded.threaded_draw_roots);
+        words("exclude", loaded.threaded_draw_exclude);
+        if (td.contains("max_functions"))
+            loaded.threaded_draw_max_functions =
+                static_cast<uint32_t>(toml::find<int64_t>(td, "max_functions"));
+    }
     loaded.quality_presets = parse_quality_presets(cfg, root, config_path);
     loaded.mod_immediate_sites = parse_mod_immediate_sites(cfg, config_path);
     return loaded;

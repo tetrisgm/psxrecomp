@@ -43,6 +43,16 @@ if(BUILD_TESTING)
     add_executable(debug_socket_shutdown_test tests/test_debug_socket_shutdown.cpp)
     target_include_directories(debug_socket_shutdown_test PRIVATE src)
     find_package(Threads REQUIRED)
+    add_executable(draw_worker_pool_test tests/test_draw_worker_pool.cpp src/draw_worker_pool.cpp)
+    target_include_directories(draw_worker_pool_test PRIVATE include)
+    target_link_libraries(draw_worker_pool_test PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(draw_worker_pool_test PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(draw_worker_pool_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME draw_worker_pool_test COMMAND draw_worker_pool_test)
+    set_tests_properties(draw_worker_pool_test PROPERTIES TIMEOUT 15)
     target_link_libraries(debug_socket_shutdown_test PRIVATE Threads::Threads)
     if(WIN32)
         target_link_libraries(debug_socket_shutdown_test PRIVATE ws2_32)
@@ -921,8 +931,10 @@ if(BUILD_TESTING)
 
     add_executable(gte_register_access_test
         tests/test_gte_register_access.cpp
+        tests/pgxp_test_mod_memory.cpp
         src/gte.cpp
         src/pgxp.cpp
+        src/pgxp_ctx.cpp
         src/psx_ram_geometry.c
     )
     target_include_directories(gte_register_access_test PRIVATE include)
@@ -933,7 +945,9 @@ if(BUILD_TESTING)
     add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
     # Same ABI/result corpus for the native operation entry and the reference.
     add_executable(gte_hle_contract_test
-        tests/test_gte_register_access.cpp src/gte.cpp src/pgxp.cpp src/psx_ram_geometry.c)
+        tests/test_gte_register_access.cpp tests/pgxp_test_mod_memory.cpp
+        src/gte.cpp src/pgxp.cpp src/pgxp_ctx.cpp
+        src/psx_ram_geometry.c)
     target_include_directories(gte_hle_contract_test PRIVATE include)
     target_compile_definitions(gte_hle_contract_test PRIVATE
         PSX_NO_DEBUG_TOOLS=1 PSX_GTE_REGISTER_TEST=1 PSX_ENABLE_BLOCK_CYCLES=1)

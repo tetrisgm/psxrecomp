@@ -466,6 +466,11 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
     ${PSXRECOMP_ROOT}/runtime/src/projection_scale_config.cpp
     ${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/pgxp_ctx.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/psx_exec_ctx.c
+    ${PSXRECOMP_ROOT}/runtime/src/draw_worker_pool.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/psx_dctx_bios.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_exec_ctx_bench.c
     ${PSXRECOMP_ROOT}/runtime/src/pgxp_session.cpp
     ${PSXRECOMP_ROOT}/runtime/src/nd_intro_ot.c
     ${PSXRECOMP_ROOT}/runtime/src/crc32.c
@@ -1600,6 +1605,15 @@ function(psxrecomp_add_runtime_target target)
         set_source_files_properties("${PSXRT_GAME_GENERATED_DISPATCH_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_GENERATED_DISPATCH_C}")
         list(APPEND _game_generated_check "${PSXRT_GAME_GENERATED_DISPATCH_C}")
+        # Lean draw-context clones (docs/THREADED_CONTEXTS.md): emitted beside
+        # the dispatch table by every current generate. Older generated trees
+        # have none and build without draw contexts.
+        string(REGEX REPLACE "_dispatch[.]c$" "_draw.c" _psxrt_draw_c
+            "${PSXRT_GAME_GENERATED_DISPATCH_C}")
+        if(EXISTS "${_psxrt_draw_c}")
+            set_source_files_properties("${_psxrt_draw_c}" PROPERTIES GENERATED TRUE)
+            list(APPEND generated_sources "${_psxrt_draw_c}")
+        endif()
         set(has_game_dispatch TRUE)
         if(EXISTS "${PSXRT_GAME_GENERATED_DISPATCH_C}")
             file(STRINGS "${PSXRT_GAME_GENERATED_DISPATCH_C}"
@@ -1662,6 +1676,7 @@ function(psxrecomp_add_runtime_target target)
     set(_execution_contract
         "${PSXRECOMP_ROOT}/runtime/src/gte.cpp"
         "${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp"
+        "${PSXRECOMP_ROOT}/runtime/src/pgxp_engine.inc"
         "${PSXRECOMP_ROOT}/runtime/include/hle_gte.h"
         "${PSXRECOMP_ROOT}/runtime/include/cpu_state.h"
         "${PSXRECOMP_ROOT}/runtime/include/gte.h"
