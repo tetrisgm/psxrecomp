@@ -8447,7 +8447,7 @@ int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *pro
         } else {
             unsigned op = input.word >> 24;
             if (gp0_state == GP0_IDLE &&
-                (!gp0_command_word_count(op) || op == 0x1F || (op >= 0xC0 && op <= 0xDF))) {
+                (!gp0_command_word_count(op) || op == 0x1F || (op >= 0xA0 && op <= 0xDF))) {
                 s_replay_fault = 1; break;
             }
             s_replay_next_vertex = input.vertex;

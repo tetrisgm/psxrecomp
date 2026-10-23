@@ -65,6 +65,7 @@ int main(void) {
     /* Actual queued generation reservation/admission at a noninteger rate. */
     s_interp_valid=1; s_interp_w=320; s_interp_h=240; s_interp_source_path=GL_PRES_VRAM;
     s_interp_source=1; s_interp_source_hz=60; s_interp_target_hz=100;
+    gr_fill_rect(384,0,16,16,0x1F); /* red texture at snapshot time */
     rt_release();
     GLRenderAsyncToken tokens[8];
     now=pt_clock_ns();
@@ -72,21 +73,40 @@ int main(void) {
                                                 0,0,320,240,tokens,8);
     check(count>=3 && count<=4,"100Hz asynchronous outputs over 30Hz window");
     if (count>1) {
+        gr_fill_rect(384,0,16,16,0x3E0); /* live texture changes before worker returns */
         check(gl_renderer_pass_async_begin(&tokens[1]),"begin reserved generation");
         gr_set_draw_area(0,0,319,239);
-        gr_fill_rect(0,0,16,16,0x1F);
+        gr_set_color_modulation(128,128,128,1);
+        gr_draw_textured_rect(0,0,16,16,0,0,0,0,0x106);
         check(gl_renderer_pass_async_end(&tokens[1],1),"publish whole async transaction");
         check(!gl_renderer_pass_async_begin(&tokens[1]),"duplicate completion rejected");
         GLRenderAsyncToken stale=tokens[2]; stale.output.epoch++;
         check(!gl_renderer_pass_async_begin(&stale),"old epoch rejected before recording");
         check(gl_renderer_pass_async_begin(&tokens[2]),"second completed output accepted");
-        gr_fill_rect(0,0,16,16,0x3E0);
+        gr_set_color_modulation(128,128,128,1);
+        gr_draw_textured_rect(0,0,16,16,0,0,0,0,0x106);
         check(gl_renderer_pass_async_end(&tokens[2],1),"second output transaction committed");
         gl_renderer_render_thread_sync("check async capture");
         int found=0;
         for(int i=0;i<PASS_GENERATIONS;++i)
             if(s_pgen[i].async_id==tokens[1].output.generation && s_pgen[i].n==2) found++;
         check(found==1,"completed output appended to original generation");
+        unsigned char *pixels=malloc(320u*240u*4u);
+        int red=0;
+        for(int i=0;i<PASS_GENERATIONS;++i) if(s_pgen[i].async_id==tokens[1].output.generation) {
+            glBindTexture(GL_TEXTURE_2D,s_pgen_tex[i][1]);
+            glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+            for(unsigned k=0;k<320u*240u;++k)
+                if(pixels[4*k]>200 && pixels[4*k+1]<20) red++;
+        }
+        free(pixels);
+        check(red>=200,"worker sampled immutable red texture after live texture became green");
+        pack_flush();
+        uint16_t *raw=malloc(VRAM_W*VRAM_H*sizeof(uint16_t));
+        glBindTexture(GL_TEXTURE_2D,s_raw_tex);
+        glGetTexImage(GL_TEXTURE_2D,0,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,raw);
+        check((raw[384]&0x7FFF)==0x3E0,"live green texture restored after worker transaction");
+        free(raw);
         check(glGetError()==GL_NO_ERROR,"async GPU transaction clean");
         pt_drain(); pt_get_stats(&st);
         check(st.presents>=3,"phase0 and completed draw consumed by presenter");
