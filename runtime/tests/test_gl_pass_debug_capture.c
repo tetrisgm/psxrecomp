@@ -15,6 +15,13 @@ static float test_depth_read(GLuint fbo) {
     glReadPixels(4,4,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&value);
     return value;
 }
+static int test_snap_triangle(int lower, float gap[3]) {
+    int32_t ix[3]={0,40,lower?40:0}, iy[3]={lower?20:10,20,lower?30:20};
+    int32_t fx[3]={0,40*65536,lower?40*65536:0};
+    int32_t fy[3]={lower?1323827:10*65536,lower?1323827:1284506,lower?30*65536:1284506};
+    float z[3]={1000,1000,1000}; uint32_t keys[3]={0};
+    return pgxp_snap_triangle(s_snap,ix,iy,fx,fy,z,keys,gap);
+}
 int main(void) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return 77;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -71,7 +78,11 @@ int main(void) {
     s_interp_w=426*s_hr_scale; s_interp_h=240*s_hr_scale;
     test_depth_clear(s_hr_fbo,0.25); test_depth_clear(pass_wide_fbo_for(0),0.375);
     s_depth_need_clear=0; s_depth_used=1; s_depth_need_reason=DCLR_THRESHOLD; s_depth_last_avg=123;
+    s_snap=calloc(1,sizeof *s_snap); pgxp_snap_reset(s_snap);
+    float ignored[3], first_gap[3], repeated_gap[3];
+    test_snap_triangle(0,ignored);
     check(transaction_begin(0,0,320,240,1,2,0,0),"depth checkpoint begins");
+    int first_snap=test_snap_triangle(1,first_gap);
     test_depth_clear(s_hr_fbo,0.75); test_depth_clear(pass_wide_fbo_for(0),0.875);
     s_depth_need_clear=1; s_depth_used=0; s_depth_need_reason=DCLR_FILL; s_depth_last_avg=987;
     transaction_restore();
@@ -79,13 +90,24 @@ int main(void) {
     check(fabsf(test_depth_read(pass_wide_fbo_for(0))-0.375f)<0.00001f,"wide depth restored");
     check(!s_depth_need_clear && s_depth_used && s_depth_need_reason==DCLR_THRESHOLD &&
           s_depth_last_avg==123,"depth clear history restored");
+    check(first_snap>0 && test_snap_triangle(1,repeated_gap)==first_snap &&
+          !memcmp(first_gap,repeated_gap,sizeof first_gap),"repeated full draw has identical seam gaps");
+    /* Restore baseline before the next transaction, then force an area change
+     * inside it to exercise the GPU register-resync reset ordering. */
+    pgxp_snap_reset(s_snap); test_snap_triangle(0,ignored);
     check(transaction_begin(0,0,320,240,0,2,1,0),"depth backup reused");
     check(async_vram_capture(s_pgen_write),"immutable async depth captured");
     test_depth_clear(s_hr_fbo,0.75); s_depth_last_avg=987;
     check(async_vram_enter(s_pgen_write),"immutable async depth entered");
     check(fabsf(test_depth_read(s_hr_fbo)-0.25f)<0.00001f && s_depth_last_avg==123,
           "async job begins with captured depth and history");
+    check(test_snap_triangle(1,repeated_gap)==first_snap &&
+          !memcmp(first_gap,repeated_gap,sizeof first_gap),"async seam gaps match original baseline");
+    glb_set_draw_area(7,8,99,100);
     async_vram_leave(); transaction_restore();
+    glb_set_draw_area(s_pb_area[0],s_pb_area[1],s_pb_area[2],s_pb_area[3]);
+    check(test_snap_triangle(1,repeated_gap)==first_snap &&
+          !memcmp(first_gap,repeated_gap,sizeof first_gap),"register resync preserves restored seam history");
     check(glGetError()==GL_NO_ERROR,"capture leaves clean GL state");
     gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
     printf("checks=%d failures=%d\n",checks,failures);
