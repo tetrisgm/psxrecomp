@@ -148,9 +148,13 @@ int main(void) {
         s_pgen_cur=i; s_pgen[i].promoted=1; s_pgen[i].t_len=1.0;
         check(!pass_gen_present_at(0.5,1),"timed generation cannot leak into legacy flip presentation");
     }
+    // No fresh reservation during this gap: ownership must not revert to a
+    // newer live frame before delayed worker output resumes.
+    while(pt_clock_ns()<next_tokens[next_count-1].output.expires+1000000u) SDL_Delay(1);
+    check(async_display_active(),"expired output window still holds timed-session ownership");
     uint64_t old_epoch=gl_renderer_present_epoch();
     gl_renderer_pass_async_invalidate();
-    check(gl_renderer_present_epoch()!=old_epoch && !gl_renderer_pass_async_begin(&tokens[1]),
+    check(gl_renderer_present_epoch()!=old_epoch && !async_display_active() && !gl_renderer_pass_async_begin(&tokens[1]),
           "discontinuity retires outstanding tokens without GL acquisition");
     gl_renderer_shutdown();
     SDL_DestroyWindow(win);

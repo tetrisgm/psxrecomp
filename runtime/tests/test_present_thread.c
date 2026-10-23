@@ -138,6 +138,21 @@ static void run_timed(void) {
     pt_stop();
 
     reset();
+    check(pt_start(&c), "timestamp-order presenter starts");
+    pt_set_epoch(5);
+    begin=pt_clock_ns();
+    t=(PtTiming){5,begin+40000000u,begin+1000000000u};
+    check(pt_try_submit_at((void *)32,&t,&done)>=0,"future base queued first");
+    t.not_before_ns=begin+20000000u;
+    check(pt_try_submit_at((void *)31,&t,&done)>=0,"earlier worker arrives after future base");
+    pt_drain();
+    check(atomic_load(&n_presented)==2 && presented[0]==31 && presented[1]==32,
+          "presentation follows timestamps rather than worker completion order");
+    pt_get_stats(&st);
+    check(!st.waits && !st.timed_dropped,"reordering neither waits producer nor expires earlier image");
+    pt_stop();
+
+    reset();
     c.slots = 2;
     check(pt_start(&c), "bounded timed presenter starts");
     pt_set_epoch(2);

@@ -277,7 +277,18 @@ int pt_try_submit_at(void *ready, const PtTiming *timing, void **next_done) {
     P.timing[cur] = *timing;
     P.ready[cur] = ready;
     P.state[cur] = S_QUEUED;
-    P.queue[(P.q_head + P.q_len) % PT_MAX_SLOTS] = cur;
+    /* Reservations can publish a future base image before an earlier
+     * worker finishes. Keep timed outputs in timestamp order, without moving
+     * them across legacy untimed submissions or another session's epoch. */
+    int insert=P.q_len;
+    while (insert>0) {
+        const int prior=P.queue[(P.q_head+insert-1)%PT_MAX_SLOTS];
+        if (P.timing[prior].epoch!=timing->epoch ||
+            P.timing[prior].not_before_ns<=timing->not_before_ns) break;
+        P.queue[(P.q_head+insert)%PT_MAX_SLOTS]=prior;
+        --insert;
+    }
+    P.queue[(P.q_head+insert)%PT_MAX_SLOTS]=cur;
     P.q_len++;
     P.st.submits++;
     if (P.q_len > P.st.queued_high) P.st.queued_high = P.q_len;
