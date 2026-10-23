@@ -1394,12 +1394,20 @@ uint32_t render_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t end,
 }
 int render_pass_async_admit(const RenderPassAsyncToken *token,
     const GpuReplayState *state,const GpuReplayProvider *provider) {
-    if (!passes_allowed() || g_psx_render_pass_active || !state || !provider) return 0;
+    s_stats.async_attempts++;
+    if (!passes_allowed() || g_psx_render_pass_active || !state || !provider) {
+        s_stats.async_status_refused++; return 0;
+    }
     if (!gl_renderer_pass_async_begin(token)) return 0;
-    if (!gpu_pass_checkpoint_save()) { gl_renderer_pass_async_end(token,0); return 0; }
+    if (!gpu_pass_checkpoint_save()) {
+        s_stats.async_checkpoint_refused++; gl_renderer_pass_async_end(token,0); return 0;
+    }
     g_psx_render_pass_active = 1;
     int ok = gpu_replay_execute(state,provider);
+    if (!ok) { s_stats.async_replay_refused++; s_stats.async_last_replay_error=gpu_replay_last_error(); }
     gpu_pass_checkpoint_restore();
     g_psx_render_pass_active = 0;
-    return gl_renderer_pass_async_end(token,ok);
+    int admitted=gl_renderer_pass_async_end(token,ok);
+    if(admitted) s_stats.async_admitted++;
+    return admitted;
 }

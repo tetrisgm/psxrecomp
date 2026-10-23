@@ -89,6 +89,16 @@ uint32_t gl_renderer_pass_async_reserve(uint32_t period, uint64_t window_begin,
     GLRenderAsyncToken *tokens,uint32_t max);
 int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token);
 int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep);
+/* Lifetime counters, sampled without GL acquisition or queue waits. */
+typedef struct GLRenderAsyncStats {
+    uint64_t unavailable, stale, late, duplicate, ring_full;
+    uint64_t render_stale, render_late, resource, unsupported, capture;
+    uint64_t submitted, presented_to_queue;
+} GLRenderAsyncStats;
+void gl_renderer_pass_async_stats(GLRenderAsyncStats *out);
+/* Main-thread discontinuity: cancel queued timed images and all outstanding
+ * tokens immediately, without acquiring GL or waiting for workers. */
+void gl_renderer_pass_async_invalidate(void);
 int gl_renderer_pass_queued(void);
 /* Queued-pass counters: plans shed while the render thread was two frames
  * behind, begins the render thread refused, and out-of-rect writes. */

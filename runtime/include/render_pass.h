@@ -48,6 +48,8 @@ typedef struct RenderPassFailure {
 } RenderPassFailure;
 
 typedef struct RenderPassStats {
+    uint64_t async_attempts, async_admitted, async_status_refused, async_checkpoint_refused, async_replay_refused;
+    int async_last_replay_error;
     uint64_t plans;           /* psx_mod_render_pass_plan calls that planned >= 1 */
     uint64_t planned;         /* phases planned (after shedding) */
     uint64_t wanted;          /* phases wanted before shedding */

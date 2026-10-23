@@ -8955,7 +8955,7 @@ static void handle_render_pass_stats(int id, const char *json)
     uint64_t gd[10], image_bytes = 0;
     uint32_t image_textures;
     char failure_json[2048];
-    char admission_json[768];
+    char admission_json[768], async_json[1024];
     char abort_detail_json[sizeof st.last_abort_detail * 6 + 1];
     DirtyRamSpanFailure sf;
     render_pass_get_stats(&st);
@@ -9003,6 +9003,9 @@ static void handle_render_pass_stats(int id, const char *json)
              admission.idle_ms, admission.present_ms, admission.prior_pass_ms,
              admission.present_reserve_ms, admission.spare_ms, admission.frame_ms,
              admission.cost_ms, admission.budget_ms, admission.wanted, admission.planned);
+    GLRenderAsyncStats ast; gl_renderer_pass_async_stats(&ast);
+    snprintf(async_json,sizeof async_json,"{\"attempts\":%llu,\"admitted\":%llu,\"status_refused\":%llu,\"checkpoint_refused\":%llu,\"replay_refused\":%llu,\"unavailable\":%llu,\"stale\":%llu,\"late\":%llu,\"duplicate\":%llu,\"ring_full\":%llu,\"render_stale\":%llu,\"render_late\":%llu,\"resource\":%llu,\"unsupported\":%llu,\"capture\":%llu,\"submitted\":%llu,\"presented_to_queue\":%llu,\"last_replay_error\":%d}",
+             (unsigned long long)st.async_attempts,(unsigned long long)st.async_admitted,(unsigned long long)st.async_status_refused,(unsigned long long)st.async_checkpoint_refused,(unsigned long long)st.async_replay_refused,(unsigned long long)ast.unavailable,(unsigned long long)ast.stale,(unsigned long long)ast.late,(unsigned long long)ast.duplicate,(unsigned long long)ast.ring_full,(unsigned long long)ast.render_stale,(unsigned long long)ast.render_late,(unsigned long long)ast.resource,(unsigned long long)ast.unsupported,(unsigned long long)ast.capture,(unsigned long long)ast.submitted,(unsigned long long)ast.presented_to_queue,st.async_last_replay_error);
     image_textures = gl_renderer_pass_image_textures(&image_bytes);
     send_fmt("{\"id\":%d,\"ok\":true,\"plans\":%llu,\"planned\":%llu,"
              "\"wanted\":%llu,\"refused\":%llu,\"passes\":%llu,"
@@ -9031,7 +9034,7 @@ static void handle_render_pass_stats(int id, const char *json)
              "\"queued\":{\"active\":%d,\"budget_shed\":%llu,\"rests\":%llu,"
              "\"cost_ms\":%.3f,\"backlog_shed\":%llu,\"begin_refused\":%llu,"
              "\"leaks\":%llu},"
-             "\"admission\":%s,\"last_failure\":%s,\"last_abort_detail\":\"%s\","
+             "\"async\":%s,\"admission\":%s,\"last_failure\":%s,\"last_abort_detail\":\"%s\","
              "\"span_fail\":{\"reason\":%u,\"pc\":\"0x%08X\",\"start\":\"0x%08X\","
              "\"stop\":\"0x%08X\",\"ra\":\"0x%08X\",\"after\":\"0x%08X\","
              "\"insns\":%llu}}",
@@ -9073,7 +9076,7 @@ static void handle_render_pass_stats(int id, const char *json)
              (unsigned long long)st.queued_rests, st.queued_cost_ms,
              (unsigned long long)q_backlog, (unsigned long long)q_refused,
              (unsigned long long)q_leaks,
-             admission_json, failure_json, abort_detail_json,
+             async_json, admission_json, failure_json, abort_detail_json,
              (unsigned)sf.reason, (unsigned)sf.pc, (unsigned)sf.start_pc,
              (unsigned)sf.stop_pc, (unsigned)sf.ra, (unsigned)sf.after,
              (unsigned long long)sf.insns);

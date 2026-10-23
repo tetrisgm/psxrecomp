@@ -109,9 +109,17 @@ int main(void) {
         free(raw);
         check(glGetError()==GL_NO_ERROR,"async GPU transaction clean");
         pt_drain(); pt_get_stats(&st);
-        check(st.presents>=3,"phase0 and completed draw consumed by presenter");
+        check(st.submits>=4 && st.presents+st.timed_dropped==st.submits,
+              "phase0 and worker submissions presented or explicitly expired");
         check(pt_clock_ns()>=tokens[1].output.deadline,"async output honored its own timestamp");
     }
+    GLRenderAsyncStats async_stats; gl_renderer_pass_async_stats(&async_stats);
+    check(async_stats.duplicate==1 && async_stats.stale==1 && async_stats.submitted==2,
+          "async diagnostics distinguish duplicate, epoch and successful admission");
+    uint64_t old_epoch=gl_renderer_present_epoch();
+    gl_renderer_pass_async_invalidate();
+    check(gl_renderer_present_epoch()!=old_epoch && !gl_renderer_pass_async_begin(&tokens[1]),
+          "discontinuity retires outstanding tokens without GL acquisition");
     gl_renderer_shutdown();
     SDL_DestroyWindow(win);
     SDL_Quit();

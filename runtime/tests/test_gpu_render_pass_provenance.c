@@ -376,6 +376,10 @@ static void test_immutable_replay(void) {
     assert(gpu_pass_checkpoint_save()); replay_metadata_ok = 1;
     replay_word.word = 0xF0000000;
     assert(!gpu_replay_execute(capture, &p)); gpu_pass_checkpoint_restore();
+    assert(gpu_replay_last_error()==GPU_REPLAY_UNSUPPORTED);
+    assert(gpu_pass_checkpoint_save()); replay_word.word = 0xA0000000;
+    assert(!gpu_replay_execute(capture,&p));
+    assert(gpu_replay_last_error()==GPU_REPLAY_UNSUPPORTED); gpu_pass_checkpoint_restore();
     assert(gpu_pass_checkpoint_save()); replay_word.word = 0x20000000;
     assert(!gpu_replay_execute(capture, &p)); gpu_pass_checkpoint_restore();
     assert(gpu_pass_checkpoint_save()); replay_word.word = 0;

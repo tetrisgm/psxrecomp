@@ -51,6 +51,11 @@ void gpu_replay_release(GpuReplayState *state);
  * output goes through the ordinary renderer queue. Return 0 => discard the
  * enclosing transaction. Never reruns guest code or reads live RAM/PGXP.
  * Configuration/session generation validation belongs to caller admission. */
+/* Last main-thread replay refusal; latched until the next execute. */
+enum { GPU_REPLAY_OK, GPU_REPLAY_ARGUMENT, GPU_REPLAY_MEMORY,
+       GPU_REPLAY_PRECISION, GPU_REPLAY_SNAPSHOT, GPU_REPLAY_METADATA,
+       GPU_REPLAY_WORD, GPU_REPLAY_UNSUPPORTED, GPU_REPLAY_INCOMPLETE };
+int gpu_replay_last_error(void);
 int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *provider);
 #ifdef __cplusplus
 }
