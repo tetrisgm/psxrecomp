@@ -1,8 +1,19 @@
 /* Real hidden-GL verification of timed slot handoff and reset cancellation.
  * Reuse the source-owned render-thread fixture's backend and host services. */
+static void timed_pixel_probe(int slot);
+#define GL_PRESENT_THREAD_TEST_HOOK timed_pixel_probe
 #define main render_thread_fixture_main
 #include "test_gl_render_thread.c"
 #undef main
+
+static unsigned timed_red_pixels;
+static void timed_pixel_probe(int slot) {
+    (void)slot;
+    unsigned char pixels[320*240*4];
+    glReadPixels(0,0,320,240,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    for(unsigned i=0;i<320*240;i++)
+        if(pixels[i*4]>200 && pixels[i*4+1]<20) ++timed_red_pixels;
+}
 
 void host_sampler_retarget_current(const char *thread) { (void)thread; }
 
@@ -152,6 +163,26 @@ int main(void) {
     // newer live frame before delayed worker output resumes.
     while(pt_clock_ns()<next_tokens[next_count-1].output.expires+1000000u) SDL_Delay(1);
     check(async_display_active(),"expired output window still holds timed-session ownership");
+    // Presentation must establish its own raster state after a guest draw.
+    GLuint solid=make_tex(GL_RGBA8,320,240,GL_RGBA,GL_UNSIGNED_BYTE);
+    unsigned char solid_pixels[320*240*4];
+    for(unsigned i=0;i<320*240;++i) {
+        solid_pixels[4*i]=255; solid_pixels[4*i+1]=solid_pixels[4*i+2]=0; solid_pixels[4*i+3]=255;
+    }
+    glBindTexture(GL_TEXTURE_2D,solid);
+    glTexSubImage2D(GL_TEXTURE_2D,0,0,0,320,240,GL_RGBA,GL_UNSIGNED_BYTE,solid_pixels);
+    unsigned red_before=timed_red_pixels;
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_NEVER);
+    glEnable(GL_STENCIL_TEST); glStencilFunc(GL_NEVER,0,0xff);
+    glEnable(GL_BLEND); glBlendFunc(GL_ZERO,GL_ONE);
+    glColorMask(GL_FALSE,GL_FALSE,GL_FALSE,GL_FALSE);
+    uint64_t immediate=pt_clock_ns();
+    PtTiming color_time={gl_renderer_present_epoch(),immediate,immediate+1000000000u};
+    check(gl_renderer_set_present_timing(&color_time) && interp_present_pair(solid,solid,0,0),
+          "compose timed image after hostile guest raster state");
+    pt_drain();
+    check(timed_red_pixels-red_before>70000,"presenter actually receives the composed red image");
+    glDeleteTextures(1,&solid);
     uint64_t old_epoch=gl_renderer_present_epoch();
     gl_renderer_pass_async_invalidate();
     check(gl_renderer_present_epoch()!=old_epoch && !async_display_active() && !gl_renderer_pass_async_begin(&tokens[1]),
