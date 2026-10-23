@@ -166,6 +166,23 @@ bool emit_draw_ctx(const GameDispatchUnit& unit,
         }
     }
 
+    // An indirect jump can enter any registered wrapper of a selected shared
+    // alias body. The body does not reference those wrappers, so ordinary
+    // forward call closure cannot discover them.
+    std::map<size_t, std::set<std::string>> alias_entries;
+    for (size_t i = 0; i < funcs.size(); ++i) {
+        const auto& name = funcs[i].function_name;
+        if (name.rfind("func_", 0) != 0 ||
+            !unit.dispatch_addrs.count(name_addr(name))) continue;
+        std::set<std::string> refs;
+        symbol_refs(strip_comments(funcs[i].full_code), refs);
+        for (const auto& ref : refs) {
+            if (ref.rfind("psx_alias_body_", 0) != 0) continue;
+            auto def = defines.find(ref);
+            if (def != defines.end()) alias_entries[def->second].insert(name);
+        }
+    }
+
     auto owner_of = [&](uint32_t pc, uint32_t* owner) {
         if (unit.dispatch_addrs.count(pc)) { *owner = pc; return true; }
         auto it = conts.find(pc);
@@ -202,6 +219,11 @@ bool emit_draw_ctx(const GameDispatchUnit& unit,
     while (!work.empty()) {
         const size_t idx = work.front();
         work.pop_front();
+        for (const auto& entry : alias_entries[idx]) {
+            const uint32_t address = name_addr(entry);
+            if (excluded.count(address)) excluded_hits.insert(address);
+            else add(entry);
+        }
         const std::string code = strip_comments(funcs[idx].full_code);
         std::set<std::string> refs;
         symbol_refs(code, refs);
