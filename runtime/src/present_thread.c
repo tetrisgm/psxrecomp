@@ -89,6 +89,7 @@ static struct {
     int      q_head, q_len;
     int      current;
     PtStats  st;
+    uint64_t last_present_ns;
 } P;
 static int s_pt_inited = 0;
 
@@ -119,13 +120,20 @@ static void *present_loop(void) {
         mtx_unlock(&P.mtx);
         const uint64_t t0 = now_ns();
         void *done = drop ? ready : P.cfg.present(P.cfg.user, slot, ready);
-        const uint64_t dt = now_ns() - t0;
+        const uint64_t finished = now_ns();
+        const uint64_t dt = finished - t0;
         mtx_lock(&P.mtx);
         if (drop) P.st.timed_dropped++;
         else {
             P.st.presents++;
             P.st.present_ns += dt;
             if (dt > P.st.present_max_ns) P.st.present_max_ns = dt;
+            if (P.last_present_ns) {
+                const uint64_t gap = finished - P.last_present_ns;
+                if (gap > P.st.present_gap_max_ns) P.st.present_gap_max_ns = gap;
+                if (gap > 25000000ull) P.st.present_gaps_over_25ms++;
+            }
+            P.last_present_ns = finished;
         }
         P.done[slot] = done;
         P.state[slot] = S_FREE;
@@ -164,6 +172,7 @@ int pt_start(const PtConfig *cfg) {
     P.current = 0;
     P.state[0] = S_COMPOSING;
     memset(&P.st, 0, sizeof P.st);
+    P.last_present_ns = 0;
     P.st.slots = cfg->slots;
     mtx_unlock(&P.mtx);
     int ok;

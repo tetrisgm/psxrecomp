@@ -95,6 +95,7 @@ void pt_drain(void);
 
 typedef struct PtStats {
     uint64_t submits, presents, waits, wait_ns, present_ns, present_max_ns;
+    uint64_t present_gap_max_ns, present_gaps_over_25ms;
     uint64_t timed_dropped, timed_refused;
     int      slots, queued_high;
 } PtStats;

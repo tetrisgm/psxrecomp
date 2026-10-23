@@ -10841,12 +10841,14 @@ int gl_renderer_present_thread_json(char *out, size_t cap) {
     return snprintf(out, cap,
         "\"present_thread\":{\"active\":%d,\"slots\":%d,\"submits\":%llu,\"presents\":%llu,"
         "\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
-        "\"queued_high\":%d,\"timed_dropped\":%llu,\"timed_refused\":%llu}",
+        "\"queued_high\":%d,\"timed_dropped\":%llu,\"timed_refused\":%llu,"
+        "\"gap_ms_max\":%.3f,\"gaps_over_25ms\":%llu}",
         s_pt_on, st.slots, (unsigned long long)st.submits, (unsigned long long)st.presents,
         (unsigned long long)st.waits, st.wait_ns / 1e6,
         st.presents ? (double)st.present_ns / (double)st.presents / 1e6 : 0.0,
         st.present_max_ns / 1e6, st.queued_high,
-        (unsigned long long)st.timed_dropped, (unsigned long long)st.timed_refused);
+        (unsigned long long)st.timed_dropped, (unsigned long long)st.timed_refused,
+        st.present_gap_max_ns / 1e6, (unsigned long long)st.present_gaps_over_25ms);
 }
 static void gl_swap_now(int generated);
 static int  fg_keep_real(void);      /* frame generation */
