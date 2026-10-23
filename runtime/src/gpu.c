@@ -86,6 +86,22 @@ static int      gp0_words_needed;
 static uint32_t gp0_next_source_addr = 0xFFFFFFFFu;
 static uint32_t gp0_cmd_source_addr  = 0xFFFFFFFFu;
 static uint16_t gp0_ot_rank = 0xFFFFu;
+#ifndef PSX_NO_DEBUG_TOOLS
+static GpuCommandTap s_command_tap;
+static void *s_command_tap_user;
+static int s_command_tap_active;
+void gpu_set_command_tap(GpuCommandTap tap, void *user) {
+    s_command_tap = tap;
+    s_command_tap_user = user;
+}
+static void gpu_tap_command(uint32_t word, uint32_t source) {
+    if (s_command_tap && !s_command_tap_active) {
+        s_command_tap_active = 1;
+        s_command_tap(word, source, s_command_tap_user);
+        s_command_tap_active = 0;
+    }
+}
+#endif
 
 /* ---- Widescreen proportion correction --------------------------------------
  * Active only when [video] aspect_ratio != 4:3 AND the game's [widescreen]
@@ -7722,6 +7738,9 @@ static void gpu_write_gp0_body(uint32_t val) {
  * own phase so it is separable from the guest code that issued the write.
  * Covers both the MMIO store chokepoint and DMA channel-2 feeds. */
 void gpu_write_gp0(uint32_t val) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    gpu_tap_command(val, gp0_next_source_addr);
+#endif
     extern int g_exec_phase;
     int prev_phase = g_exec_phase;
     g_exec_phase = 4;
@@ -7873,6 +7892,9 @@ static void gp1_get_info(uint32_t val) {
 }
 
 void gpu_write_gp1(uint32_t val) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    gpu_tap_command(val, UINT32_MAX - 1u);
+#endif
     uint32_t cmd = (val >> 24) & 0x3F;
 
     switch (cmd) {
