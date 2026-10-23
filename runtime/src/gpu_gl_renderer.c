@@ -9245,6 +9245,23 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
     s_pass_dead = 0;
     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
 }
+#define ASYNC_COUNTERS(X) X(unavailable) X(stale) X(late) X(duplicate) X(ring_full) \
+    X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue)
+#define ASYNC_DECLARE(n) static _Atomic uint64_t s_async_count_##n;
+ASYNC_COUNTERS(ASYNC_DECLARE)
+#undef ASYNC_DECLARE
+#define ASYNC_COUNT(n) atomic_fetch_add(&s_async_count_##n,1)
+void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
+    if (!out) return;
+#define ASYNC_LOAD(n) out->n=atomic_load(&s_async_count_##n);
+    ASYNC_COUNTERS(ASYNC_LOAD)
+#undef ASYNC_LOAD
+}
+void gl_renderer_pass_async_invalidate(void) {
+    uint64_t epoch=atomic_fetch_add(&s_pt_epoch,1)+1;
+    if(!epoch) { epoch=1; atomic_store(&s_pt_epoch,epoch); }
+    pt_set_epoch(epoch);
+}
 static int async_record(uint16_t op,const GLRenderAsyncToken *token) {
     void *p=rt_cmd_begin(op,0,sizeof(*token));
     if (!p) return 0;
@@ -9271,20 +9288,29 @@ uint32_t gl_renderer_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t 
     base.output.expires=end; /* reserve carries the entire display window */
     base.output.alpha_q16=0;
     if (!async_record(RTH_ASYNC_RESERVE,&base) || !rt_batch_try_commit()) {
-        rt_batch_discard(); return 0;
+        ASYNC_COUNT(ring_full); rt_batch_discard(); return 0;
     }
     s_async_id++; s_async_last_index=0; s_async_has_index=0; s_async_timeline=next;
     for (int i=0;i<n;++i) tokens[i]=(GLRenderAsyncToken){outputs[i],x,y,w,h,period};
     return (uint32_t)n;
 }
 int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
-    if (!token || !pass_queued() || !s_pt_on || rt_batch_active() ||
-        token->output.epoch!=gl_renderer_present_epoch() ||
-        !render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns()) ||
-        (s_async_has_index && token->output.index<=s_async_last_index)) return 0;
-    if (!rt_batch_begin()) return 0;
+    if (!token || !pass_queued() || !s_pt_on || rt_batch_active()) {
+        ASYNC_COUNT(unavailable); return 0;
+    }
+    if (token->output.epoch!=gl_renderer_present_epoch() ||
+        token->output.epoch!=s_async_timeline.epoch || token->output.generation!=s_async_id) {
+        ASYNC_COUNT(stale); return 0;
+    }
+    if (!render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns())) {
+        ASYNC_COUNT(late); return 0;
+    }
+    if (s_async_has_index && token->output.index<=s_async_last_index) {
+        ASYNC_COUNT(duplicate); return 0;
+    }
+    if (!rt_batch_begin()) { ASYNC_COUNT(ring_full); return 0; }
     s_async_recording=*token;
-    if (!async_record(RTH_ASYNC_BEGIN,token)) { rt_batch_discard(); return 0; }
+    if (!async_record(RTH_ASYNC_BEGIN,token)) { ASYNC_COUNT(ring_full); rt_batch_discard(); return 0; }
     return 1;
 }
 int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
@@ -9299,10 +9325,15 @@ int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
     RTH_REC(RTH_PASS_END,0,(int32_t)token->output.alpha_q16,keep);
     if (!keep || token->output.epoch!=gl_renderer_present_epoch() ||
         !render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns())) {
+        if (keep) {
+            if(token->output.epoch!=gl_renderer_present_epoch()) ASYNC_COUNT(stale);
+            else ASYNC_COUNT(late);
+        }
         rt_batch_discard(); return 0;
     }
     int ok=rt_batch_try_commit();
-    if (ok) { s_async_last_index=token->output.index; s_async_has_index=1; }
+    if (ok) { ASYNC_COUNT(submitted); s_async_last_index=token->output.index; s_async_has_index=1; }
+    else ASYNC_COUNT(ring_full);
     return ok;
 }
 int gl_renderer_stereo_begin(int x, int y, int w, int h, int reuse) {
@@ -9388,11 +9419,11 @@ static int async_vram_enter(int gi) {
     AsyncVram *v=&s_async_vram[gi];
     if(!v->raw_fbo || v->scale!=s_hr_scale ||
         v->resource_epoch!=atomic_load(&s_async_resource_epoch) || !async_raw_allocate(&s_async_work)) return 0;
+    if(s_pb_wide_src && (!v->wide_fbo || v->wide_w!=s_pb_wide_w || v->wide_h!=s_pb_wide_h)) return 0;
     pass_blit(v->raw_fbo,s_async_work.raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
     pass_blit(v->hr_fbo,s_hr_fbo,0,0,s_pass_x*s_hr_scale,s_pass_y*s_hr_scale,
               v->hr_w,v->hr_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
     if(s_pb_wide_src) {
-        if(!v->wide_fbo || v->wide_w!=s_pb_wide_w || v->wide_h!=s_pb_wide_h) return 0;
         pass_blit(v->wide_fbo,s_pb_wide_src,0,0,0,s_pass_y*s_hr_scale,
                   v->wide_w,v->wide_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
     }
@@ -15077,8 +15108,12 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
         pt_clock_ns()>=output->expires || g->source_path!=s_interp_source_path ||
         g->tex_w!=s_interp_w || g->tex_h!=s_interp_h) return;
     PtTiming timing={output->epoch,output->deadline,output->expires};
-    if (gl_renderer_set_present_timing(&timing))
+    if (gl_renderer_set_present_timing(&timing)) {
+        PtStats before,after; pt_get_stats(&before);
         (void)interp_present_pair(s_pgen_tex[gi][slot],s_pgen_tex[gi][slot],0.0f,s_interp_blend_mode);
+        pt_get_stats(&after);
+        if(after.submits>before.submits) ASYNC_COUNT(presented_to_queue);
+    }
     memset(&s_pt_next_timing,0,sizeof s_pt_next_timing);
 }
 
@@ -15103,11 +15138,11 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     if(s_async_exec && c->op==RTH_COPY) {
         if(v[0]==v[2] && v[1]==v[3] && !s_mask_set) return; /* identity copy */
         if(v[0]<s_pass_x || v[1]<s_pass_y || v[0]+v[4]>s_pass_x+s_pass_w ||
-            v[1]+v[5]>s_pass_y+s_pass_h) { s_async_invalid=1; return; }
+            v[1]+v[5]>s_pass_y+s_pass_h) { ASYNC_COUNT(unsupported); s_async_invalid=1; return; }
     }
     if(s_async_exec && c->op==RTH_WIDE_FEEDBACK &&
         (v[0]!=s_pass_x || v[2]<s_pass_y || v[2]+v[6]>s_pass_y+s_pass_h)) {
-        s_async_invalid=1; return;
+        ASYNC_COUNT(unsupported); s_async_invalid=1; return;
     }
     switch (c->op) {
     case RTH_SEMI:      glb_set_semi_transparency(v[0], v[1]); break;
@@ -15203,6 +15238,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         if (token.output.epoch!=gl_renderer_present_epoch() || pt_clock_ns()>token.output.expires) break;
         if (transaction_begin(token.x,token.y,token.w,token.h,1,token.period_vblanks,0,0)) {
             if(!async_vram_capture(s_pgen_write)) {
+                ASYNC_COUNT(capture);
                 s_pgen[s_pgen_write].valid=0; pass_end_now(0,0); break;
             }
             s_pgen[s_pgen_write].async_id=token.output.generation;
@@ -15223,16 +15259,19 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         for (int k=0;k<PASS_GENERATIONS;++k)
             if (s_pgen[k].valid && s_pgen[k].async_id==token.output.generation &&
                 s_pgen[k].async_epoch==token.output.epoch) gi=k;
-        if (gi<0 || token.output.epoch!=gl_renderer_present_epoch() ||
-            pt_clock_ns()>token.output.deadline) { s_pass_dead=1; break; }
+        if (gi<0 || token.output.epoch!=gl_renderer_present_epoch()) {
+            ASYNC_COUNT(render_stale); s_pass_dead=1; break;
+        }
+        if (pt_clock_ns()>token.output.deadline) { ASYNC_COUNT(render_late); s_pass_dead=1; break; }
         s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0;
         if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
             s_pass_leaks_at_begin=s_pass_leaks;
             if(!async_vram_enter(gi)) {
+                ASYNC_COUNT(resource);
                 pass_end_now(0,0); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write;
                 atomic_fetch_add(&s_pass_q_refused,1);
             }
-        } else { s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
+        } else { ASYNC_COUNT(capture); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
         break;
     }
     case RTH_PASS_BEGIN:

@@ -72,7 +72,7 @@ static int s_replay_world_scene, s_replay_native_scene, s_replay_retained_scene;
 static GpuReplayVertex s_replay_next_vertex, s_replay_vertices[16];
 static uint32_t replay_read(uint32_t address, unsigned width) {
     uint32_t value = 0;
-    if (!s_replay->read(s_replay->user, address, width, &value)) s_replay_fault = 1;
+    if (!s_replay->read(s_replay->user, address, width, &value)) s_replay_fault = GPU_REPLAY_MEMORY;
     return value;
 }
 static uint32_t gpu_input_read_word(uint32_t a) {
@@ -118,7 +118,7 @@ static const GpuReplayVertex *replay_vertex(uint32_t address, uint32_t word) {
         if (GPU_RAM_KEY(expected) == GPU_RAM_KEY(address) && gp0_cmd_buf[i] == word)
             return &s_replay_vertices[i];
     }
-    s_replay_fault = 1;
+    s_replay_fault = GPU_REPLAY_PRECISION;
     return NULL;
 }
 static int gpu_input_precise(uint32_t a, uint32_t w, int32_t x, int32_t y,
@@ -8424,7 +8424,9 @@ GpuReplayState *gpu_replay_capture(void) {
     return state;
 }
 void gpu_replay_release(GpuReplayState *state) { free(state); }
+int gpu_replay_last_error(void) { return s_replay_fault; }
 int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *provider) {
+    s_replay_fault = GPU_REPLAY_ARGUMENT;
     if (!state || !provider || !provider->word || !provider->read ||
         !provider->prepare_metadata || s_replay || !s_pass_regs_len ||
         gl_renderer_frame_generation()) return 0;
@@ -8433,7 +8435,7 @@ int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *pro
     s_replay_native_scene = state->native_scene;
     s_replay_retained_scene = state->retained_scene;
     PstR r; pst_r_init(&r, state->regs, state->regs_len);
-    if (!gpu_snap_parse(&r)) s_replay_fault = 1;
+    if (!gpu_snap_parse(&r)) s_replay_fault = GPU_REPLAY_SNAPSHOT;
     gpu_pass_provenance_transfer((GpuPassPresentationState *)&state->presentation, 1);
     gpu_pass_scene_transfer((GpuPassPresentationState *)&state->presentation, 1);
     gr_set_texture_window(texture_window_value);
@@ -8441,29 +8443,30 @@ int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *pro
     gr_set_draw_offset(draw_offset_x, draw_offset_y);
     gr_set_mask_bits(set_mask_bit, check_mask_bit);
     gr_set_dither(dither_enabled);
-    if (!provider->prepare_metadata(provider->user)) s_replay_fault = 1;
+    if (!provider->prepare_metadata(provider->user)) s_replay_fault = GPU_REPLAY_METADATA;
     ws_nw_sync_target();
     for (size_t i = 0; i < provider->count && !s_replay_fault; ++i) {
         GpuReplayWord input;
-        if (!provider->word(provider->user, i, &input)) { s_replay_fault = 1; break; }
+        if (!provider->word(provider->user, i, &input)) { s_replay_fault = GPU_REPLAY_WORD; break; }
         if (input.source == UINT32_MAX - 1u) {
             /* Draw streams may set DMA direction, not reset/display/read state. */
-            if ((input.word >> 24) != 4u) { s_replay_fault = 1; break; }
+            if ((input.word >> 24) != 4u) { s_replay_fault = GPU_REPLAY_UNSUPPORTED; break; }
             gpu_write_gp1(input.word);
         } else {
             unsigned op = input.word >> 24;
             if (gp0_state == GP0_IDLE &&
                 (!gp0_command_word_count(op) || op == 0x1F || (op >= 0xA0 && op <= 0xDF))) {
-                s_replay_fault = 1; break;
+                s_replay_fault = GPU_REPLAY_UNSUPPORTED; break;
             }
             s_replay_next_vertex = input.vertex;
             gpu_set_gp0_source(input.source);
             gpu_write_gp0(input.word);
         }
     }
-    if (!s_replay_fault && provider->finish && !provider->finish(provider->user)) s_replay_fault=1;
+    if (!s_replay_fault && provider->finish && !provider->finish(provider->user)) s_replay_fault=GPU_REPLAY_METADATA;
     gpu_ws_end_linked_list();
-    int ok = !s_replay_fault && gp0_state == GP0_IDLE;
+    if (!s_replay_fault && gp0_state != GP0_IDLE) s_replay_fault=GPU_REPLAY_INCOMPLETE;
+    int ok = !s_replay_fault;
     s_replay = NULL;
     return ok;
 }

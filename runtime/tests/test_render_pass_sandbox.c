@@ -230,6 +230,7 @@ int gl_renderer_pass_async_begin(const GLRenderAsyncToken *t) { return t!=NULL; 
 int gl_renderer_pass_async_end(const GLRenderAsyncToken *t,int keep) {
     (void)t; async_test_keep=keep; return keep;
 }
+int gpu_replay_last_error(void) { return 0; }
 int gpu_replay_execute(const GpuReplayState *s,const GpuReplayProvider *p) {
     (void)s;(void)p; async_test_calls++; return g_psx_render_pass_active;
 }
@@ -1183,6 +1184,10 @@ static void test_async_wrapper(void) {
     CHECK(!render_pass_async_admit(&token,(const GpuReplayState *)&opaque,&provider),
           "nested async admission refused");
     g_psx_render_pass_active=0;
+    RenderPassStats stats; render_pass_get_stats(&stats);
+    CHECK(stats.async_attempts==3 && stats.async_admitted==1 &&
+          stats.async_checkpoint_refused==1 && stats.async_status_refused==1,
+          "async diagnostic counts distinguish scope and checkpoint refusal");
 }
 
 int main(void) {
