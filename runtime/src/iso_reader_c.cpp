@@ -7,8 +7,128 @@
 #include "host_span_ring.h"
 #include "iso_reader.h"
 #include "mod_runtime.h"
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+
+/* Disc read-ahead (PSX_CD_PREFETCH=0 turns it off). Raw sector reads (data,
+ * XA and CD-DA streaming all read raw from a BIN/CHD) used to seek and read
+ * the image file -- and for a CHD decompress a hunk -- on the emulation
+ * thread, one sector at a time. A worker with its own ISOReader on the same
+ * image now reads the next sectors ahead into a small direct-mapped cache;
+ * the emulation thread copies a hit and reads a miss itself, exactly as
+ * before. The bytes are the image's either way: mod extents and patches are
+ * applied by the callers below after the base read, unchanged. Guest timing
+ * never depended on host I/O, so nothing the guest sees changes. */
+namespace {
+constexpr uint32_t kPrefetchSlots = 64;     /* cache size, sectors */
+constexpr uint32_t kPrefetchAhead = 24;     /* read this far past a request */
+
+struct Prefetch {
+    std::string path;
+    std::mutex m;
+    std::condition_variable cv;
+    std::thread worker;
+    bool stop = false, started = false, failed = false;
+    uint32_t next = 0, end = 0;  /* the worker's window [next, end) */
+    struct Slot { uint32_t lba; bool valid, ok; uint8_t data[2352]; };
+    Slot slots[kPrefetchSlots];
+    uint64_t hits = 0, misses = 0;
+
+    explicit Prefetch(const char* p) : path(p) {
+        for (auto& s : slots) { s.valid = false; s.ok = false; s.lba = 0; }
+    }
+    ~Prefetch() {
+        { std::lock_guard<std::mutex> lock(m); stop = true; }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();
+    }
+    void run() {
+        PS1::ISOReader reader;
+        if (!reader.Open(path)) {
+            std::lock_guard<std::mutex> lock(m);
+            failed = true;
+            return;
+        }
+        uint8_t buf[2352];
+        std::unique_lock<std::mutex> lock(m);
+        for (;;) {
+            cv.wait(lock, [&] { return stop || next < end; });
+            if (stop) return;
+            const uint32_t lba = next++;
+            if (slots[lba % kPrefetchSlots].valid && slots[lba % kPrefetchSlots].lba == lba)
+                continue;
+            lock.unlock();
+            const bool ok = reader.ReadRawSector(lba, buf);
+            lock.lock();
+            /* Any sector read is the image's: store it even if the window
+             * moved meanwhile (at worst it evicts one the window wants,
+             * which the emulation thread then reads itself). */
+            Slot& d = slots[lba % kPrefetchSlots];
+            d.lba = lba; d.ok = ok; d.valid = true;
+            if (ok) std::memcpy(d.data, buf, sizeof buf);
+        }
+    }
+    /* 1 hit (buffer filled, *ok = that read's result), 0 miss. Either way
+     * moves the window to the kPrefetchAhead sectors after lba. */
+    int lookup(uint32_t lba, uint8_t* buffer, bool* ok) {
+        std::lock_guard<std::mutex> lock(m);
+        if (failed) return 0;
+        if (!started) {
+            started = true;
+            worker = std::thread([this] { run(); });
+        }
+        Slot& s = slots[lba % kPrefetchSlots];
+        const int hit = s.valid && s.lba == lba;
+        if (hit) {
+            *ok = s.ok;
+            if (s.ok) std::memcpy(buffer, s.data, sizeof s.data);
+            hits++;
+        } else {
+            misses++;
+        }
+        /* Sequential reads keep the worker going; a seek (the worker behind
+         * this read, or far past it) restarts it right after it. */
+        if (next <= lba || next > lba + 1 + kPrefetchAhead) next = lba + 1;
+        end = lba + 1 + kPrefetchAhead;
+        cv.notify_one();
+        return hit;
+    }
+};
+
+std::mutex g_prefetch_mutex;
+std::map<void*, std::unique_ptr<Prefetch>> g_prefetch;
+
+bool prefetch_enabled() {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = std::getenv("PSX_CD_PREFETCH");
+        on = (e && *e) ? (*e != '0') : 1;
+    }
+    return on != 0;
+}
+
+Prefetch* prefetch_for(void* handle) {
+    std::lock_guard<std::mutex> lock(g_prefetch_mutex);
+    auto it = g_prefetch.find(handle);
+    return it == g_prefetch.end() ? nullptr : it->second.get();
+}
+
+bool read_raw_base(void* handle, uint32_t lba, uint8_t* buffer) {
+    auto* reader = static_cast<PS1::ISOReader*>(handle);
+    if (Prefetch* p = prefetch_for(handle)) {
+        bool ok = false;
+        if (p->lookup(lba, buffer, &ok)) return ok;
+    }
+    return reader->ReadRawSector(lba, buffer);
+}
+}  // namespace
 
 extern "C" {
 
@@ -18,7 +138,21 @@ void* iso_open(const char* path) {
         delete reader;
         return nullptr;
     }
+    if (path && prefetch_enabled()) {
+        std::lock_guard<std::mutex> lock(g_prefetch_mutex);
+        g_prefetch[reader] = std::make_unique<Prefetch>(path);
+    }
     return reader;
+}
+
+/* Read-ahead counters for the debug server (0 when off). */
+void iso_prefetch_stats(void* handle, uint64_t* hits, uint64_t* misses) {
+    *hits = *misses = 0;
+    if (Prefetch* p = handle ? prefetch_for(handle) : nullptr) {
+        std::lock_guard<std::mutex> lock(p->m);
+        *hits = p->hits;
+        *misses = p->misses;
+    }
 }
 
 int iso_read_sector(void* handle, uint32_t lba, uint8_t* buffer, int size) {
@@ -36,7 +170,7 @@ int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size) {
     if (!handle || !buffer || size < 2352) return 0;
     auto* reader = static_cast<PS1::ISOReader*>(handle);
     const uint64_t span_t0 = host_span_begin();
-    const bool read_ok = mod_runtime_read_disc_extent(lba, 1, buffer, size) || reader->ReadRawSector(lba, buffer);
+    const bool read_ok = mod_runtime_read_disc_extent(lba, 1, buffer, size) || read_raw_base(reader, lba, buffer);
     host_span_end(HSPAN_DISC_READ, span_t0, lba);
     if (!read_ok) return 0;
     mod_runtime_patch_disc_sector(lba, 1, buffer, 2352);
@@ -106,6 +240,13 @@ int iso_track_is_audio(void* handle, int track) {
 
 void iso_close(void* handle) {
     if (!handle) return;
+    std::unique_ptr<Prefetch> prefetch;
+    {
+        std::lock_guard<std::mutex> lock(g_prefetch_mutex);
+        auto it = g_prefetch.find(handle);
+        if (it != g_prefetch.end()) { prefetch = std::move(it->second); g_prefetch.erase(it); }
+    }
+    prefetch.reset();   /* joins the worker before the reader goes */
     auto* reader = static_cast<PS1::ISOReader*>(handle);
     reader->Close();
     delete reader;
@@ -134,7 +275,7 @@ int iso_read_cdda_sector(void* handle,uint32_t lba,uint8_t* buffer,int size) {
     if(!mod_runtime_cdda_track_count()) return iso_read_raw_sector(handle,lba,buffer,size);
     uint32_t source=0;
     const int kind=mod_runtime_read_cdda_sector(lba,buffer,size,&source);
-    return kind==1 || (kind==2 && static_cast<PS1::ISOReader*>(handle)->ReadRawSector(source,buffer));
+    return kind==1 || (kind==2 && read_raw_base(handle,source,buffer));
 }
 
 } /* extern "C" */

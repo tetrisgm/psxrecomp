@@ -5447,7 +5447,11 @@ static void handle_geom_correction(int id, const char *json)
 /* host_profile — histogram of the always-on host CPU sampler (host_sampler.c)
  * over a window of the ring: {"cmd":"host_profile","since":SEQ} or
  * {"cmd":"host_profile","frames":N} (the last N guest frames), optional
- * "frame_lo"/"frame_hi" (an absolute guest-frame window), "pass":1 (only samples inside render passes) / "pass":0 (outside), "top":K.
+ * "frame_lo"/"frame_hi" (an absolute guest-frame window), "pass":1 (only samples inside render passes) / "pass":0 (outside), "top":K,
+ * "callers":1 (with PSX_HOST_SAMPLER_CALLERS=1: a sample outside the exe is
+ * binned at its innermost exe caller; "via_callers" counts them), "phase":P
+ * (only samples taken while the emulation thread's g_exec_phase was P; 4 =
+ * GP0 command processing).
  * Addresses are executable-relative; tools/host_profile.py names them. Take
  * "seq" from one reply as "since" of the next to profile what ran between. */
 static void handle_host_profile(int id, const char *json)
@@ -5463,6 +5467,9 @@ static void handle_host_profile(int id, const char *json)
     const int frame_lo_abs = json_get_int(json, "frame_lo", -1);
     const int frame_hi_abs = json_get_int(json, "frame_hi", -1);
     const int pass = json_get_int(json, "pass", -1);
+    const int callers = json_get_int(json, "callers", 0);
+    const int phase = json_get_int(json, "phase", -1);
+    uint64_t via_callers = 0;
     int top = json_get_int(json, "top", 60);
     if (top < 1) top = 1;
     if (top > 400) top = 400;
@@ -5479,7 +5486,9 @@ static void handle_host_profile(int id, const char *json)
         if (frame_lo_abs >= 0 && smp.frame < (uint32_t)frame_lo_abs) continue;
         if (frame_hi_abs >= 0 && smp.frame > (uint32_t)frame_hi_abs) continue;
         if (pass >= 0 && (int)smp.in_pass != pass) continue;
+        if (phase >= 0 && (int)smp.phase != phase) continue;
         total++;
+        if (callers && smp.caller) { smp.rva = smp.caller; via_callers++; }
         int b = 0;
         while (b < nb && rvas[b] != smp.rva) b++;
         if (b == nb) {
@@ -5527,10 +5536,12 @@ static void handle_host_profile(int id, const char *json)
     if (!buf) { send_err(id, "oom"); return; }
     size_t n = (size_t)snprintf(buf, cap,
         "{\"id\":%d,\"ok\":true,\"supported\":%d,\"seq\":%llu,"
-        "\"image_base\":\"0x%llX\",\"samples\":%llu,\"unbinned\":%llu,\"top\":[",
+        "\"image_base\":\"0x%llX\",\"samples\":%llu,\"unbinned\":%llu,"
+        "\"via_callers\":%llu,\"top\":[",
         id, host_sampler_supported(), (unsigned long long)seq,
         (unsigned long long)host_sampler_image_base(),
-        (unsigned long long)total, (unsigned long long)dropped);
+        (unsigned long long)total, (unsigned long long)dropped,
+        (unsigned long long)via_callers);
     for (int k = 0; k < top; k++) {
         int best = -1;
         for (int b = 0; b < nb; b++)
@@ -14161,6 +14172,18 @@ static void handle_fn_exit_dump(int id, const char *json) {
  *
  * Parameters: "tail" (int, default 256) — how many recent entries to return.
  */
+/* cd_prefetch - disc read-ahead (PSX_CD_PREFETCH): sectors served from the
+ * worker's cache (hits) and read on the emulation thread (misses). */
+extern void cdrom_prefetch_stats(uint64_t *hits, uint64_t *misses);
+static void handle_cd_prefetch(int id, const char *json)
+{
+    (void)json;
+    uint64_t hits = 0, misses = 0;
+    cdrom_prefetch_stats(&hits, &misses);
+    send_fmt("{\"id\":%d,\"ok\":true,\"hits\":%llu,\"misses\":%llu}", id,
+             (unsigned long long)hits, (unsigned long long)misses);
+}
+
 static void handle_cd_read_log(int id, const char *json)
 {
     extern uint32_t cd_dma_log_get_total(void);
@@ -16625,6 +16648,7 @@ static const CmdEntry s_commands[] = {
     { "fn_exit_dump",      handle_fn_exit_dump },
     { "overlay_dump",      handle_overlay_dump },
     { "cd_read_log",       handle_cd_read_log },
+    { "cd_prefetch",       handle_cd_prefetch },
     { "runtime_menu",      handle_runtime_menu },
     { "disc_tray_log",     handle_disc_tray_log },
     { "disc_select",       handle_disc_select },
