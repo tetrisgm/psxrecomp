@@ -402,6 +402,18 @@ renderer restores drawing-area state before seam/depth history so the later
 GPU register resync cannot erase the restored index. Repeated-full and
 asynchronous seam-gap tests run in the hidden GL capture fixture.
 
+For bounded presentation measurements, set `PSX_PRESENT_TRACE` to a CSV path.
+The present-thread callback samples its actual composed slot through an 8×8
+RGBA downsample (256-byte readback) and records the post-swap monotonic time,
+epoch, generation, output index, interpolation alpha, deadline, expiry and
+sample hash. Per-second presented/sample-change counts also go to stderr.
+Equal samples can miss changes outside the sample points: hash changes are a
+lower bound on distinct composed images, not a whole-image equality proof or
+a guarantee of physical display scanout. The tracing readback adds overhead;
+leave it unset during normal play. The hidden GL timing fixture checks that
+repeated images retain their hash, a changed image differs, and provenance
+survives the actual presenter callback on Windows and macOS.
+
 `PSX_RENDER_PASS_QUEUED=0` restores the synchronous handoff and the
 host-time budget above; `PSX_RENDER_PASS_VERIFY=1` implies it, since
 verification reads GL state back.

@@ -18,6 +18,11 @@ static void timed_pixel_probe(int slot) {
 void host_sampler_retarget_current(const char *thread) { (void)thread; }
 
 int main(void) {
+#ifdef _WIN32
+    _putenv_s("PSX_PRESENT_TRACE","present-trace.csv");
+#else
+    setenv("PSX_PRESENT_TRACE","present-trace.csv",1);
+#endif
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return 77;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -47,7 +52,7 @@ int main(void) {
     gl_renderer_render_thread_sync("timed output fixture");
     uint64_t now = pt_clock_ns();
     PtTiming timing = {gl_renderer_present_epoch(), now + 30000000u,
-                       now + 1000000000u};
+                       now + 1000000000u,7,40,32768};
     check(gl_renderer_set_present_timing(&timing), "valid timing arms composed output");
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     glClearColor(0.2f, 0.4f, 0.6f, 1.0f);
@@ -59,6 +64,14 @@ int main(void) {
     pt_get_stats(&st);
     check(st.presents == 1 && !st.waits, "timed swap presented without producer wait");
     check(pt_clock_ns() >= timing.not_before_ns, "presentation honored deadline");
+    for(int changed=0;changed<2;changed++) {
+        timing.not_before_ns=pt_clock_ns(); timing.expires_ns=timing.not_before_ns+1000000000u;
+        timing.index=41+changed;
+        check(gl_renderer_set_present_timing(&timing),"trace frame timing");
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+        glClearColor(changed?0.8f:0.2f,0.4f,0.6f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
+        gl_present_swap(); pt_drain();
+    }
     now = pt_clock_ns();
     timing.not_before_ns = now + 5000000000ull;
     timing.expires_ns = now + 6000000000ull;
@@ -69,7 +82,7 @@ int main(void) {
     interp_reset_history_unlocked();
     pt_drain();
     pt_get_stats(&st);
-    check(st.timed_dropped == 1 && st.presents == 1, "history reset retires queued image");
+    check(st.timed_dropped == 1 && st.presents == 3, "history reset retires queued image");
     check(!gl_renderer_set_present_timing(&timing), "stale epoch cannot arm a new swap");
     check(pt_clock_ns() - now < 1000000000u, "reset did not wait for future presentation");
     check(glGetError() == GL_NO_ERROR, "no GL errors after cancelled fence reuse");
@@ -188,6 +201,22 @@ int main(void) {
     check(gl_renderer_present_epoch()!=old_epoch && !async_display_active() && !gl_renderer_pass_async_begin(&tokens[1]),
           "discontinuity retires outstanding tokens without GL acquisition");
     gl_renderer_shutdown();
+    FILE *trace=fopen("present-trace.csv","rb");
+    check(trace!=NULL,"presenter wrote trace");
+    if(trace) {
+        char line[400]; unsigned long long hash[3]={0}; int changes[3]={0};
+        (void)fgets(line,sizeof line,trace);
+        for(int i=0;i<3;i++) {
+            unsigned long long time,epoch,gen,index,deadline,expires; unsigned alpha;
+            int fields=fgets(line,sizeof line,trace)?sscanf(line,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%llX,%d",
+                &time,&epoch,&gen,&index,&alpha,&deadline,&expires,&hash[i],&changes[i]):0;
+            check(fields==9 && gen==7 && index==(unsigned)(40+i) && alpha==32768,
+                  "trace retains output provenance at actual callback");
+        }
+        check(hash[0]==hash[1] && hash[1]!=hash[2] && changes[0]==1 && changes[1]==0 && changes[2]==1,
+              "actual presenter sampling distinguishes changing and repeated images");
+        fclose(trace);
+    }
     SDL_DestroyWindow(win);
     SDL_Quit();
     printf("checks=%d failures=%d\n", checks, failures);
