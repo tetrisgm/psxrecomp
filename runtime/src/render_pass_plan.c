@@ -7,6 +7,88 @@
 
 #define Q16 65536.0
 
+/* Compute a*b/d without accumulating fractional periods. Splitting a first
+ * keeps long-running sessions representable even when a*b would overflow.
+ * Reject extremes that cannot be represented by these integer products. */
+static int output_muldiv(uint64_t a, uint64_t b, uint64_t d, int ceil,
+                          uint64_t *value) {
+    uint64_t q, r, low;
+    if (!d || !b) return 0;
+    q = a / d;
+    r = a % d;
+    if (q > UINT64_MAX / b || r > UINT64_MAX / b) return 0;
+    q *= b;
+    r *= b;
+    low = r / d + (ceil && r % d != 0);
+    if (q > UINT64_MAX - low) return 0;
+    *value = q + low;
+    return 1;
+}
+
+int render_pass_output_init(RenderPassOutputTimeline *timeline,
+                            uint64_t frequency, uint32_t rate_numerator,
+                            uint32_t rate_denominator, uint64_t origin,
+                            uint64_t epoch) {
+    RenderPassOutputTimeline next;
+    if (!timeline || !frequency || !rate_numerator || !rate_denominator ||
+        !epoch || frequency > UINT64_MAX / rate_denominator) return 0;
+    next.epoch = epoch;
+    next.origin = origin;
+    next.period_numerator = frequency * rate_denominator;
+    /* Sub-tick outputs cannot have distinct deadlines. */
+    if (next.period_numerator < rate_numerator) return 0;
+    next.rate_numerator = rate_numerator;
+    next.next_index = 0;
+    *timeline = next;
+    return 1;
+}
+
+int render_pass_output_plan(RenderPassOutputTimeline *timeline,
+                            uint64_t window_begin, uint64_t window_end,
+                            uint64_t now, uint64_t generation,
+                            RenderPassOutput *outputs, uint32_t capacity) {
+    RenderPassOutput staged[RENDER_PASS_MAX_PHASES];
+    uint64_t index, threshold, first = 0;
+    uint32_t count = 0;
+    if (!timeline || !outputs || !capacity || !timeline->epoch ||
+        !timeline->rate_numerator ||
+        timeline->period_numerator < timeline->rate_numerator ||
+        window_end <= window_begin) return -1;
+    if (capacity > RENDER_PASS_MAX_PHASES) capacity = RENDER_PASS_MAX_PHASES;
+    threshold = now > window_begin ? now : window_begin;
+    if (threshold > timeline->origin &&
+        !output_muldiv(threshold - timeline->origin, timeline->rate_numerator,
+                       timeline->period_numerator, 1, &first)) return -1;
+    index = first > timeline->next_index ? first : timeline->next_index;
+    while (count < capacity) {
+        uint64_t offset, deadline, phase;
+        if (!output_muldiv(index, timeline->period_numerator,
+                           timeline->rate_numerator, 0, &offset) ||
+            offset > UINT64_MAX - timeline->origin) return -1;
+        deadline = timeline->origin + offset;
+        if (deadline >= window_end) break;
+        if (!output_muldiv(deadline - window_begin, 65536u,
+                           window_end - window_begin, 0, &phase) ||
+            index == UINT64_MAX) return -1;
+        staged[count].epoch = timeline->epoch;
+        staged[count].generation = generation;
+        staged[count].index = index++;
+        staged[count].deadline = deadline;
+        staged[count++].alpha_q16 = (uint32_t)phase;
+    }
+    memcpy(outputs, staged, count * sizeof *outputs);
+    timeline->next_index = index;
+    return (int)count;
+}
+
+int render_pass_output_current(const RenderPassOutputTimeline *timeline,
+                               const RenderPassOutput *output,
+                               uint64_t generation, uint64_t now) {
+    return timeline && output && timeline->epoch &&
+           output->epoch == timeline->epoch &&
+           output->generation == generation && now <= output->deadline;
+}
+
 static uint32_t to_q16(double p) {
     double q = floor(p * Q16 + 0.5);
     if (q < 1.0) q = 1.0;
