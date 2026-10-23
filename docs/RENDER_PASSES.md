@@ -472,3 +472,47 @@ saved context rather than resetting depth to zero. Normal-return verification
 also checks balance. This host context is never serialized in guest savestates.
 TCP render_pass_stats.last_abort_detail names skipped exits and remains latched
 across successes until session reset.
+
+### Asynchronous draw-context output
+
+`render_pass_async_reserve` (main thread) takes the snapshot pair's host display
+window in `pt_clock_ns()` nanoseconds and the completed real-frame VRAM rect.
+It queues phase-zero capture and returns immutable `RenderPassAsyncToken`s.
+Their `output` contains epoch, generation, grid index, Q16 snapshot alpha,
+deadline and expiration. The rational grid supports noninteger output/logic
+ratios; no guest tick rate changes. Skip a returned alpha-zero token: reserve
+already schedules that real-frame image.
+
+A worker runs only private guest draw code. Main later calls
+`render_pass_async_admit(token, gpu_state, provider)` with its completed stream.
+`gpu_replay_capture()` snapshots GPU register/tag/scene inputs at the original
+capture point. Provider `read` supplies private RAM/scratchpad/arena bytes;
+`word` supplies each GP0/GP1 word with its accepted and raw PGXP receipt and may
+apply ordered immutable mod-tag events before that word. `prepare_metadata`
+is mandatory and must refuse if active mod inputs are missing. GPU parsing
+stays on main; no guest draw function runs again during admission.
+
+Epoch/generation/deadline checks occur before recording and again on the render
+thread. Completions older than an already admitted output are dropped. A private
+render-ring batch publishes the entire GPU transaction only if capacity exists;
+overflow, expiration and refusal publish nothing and never acquire the GL
+context. The pass restores GPU registers/tags and its VRAM rectangle. The caller
+must keep texture/VRAM resources and enhancement configuration valid for that
+snapshot generation and cancel on changes. A new reservation retires older
+main-side admission tokens. GPU frame generation is unsupported by this provider
+and explicitly refused.
+
+The render thread copies each completed image into a presenter-owned FBO and
+submits its exact not-before/expiration times. One scratch image is reused per
+generation, so higher output rates do not retain one 8K texture per output.
+The existing flip scheduler is suppressed during a reserved display window;
+untimed rendering outside it keeps its previous behavior. Full presenter slots
+drop an optional output. Queueing a token is not evidence that it appeared on
+screen: game-mode identity, real workload throughput and distinct-frame counts
+remain integration checks.
+
+`test_gl_output_timing.c` exercises real hidden GL generation reservation,
+immutable admission, duplicate/stale rejection, bounded scratch reuse and timed
+presentation. `test_gpu_render_pass_provenance.c` covers private input replay,
+PGXP/raw depth, missing metadata, truncated/control streams and state rollback.
+`test_render_thread.c` covers atomic batch publication and failed-batch discard.
