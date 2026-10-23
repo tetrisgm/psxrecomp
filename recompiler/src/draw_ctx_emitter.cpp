@@ -39,13 +39,17 @@ void symbol_refs(const std::string& code, std::set<std::string>& out) {
     }
 }
 
-// Constant CPS transfers: `cpu->pc = 0xXXXXXXXXu;`.
+// Constant CPS transfers (`cpu->pc = 0xXXXXXXXXu;`) and constant links
+// (`cpu->gpr[31] = 0xXXXXXXXXu;`): a call returns to its link, which can be
+// the entry of a separate compiled function when the emitter split the code
+// after the call.
 void cps_targets(const std::string& code, std::set<uint32_t>& out) {
-    const std::string p = "cpu->pc = 0x";
-    for (size_t at = code.find(p); at != std::string::npos; at = code.find(p, at + 1)) {
-        const size_t hex = at + p.size();
-        if (!is_hex8(code, hex) || hex + 9 > code.size() || code[hex + 8] != 'u') continue;
-        out.insert(static_cast<uint32_t>(std::strtoul(code.substr(hex, 8).c_str(), nullptr, 16)));
+    for (const std::string p : {"cpu->pc = 0x", "cpu->gpr[31] = 0x"}) {
+        for (size_t at = code.find(p); at != std::string::npos; at = code.find(p, at + 1)) {
+            const size_t hex = at + p.size();
+            if (!is_hex8(code, hex) || hex + 9 > code.size() || code[hex + 8] != 'u') continue;
+            out.insert(static_cast<uint32_t>(std::strtoul(code.substr(hex, 8).c_str(), nullptr, 16)));
+        }
     }
 }
 

@@ -245,7 +245,10 @@ int psx_ctx_bench_json(CPUState *cpu, const char *calls, const char *writes,
     if (threads < 1) threads = 1;
     if (threads > BENCH_MAX_THREADS - 1) threads = BENCH_MAX_THREADS - 1;
     plan->reps = reps < 1 ? 1 : reps;
-    plan->sp = sp ? sp : ((cpu->gpr[29] - 0x100u) & ~7u);
+    /* The live $sp may be the kernel's exception stack when the command
+     * runs; default to the top of user RAM (context RAM is private, so the
+     * calls' frames cannot hurt the machine). */
+    plan->sp = sp ? sp : 0x801FFF00u;
     if (!psx_ctx_available()) { snprintf(out, cap, "\"error\":\"no draw clones in this build\""); goto done; }
 
     const double ts0 = now_ms();
