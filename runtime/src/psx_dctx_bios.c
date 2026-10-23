@@ -2,9 +2,10 @@
 #include "psx_dctx_mem.h"
 #include "pgxp_ctx.h"
 
-/* OpenBIOS memcpy, qualified against the actual vector, table dispatcher and
+/* OpenBIOS memcpy/memset, qualified against the actual vector, table dispatcher and
  * routine bytes, not a BIOS name or the caller's title. Reference:
- * generated/OpenBIOS_full.c, BFC085D8..BFC08600. Forward byte-copy semantics
+ * generated/OpenBIOS_full.c, BFC085D8..BFC08600 and BFC086C4..BFC086E4.
+ * Forward byte-copy semantics
  * preserve overlap, RAM mirrors and scratchpad boundaries. Caller-saved
  * registers and PGXP effects follow that reference as well. Other BIOS
  * implementations and patched vectors fail closed until qualified. */
