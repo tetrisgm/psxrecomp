@@ -120,6 +120,11 @@ int duck_texture_pack_track_upload(DuckTexturePack* pack,
                                    uint16_t x, uint16_t y,
                                    uint16_t width_words, uint16_t height,
                                    const uint16_t* vram, size_t count);
+/* Render-owner tracking identity; unrelated writes leave it unchanged. */
+void duck_texture_pack_clear_lookup_cache(DuckTexturePack* pack);
+uint64_t duck_texture_pack_tracking_generation(const DuckTexturePack* pack);
+int duck_texture_pack_invalidation_changes(const DuckTexturePack* pack, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+
 void duck_texture_pack_invalidate(DuckTexturePack* pack,
                                   uint16_t x, uint16_t y,
                                   uint16_t width_words, uint16_t height);

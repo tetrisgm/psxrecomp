@@ -401,6 +401,21 @@ extern "C" void gpu_hd_textures_set_dump_enabled(int enabled) {
 }
 extern "C" int gpu_hd_textures_replacements_enabled(void) { return session && session->replacements; }
 extern "C" int gpu_hd_textures_dump_enabled(void) { return session && session->dump; }
+extern "C" uint64_t gpu_hd_textures_tracking_generation(void) {
+    static uint64_t token=1, last_config=0, last_beetle=0, last_duck=0;
+    uint64_t beetle=session?hd_texture_pack_tracking_generation(session->beetle):0;
+    uint64_t duck=session?duck_texture_pack_tracking_generation(session->duck):0;
+    if (generation!=last_config || beetle!=last_beetle || duck!=last_duck) {
+        ++token; last_config=generation; last_beetle=beetle; last_duck=duck;
+    }
+    return token;
+}
+extern "C" int gpu_hd_textures_invalidation_changes(int x,int y,int w,int h) {
+    if (!session || w<1 || h<1) return 0;
+    if (w>1024 || h>512) return 1;
+    return hd_texture_pack_invalidation_changes(session->beetle,x&1023,y&511,w,h) ||
+           duck_texture_pack_invalidation_changes(session->duck,x&1023,y&511,w,h);
+}
 extern "C" int gpu_hd_textures_active(void) { return session && (session->replacements || session->dump); }
 extern "C" void gpu_hd_textures_get_diag(GpuHdTextureDiag* out) {
     if (!out) return;
@@ -435,7 +450,11 @@ extern "C" void gpu_hd_textures_note_gl_cache(int eviction) {
         else ++session->diag.gl_uploads;
     }
 }
-extern "C" void gpu_hd_textures_bind_vram(const uint16_t* vram) { native_vram = vram; }
+extern "C" void gpu_hd_textures_bind_vram(const uint16_t* vram) {
+    native_vram = vram;
+    /* Private replay buffers reuse an address with different contents. */
+    if (session) duck_texture_pack_clear_lookup_cache(session->duck);
+}
 extern "C" void gpu_hd_textures_suppress_dumps(int on) { dumps_suppressed = on != 0; }
 extern "C" void gpu_hd_textures_set_vram(const uint16_t* vram) { native_vram = vram; gpu_hd_textures_reset_tracking(); }
 extern "C" void gpu_hd_textures_reset_tracking(void) {

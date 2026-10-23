@@ -281,6 +281,11 @@ void test_palette_match_and_invalidation(Fixture& fixture) {
               hash == fixture.upload_hash,
           "upload tracking returns exact content hash");
 
+    uint64_t tracking=hd_texture_pack_tracking_generation(pack);
+    check(!hd_texture_pack_invalidation_changes(pack,700,400,16,16),"unrelated draw does not touch HD provenance");
+    hd_texture_pack_invalidate(pack,700,400,16,16);
+    check(hd_texture_pack_tracking_generation(pack)==tracking,"unrelated invalidation preserves tracking generation");
+    check(hd_texture_pack_invalidation_changes(pack,10,20,1,1),"source overwrite changes HD provenance");
     HdTextureDrawQuery four = query4(fixture.vram, 0, 31);
     HdTextureMatch match{};
     check(hd_texture_pack_match(pack, &four, &match) == HD_TEXTURE_LOOKUP_FOUND,
