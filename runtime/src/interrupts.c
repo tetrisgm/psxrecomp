@@ -35,6 +35,7 @@
 #include "dma.h"
 #include "cpu_state.h"
 #include "debug_server.h"
+#include "draw_service.h"
 #include "event_ring.h"
 #include "lockstep.h"
 #include "psx_cycles.h"
@@ -1122,6 +1123,12 @@ void psx_check_interrupts(CPUState* cpu) {
     /* Frozen guest time (psx_cycle_freeze.h): no delivery, and no
      * check-boundary bookkeeping that the stock timeline would not do. */
     if (g_psx_guest_time_frozen) return;
+    /* Optional host-only output admission. Lean worker code has no interrupt
+     * checks. Avoid nested BIOS/guest callbacks and amortize the empty poll. */
+    if (g_draw_service_enabled && !in_exception && !s_defer_switch_pending) {
+        static unsigned draw_poll_stride;
+        if ((++draw_poll_stride & 127u) == 0) draw_service_poll();
+    }
     psx_cyc_batch_flush();
     extern int g_ls_suppress_record;
     extern int psx_netplay_active(void);

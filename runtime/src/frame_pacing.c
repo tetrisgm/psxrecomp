@@ -9,6 +9,7 @@
 #ifndef FRAME_PACING_PURE_ONLY
 #include "psx_sdl.h"
 #include "host_time.h"
+#include "draw_service.h"
 #endif
 
 uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
@@ -63,11 +64,14 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
     }
 
     for (;;) {
+        draw_service_poll();
         now = SDL_GetPerformanceCounter();     /* ONE read per iteration */
         uint32_t ms = frame_pacing_sleep_ms(now, p->next_deadline, freq, period);
         if (ms == 0) break;
         /* Waitable timer on Win32; usleep on Unix — not coarse Sleep/SDL_Delay. */
-        psx_host_sleep_ms(ms);
+        /* Keep completed optional frames serviceable while main is paced.
+         * Poll checks thread ownership, so render-thread waits remain inert. */
+        psx_host_sleep_ms(draw_service_active() && ms > 1 ? 1 : ms);
     }
     while (SDL_GetPerformanceCounter() < p->next_deadline) {
         /* final sub-ms spin */

@@ -42,7 +42,7 @@ typedef struct {
     int ncalls;
     BenchWrite writes[BENCH_MAX_WRITES];
     int nwrites;
-    uint32_t sp;
+    uint32_t sp, ra;
     int reps;
 } BenchPlan;
 
@@ -187,7 +187,7 @@ static void run_job(BenchJob *j) {
         for (int i = 0; i < p->ncalls; i++) {
             cpu->gpr[29] = p->sp;
             const PsxCtxStatus s = psx_ctx_call(j->ctx, p->calls[i].fn, p->calls[i].args,
-                                                p->calls[i].nargs, 0, NULL);
+                                                p->calls[i].nargs, p->ra, NULL);
             if (s != PSX_CTX_OK) {
                 j->status = s;
                 j->failed_call = i;
@@ -275,7 +275,7 @@ static double run_full(CPUState *cpu, const BenchPlan *p, uint32_t ram_bytes,
             const BenchCall *c = &p->calls[i];
             cpu->gpr[29] = p->sp;
             int charged = 0;
-            (void)psx_mod_call_guest_uncharged(cpu, c->fn, PSX_CTX_STOP_PC,
+            (void)psx_mod_call_guest_uncharged(cpu, c->fn, p->ra,
                 c->args[0], c->args[1], c->args[2], c->args[3], 0x7FFFFFFFu, &charged);
         }
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -291,7 +291,7 @@ static double run_full(CPUState *cpu, const BenchPlan *p, uint32_t ram_bytes,
 }
 
 int psx_ctx_bench_json(CPUState *cpu, const char *calls, const char *writes,
-                       int threads, int reps, int full, uint32_t sp,
+                       int threads, int reps, int full, uint32_t sp, uint32_t ra,
                        const char *dump_path, char *out, size_t cap) {
     BenchPlan *plan = (BenchPlan *)calloc(1, sizeof *plan);
     BenchJob *jobs = (BenchJob *)calloc(BENCH_MAX_THREADS + 1, sizeof *jobs);
@@ -311,6 +311,11 @@ int psx_ctx_bench_json(CPUState *cpu, const char *calls, const char *writes,
      * runs; default to the top of user RAM (context RAM is private, so the
      * calls' frames cannot hurt the machine). */
     plan->sp = sp ? sp : 0x801FFF00u;
+    plan->ra = ra ? ra : PSX_CTX_STOP_PC;
+    if (full && !ra) {
+        snprintf(out, cap, "\"error\":\"full reference requires a valid guest ra\"");
+        goto done;
+    }
     if (!psx_ctx_available()) { snprintf(out, cap, "\"error\":\"no draw clones in this build\""); goto done; }
 
     const double ts0 = now_ms();
