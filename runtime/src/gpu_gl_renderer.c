@@ -5655,6 +5655,7 @@ void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
             rt_cmd_commit();
             return;
         }
+        if (rt_batch_active()) return;
         gl_rth_acquire("projected_oversize");
     }
     PSXProjectedVertex polygon[12];
@@ -11725,7 +11726,7 @@ static int rth_mirror_wide_present_ok(int base_x) {
 
 static int rth_rec_ints(uint16_t op, uint16_t flags, int n, const int32_t *v) {
     int32_t *p = (int32_t *)rt_cmd_begin(op, flags, (uint32_t)n * 4u);
-    if (!p) return 0;
+    if (!p) return rt_batch_active();
     memcpy(p, v, (size_t)n * 4u);
     rt_cmd_commit();
     return 1;
@@ -14765,6 +14766,7 @@ static void rtb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) 
             rt_cmd_commit();
             return;
         }
+        if (rt_batch_active()) return;
         gl_rth_acquire("oversize_upload");
     }
     glb_vram_transfer_in(x, y, w, h, d);
