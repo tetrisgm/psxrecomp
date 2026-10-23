@@ -8260,7 +8260,7 @@ static void interp_present_source_interval(void) {
             s_interp_phase_lo, s_interp_phase_hi))
         return;
     pass_apply_promotion();
-    if (async_display_active()) return; /* token outputs own this host window */
+    if (async_display_active()) return; /* timed session owns presentation */
     if (pass_queued_presenter() && s_rth_on && rt_on_render_thread()) {
         /* Queued passes: exactly one output for this guest VBlank, now. The
          * guest's own pacer sets the cadence; the image is the one for this
@@ -8369,7 +8369,7 @@ static RenderPassOutputTimeline s_async_timeline;
 static uint64_t s_async_id, s_async_last_index;
 static int s_async_rate, s_async_exec, s_async_previous_write, s_async_has_index;
 static GLRenderAsyncToken s_async_recording, s_async_executing;
-static uint64_t s_async_display_until, s_async_display_epoch;
+static uint64_t s_async_display_epoch;
 /* Generation-local native texture bytes and initial destination surfaces. */
 typedef struct AsyncVram {
     GLuint raw_tex,raw_fbo,hr_tex,hr_rb,hr_fbo,wide_tex,wide_rb,wide_fbo;
@@ -15291,8 +15291,11 @@ static const GpuRenderBackend GL_RT_BACKEND = {
 
 /* ---- replay (render thread) ---------------------------------------------- */
 static int async_display_active(void) {
-    return s_async_display_epoch==gl_renderer_present_epoch() &&
-           pt_clock_ns()<s_async_display_until;
+    /* A missed worker deadline holds the previous image. Returning to the
+     * live flip here would jump ahead of this delayed interpolation timeline,
+     * then jump backwards when its next completed output arrives. The owner
+     * explicitly invalidates the epoch on pause, scene or mode changes. */
+    return s_async_display_epoch && s_async_display_epoch==gl_renderer_present_epoch();
 }
 static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *output) {
     PassGen *g=&s_pgen[gi];
@@ -15450,7 +15453,6 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
             s_pgen[s_pgen_write].async_id=token.output.generation;
             s_pgen[s_pgen_write].async_epoch=token.output.epoch;
             pass_end_now(0,0);
-            s_async_display_until=token.output.expires;
             s_async_display_epoch=token.output.epoch;
             RenderPassOutput first=token.output;
             uint64_t period=(uint64_t)(1e9/s_interp_target_hz);
