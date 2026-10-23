@@ -21,6 +21,14 @@ uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
 void     gpu_write_gp0(uint32_t val);  /* 0x1F801810 write */
 void     gpu_write_gp1(uint32_t val);  /* 0x1F801814 write */
 void     gpu_set_gp0_source(uint32_t addr); /* diagnostic source for next GP0 word */
+#ifndef PSX_NO_DEBUG_TOOLS
+/* Main-thread diagnostic tap before raw GPU input is consumed. GP0 source is
+ * the supplied DMA address or UINT32_MAX; GP1 is UINT32_MAX-1. The observer
+ * must not modify guest/GPU state. NULL removes it; nested inputs are not
+ * reported recursively. This is not serialized guest state. */
+typedef void (*GpuCommandTap)(uint32_t word, uint32_t source, void *user);
+void gpu_set_command_tap(GpuCommandTap tap, void *user);
+#endif
 /* Linked-list provenance for the next GP0 words. `word_count == 0` identifies
  * an ordering-table link node; packet nodes retain the most recently visited
  * OT rank. This lets diagnostics distinguish front-layer UI packets from
