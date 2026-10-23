@@ -483,6 +483,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader_c.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_cycles.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_icache.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_timing_snapshot.c
     ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/guest_cycle_profile.c
     ${PSXRECOMP_ROOT}/runtime/src/latency_ring.c

@@ -6,6 +6,10 @@
  * HIT path is inlined in psx_icache.h; this file owns reset + MISS refill.
  */
 #include "psx_icache.h"
+#include "psx_icache_state.h"
+#ifndef PSX_ICACHE_STATE_HELPERS
+#define PSX_ICACHE_STATE_HELPERS 1
+#endif
 #include "cpu_state.h"
 #include "psx_cycles.h"
 #include "psx_instr_cost.h"   /* psx_fetch_uncached: shared with both emitters */
@@ -77,6 +81,16 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     if (g_psx_icache_active < 0) g_psx_icache_active = psx_icache_enabled();
     if (!g_psx_icache_active) return;
+#if PSX_ICACHE_STATE_HELPERS
+    uint32_t cost = psx_icache_state_fetch(g_psx_icache_tv, addr);
+    if (!cost) return;        /* HIT: +0, no give-back clear */
+
+    /* MISS — clear the pending load give-back (Beetle cpu.cpp:542-543). */
+    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb_which = 0u;
+
+    psx_cpu_charge(cost);
+#else
     uint32_t idx = (addr & 0xFFCu) >> 2;
     if (g_psx_icache_tv[idx] == addr) return;        /* HIT: +0, no give-back clear */
 
@@ -102,6 +116,7 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
         cost++;
     }
     psx_cpu_charge(cost);
+#endif
 #else
     (void)cpu;
     (void)addr;
@@ -128,6 +143,9 @@ void psx_icache_isc_store(uint32_t biu, uint32_t addr, uint32_t value) {
     if (g_ls_replay_active && s_icache_shadow_state != 2) return;
     if (g_psx_icache_active < 0) g_psx_icache_active = psx_icache_enabled();
     if (!g_psx_icache_active) return;
+#if PSX_ICACHE_STATE_HELPERS
+    psx_icache_state_isc_store(g_psx_icache_tv, biu, addr, value);
+#else
     if (!(biu & PSX_BIU_ICACHE_ENABLE)) return;
     if (!(biu & (PSX_BIU_TAG_TEST | PSX_BIU_INVALIDATE | PSX_BIU_LOCK))) return;
     uint32_t valid = (biu & PSX_BIU_TAG_TEST)
@@ -137,6 +155,7 @@ void psx_icache_isc_store(uint32_t biu, uint32_t addr, uint32_t value) {
     for (uint32_t i = 0; i < 4u; i++)
         g_psx_icache_tv[bidx + i] =
             ((valid & (1u << i)) ? 0x0u : 0x2u) | line | (i << 2);
+#endif
 #else
     (void)biu;
     (void)addr;

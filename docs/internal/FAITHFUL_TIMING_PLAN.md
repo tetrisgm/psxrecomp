@@ -1,5 +1,10 @@
 # Faithful Timing Core — Game Plan (psxrecomp)
 
+2026-10-23: standalone context-timing groundwork adds immutable timing inputs
+and state-only I-cache helpers, without real-frame execution/publication.
+Windows/macOS differential and capture checks pass; scope and limitations:
+[CONTEXT_TIMING.md](../CONTEXT_TIMING.md).
+
 **READ THIS EACH SESSION.** Referenced from CLAUDE.md Rule -1 and from the
 auto-memory ([[psxrecomp-build-faithful-core-not-hacks]],
 [[precise_irq_slice_state]]). This is the authoritative plan; update the

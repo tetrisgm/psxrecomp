@@ -578,6 +578,27 @@ if(BUILD_TESTING)
         PSX_ENABLE_BLOCK_CYCLES=1 PSX_OVERLAY_DLL_BUILD=1)
     add_test(NAME psx_icache_elision_guard_test COMMAND psx_icache_elision_guard_test)
 
+    foreach(_icache_helpers IN ITEMS 0 1)
+        add_executable(psx_icache_state_${_icache_helpers}_test
+            tests/test_psx_icache_state.c src/psx_icache.c)
+        target_include_directories(psx_icache_state_${_icache_helpers}_test PRIVATE include)
+        target_compile_definitions(psx_icache_state_${_icache_helpers}_test PRIVATE
+            PSX_ENABLE_BLOCK_CYCLES=1 PSX_OVERLAY_DLL_BUILD=1
+            PSX_ICACHE_STATE_HELPERS=${_icache_helpers})
+        target_compile_options(psx_icache_state_${_icache_helpers}_test PRIVATE
+            $<$<C_COMPILER_ID:MSVC>:/UNDEBUG>
+            $<$<NOT:$<C_COMPILER_ID:MSVC>>:-UNDEBUG>)
+        add_test(NAME psx_icache_state_${_icache_helpers}_test
+            COMMAND psx_icache_state_${_icache_helpers}_test)
+    endforeach()
+    add_executable(psx_timing_snapshot_test
+        tests/test_psx_timing_snapshot.c src/psx_timing_snapshot.c)
+    target_include_directories(psx_timing_snapshot_test PRIVATE include)
+    target_compile_options(psx_timing_snapshot_test PRIVATE
+        $<$<C_COMPILER_ID:MSVC>:/UNDEBUG>
+        $<$<NOT:$<C_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    add_test(NAME psx_timing_snapshot_test COMMAND psx_timing_snapshot_test)
+
     foreach(_ram_geometry IN ITEMS retail expanded)
         add_executable(psx_memory_geometry_${_ram_geometry}_test
             tests/test_psx_memory_geometry.c)
