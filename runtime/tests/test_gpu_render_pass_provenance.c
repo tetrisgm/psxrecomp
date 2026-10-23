@@ -288,7 +288,6 @@ static void test_auto_ui_prepass(void) {
 }
 
 
-float pgxp_get_unclamped_depth(uint32_t a,uint32_t w) { (void)a;(void)w;return 0; }
 static uint32_t immutable_hud[5];
 static int list_read(void *u,uint32_t address,unsigned width,uint32_t *out) {
     (void)u; unsigned shift=8u*(address&3u);
