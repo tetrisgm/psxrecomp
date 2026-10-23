@@ -3,6 +3,18 @@
 #include "test_gl_render_thread.c"
 #undef main
 void host_sampler_retarget_current(const char *thread) { (void)thread; }
+static void test_depth_clear(GLuint fbo, double value) {
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,fbo);
+    glDisable(GL_SCISSOR_TEST); glDepthMask(GL_TRUE); glClearDepth(value);
+    glClear(GL_DEPTH_BUFFER_BIT);
+}
+static float test_depth_read(GLuint fbo) {
+    float value=0;
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    glReadPixels(4,4,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&value);
+    return value;
+}
 int main(void) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return 77;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -54,6 +66,26 @@ int main(void) {
         free(actual);free(expected);glDeleteTextures(1,&texture);
     }
     s_pass_active=0;
+    s_interp_enabled=1; s_interp_suspended=0; s_interp_source=1;
+    s_interp_source_hz=30; s_interp_valid=1; s_interp_source_path=GL_PRES_WIDE;
+    s_interp_w=426*s_hr_scale; s_interp_h=240*s_hr_scale;
+    test_depth_clear(s_hr_fbo,0.25); test_depth_clear(pass_wide_fbo_for(0),0.375);
+    s_depth_need_clear=0; s_depth_used=1; s_depth_need_reason=DCLR_THRESHOLD; s_depth_last_avg=123;
+    check(transaction_begin(0,0,320,240,1,2,0,0),"depth checkpoint begins");
+    test_depth_clear(s_hr_fbo,0.75); test_depth_clear(pass_wide_fbo_for(0),0.875);
+    s_depth_need_clear=1; s_depth_used=0; s_depth_need_reason=DCLR_FILL; s_depth_last_avg=987;
+    transaction_restore();
+    check(fabsf(test_depth_read(s_hr_fbo)-0.25f)<0.00001f,"canonical depth restored");
+    check(fabsf(test_depth_read(pass_wide_fbo_for(0))-0.375f)<0.00001f,"wide depth restored");
+    check(!s_depth_need_clear && s_depth_used && s_depth_need_reason==DCLR_THRESHOLD &&
+          s_depth_last_avg==123,"depth clear history restored");
+    check(transaction_begin(0,0,320,240,0,2,1,0),"depth backup reused");
+    check(async_vram_capture(s_pgen_write),"immutable async depth captured");
+    test_depth_clear(s_hr_fbo,0.75); s_depth_last_avg=987;
+    check(async_vram_enter(s_pgen_write),"immutable async depth entered");
+    check(fabsf(test_depth_read(s_hr_fbo)-0.25f)<0.00001f && s_depth_last_avg==123,
+          "async job begins with captured depth and history");
+    async_vram_leave(); transaction_restore();
     check(glGetError()==GL_NO_ERROR,"capture leaves clean GL state");
     gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
     printf("checks=%d failures=%d\n",checks,failures);

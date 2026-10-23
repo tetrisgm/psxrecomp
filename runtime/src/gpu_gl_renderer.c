@@ -8370,6 +8370,8 @@ typedef struct AsyncVram {
     int raw_w,raw_h,hr_w,hr_h,wide_w,wide_h,scale;
     uint16_t *cpu;
     uint64_t resource_epoch;
+    int depth_need, depth_used, depth_reason;
+    float depth_avg;
 } AsyncVram;
 static AsyncVram s_async_vram[PASS_GENERATIONS],s_async_work;
 static _Atomic uint64_t s_async_resource_epoch=1;
@@ -8438,6 +8440,12 @@ static int      s_pb_up_n = 0, s_pb_gpu_dirty = 0, s_pb_stencil_valid = 1;
 static uint64_t s_pb_present_dirty[PRES_ROWS];
 static int      s_pb_force_present = 0, s_pb_last_path = -1;
 static int      s_pb_last_dx = 0, s_pb_last_dy = 0, s_pb_last_dw = 0, s_pb_last_dh = 0;
+static int s_pb_depth_need, s_pb_depth_used, s_pb_depth_reason;
+static float s_pb_depth_avg;
+static GLbitfield pass_depth_bit(void) {
+    const char *off = getenv("PSX_RENDER_PASS_DEPTH_CHECKPOINT");
+    return off && !strcmp(off, "0") ? 0 : GL_DEPTH_BUFFER_BIT;
+}
 
 /* Per-pass host cost (render_pass_plan.h RenderPassCost), and the presented
  * image size it was measured at. Another size (an aspect or internal-
@@ -9036,7 +9044,7 @@ static int pass_journal_protect(int x, int y, int w, int h) {
     if (render_pass_journal_add(&s_pj_cpu, s_vram, VRAM_W, x, y, w, h) != i)
         return 0;
     pass_blit(s_hr_fbo, j->hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
-              GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+              GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
     pass_blit(s_raw_fbo, j->raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
     s_pj_total++;
     return 1;
@@ -9049,7 +9057,7 @@ static void pass_journal_rollback(void) {
         int x = s_pj_cpu.x[i], y = s_pj_cpu.y[i];
         int w = s_pj_cpu.w[i], h = s_pj_cpu.h[i];
         pass_blit(j->hr_fbo, s_hr_fbo, 0, 0, x * S, y * S, w * S, h * S,
-                  GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                  GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
         pass_blit(j->raw_fbo, s_raw_fbo, 0, 0, x, y, w, h, GL_COLOR_BUFFER_BIT);
     }
     render_pass_journal_rollback(&s_pj_cpu, s_vram, VRAM_W);
@@ -9163,7 +9171,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
                              PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT))
         return pass_begin_refuse("backup_raw");
     pass_blit(s_hr_fbo, s_pb_hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
-              GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+              GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
     pass_blit(s_raw_fbo, s_pb_raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
     s_pb_wide_src = g_wide_w > 0 ? pass_wide_fbo_for(x) : 0;
     if (s_pb_wide_src) {
@@ -9173,7 +9181,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
                                  h * S, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE))
             return pass_begin_refuse("backup_wide");
         pass_blit(s_pb_wide_src, s_pb_wide_fbo, 0, y * S, 0, 0, g_wide_w * S,
-                  h * S, GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                  h * S, GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
     }
     if (s_pb_cpu_cap < (size_t)w * (size_t)h) {
         free(s_pb_cpu);
@@ -9196,6 +9204,8 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
     s_pb_last_dx = s_last_dx; s_pb_last_dy = s_last_dy;
     s_pb_last_dw = s_last_dw; s_pb_last_dh = s_last_dh;
     s_pb_x = x; s_pb_y = y; s_pb_w = w; s_pb_h = h; s_pb_scale = S;
+    s_pb_depth_need = s_depth_need_clear; s_pb_depth_used = s_depth_used;
+    s_pb_depth_reason = s_depth_need_reason; s_pb_depth_avg = s_depth_last_avg;
 
 backed_up:
     s_pass_x = x; s_pass_y = y; s_pass_w = w; s_pass_h = h;
@@ -9217,8 +9227,8 @@ backed_up:
  * colour (hr surface, native-wide band); everything else is put back. */
 static void transaction_restore_ex(int keep_color) {
     int S = s_hr_scale, gi = s_pgen_write;
-    const GLbitfield hr_bits = keep_color ? GL_STENCIL_BUFFER_BIT
-                                          : GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+    const GLbitfield hr_bits = (keep_color ? GL_STENCIL_BUFFER_BIT
+                                          : GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT) | pass_depth_bit();
     (void)gi;
     if (!s_pass_active) return;
     /* Roll the journal, then the rect back. */
@@ -9248,6 +9258,10 @@ static void transaction_restore_ex(int keep_color) {
     s_last_present_path = s_pb_last_path;
     s_last_dx = s_pb_last_dx; s_last_dy = s_pb_last_dy;
     s_last_dw = s_pb_last_dw; s_last_dh = s_pb_last_dh;
+    if (pass_depth_bit()) {
+        s_depth_need_clear = s_pb_depth_need; s_depth_used = s_pb_depth_used;
+        s_depth_need_reason = s_pb_depth_reason; s_depth_last_avg = s_pb_depth_avg;
+    }
     s_pass_active = 0;
     s_pass_local = 0;
     s_pb_valid = !keep_color;
@@ -9470,11 +9484,13 @@ static int async_vram_capture(int gi) {
     pack_flush();
     pass_blit(s_raw_fbo,v->raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
     pass_blit(s_pb_hr_fbo,v->hr_fbo,0,0,0,0,s_pb_hr_w,s_pb_hr_h,
-              GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+              GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
     if(s_pb_wide_src) pass_blit(s_pb_wide_fbo,v->wide_fbo,0,0,0,0,s_pb_wide_w,s_pb_wide_h,
-                               GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+                               GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
     memcpy(v->cpu,s_vram,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
     v->scale=s_hr_scale; v->resource_epoch=atomic_load(&s_async_resource_epoch);
+    v->depth_need=s_pb_depth_need; v->depth_used=s_pb_depth_used;
+    v->depth_reason=s_pb_depth_reason; v->depth_avg=s_pb_depth_avg;
     return 1;
 }
 static int async_vram_enter(int gi) {
@@ -9484,16 +9500,20 @@ static int async_vram_enter(int gi) {
     if(s_pb_wide_src && (!v->wide_fbo || v->wide_w!=s_pb_wide_w || v->wide_h!=s_pb_wide_h)) return 0;
     pass_blit(v->raw_fbo,s_async_work.raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
     pass_blit(v->hr_fbo,s_hr_fbo,0,0,s_pass_x*s_hr_scale,s_pass_y*s_hr_scale,
-              v->hr_w,v->hr_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+              v->hr_w,v->hr_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
     if(s_pb_wide_src) {
         pass_blit(v->wide_fbo,s_pb_wide_src,0,0,0,s_pass_y*s_hr_scale,
-                  v->wide_w,v->wide_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+                  v->wide_w,v->wide_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
     }
     memcpy(s_async_work.cpu,v->cpu,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
     s_async_live_cpu=s_vram; s_async_live_raw_tex=s_raw_tex; s_async_live_raw_fbo=s_raw_fbo;
     s_vram=s_async_work.cpu; s_raw_tex=s_async_work.raw_tex; s_raw_fbo=s_async_work.raw_fbo;
     rth_rebind_vram(s_vram); s_async_vram_bound=1;
     rect_clear(&s_cpu_dirty); rect_clear(&s_pack_dirty); s_gpu_dirty=0; s_up_nrects=0;
+    if (pass_depth_bit()) {
+        s_depth_need_clear=v->depth_need; s_depth_used=v->depth_used;
+        s_depth_need_reason=v->depth_reason; s_depth_last_avg=v->depth_avg;
+    }
     return 1;
 }
 static void async_vram_leave(void) {
