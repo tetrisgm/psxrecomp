@@ -191,6 +191,9 @@ static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int
                                      const uint32_t word[3], float e[3]) {
     s->tris++;
     float px[3], py[3], iz[3], on[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+#ifndef PSX_PGXP_SNAP_EAGER_NORMALS
+    unsigned char normal_done[3] = {0, 0, 0};
+#endif
     uint32_t key[3];
     int offgrid[3];
     e[0] = e[1] = e[2] = 0.0f;
@@ -206,12 +209,14 @@ static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int
     }
     const float area = pgxp_snap_cross(px[1] - px[0], py[1] - py[0], px[2] - px[0], py[2] - py[0]);
     const int usable = fabsf(area) > 1e-4f && s->n_edges > 0;
-    for (int k = 0; k < 3 && usable; k++) {            /* outward edge normals */
+#ifdef PSX_PGXP_SNAP_EAGER_NORMALS
+    for (int k = 0; k < 3 && usable; k++) {            /* old eager path for comparison */
         const int b = (k + 1) % 3;
         const float ex = px[b] - px[k], ey = py[b] - py[k], l = sqrtf(ex * ex + ey * ey);
         const float sg = area > 0.0f ? 1.0f : -1.0f;
         if (l > 1e-6f) { on[k][0] = sg * ey / l; on[k][1] = -sg * ex / l; }
     }
+#endif
 
     /* Gather, once per vertex: the earlier edges whose integer line passes
      * within PGXP_SNAP_LINE_TOL of it (both index families, the vertex's row
@@ -348,6 +353,21 @@ static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int
         }
         if (best <= 0.0f) continue;
         const int kp = (v + 2) % 3;          /* edges kp (into v) and v (out) */
+#ifndef PSX_PGXP_SNAP_EAGER_NORMALS
+        /* Most triangles never reach this rule. Only normalize an edge when
+         * a qualifying T-junction actually needs its outward direction. */
+        const int needed[2] = {kp, v};
+        for (int j = 0; j < 2; j++) {
+            const int k = needed[j];
+            if (normal_done[k]) continue;
+            const int b = (k + 1) % 3;
+            const float ex = px[b] - px[k], ey = py[b] - py[k];
+            const float l = sqrtf(ex * ex + ey * ey);
+            const float sg = area > 0.0f ? 1.0f : -1.0f;
+            if (l > 1e-6f) { on[k][0] = sg * ey / l; on[k][1] = -sg * ex / l; }
+            normal_done[k] = 1;
+        }
+#endif
         const float ep = best * (on[kp][0] * bnx + on[kp][1] * bny);
         const float en = best * (on[v][0] * bnx + on[v][1] * bny);
         if (ep > e[kp]) e[kp] = fminf(ep, PGXP_SNAP_MAX_PX);
