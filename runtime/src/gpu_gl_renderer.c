@@ -325,6 +325,7 @@ static PFN_glWaitSync   p_glWaitSync;
 static PFN_glDeleteSync p_glDeleteSync;
 static PFN_glBindFramebuffer p_glBindFramebuffer_raw;
 static int    s_pt_on = 0;               /* redirect active (present thread running) */
+static int    s_pt_want = 0;
 static _Atomic uint64_t s_pt_epoch = 1;
 static PtTiming s_pt_next_timing;        /* GL owning thread, one swap only */
 
@@ -9718,7 +9719,7 @@ static uint64_t s_swaps_total = 0;   /* every swap, real or generated (diagnosti
  * composing side waits only while every slot is queued or on screen. */
 #define PT_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define PT_TIMEOUT_IGNORED 0xFFFFFFFFFFFFFFFFull
-static int           s_pt_want = 0, s_pt_slots = 3;
+static int           s_pt_slots = 3;
 static GLenum        s_pt_format = GL_RGBA8;   /* the window's: no alpha -> GL_RGB8 */
 static SDL_GLContext s_pt_ctx = NULL;
 static GLuint        s_pts_tex[PT_MAX_SLOTS], s_pts_rb[PT_MAX_SLOTS], s_pts_fbo[PT_MAX_SLOTS];
@@ -11300,7 +11301,8 @@ static int gl_rth_eligible(void) {
     extern int psx_netplay_active(void);
     return s_raster_ok && s_ctx && !s_cpu_auth_dual && !s_depth24_skip_up &&
            !(s_hd_native_authority && s_rth_a0_open) &&
-           !gpu_display_is_depth24() && !s_interp_enabled && !s_pass_active &&
+           !gpu_display_is_depth24() &&
+           (!s_interp_enabled || (s_rth_on ? s_pt_on : s_pt_want)) && !s_pass_active &&
            !psx_netplay_active() && !psx_openxr_session_active() &&
            gr_backend() == GR_BACKEND_OPENGL;
 }
@@ -14582,7 +14584,7 @@ int gl_renderer_render_thread_start(int max_frames) {
     cfg.tick = fg_tick;
     fg_invalidate();
     (void)pt_begin();   /* [video] present_thread; falls back to direct swaps */
-    if (!rt_start(&cfg)) {
+    if ((s_interp_enabled && !s_pt_on) || !rt_start(&cfg)) {
         pt_end();
         s_rth_on = 0;
         s_vram = s_rth_vram_pub;
