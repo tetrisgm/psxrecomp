@@ -19,6 +19,7 @@
 #include "gte_ctx.h"
 #include "pgxp_ctx.h"
 #include "psx_memory.h"
+#include "timers.h"
 
 /* memory.c / gpu.c / interrupts (main context, read at snapshot only) */
 extern uint8_t *memory_get_ram_ptr(void);
@@ -173,6 +174,7 @@ struct PsxCtxSnapshot {
     uint32_t gpustat;
     uint32_t dma_madr[7], dma_bcr[7], dma_chcr[7];
     uint32_t dpcr, dicr, i_stat, i_mask;
+    uint32_t timer_counter[3], timer_mode[3], timer_target[3];
 };
 
 PsxCtxSnapshot *psx_ctx_snapshot_capture(const CPUState *cpu, unsigned flags) {
@@ -198,6 +200,17 @@ PsxCtxSnapshot *psx_ctx_snapshot_capture(const CPUState *cpu, unsigned flags) {
     s->dicr = dma_get_dicr();
     s->i_stat = i_stat;
     s->i_mask = i_mask;
+    {
+        uint16_t counter[3], target[3];
+        uint32_t mode[3], frac[3];
+        int32_t irq_line[3];
+        timers_get_snapshot(counter, mode, target, irq_line, frac);
+        for (int i = 0; i < 3; i++) {
+            s->timer_counter[i] = counter[i];
+            s->timer_mode[i] = mode[i];
+            s->timer_target[i] = target[i];
+        }
+    }
     return s;
 }
 
@@ -273,6 +286,9 @@ int psx_ctx_begin(PsxExecCtx *x, const PsxCtxSnapshot *s) {
     x->dicr = s->dicr & 0x7FFFFFFFu;
     x->i_stat = s->i_stat;
     x->i_mask = s->i_mask;
+    memcpy(x->timer_counter, s->timer_counter, sizeof x->timer_counter);
+    memcpy(x->timer_mode, s->timer_mode, sizeof x->timer_mode);
+    memcpy(x->timer_target, s->timer_target, sizeof x->timer_target);
     x->gpu_n = 0;
     memset(&x->stats, 0, sizeof x->stats);
     x->status = PSX_CTX_OK;
@@ -502,6 +518,22 @@ static uint32_t mmio_read32(PsxExecCtx *x, uint32_t phys) {
         return v | (master ? 0x80000000u : 0u);
     }
     if (phys == 0x1F801814u) return ctx_gpustat(x);
+    /* Root counters: guest time does not run in a draw context. A counter
+     * read returns the snapshot value advanced by one per read, so a polling
+     * loop (libgpu's DMA wait timeout) always makes progress and every
+     * context sees the same values for the same reads. */
+    if (phys >= 0x1F801100u && phys < 0x1F801130u && (phys & 0xFu) < 0xCu) {
+        const uint32_t t = (phys - 0x1F801100u) >> 4;
+        switch (phys & 0xCu) {
+        case 0x0u: return x->timer_counter[t]++ & 0xFFFFu;
+        case 0x4u: {
+            const uint32_t m = x->timer_mode[t];
+            x->timer_mode[t] &= ~(3u << 11);    /* reached-flags clear on read */
+            return m;
+        }
+        default:   return x->timer_target[t];
+        }
+    }
     psx_dctx_fault(&x->cpu, PSX_CTX_FAULT_DEVICE_READ, phys,
                    phys == 0x1F801810u ? "GPUREAD" : "device register");
 }
