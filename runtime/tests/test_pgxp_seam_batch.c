@@ -1,10 +1,16 @@
-#include "pgxp_seam_batch.h"
+#include "pgxp_seam_rth_stream.h"
 #undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 
 static PgxpSnap baseline, serial, mutated;
 static PgxpSnapBatch batch[4];
+
+static PgxpRthSeamEvent test_map(uint16_t op) {
+    return op == 1 ? PGXP_RTH_PRECISE :
+           op == 2 ? PGXP_RTH_DEPTH :
+           op == 3 ? PGXP_RTH_FLAT_TRI : PGXP_RTH_UNSUPPORTED;
+}
 
 static PgxpSnapBatchInput make_tri(const float x[3], const float y[3]) {
     PgxpSnapBatchInput in = {0};
@@ -27,6 +33,78 @@ int main(void) {
         make_tri(xa, ya), make_tri(xb, yb),
         make_tri(xc, yc), make_tri(xd, yd)
     };
+    PgxpRthSeamStream stream;
+    pgxp_rth_seam_stream_init(&stream, 1, 1, 100.0f, 0);
+    for (int i = 0; i < 4; i++) {
+        int32_t precise[7] = {1};
+        int32_t depth[4] = {1};
+        int32_t tri[7] = {input[i].ix[0],input[i].iy[0],input[i].ix[1],
+                          input[i].iy[1],input[i].ix[2],input[i].iy[2],0};
+        for (int k = 0; k < 3; k++) {
+            precise[1 + 2*k] = input[i].fx[k];
+            precise[2 + 2*k] = input[i].fy[k];
+        }
+        memcpy(depth + 1, input[i].z, sizeof input[i].z);
+        assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_PRECISE, precise, 7));
+        assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_DEPTH, depth, 4));
+        assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_FLAT_TRI, tri, 7));
+    }
+    assert(stream.count == 4);
+    for (int i = 0; i < 4; i++)
+        assert(pgxp_snap_batch_input_equal(&stream.input[i], &input[i]));
+    int32_t semi[2] = {1, 0};
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_SEMI, semi, 2));
+    int32_t precise[7] = {1,0,0,0,0,0,0}, depth[4] = {1};
+    memcpy(depth + 1, input[0].z, sizeof input[0].z);
+    int32_t tri[7] = {0};
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_PRECISE, precise, 7));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_DEPTH, depth, 4));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_FLAT_TRI, tri, 7));
+    assert(stream.count == 4); /* semitransparent triangles do not snap */
+    semi[0] = 0;
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_SEMI, semi, 2));
+    const PgxpRthSeamEvent kinds[3] = {
+        PGXP_RTH_GOURAUD_TRI, PGXP_RTH_TEX_TRI, PGXP_RTH_SHADED_TEX_TRI
+    };
+    const size_t width[3] = {9, 15, 19};
+    const size_t pos[3][6] = {
+        {0,1,3,4,6,7}, {0,1,4,5,8,9}, {0,1,5,6,10,11}
+    };
+    for (int kind = 0; kind < 3; kind++) {
+        int32_t words[19] = {0};
+        for (int k = 0; k < 3; k++) {
+            words[pos[kind][2*k]] = input[0].ix[k];
+            words[pos[kind][2*k+1]] = input[0].iy[k];
+        }
+        assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_PRECISE, precise, 7));
+        assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_DEPTH, depth, 4));
+        assert(pgxp_rth_seam_stream_feed(&stream, kinds[kind], words, width[kind]));
+        assert(stream.count == (size_t)5 + (size_t)kind);
+    }
+    /* Near geometry is deliberately excluded by the renderer's depth gate. */
+    float near_z[3] = {10.0f, 1000.0f, 1000.0f};
+    memcpy(depth + 1, near_z, sizeof near_z);
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_PRECISE, precise, 7));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_DEPTH, depth, 4));
+    assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_FLAT_TRI, tri, 7));
+    assert(stream.count == 7);
+    assert(!pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_UNSUPPORTED, NULL, 0));
+    assert(!stream.valid);
+    pgxp_rth_seam_stream_release(&stream);
+    pgxp_rth_seam_stream_init(&stream, 1, 1, 100.0f, 0);
+    int32_t grouped[2+7 + 2+4 + 2+7] = {
+        1,7, 1,0,0,0,0,0,0,
+        2,4, 1,0,0,0,
+        3,7, 0,0,40,0,40,20,0
+    };
+    float group_z[3] = {1000.0f, 1000.0f, 1000.0f};
+    memcpy(&grouped[12], group_z, sizeof group_z);
+    assert(pgxp_rth_seam_stream_feed_group(&stream, grouped,
+                                           sizeof grouped / sizeof grouped[0], test_map));
+    assert(stream.count == 1);
+    assert(!pgxp_rth_seam_stream_feed_group(&stream, grouped,
+                                            sizeof grouped / sizeof grouped[0] - 1, test_map));
+    pgxp_rth_seam_stream_release(&stream);
     float expected[4][3];
     float gap[3];
     int expected_count[4];
