@@ -96,7 +96,7 @@ int main(void) {
      * inside it to exercise the GPU register-resync reset ordering. */
     pgxp_snap_reset(s_snap); test_snap_triangle(0,ignored);
     check(transaction_begin(0,0,320,240,0,2,1,0),"depth backup reused");
-    check(async_vram_capture(s_pgen_write),"immutable async depth captured");
+    check(async_vram_capture(s_pgen_write,0),"immutable async depth captured");
     test_depth_clear(s_hr_fbo,0.75); s_depth_last_avg=987;
     check(async_vram_enter(s_pgen_write),"immutable async depth entered");
     check(fabsf(test_depth_read(s_hr_fbo)-0.25f)<0.00001f && s_depth_last_avg==123,
@@ -108,6 +108,22 @@ int main(void) {
     glb_set_draw_area(s_pb_area[0],s_pb_area[1],s_pb_area[2],s_pb_area[3]);
     check(test_snap_triangle(1,repeated_gap)==first_snap &&
           !memcmp(first_gap,repeated_gap,sizeof first_gap),"register resync preserves restored seam history");
+    transaction_restore();
+    check(transaction_begin(0,0,320,240,0,2,0,0),"transfer capture begins");
+    GLuint captured_hr=s_pb_hr_fbo, captured_wide=s_pb_wide_fbo;
+    check(async_vram_capture(s_pgen_write,1),"transfer capture prepares immutable metadata");
+    transaction_restore();
+    async_vram_take_backup(s_pgen_write);
+    check(s_async_vram[s_pgen_write].hr_fbo==captured_hr &&
+          s_async_vram[s_pgen_write].wide_fbo==captured_wide && !s_pb_valid,
+          "transfer owns complete captured attachments and invalidates backup reuse");
+    check(transaction_begin(0,0,320,240,0,2,0,0),"fresh backup after ownership transfer");
+    test_depth_clear(s_hr_fbo,0.75);
+    check(async_vram_enter(s_pgen_write),"transferred capture enters");
+    check(fabsf(test_depth_read(s_hr_fbo)-0.25f)<0.00001f &&
+          fabsf(test_depth_read(pass_wide_fbo_for(0))-0.375f)<0.00001f,
+          "transferred canonical and wide depth attachments retain pixels");
+    async_vram_leave(); transaction_restore();
     check(glGetError()==GL_NO_ERROR,"capture leaves clean GL state");
     gl_renderer_shutdown(); SDL_DestroyWindow(win); SDL_Quit();
     printf("checks=%d failures=%d\n",checks,failures);

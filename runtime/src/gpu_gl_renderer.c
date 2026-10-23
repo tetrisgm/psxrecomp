@@ -8395,7 +8395,7 @@ static GLuint s_async_live_raw_tex,s_async_live_raw_fbo;
 static uint16_t *s_async_live_cpu;
 static int s_async_vram_bound,s_async_invalid;
 static void async_vram_release(int gi);
-static int async_vram_capture(int gi);
+static int async_vram_capture(int gi, int transfer_backup);
 static int async_vram_enter(int gi);
 static void async_vram_leave(void);
 
@@ -9377,11 +9377,13 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
     X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue) \
     X(resource_scale) X(resource_epoch) X(resource_wide) X(resource_alloc) \
     X(resource_acquire) X(resource_hd) X(epoch_acquire) X(epoch_hd) \
+    X(reserve_ns) X(enter_ns) X(replay_ns) X(finish_ns) X(replay_count) \
     X(present_calls) X(present_invalid) X(present_expired) X(present_mismatch) X(present_unready) X(present_refused)
 #define ASYNC_DECLARE(n) static _Atomic uint64_t s_async_count_##n;
 ASYNC_COUNTERS(ASYNC_DECLARE)
 #undef ASYNC_DECLARE
 #define ASYNC_COUNT(n) atomic_fetch_add(&s_async_count_##n,1)
+static uint64_t s_async_replay_started;
 void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
     if (!out) return;
 #define ASYNC_LOAD(n) out->n=atomic_load(&s_async_count_##n);
@@ -9529,20 +9531,20 @@ static int async_raw_allocate(AsyncVram *v) {
     return v->cpu && pass_make_color_fbo(&v->raw_tex,NULL,&v->raw_fbo,
         &v->raw_w,&v->raw_h,VRAM_W,VRAM_H,PSXGL_R16UI,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT);
 }
-static int async_vram_capture(int gi) {
+static int async_vram_capture(int gi, int transfer_backup) {
     AsyncVram *v=&s_async_vram[gi];
     if(!async_raw_allocate(v) ||
-       !pass_make_color_fbo(&v->hr_tex,&v->hr_rb,&v->hr_fbo,&v->hr_w,&v->hr_h,
-          s_pb_hr_w,s_pb_hr_h,GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE)) return 0;
-    if(s_pb_wide_src && !pass_make_color_fbo(&v->wide_tex,&v->wide_rb,&v->wide_fbo,
+       (!transfer_backup && !pass_make_color_fbo(&v->hr_tex,&v->hr_rb,&v->hr_fbo,&v->hr_w,&v->hr_h,
+          s_pb_hr_w,s_pb_hr_h,GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE))) return 0;
+    if(!transfer_backup && s_pb_wide_src && !pass_make_color_fbo(&v->wide_tex,&v->wide_rb,&v->wide_fbo,
         &v->wide_w,&v->wide_h,s_pb_wide_w,s_pb_wide_h,GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE)) return 0;
     /* Flush before copying: the CPU mirror may intentionally be stale when
      * native-authority raster is off, but the integer texture is coherent. */
     pack_flush();
     pass_blit(s_raw_fbo,v->raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
-    pass_blit(s_pb_hr_fbo,v->hr_fbo,0,0,0,0,s_pb_hr_w,s_pb_hr_h,
+    if (!transfer_backup) pass_blit(s_pb_hr_fbo,v->hr_fbo,0,0,0,0,s_pb_hr_w,s_pb_hr_h,
               GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
-    if(s_pb_wide_src) pass_blit(s_pb_wide_fbo,v->wide_fbo,0,0,0,0,s_pb_wide_w,s_pb_wide_h,
+    if(!transfer_backup && s_pb_wide_src) pass_blit(s_pb_wide_fbo,v->wide_fbo,0,0,0,0,s_pb_wide_w,s_pb_wide_h,
                                GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT|pass_depth_bit());
     memcpy(v->cpu,s_vram,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
     v->scale=s_hr_scale; v->resource_epoch=atomic_load(&s_async_resource_epoch);
@@ -9553,6 +9555,22 @@ static int async_vram_capture(int gi) {
     if(!pass_snap_capture(&v->snap,&v->snap_present,s_pb_snap_present?s_pb_snap:NULL)) return 0;
     memcpy(v->area,s_pb_area,sizeof v->area);
     return 1;
+}
+/* Reserve performs no draw. Once its transaction has restored the live
+ * surfaces, transfer the complete backup attachments instead of copying them.
+ * The old generation storage becomes reusable backup storage; its contents
+ * are not a valid backup until the next transaction captures the live frame. */
+static void async_vram_take_backup(int gi) {
+    AsyncVram *v=&s_async_vram[gi];
+#define TAKE(type,field,backup) do { type old=v->field; v->field=backup; backup=old; } while(0)
+    TAKE(GLuint,hr_tex,s_pb_hr_tex); TAKE(GLuint,hr_rb,s_pb_hr_rb); TAKE(GLuint,hr_fbo,s_pb_hr_fbo);
+    TAKE(int,hr_w,s_pb_hr_w); TAKE(int,hr_h,s_pb_hr_h);
+    if (s_pb_wide_src) {
+        TAKE(GLuint,wide_tex,s_pb_wide_tex); TAKE(GLuint,wide_rb,s_pb_wide_rb); TAKE(GLuint,wide_fbo,s_pb_wide_fbo);
+        TAKE(int,wide_w,s_pb_wide_w); TAKE(int,wide_h,s_pb_wide_h);
+    }
+#undef TAKE
+    s_pb_valid=0;
 }
 static int async_vram_enter(int gi) {
     AsyncVram *v=&s_async_vram[gi];
@@ -15529,25 +15547,29 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         s_dyn_rth_disp_valid = 0;
         break;
     case RTH_ASYNC_RESERVE: {
+        uint64_t stage_start=pt_clock_ns();
         GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
         if (token.output.epoch!=gl_renderer_present_epoch() || pt_clock_ns()>token.output.expires) break;
         if (transaction_begin(token.x,token.y,token.w,token.h,1,token.period_vblanks,0,0)) {
-            if(!async_vram_capture(s_pgen_write)) {
+            if(!async_vram_capture(s_pgen_write,1)) {
                 ASYNC_COUNT(capture);
                 s_pgen[s_pgen_write].valid=0; pass_end_now(0,0); break;
             }
             s_pgen[s_pgen_write].async_id=token.output.generation;
             s_pgen[s_pgen_write].async_epoch=token.output.epoch;
             pass_end_now(0,0);
+            async_vram_take_backup(s_pgen_write);
             s_async_display_epoch=token.output.epoch;
             RenderPassOutput first=token.output;
             uint64_t period=(uint64_t)(1e9/s_interp_target_hz);
             if(first.deadline+period<first.expires) first.expires=first.deadline+period;
             if (!token.output.alpha_q16) async_present_slot(s_pgen_write,0,&first);
         }
+        atomic_fetch_add(&s_async_count_reserve_ns,pt_clock_ns()-stage_start);
         break;
     }
     case RTH_ASYNC_BEGIN: {
+        uint64_t stage_start=pt_clock_ns();
         GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
         int gi=-1;
         for (int k=0;k<PASS_GENERATIONS;++k)
@@ -15566,6 +15588,8 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
                 atomic_fetch_add(&s_pass_q_refused,1);
             } else gpu_hd_textures_suppress_dumps(1);
         } else { ASYNC_COUNT(capture); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
+        s_async_replay_started=pt_clock_ns();
+        atomic_fetch_add(&s_async_count_enter_ns,s_async_replay_started-stage_start);
         break;
     }
     case RTH_PASS_BEGIN:
@@ -15577,7 +15601,9 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
             atomic_fetch_add(&s_pass_q_refused, 1);
         }
         break;
-    case RTH_PASS_END:
+    case RTH_PASS_END: {
+        uint64_t stage_start=pt_clock_ns();
+        if (s_async_exec) { ASYNC_COUNT(replay_count); atomic_fetch_add(&s_async_count_replay_ns,stage_start-s_async_replay_started); }
         if (s_pass_dead) { s_pass_dead = 0; break; }
         if (s_async_invalid || s_pass_leaks != s_pass_leaks_at_begin) {
             atomic_fetch_add(&s_pass_q_leaks, s_pass_leaks - s_pass_leaks_at_begin);
@@ -15594,8 +15620,10 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
             }
             gpu_hd_textures_suppress_dumps(0);
             s_async_exec=0; s_async_invalid=0; s_pgen_write=s_async_previous_write;
+            atomic_fetch_add(&s_async_count_finish_ns,pt_clock_ns()-stage_start);
         }
         break;
+    }
     case RTH_PEEK: {
         uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);
         (void)gl_renderer_fbo_peek(v[0], v[1], v[2], v[3], (uint16_t *)(uintptr_t)ptr);
