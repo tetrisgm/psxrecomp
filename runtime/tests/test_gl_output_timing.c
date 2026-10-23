@@ -116,6 +116,10 @@ int main(void) {
     GLRenderAsyncStats async_stats; gl_renderer_pass_async_stats(&async_stats);
     check(async_stats.duplicate==1 && async_stats.stale==1 && async_stats.submitted==2,
           "async diagnostics distinguish duplicate, epoch and successful admission");
+    for(int i=0;i<PASS_GENERATIONS;++i) if(s_pgen[i].async_id==tokens[1].output.generation) {
+        s_pgen_cur=i; s_pgen[i].promoted=1; s_pgen[i].t_len=1.0;
+        check(!pass_gen_present_at(0.5,1),"timed generation cannot leak into legacy flip presentation");
+    }
     uint64_t old_epoch=gl_renderer_present_epoch();
     gl_renderer_pass_async_invalidate();
     check(gl_renderer_present_epoch()!=old_epoch && !gl_renderer_pass_async_begin(&tokens[1]),
