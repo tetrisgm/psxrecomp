@@ -386,6 +386,14 @@ context taken from the render thread:
   kept whatever the internal resolution (three generations, about 0.8 GiB of
   textures at 8K, allocated as used).
 
+Depth/stencil attachments and PGXP depth-clear history roll back with each
+discarded transaction, including native-wide surfaces and journaled writes.
+Immutable asynchronous snapshots carry the same depth baseline. This reuses
+the backup attachments already allocated for stencil. The hidden GL capture
+fixture checks canonical/wide depth, clear history and asynchronous restoration
+on Windows and macOS. `PSX_RENDER_PASS_DEPTH_CHECKPOINT=0` disables depth
+restoration for diagnosing comparisons with the previous behavior.
+
 `PSX_RENDER_PASS_QUEUED=0` restores the synchronous handoff and the
 host-time budget above; `PSX_RENDER_PASS_VERIFY=1` implies it, since
 verification reads GL state back.
