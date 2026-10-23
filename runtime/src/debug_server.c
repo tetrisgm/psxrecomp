@@ -5834,6 +5834,9 @@ static void handle_pgxp(int id, const char *json)
     int cu = json_get_int(json, "culling", -1);
     if (cu >= 0)
         pgxp_set_culling(cu != 0);
+    /* Seam snapping: 1 on, 0 off, -1 follow [video] pgxp_seam. */
+    if (strstr(json, "\"snap\""))
+        gl_renderer_set_seam_snap(json_get_int(json, "snap", -1));
     /* tolerance is fractional (sub-pixel), so scan it directly — json_get_int
      * would truncate 0.5 to 0. */
     const char *p = strstr(json, "\"tolerance\"");
@@ -5849,13 +5852,17 @@ static void handle_pgxp(int id, const char *json)
     gl_renderer_pgxp_render_stats(&depth_tris, &depth_clears, &seam_tris);
     uint64_t dr[5];
     gl_renderer_pgxp_depth_clear_reasons(dr);
+    uint64_t sn_tris = 0, sn_snapped = 0, sn_edges = 0, sn_strips = 0;
+    gl_renderer_seam_snap_stats(&sn_tris, &sn_snapped, &sn_edges, &sn_strips);
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"cpu_mode\":%d,"
              "\"tolerance\":%.3f,\"position_fallback\":%d,"
              "\"preserve_projection\":%d,\"culling\":%d,"
              "\"suppress\":%u,\"active\":%d,\"depth_buffer\":%d,"
              "\"depth_tris\":%llu,\"depth_clears\":%llu,\"seam_tris\":%llu,"
              "\"depth_clear_reasons\":{\"config\":%llu,\"area\":%llu,\"fill\":%llu,"
-             "\"threshold\":%llu,\"present\":%llu}}",
+             "\"threshold\":%llu,\"present\":%llu},"
+             "\"snap\":{\"active\":%d,\"tris\":%llu,\"snapped_tris\":%llu,"
+             "\"snapped_edges\":%llu,\"strip_tris\":%llu,\"us\":%llu}}",
              id, pgxp_enabled(), pgxp_cpu_mode(), (double)pgxp_tolerance(),
              pgxp_position_fallback(), pgxp_preserve_projection(),
              pgxp_culling(),
@@ -5864,7 +5871,11 @@ static void handle_pgxp(int id, const char *json)
              (unsigned long long)depth_clears, (unsigned long long)seam_tris,
              (unsigned long long)dr[0], (unsigned long long)dr[1],
              (unsigned long long)dr[2], (unsigned long long)dr[3],
-             (unsigned long long)dr[4]);
+             (unsigned long long)dr[4], gl_renderer_seam_snap_active(),
+             (unsigned long long)sn_tris, (unsigned long long)sn_snapped,
+             (unsigned long long)sn_edges,
+             (unsigned long long)sn_strips,
+             (unsigned long long)gl_renderer_seam_snap_us());
 }
 
 static void handle_gpu_state(int id, const char *json)

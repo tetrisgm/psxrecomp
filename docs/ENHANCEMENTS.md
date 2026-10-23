@@ -1241,7 +1241,7 @@ vertex depth, `src/core/settings.cpp` defaults). GooseStation
 | Tolerance | `PGXPTolerance` -1 | `pgxp_tolerance` | same |
 | Depth buffer | `PGXPDepthBuffer`: per-vertex w as depth, LEQUAL, only for polygons whose w differ (3D) and opaque unless `PGXPTransparentDepthTest`; cleared on drawing-area change and when average z rises by `PGXPDepthThreshold` (4096) | no | **yes**, `pgxp_depth_buffer`, key 9 |
 | 2D polygons | sprite mode for non-3D precise polygons; `PGXPDisableOn2DPolygons` draws invalid-w polygons native | unproven vertices native per vertex; precise axis-aligned quads bypass the rect path (G1.11) | same; 2D never tests/writes depth |
-| T-junction / seam handling | none for polygons (line expansion only) | none | **seam expansion**, `pgxp_seam`, key F11 |
+| T-junction / seam handling | none for polygons (line expansion only) | none | **seam expansion**, `pgxp_seam`, key F11; seam snapping (G1.15) |
 
 **Depth buffer.** gpu.c passes each triangle's SZ when all three vertices
 are dataflow-precise (`gr_set_depth_triangle`). The GL backend draws an
@@ -1319,6 +1319,61 @@ own clear: `gl_frame_gen_test` draws overlapping PGXP triangles out of painter
 order and requires the in-between frame at phase 1 to equal the real one,
 with each feature (depth, colour) alone and together; each changes the real
 image there.
+
+### G1.15 — Seam snapping: the gaps PGXP's sub-pixel positions open (2026-10-22)
+
+**What it fixes.** Two surfaces the PS1 drew on the same integer line touch
+on hardware, whatever their exact positions: the integer raster closes
+them. With PGXP each vertex keeps its sub-pixel position, and consecutive
+rows of a road over a crest, block boundaries and T-junctions of subdivided
+meshes end up as much as ~1 native pixel apart. At 13x/18x that is a 13-18
+output-pixel stripe of whatever was drawn behind (R4: far scenery between
+road rows at every crest, sky cracks along wall tops; owner report "the
+seams are pgxp"). Seam expansion (`fine`, 1 output px) cannot reach them,
+and widening it bloats every silhouette. PGXP itself stays as it is: no
+clamping, no snapping of vertices, no wobble.
+
+**How.** `runtime/src/pgxp_seam_snap.h` measures, per frame and in draw
+order, every depth-tested PGXP 3D triangle against the edges drawn before
+it. An edge pairs with an earlier one when, in integer (PS1) space, both
+its ends lie on that edge's line (within 0.75 px) overlapping it by at
+least 1 px, and in precise space the two are parallel (~3 deg), on opposite
+sides, at depths within 12% and no more than 1 native px apart (the PS1's
+rounding). A vertex lying on an earlier edge's interior (or up to 3 px past
+its end) is a T-junction, measured the same way. The gap becomes a strip
+from the triangle's own edge outward (the parallelogram, plus a cap where
+two strips meet), its UV / colour / q / SZ extrapolated barycentrically
+from the triangle (textures continue), its depth pushed behind the
+triangle's plane by more than the colour pass's near tolerance. Strips
+queue beside the batch and draw as a batch of their own after it, so they
+only land where what is already there is clearly farther: the gap. They
+never cover the neighbour, and a triangle that lies along an earlier edge
+on the same side in precise space too (a decal: lane marks, kerbs,
+shadows) gets none. Edges of the same mesh (a shared precise vertex) never
+pair, and a gap no wider than seam expansion's own reach gets no strip. The
+index is keyed by line, not area: an edge lives in 8-px cells along its
+major axis and the integer rows within the line tolerance, so one lookup per
+vertex finds its collinear candidates however much geometry overlaps.
+
+**Scope.** Follows `[video] pgxp_seam` (on for `fine` and `wide`, R4's
+default `fine`); `PSX_PGXP_SNAP=0` turns it off for a run; the debug
+server's `pgxp` command takes `"snap": 1 | 0 | -1` (on / off / follow the
+setting) and reports `snap: {active, tris, snapped_tris, snapped_edges,
+strip_tris, us}`. Frame generation's in-between frames redraw without
+strips. Host-side and visual only; guest state is untouched.
+
+**R4 (hook flavor, hidden GL, deterministic route-anchored captures, slots
+1/3/6/8, 13x and 18x).** The crest stripes (slot 6, road rows under the
+TIME banner), the far-road stripes beyond the overpass (slot 1) and the sky
+cracks along the Helter Skelter wall tops (slot 8) close; silhouettes and
+decals are unchanged. A strip can extend a surface by up to the measured
+gap where the scenery behind is farther, as the integer raster would have
+(a far headlight streak on slot 3 grows by ~0.6 native px). Cost on the
+render thread, measured with the CPU saturated by other jobs: 1.4-2.2 ms a
+frame for ~800-1200 3D triangles at 18x (about 1.5 us a triangle); 0
+dispatch / segment misses and 4 mixed triangles in a boot-to-race smoke.
+`tests/test_pgxp_seam_snap.c` pins the measurements (crest gap, shared
+mesh, overlap, decal, depth and size limits, T-junction, reset).
 
 ## IR1 — Internal resolution presets (Native … 8K) and the GL scale ceiling (2026-09-26)
 

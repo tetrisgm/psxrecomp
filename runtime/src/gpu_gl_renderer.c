@@ -79,6 +79,7 @@
 #include "gl_scale_limits.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "pgxp_seam_snap.h"
 #include "video_telemetry.h"
 #include "gpu_hd_textures.h"
 #include "mod_texture_banks.h"
@@ -785,6 +786,10 @@ static float   s_pq[3];
  * vertex, 1..65535, from validated dataflow shadows. */
 static int     s_pz_valid = 0;
 static float   s_pz[3];
+/* PGXP seam snapping (pgxp_seam_snap.h): the gap, native px, between each
+ * edge (k -> k+1) of the triangle being drawn and an earlier neighbour,
+ * filled by snap strips (snap_strip_tris). */
+static float   s_snap_e[3];
 /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
  * and the seam expansion of opaque 3D polygons (0 off, 1 = 1 output px
@@ -3488,6 +3493,11 @@ static void wide_clear_bd_scale(GLint uScale, GLint uCenter) {
 #define TEXBATCH_MAXV 8190                 /* multiple of 3; ~2730 tris */
 static float s_tb[TEXBATCH_MAXV * TEXV];
 static int   s_tb_n = 0;                    /* verts queued */
+/* The batch's seam snapping strips (snap_strip_tris), drawn as their own
+ * batch right after it: each strip must be depth-tested against everything
+ * the batch drew, and a batch's colour pass writes no depth. */
+static float s_tbs[TEXBATCH_MAXV * TEXV];
+static int   s_tbs_n = 0;
 static int   s_tb_semi = -2;
 static int   s_tb_depth = 0;                /* PGXP depth mode (batch key) */
 static int   s_tb_b3d = 0;                  /* bloom on: 3D (bloom source) batch (key) */
@@ -4184,6 +4194,12 @@ static void flush_tex_batch_impl(void) {
     }
     hr_end();
     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
+    if (s_tbs_n > 0) {   /* the strips, as a batch of their own (same keys) */
+        memcpy(s_tb, s_tbs, (size_t)s_tbs_n * TEXV * sizeof(float));
+        s_tb_n = s_tbs_n;
+        s_tbs_n = 0;
+        flush_tex_batch_impl();
+    }
 }
 
 /* Flat / gouraud GEO batch — MotK title/char-select starfields issue ~30k/s
@@ -4191,6 +4207,8 @@ static void flush_tex_batch_impl(void) {
  * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
 #define FLATBATCH_MAXV 8190                 /* multiple of 3 */
 #define FLATBATCH_MAXL (FLATBATCH_MAXV / 6)   /* line quads the batch can hold */
+static float s_fbs[FLATBATCH_MAXV * 6];     /* its seam snapping strips (s_tbs) */
+static int   s_fbs_n = 0;
 /* The batch, then room for its windowed lines' GL_LINES vertices (s_fbl),
  * which flush_flat_batch uploads right after it. */
 static float s_fb[(FLATBATCH_MAXV + 2 * FLATBATCH_MAXL) * 6];
@@ -4316,6 +4334,12 @@ static void flush_flat_batch_impl(void) {
         gl_perf_mirror_end();
     }
     hr_end();
+    if (s_fbs_n > 0) {   /* the strips, as a batch of their own (same keys) */
+        memcpy(s_fb, s_fbs, (size_t)s_fbs_n * 6 * sizeof(float));
+        s_fb_n = s_fbs_n;
+        s_fbs_n = 0;
+        flush_flat_batch_impl();
+    }
 }
 
 /* A PS1 line as a quad one NATIVE pixel thick (used at S > 1).
@@ -4541,6 +4565,137 @@ static void seam_q(const float B[3][3], float q[3]) {
     for (int k = 0; k < 3; k++) { o[k] = 0.0f; for (int i = 0; i < 3; i++) o[k] += B[k][i] * q[i]; }
     for (int k = 0; k < 3; k++) q[k] = o[k] > 1e-9f ? o[k] : q[k];
 }
+/* Seam snapping strips (pgxp_seam_snap.h). An edge with a measured gap to
+ * an earlier neighbour gets a strip: the parallelogram from the edge out by
+ * the gap (and a cap where two such edges meet), drawn after the triangle
+ * with its attributes extrapolated from the triangle
+ * (textures continue, nothing slides) and its depth pushed back past the
+ * colour pass's near tolerance. So a strip only ever lands where what is
+ * already there is clearly farther -- the gap, showing the scenery behind --
+ * and never over the neighbour itself or a decal on it; the triangle and
+ * every vertex keep their PGXP positions. Corners: up to 3 strips of two
+ * triangles plus 3 caps. Strips queue beside the batch (s_tbs / s_fbs) and
+ * draw as a batch of their own when it flushes, after its depth is laid
+ * down. */
+#define SNAP_STRIP_MAX_TRIS 9
+static int snap_strip_tris(const float x[3], const float y[3],
+                           float sx[SNAP_STRIP_MAX_TRIS][3], float sy[SNAP_STRIP_MAX_TRIS][3]) {
+    if (s_snap_e[0] <= 0.0f && s_snap_e[1] <= 0.0f && s_snap_e[2] <= 0.0f) return 0;
+    const float area = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
+    if (fabsf(area) < 1e-4f) return 0;
+    const float sgn = area > 0.0f ? 1.0f : -1.0f;
+    float nx[3], ny[3];
+    for (int k = 0; k < 3; k++) {
+        const int k1 = (k + 1) % 3;
+        const float ex = x[k1] - x[k], ey = y[k1] - y[k], l = sqrtf(ex * ex + ey * ey);
+        if (l < 1e-5f) return 0;
+        nx[k] = sgn * ey / l; ny[k] = -sgn * ex / l;
+    }
+    int n = 0;
+    for (int k = 0; k < 3; k++) {
+        const float e = s_snap_e[k];
+        if (e <= 0.0f) continue;
+        const int b = (k + 1) % 3;
+        const float ax2 = x[k] + e * nx[k], ay2 = y[k] + e * ny[k];
+        const float bx2 = x[b] + e * nx[k], by2 = y[b] + e * ny[k];
+        sx[n][0] = x[k]; sy[n][0] = y[k]; sx[n][1] = x[b]; sy[n][1] = y[b];
+        sx[n][2] = bx2;  sy[n][2] = by2;  n++;
+        sx[n][0] = x[k]; sy[n][0] = y[k]; sx[n][1] = bx2;  sy[n][1] = by2;
+        sx[n][2] = ax2;  sy[n][2] = ay2;  n++;
+    }
+    for (int v = 0; v < 3; v++) {               /* caps between two strips */
+        const int kp = (v + 2) % 3;
+        if (s_snap_e[kp] <= 0.0f || s_snap_e[v] <= 0.0f) continue;
+        sx[n][0] = x[v]; sy[n][0] = y[v];
+        sx[n][1] = x[v] + s_snap_e[kp] * nx[kp]; sy[n][1] = y[v] + s_snap_e[kp] * ny[kp];
+        sx[n][2] = x[v] + s_snap_e[v] * nx[v];   sy[n][2] = y[v] + s_snap_e[v] * ny[v];
+        n++;
+    }
+    return n;
+}
+/* Barycentric coordinates B[k][i] of points (cx[k],cy[k]) in triangle x,y. */
+static void snap_bary(const float x[3], const float y[3], const float cx[3], const float cy[3],
+                      float B[3][3]) {
+    const float inv = 1.0f / ((x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]));
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < 3; i++) {
+            const int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
+            B[k][i] = ((x[i2] - x[i1]) * (cy[k] - y[i1]) - (y[i2] - y[i1]) * (cx[k] - x[i1])) * inv;
+        }
+}
+/* A strip's depth: behind its own plane by more than the colour pass's
+ * near tolerance (u_zbias, plus its 48-unit term), so it never wins against
+ * a surface at that plane. */
+static float snap_strip_depth(float z) {
+    return z * (1.0f + 1.5f * pgxp_depth_tol()) + 64.0f;
+}
+static uint64_t s_snap_strip_tris = 0;
+/* The frame's edge index (allocated on first use, reset at every present).
+ * Seam snapping is a seam-expansion extra: it follows [video] pgxp_seam
+ * (fine / wide); PSX_PGXP_SNAP=0 turns it off for one run and the debug
+ * server forces it on (1) / off (0) or back to the setting (-1). Frame
+ * generation's in-between frames redraw a recorded frame and do not snap. */
+static PgxpSnap *s_snap;
+static uint64_t s_snap_ticks = 0;           /* time measuring, perf counter */
+static int s_snap_env = -1, s_snap_force = -1, s_snap_suspend = 0;
+static int seam_snap_enabled(void) {
+    if (s_snap_suspend) return 0;
+    if (s_snap_force >= 0) return s_snap_force;
+    if (s_snap_env < 0) {
+        const char *e = getenv("PSX_PGXP_SNAP");
+        s_snap_env = (e && *e) ? (*e != '0') : 1;
+    }
+    return s_snap_env && s_pgxp_seam > 0;
+}
+void gl_renderer_set_seam_snap(int mode) {
+    GL_RT_SYNC("set_seam_snap");
+    s_snap_force = mode < 0 ? -1 : (mode ? 1 : 0);
+}
+int gl_renderer_seam_snap_active(void) { return seam_snap_enabled(); }
+void gl_renderer_seam_snap_stats(uint64_t *tris, uint64_t *snapped_tris,
+                                 uint64_t *snapped_edges, uint64_t *strip_tris) {
+    if (tris) *tris = s_snap ? s_snap->tris : 0;
+    if (snapped_tris) *snapped_tris = s_snap ? s_snap->snapped_tris : 0;
+    if (snapped_edges) *snapped_edges = s_snap ? s_snap->snapped_edges : 0;
+    if (strip_tris) *strip_tris = s_snap_strip_tris;
+}
+/* Cumulative time spent measuring gaps, microseconds. */
+uint64_t gl_renderer_seam_snap_us(void) {
+    const uint64_t f = SDL_GetPerformanceFrequency();
+    return f ? s_snap_ticks * 1000000ull / f : 0;
+}
+/* Measure this depth-tested PGXP triangle's gaps (s_snap_e) against the
+ * frame so far and record it. xs/ys: its integer vertices. */
+static int seam_snap_measure(const int *xs, const int *ys) {
+    s_snap_e[0] = s_snap_e[1] = s_snap_e[2] = 0.0f;
+    if (!seam_snap_enabled() || !s_pc_valid || !s_pz_valid) return 0;
+    if (!s_snap) {
+        s_snap = (PgxpSnap *)calloc(1, sizeof *s_snap);
+        if (!s_snap) return 0;
+        pgxp_snap_reset(s_snap);
+    }
+    /* A frame that never changes its drawing area nor presents (a hidden
+     * context) still starts over once the index is full. */
+    if (s_snap->n_edges > PGXP_SNAP_MAX_EDGES - 3 || s_snap->n_links > PGXP_SNAP_MAX_LINKS - 4096)
+        pgxp_snap_reset(s_snap);
+    int32_t ix[3], iy[3], fx[3], fy[3];
+    const uint32_t word[3] = { 0, 0, 0 };
+    for (int i = 0; i < 3; i++) {
+        ix[i] = xs[i]; iy[i] = ys[i];
+        fx[i] = (int32_t)lrintf(s_pc_x[i] * 65536.0f);
+        fy[i] = (int32_t)lrintf(s_pc_y[i] * 65536.0f);
+    }
+    const uint64_t t0 = SDL_GetPerformanceCounter();
+    int n = pgxp_snap_triangle(s_snap, ix, iy, fx, fy, s_pz, word, s_snap_e);
+    s_snap_ticks += SDL_GetPerformanceCounter() - t0;
+    /* A gap no wider than seam expansion's own reach is already closed by
+     * it: no strip. */
+    const float w = pgxp_seam_width();
+    for (int k = 0; k < 3 && n; k++)
+        if (s_snap_e[k] > 0.0f && s_snap_e[k] <= w) { s_snap_e[k] = 0.0f; n--; }
+    return n;
+}
+
 static void seam_sz(const float B[3][3], float z[3]) {
     float limit = fmaxf(z[0], fmaxf(z[1], z[2])) > 65535.0f ? 2147483648.0f : 65535.0f;
     float o[3];
@@ -4724,7 +4879,11 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
                        s_fb_mask != (int)s_mask_set || s_fb_gate != gate ||
                        s_fb_depth != dmode || s_fb_b3d != b3d))
         flush_flat_batch();
-    if (s_fb_n + n > FLATBATCH_MAXV)
+    /* Room for this triangle and its seam snapping strips in one batch. */
+    const int snap_on = n == 3 && dmode == 1 && s_pgxp_seam && pgxp_tri_is_3d() && precise &&
+                        seam_snap_measure(xs, ys) > 0;
+    if (s_fb_n + n > FLATBATCH_MAXV ||
+        (snap_on && s_fbs_n + 3 * SNAP_STRIP_MAX_TRIS > FLATBATCH_MAXV))
         flush_flat_batch();
     s_fb_mode = GL_TRIANGLES;
     s_fb_semi = semi;
@@ -4745,6 +4904,8 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         v[5] = mask_a;
         s_fb_n++;
     }
+    float snap_src[3 * 6];
+    if (snap_on) memcpy(snap_src, v0, sizeof snap_src);
     if (n == 3 && pgxp_tri_is_3d()) {
         float z[3] = { s_pz[0], s_pz[1], s_pz[2] };
         /* Only a triangle the depth buffer tests (mode 1) expands: without
@@ -4766,6 +4927,29 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
                 : mask_a + 2.0f * pgxp_vertex_code(z[i]);
     }
     if (n == 3) pgxp_tri_log_tri('G', dmode, semi, v0, 6);
+    if (snap_on) {
+        float x[3], y[3], sx[SNAP_STRIP_MAX_TRIS][3], sy[SNAP_STRIP_MAX_TRIS][3];
+        for (int i = 0; i < 3; i++) { x[i] = snap_src[i * 6]; y[i] = snap_src[i * 6 + 1]; }
+        const int ns = snap_strip_tris(x, y, sx, sy);
+        const float qc[3] = { 1.0f / s_pz[0], 1.0f / s_pz[1], 1.0f / s_pz[2] };
+        for (int t = 0; t < ns; t++) {
+            float B[3][3], z[3] = { s_pz[0], s_pz[1], s_pz[2] };
+            snap_bary(x, y, sx[t], sy[t], B);
+            float *d = &s_fbs[s_fbs_n * 6];
+            memcpy(d, snap_src, sizeof snap_src);
+            seam_attr(B, d + 2, 6, 3, s_pgxp_cpersp ? qc : NULL);
+            seam_sz(B, z);
+            for (int i = 0; i < 3; i++) {
+                d[i * 6] = sx[t][i]; d[i * 6 + 1] = sy[t][i];
+                const float zz = snap_strip_depth(z[i]);
+                d[i * 6 + 5] = zz > 65535.0f
+                    ? -pgxp_far_vertex_code(zz, ((int)mask_a & 1), mask_a >= GPU_GEO_DITHER_CODE)
+                    : mask_a + 2.0f * pgxp_vertex_code(zz);
+            }
+            s_fbs_n += 3;
+            s_snap_strip_tris++;
+        }
+    }
 }
 
 /* Drain a pending native-wide line batch (gpu_geometry). flush_flat_batch()
@@ -4892,7 +5076,13 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             s_batch_reason[reason]++;
             flush_tex_batch();
         }
-        if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
+        /* Room for this triangle and its seam snapping strips in one batch. */
+        const int snap_on = tdmode == 1 && s_pgxp_seam && pgxp_tri_is_3d() &&
+                            seam_snap_measure(xs, ys) > 0;
+        if (s_tb_n + 3 > TEXBATCH_MAXV ||
+            (snap_on && s_tbs_n + 3 * SNAP_STRIP_MAX_TRIS > TEXBATCH_MAXV)) {
+            s_batch_reason[6]++; flush_tex_batch();
+        }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = filter; s_tb_gate = gate;
             s_tb_depth = tdmode;
@@ -4925,6 +5115,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[25] = (float)hd.alpha_mode;
             vp[26] = (float)filter; /* per-primitive filter */
         }
+        float snap_src[3 * TEXV];
+        if (snap_on) memcpy(snap_src, &s_tb[s_tb_n * TEXV], sizeof snap_src);
         if (pgxp_tri_is_3d()) {
             float *t0 = &s_tb[s_tb_n * TEXV];
             float z[3] = { s_pz[0], s_pz[1], s_pz[2] };
@@ -4952,6 +5144,35 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         }
         pgxp_tri_log_tri('T', tdmode, semi, &s_tb[s_tb_n * TEXV], TEXV);
         s_tb_n += 3;
+        if (snap_on) {
+            float x[3], y[3], sx[SNAP_STRIP_MAX_TRIS][3], sy[SNAP_STRIP_MAX_TRIS][3];
+            for (int i = 0; i < 3; i++) { x[i] = snap_src[i * TEXV]; y[i] = snap_src[i * TEXV + 1]; }
+            const int ns = snap_strip_tris(x, y, sx, sy);
+            const float qc[3] = { 1.0f / s_pz[0], 1.0f / s_pz[1], 1.0f / s_pz[2] };
+            for (int t = 0; t < ns; t++) {
+                float B[3][3], z[3] = { s_pz[0], s_pz[1], s_pz[2] };
+                float q[3] = { snap_src[19], snap_src[TEXV + 19], snap_src[2 * TEXV + 19] };
+                snap_bary(x, y, sx[t], sy[t], B);
+                float *d = &s_tbs[s_tbs_n * TEXV];
+                memcpy(d, snap_src, sizeof snap_src);
+                seam_attr(B, d + 2, TEXV, 2, s_pq_valid ? q : NULL);          /* uv  */
+                seam_attr(B, d + 4, TEXV, 3, s_pgxp_cpersp ? (s_pq_valid ? q : qc) : NULL);
+                if (s_pq_valid) {
+                    seam_q(B, q);
+                    for (int i = 0; i < 3; i++) d[i * TEXV + 19] = q[i];
+                }
+                seam_sz(B, z);
+                for (int i = 0; i < 3; i++) {
+                    d[i * TEXV] = sx[t][i]; d[i * TEXV + 1] = sy[t][i];
+                    const float zz = snap_strip_depth(z[i]);
+                    const float code = pgxp_vertex_code(zz);
+                    if (zz > 65535.0f) d[i * TEXV + 7] = pgxp_far_vertex_code(zz, 0, 0);
+                    else if (code > 0.0f) d[i * TEXV + 7] = -code;
+                }
+                s_tbs_n += 3;
+                s_snap_strip_tris++;
+            }
+        }
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
     }
     gpu_hd_textures_release_image(&hd);
@@ -5316,6 +5537,9 @@ static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
     s_pz[0] = z0; s_pz[1] = z1; s_pz[2] = z2;
 }
 static void glb_set_draw_area(int x1,int y1,int x2,int y2) {
+    /* Seam snapping: a new drawing area is a new frame (or surface). */
+    if (s_snap && (x1 != s_area_x1 || y1 != s_area_y1 || x2 != s_area_x2 || y2 != s_area_y2))
+        pgxp_snap_reset(s_snap);
     if (s_depth_used && (x1 != s_area_x1 || y1 != s_area_y1 || x2 != s_area_x2 || y2 != s_area_y2))
         DEPTH_REQUEST_CLEAR(DCLR_AREA);   /* PGXP depth: a new drawing area starts clean */
     flush_flat_batch(); flush_tex_batch(); s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
@@ -7531,6 +7755,7 @@ static void gl_perf_present_enter(void) {
     /* PGXP depth (G1.14): every displayed frame starts with a clear depth
      * buffer, whatever the game does with its drawing areas. */
     if (s_depth_used) DEPTH_REQUEST_CLEAR(DCLR_PRESENT);
+    if (s_snap) pgxp_snap_reset(s_snap);   /* seam snapping: a new frame */
     /* Replay: taken on the emulation thread when the present was recorded. */
     { extern void psx_ws_dbg_gate_frame_snapshot(void); if (!rth_replaying()) psx_ws_dbg_gate_frame_snapshot(); }
     if (!s_pf_on || rthf_owns_timer()) return;
@@ -13426,7 +13651,9 @@ static int fg_generate(double t, int swap) {
     /* Reprojected: only the cars are drawn again (their own motion). */
     s_fg_replay_objects_only = reproj;
     gpu_hd_textures_suppress_dumps(1);   /* presentation only: dumps see real frames */
+    s_snap_suspend = 1;
     fg_replay(s_fg_src_older ? b : a, L, tl, iw >= 0 ? s_fg_w_fbo : 0);
+    s_snap_suspend = 0;
     gpu_hd_textures_suppress_dumps(0);
     s_fg_replay_objects_only = 0;
     flush_line_batch();
