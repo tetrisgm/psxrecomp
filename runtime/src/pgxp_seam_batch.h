@@ -144,8 +144,11 @@ static inline int pgxp_snap_batch_preflight(PgxpSnapBatch *b, const PgxpSnap *ba
 static inline int pgxp_snap_batch_next(PgxpSnapBatch *b, size_t ordinal,
                                        const PgxpSnapBatchInput *input,
                                        float gap[3], int *count) {
-    if (!b || !b->verified || ordinal != b->consumed || ordinal >= b->count ||
-        !input || !gap || !count) return 0;
+    if (!b || !b->verified) return 0;
+    if (ordinal != b->consumed || ordinal >= b->count || !input || !gap || !count) {
+        b->verified = 0;
+        return 0;
+    }
     const PgxpSnapBatchEntry *e = &b->entries[ordinal];
     if (e->ordinal != ordinal || e->checksum != pgxp_snap_batch_input_checksum(input) ||
         !pgxp_snap_batch_input_equal(&e->input, input)) {

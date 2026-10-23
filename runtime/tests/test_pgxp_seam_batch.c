@@ -120,6 +120,8 @@ int main(void) {
         assert(pgxp_snap_batch_prepare(&batch[worker], &baseline, 41, input, 4));
         assert(pgxp_snap_batch_preflight(&batch[worker], &baseline, 41, input, 4));
         assert(!pgxp_snap_batch_next(&batch[worker], 1, &input[1], got, &count));
+        assert(!batch[worker].verified);
+        assert(pgxp_snap_batch_preflight(&batch[worker], &baseline, 41, input, 4));
         for (int i = 0; i < 4; i++) {
             assert(pgxp_snap_batch_next(&batch[worker], (size_t)i, &input[i], got, &count));
             assert(count == expected_count[i]);
