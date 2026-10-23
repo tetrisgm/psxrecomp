@@ -9344,13 +9344,13 @@ uint32_t gl_renderer_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t 
     RenderPassOutput outputs[RENDER_PASS_MAX_PHASES];
     if (max>RENDER_PASS_MAX_PHASES) max=RENDER_PASS_MAX_PHASES;
     int n=render_pass_output_plan(&next,begin,end,pt_clock_ns(),s_async_id+1,outputs,max);
-    if (n<=0 || !rt_batch_begin()) return 0;
+    if (n<=0 || !rth_group_flush() || !rt_batch_begin()) return 0;
     GLRenderAsyncToken base={outputs[0],x,y,w,h,period};
     base.output.deadline=begin;
     base.output.expires=end; /* reserve carries the entire display window */
     base.output.alpha_q16=0;
     if (!async_record(RTH_ASYNC_RESERVE,&base) || !rt_batch_try_commit()) {
-        ASYNC_COUNT(ring_full); rt_batch_discard(); return 0;
+        ASYNC_COUNT(ring_full); rth_group_flush(); rt_batch_discard(); return 0;
     }
     s_async_id++; s_async_last_index=0; s_async_has_index=0; s_async_timeline=next;
     for (int i=0;i<n;++i) tokens[i]=(GLRenderAsyncToken){outputs[i],x,y,w,h,period};
@@ -9370,9 +9370,9 @@ int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
     if (s_async_has_index && token->output.index<=s_async_last_index) {
         ASYNC_COUNT(duplicate); return 0;
     }
-    if (!rt_batch_begin()) { ASYNC_COUNT(ring_full); return 0; }
+    if (!rth_group_flush() || !rt_batch_begin()) { ASYNC_COUNT(ring_full); return 0; }
     s_async_recording=*token;
-    if (!async_record(RTH_ASYNC_BEGIN,token)) { ASYNC_COUNT(ring_full); rt_batch_discard(); return 0; }
+    if (!async_record(RTH_ASYNC_BEGIN,token)) { ASYNC_COUNT(ring_full); rth_group_flush(); rt_batch_discard(); return 0; }
     return 1;
 }
 int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
@@ -9382,7 +9382,7 @@ int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
         token->output.index!=s_async_recording.output.index ||
         token->output.deadline!=s_async_recording.output.deadline ||
         token->output.alpha_q16!=s_async_recording.output.alpha_q16) {
-        rt_batch_discard(); return 0;
+        rth_group_flush(); rt_batch_discard(); return 0;
     }
     RTH_REC(RTH_PASS_END,0,(int32_t)token->output.alpha_q16,keep);
     if (!keep || token->output.epoch!=gl_renderer_present_epoch() ||
@@ -9391,7 +9391,7 @@ int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
             if(token->output.epoch!=gl_renderer_present_epoch()) ASYNC_COUNT(stale);
             else ASYNC_COUNT(late);
         }
-        rt_batch_discard(); return 0;
+        rth_group_flush(); rt_batch_discard(); return 0;
     }
     int ok=rt_batch_try_commit();
     if (ok) { ASYNC_COUNT(submitted); s_async_last_index=token->output.index; s_async_has_index=1; }

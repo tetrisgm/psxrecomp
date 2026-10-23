@@ -75,6 +75,11 @@ int main(void) {
     if (count>1) {
         gr_fill_rect(384,0,16,16,0x3E0); /* live texture changes before worker returns */
         check(gl_renderer_pass_async_begin(&tokens[1]),"begin reserved generation");
+        gr_set_depth_triangle(1,10,11,12);
+        GLRenderAsyncToken wrong=tokens[1]; wrong.output.index++;
+        check(!gl_renderer_pass_async_end(&wrong,1) && !s_rth_group_n,
+              "aborted async batch cannot leak deferred primitive state");
+        check(gl_renderer_pass_async_begin(&tokens[1]),"retry after discarded batch");
         gr_set_draw_area(0,0,319,239);
         gr_set_color_modulation(128,128,128,1);
         gr_draw_textured_rect(0,0,16,16,0,0,0,0,0x106);
