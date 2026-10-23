@@ -8362,6 +8362,23 @@ static uint64_t s_async_id, s_async_last_index;
 static int s_async_rate, s_async_exec, s_async_previous_write, s_async_has_index;
 static GLRenderAsyncToken s_async_recording, s_async_executing;
 static uint64_t s_async_display_until, s_async_display_epoch;
+/* Generation-local native texture bytes and initial destination surfaces. */
+typedef struct AsyncVram {
+    GLuint raw_tex,raw_fbo,hr_tex,hr_rb,hr_fbo,wide_tex,wide_rb,wide_fbo;
+    int raw_w,raw_h,hr_w,hr_h,wide_w,wide_h,scale;
+    uint16_t *cpu;
+    uint64_t resource_epoch;
+} AsyncVram;
+static AsyncVram s_async_vram[PASS_GENERATIONS],s_async_work;
+static _Atomic uint64_t s_async_resource_epoch=1;
+static GLuint s_async_live_raw_tex,s_async_live_raw_fbo;
+static uint16_t *s_async_live_cpu;
+static int s_async_vram_bound,s_async_invalid;
+static void async_vram_release(int gi);
+static int async_vram_capture(int gi);
+static int async_vram_enter(int gi);
+static void async_vram_leave(void);
+
 static int async_display_active(void);
 /* Double-buffer complete pairs: the unpublished set may be overwritten while
  * the last complete pair remains visible. No temporal phases or generation. */
@@ -8779,6 +8796,7 @@ static int pass_make_color_fbo(GLuint *tex, GLuint *rb, GLuint *fbo,
 }
 
 static void pass_gen_release(int gi) {
+    async_vram_release(gi);
     if (s_ctx && s_pgen_alloc_n[gi])
         glDeleteTextures((GLsizei)s_pgen_alloc_n[gi], s_pgen_tex[gi]);
     memset(s_pgen_tex[gi], 0, sizeof s_pgen_tex[gi]);
@@ -9324,7 +9342,71 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
         }
         s_pgen_tex[gi][at] = t; g->phase[at] = alpha_q16; g->n++;
     }
+    if (s_async_exec) async_vram_leave();
     transaction_restore();
+}
+
+static void async_vram_free(AsyncVram *v) {
+    if(s_ctx) {
+        GLuint tex[3]={v->raw_tex,v->hr_tex,v->wide_tex};
+        GLuint fbo[3]={v->raw_fbo,v->hr_fbo,v->wide_fbo};
+        GLuint rb[2]={v->hr_rb,v->wide_rb};
+        glDeleteTextures(3,tex); p_glDeleteFramebuffers(3,fbo); p_glDeleteRenderbuffers(2,rb);
+    }
+    free(v->cpu); memset(v,0,sizeof(*v));
+}
+static void async_vram_release(int gi) {
+    async_vram_free(&s_async_vram[gi]);
+    /* The work texture is shared, and only needs freeing at history teardown. */
+    if(gi==PASS_GENERATIONS-1 && !s_async_vram_bound) async_vram_free(&s_async_work);
+}
+static int async_raw_allocate(AsyncVram *v) {
+    if(!v->cpu) v->cpu=malloc((size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
+    return v->cpu && pass_make_color_fbo(&v->raw_tex,NULL,&v->raw_fbo,
+        &v->raw_w,&v->raw_h,VRAM_W,VRAM_H,PSXGL_R16UI,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT);
+}
+static int async_vram_capture(int gi) {
+    AsyncVram *v=&s_async_vram[gi];
+    if(!async_raw_allocate(v) ||
+       !pass_make_color_fbo(&v->hr_tex,&v->hr_rb,&v->hr_fbo,&v->hr_w,&v->hr_h,
+          s_pb_hr_w,s_pb_hr_h,GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE)) return 0;
+    if(s_pb_wide_src && !pass_make_color_fbo(&v->wide_tex,&v->wide_rb,&v->wide_fbo,
+        &v->wide_w,&v->wide_h,s_pb_wide_w,s_pb_wide_h,GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE)) return 0;
+    /* Flush before copying: the CPU mirror may intentionally be stale when
+     * native-authority raster is off, but the integer texture is coherent. */
+    pack_flush();
+    pass_blit(s_raw_fbo,v->raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
+    pass_blit(s_pb_hr_fbo,v->hr_fbo,0,0,0,0,s_pb_hr_w,s_pb_hr_h,
+              GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    if(s_pb_wide_src) pass_blit(s_pb_wide_fbo,v->wide_fbo,0,0,0,0,s_pb_wide_w,s_pb_wide_h,
+                               GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    memcpy(v->cpu,s_vram,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
+    v->scale=s_hr_scale; v->resource_epoch=atomic_load(&s_async_resource_epoch);
+    return 1;
+}
+static int async_vram_enter(int gi) {
+    AsyncVram *v=&s_async_vram[gi];
+    if(!v->raw_fbo || v->scale!=s_hr_scale ||
+        v->resource_epoch!=atomic_load(&s_async_resource_epoch) || !async_raw_allocate(&s_async_work)) return 0;
+    pass_blit(v->raw_fbo,s_async_work.raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
+    pass_blit(v->hr_fbo,s_hr_fbo,0,0,s_pass_x*s_hr_scale,s_pass_y*s_hr_scale,
+              v->hr_w,v->hr_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    if(s_pb_wide_src) {
+        if(!v->wide_fbo || v->wide_w!=s_pb_wide_w || v->wide_h!=s_pb_wide_h) return 0;
+        pass_blit(v->wide_fbo,s_pb_wide_src,0,0,0,s_pass_y*s_hr_scale,
+                  v->wide_w,v->wide_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    }
+    memcpy(s_async_work.cpu,v->cpu,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
+    s_async_live_cpu=s_vram; s_async_live_raw_tex=s_raw_tex; s_async_live_raw_fbo=s_raw_fbo;
+    s_vram=s_async_work.cpu; s_raw_tex=s_async_work.raw_tex; s_raw_fbo=s_async_work.raw_fbo;
+    rth_rebind_vram(s_vram); s_async_vram_bound=1;
+    rect_clear(&s_cpu_dirty); rect_clear(&s_pack_dirty); s_gpu_dirty=0; s_up_nrects=0;
+    return 1;
+}
+static void async_vram_leave(void) {
+    if(!s_async_vram_bound) return;
+    s_vram=s_async_live_cpu; s_raw_tex=s_async_live_raw_tex; s_raw_fbo=s_async_live_raw_fbo;
+    rth_rebind_vram(s_vram); s_async_vram_bound=0;
 }
 
 uint32_t gl_renderer_stereo_unavailable(void) {
@@ -11853,6 +11935,7 @@ static void rth_hd_publish_private(void) {
 static void gl_rth_acquire(const char *reason) {
     if (!s_rth_on || rt_on_render_thread() || rt_held()) return;
     rt_acquire(reason);
+    atomic_fetch_add(&s_async_resource_epoch,1); /* direct GL/config/resource changes */
     rth_hd_publish_private();
     s_vram = s_rth_vram_pub;
     rth_rebind_vram(s_rth_vram_pub);
@@ -15015,6 +15098,17 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
     if (s_fg_on) fg_capture(c, payload);
+    if(!s_async_exec && (c->op==RTH_HD_NOTE || c->op==RTH_DYN_STEP))
+        atomic_fetch_add(&s_async_resource_epoch,1);
+    if(s_async_exec && c->op==RTH_COPY) {
+        if(v[0]==v[2] && v[1]==v[3] && !s_mask_set) return; /* identity copy */
+        if(v[0]<s_pass_x || v[1]<s_pass_y || v[0]+v[4]>s_pass_x+s_pass_w ||
+            v[1]+v[5]>s_pass_y+s_pass_h) { s_async_invalid=1; return; }
+    }
+    if(s_async_exec && c->op==RTH_WIDE_FEEDBACK &&
+        (v[0]!=s_pass_x || v[2]<s_pass_y || v[2]+v[6]>s_pass_y+s_pass_h)) {
+        s_async_invalid=1; return;
+    }
     switch (c->op) {
     case RTH_SEMI:      glb_set_semi_transparency(v[0], v[1]); break;
     case RTH_DITHER:    glb_set_dither(v[0]); break;
@@ -15108,6 +15202,9 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
         if (token.output.epoch!=gl_renderer_present_epoch() || pt_clock_ns()>token.output.expires) break;
         if (transaction_begin(token.x,token.y,token.w,token.h,1,token.period_vblanks,0,0)) {
+            if(!async_vram_capture(s_pgen_write)) {
+                s_pgen[s_pgen_write].valid=0; pass_end_now(0,0); break;
+            }
             s_pgen[s_pgen_write].async_id=token.output.generation;
             s_pgen[s_pgen_write].async_epoch=token.output.epoch;
             pass_end_now(0,0);
@@ -15128,13 +15225,18 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
                 s_pgen[k].async_epoch==token.output.epoch) gi=k;
         if (gi<0 || token.output.epoch!=gl_renderer_present_epoch() ||
             pt_clock_ns()>token.output.deadline) { s_pass_dead=1; break; }
-        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token;
+        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0;
         if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
             s_pass_leaks_at_begin=s_pass_leaks;
+            if(!async_vram_enter(gi)) {
+                pass_end_now(0,0); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write;
+                atomic_fetch_add(&s_pass_q_refused,1);
+            }
         } else { s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
         break;
     }
     case RTH_PASS_BEGIN:
+        s_async_invalid=0;
         if (transaction_begin(v[0], v[1], v[2], v[3], v[4], (uint32_t)v[5], v[6], 0)) {
             s_pass_leaks_at_begin = s_pass_leaks;
         } else {
@@ -15144,20 +15246,20 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         break;
     case RTH_PASS_END:
         if (s_pass_dead) { s_pass_dead = 0; break; }
-        if (s_pass_leaks != s_pass_leaks_at_begin) {
+        if (s_async_invalid || s_pass_leaks != s_pass_leaks_at_begin) {
             atomic_fetch_add(&s_pass_q_leaks, s_pass_leaks - s_pass_leaks_at_begin);
             pass_end_now(0, 0);
         } else {
             pass_end_now((uint32_t)v[0], v[1]);
         }
         if (s_async_exec) {
-            if (v[1] && s_pass_leaks==s_pass_leaks_at_begin) {
+            if (v[1] && !s_async_invalid && s_pass_leaks==s_pass_leaks_at_begin) {
                 PassGen *g=&s_pgen[s_pgen_write];
                 for(uint32_t k=1;k<g->n;++k)
                     if(g->phase[k]==s_async_executing.output.alpha_q16)
                         async_present_slot(s_pgen_write,k,&s_async_executing.output);
             }
-            s_async_exec=0; s_pgen_write=s_async_previous_write;
+            s_async_exec=0; s_async_invalid=0; s_pgen_write=s_async_previous_write;
         }
         break;
     case RTH_PEEK: {
