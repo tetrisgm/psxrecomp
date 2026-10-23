@@ -530,8 +530,8 @@ enum {
 };
 /* Optional diagnostic, measured on the render owner without suspending GL.
  * Costs include driver waits; use only to locate work, not benchmark FPS. */
-static int s_op_profile=-1;
-static uint64_t s_op_ns[RTH_GROUP+1], s_op_count[RTH_GROUP+1], s_op_async_ns[RTH_GROUP+1];
+static _Atomic int s_op_profile=-1;
+static _Atomic uint64_t s_op_ns[RTH_GROUP+1], s_op_count[RTH_GROUP+1], s_op_async_ns[RTH_GROUP+1];
 static void rth_op_report(void) {
     if (s_op_profile!=1) return;
     for (unsigned op=1;op<RTH_GROUP;op++) if(s_op_count[op])
@@ -9400,9 +9400,9 @@ ASYNC_COUNTERS(ASYNC_DECLARE)
 static uint64_t s_async_replay_started;
 void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
     if (!out) return;
-    /* Diagnostic queries happen at the end of a bounded sample. Drain before
-     * reading owner-thread counters; ordinary stats never acquire GL here. */
-    if (s_op_profile==1) { GL_RT_SYNC("render_op_profile"); rth_op_report(); }
+    /* Counters are independently atomic: diagnostic reads neither drain the
+     * render queue nor invalidate in-flight presentation generations. */
+    rth_op_report();
 #define ASYNC_LOAD(n) out->n=atomic_load(&s_async_count_##n);
     ASYNC_COUNTERS(ASYNC_LOAD)
 #undef ASYNC_LOAD
