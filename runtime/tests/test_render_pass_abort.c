@@ -165,6 +165,19 @@ uint64_t render_pass_mod_arenas_hash(void) { return 0; }
 uint64_t gpu_pass_state_hash(void) { return 42; }
 int gpu_pass_checkpoint_save(void) { return 1; }
 void gpu_pass_checkpoint_restore(void) {}
+
+static int async_test_keep, async_test_calls;
+uint32_t gl_renderer_pass_async_reserve(uint32_t p,uint64_t b,uint64_t e,
+    uint16_t x,uint16_t y,uint16_t w,uint16_t h,GLRenderAsyncToken *t,uint32_t m) {
+    (void)p;(void)b;(void)e;(void)x;(void)y;(void)w;(void)h;(void)t;(void)m; return 0;
+}
+int gl_renderer_pass_async_begin(const GLRenderAsyncToken *t) { return t!=NULL; }
+int gl_renderer_pass_async_end(const GLRenderAsyncToken *t,int keep) {
+    (void)t; async_test_keep=keep; return keep;
+}
+int gpu_replay_execute(const GpuReplayState *s,const GpuReplayProvider *p) {
+    (void)s;(void)p; async_test_calls++; return g_psx_render_pass_active;
+}
 static uint64_t s_ticks;
 uint64_t gl_renderer_perf_ticks(void) { return s_ticks += 1000; }
 uint64_t gl_renderer_perf_frequency(void) { return 1000000000u; }
