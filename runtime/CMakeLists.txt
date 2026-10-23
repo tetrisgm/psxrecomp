@@ -1015,6 +1015,16 @@ if(BUILD_TESTING)
     target_include_directories(ws_hud_anchor_test PRIVATE include)
     add_test(NAME ws_hud_anchor_test COMMAND ws_hud_anchor_test)
 
+    add_executable(gpu_display_cache_test tests/test_gpu_display_cache.c
+        src/psx_video_timing.c src/gpu_timeline.c)
+    target_include_directories(gpu_display_cache_test PRIVATE include src)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(gpu_display_cache_test PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(gpu_display_cache_test PRIVATE
+            $<IF:$<PLATFORM_ID:Darwin>,-Wl$<COMMA>-dead_strip,-Wl$<COMMA>--gc-sections>)
+    endif()
+    add_test(NAME gpu_display_cache_test COMMAND gpu_display_cache_test)
+
     add_executable(gpu_textured_dot_nw_shift_exec_test
         tests/test_gpu_textured_dot_nw_shift_exec.c
         src/psx_video_timing.c

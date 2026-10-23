@@ -11,6 +11,11 @@
  */
 
 #include "gpu.h"
+#include <stdatomic.h>
+static _Atomic uint64_t s_display_info_epoch=1;
+static void gpu_display_info_changed(void) {
+    atomic_fetch_add_explicit(&s_display_info_epoch,1,memory_order_relaxed);
+}
 #include "gpu_gl_renderer.h"
 #include "mod_texture_banks.h"
 #include "display_scanout.h"
@@ -3842,6 +3847,7 @@ uint64_t g_pollhack_vblank_count = 0;  /* instrumentation: poll-fallback VBlank 
 /* ---- Initialization ---- */
 
 static void gpu_reset_state(int clear_vram) {
+    gpu_display_info_changed();
     ws_reset_scene_history();
     if (clear_vram) {
         memset(vram, 0, sizeof(vram));
@@ -3936,18 +3942,23 @@ static void gpu_reset_state(int clear_vram) {
     s_d24_present_hold = 0;
     s_d24_present_skip = 0;
     s_d24_prev_disp_h = 0;
+    gpu_display_info_changed();
 }
 
 void gpu_init(void) {
+    gpu_display_info_changed();
     gpu_reset_state(1);
     video_mode = s_power_on_video_mode;
     (void)psx_video_timing_set_pal((int)video_mode);
+    gpu_display_info_changed();
 }
 
 void gpu_set_power_on_video_mode(int pal) {
+    gpu_display_info_changed();
     s_power_on_video_mode = pal ? 1u : 0u;
     video_mode = s_power_on_video_mode;
     (void)psx_video_timing_set_pal((int)video_mode);
+    gpu_display_info_changed();
 }
 
 /* ---- GPUSTAT read (0x1F801814) ---- */
@@ -4479,7 +4490,7 @@ int gpu_display_is_depth24(void) {
     return (int)(display_depth & 1u);
 }
 
-void gpu_get_display_info(GpuDisplayInfo* out) {
+static void gpu_display_info_compute(GpuDisplayInfo* out) {
     out->display_x = display_area_x;
     out->display_y = display_area_y;
     out->depth24   = (int)(display_depth & 1u);
@@ -4558,6 +4569,28 @@ void gpu_get_display_info(GpuDisplayInfo* out) {
     out->screen_source_skip_y = screen_source_skip_y;
     out->screen_offset_y = vertical.valid ? vertical.offset_y : 0;
     if (vres) out->screen_offset_y *= 2;
+}
+
+/* GP1 writes and register restore invalidate the derived CRTC layout. Readers
+ * keep separate cached results; no cache is part of guest/savestate state. */
+static _Thread_local struct {
+    uint64_t epoch;
+    GpuDisplayInfo value;
+    int initialized, enabled;
+} s_display_info_cache;
+void gpu_get_display_info(GpuDisplayInfo *out) {
+    if (!s_display_info_cache.initialized) {
+        const char *opt=getenv("PSX_GPU_DISPLAY_CACHE");
+        s_display_info_cache.enabled=!(opt && !strcmp(opt,"0"));
+        s_display_info_cache.initialized=1;
+    }
+    if (!s_display_info_cache.enabled) { gpu_display_info_compute(out); return; }
+    uint64_t epoch=atomic_load_explicit(&s_display_info_epoch,memory_order_relaxed);
+    if (s_display_info_cache.epoch!=epoch) {
+        gpu_display_info_compute(&s_display_info_cache.value);
+        s_display_info_cache.epoch=epoch;
+    }
+    *out=s_display_info_cache.value;
 }
 
 /* Debug accessors for GP1 display-range / mode (TCP gpu_state). */
@@ -7867,6 +7900,7 @@ static void gp1_get_info(uint32_t val) {
 }
 
 void gpu_write_gp1(uint32_t val) {
+    gpu_display_info_changed();
     uint32_t cmd = (val >> 24) & 0x3F;
 
     switch (cmd) {
@@ -7891,6 +7925,7 @@ void gpu_write_gp1(uint32_t val) {
             psx_fatal_halt(reason);
         }
     }
+    gpu_display_info_changed();
 }
 
 /* ---- boot snapshot: complete GPU register state (see boot_state.h) ---- */
@@ -7972,6 +8007,7 @@ static int gpu_snap_emit(PstW *w) {
     return 1;
 }
 static int gpu_snap_parse(PstR *r) {
+    gpu_display_info_changed();
     uint32_t u; int32_t i; uint16_t h;
 #define RU(f) do { if (!pst_r_u32(r, &u)) return 0; (f) = u; } while (0)
 #define RI(f) do { if (!pst_r_i32(r, &i)) return 0; (f) = i; } while (0)
@@ -8009,6 +8045,7 @@ static int gpu_snap_parse(PstR *r) {
 #undef RU
 #undef RI
 #undef RH
+    gpu_display_info_changed();
     return 1;
 }
 
