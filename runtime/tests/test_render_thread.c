@@ -280,7 +280,25 @@ static void test_tick(void) {
     rt_stop();
 }
 
+static void test_batch(void) {
+    reset_state(); CHECK(start(1u<<20, 2), "batch start");
+    CHECK(rt_batch_begin(), "batch begin");
+    CHECK(emit(64) && emit(128), "stage two records");
+    sleep_us(1000); CHECK(atomic_load(&exec_count)==0, "nothing published before commit");
+    CHECK(rt_batch_try_commit(), "batch commit"); rt_drain();
+    CHECK(atomic_load(&exec_count)==2 && !atomic_load(&exec_errors), "ordered atomic publish");
+    CHECK(rt_batch_begin(), "overflow begin"); CHECK(emit(64), "overflow prefix");
+    CHECK(rt_cmd_begin(OP_DATA, 0, 1u<<19)==NULL, "oversize drops batch");
+    CHECK(!rt_batch_try_commit(), "failed batch refused"); rt_drain();
+    CHECK(atomic_load(&exec_count)==2, "no partial publication");
+    emit_seq=2;
+    CHECK(rt_batch_begin(), "discard begin"); CHECK(emit(64), "discard stage");
+    rt_batch_discard(); rt_drain(); CHECK(atomic_load(&exec_count)==2, "discard invisible");
+    rt_stop();
+}
+
 int main(void) {
+    test_batch();
     test_order_and_wrap();
     test_oversize();
     test_backpressure();
