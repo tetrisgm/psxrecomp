@@ -10,6 +10,7 @@
 #include "gte_nclip_stats.h"
 #include "render_pass_projection.h"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -52,7 +53,25 @@ struct PsxGteCtx {
     PgxpCtxEngine *pgxp = nullptr;
     uint32_t caller_ra = 0;
     GteNclipState nclip;
+    int32_t s_ws_xnum = 1, s_ws_xden = 1;
+    int s_ws_suppress = 0;
+    int32_t s_ws_far_threshold = 900;
+    int s_ws_dome_on = 0;
+    int32_t s_ws_dome_num = 1, s_ws_dome_den = 1;
+    uint32_t s_ws_dome_call_sites[32] = {};
+    int s_ws_dome_call_sites_n = 0;
+    int32_t s_h_scale_num = 1, s_h_scale_den = 1;
+    int32_t s_render_view[3] = {};
+    PSXModRenderView s_render_pose = {};
+    bool s_render_rotate = false;
+    int native_43 = 0, precise_nclip = 0;
+    int s_geom_enabled = 0, s_nclip_exact_enabled = 1;
+    uint32_t s_geom_generation = 1;
 };
+
+/* Configuration is frozen on the main thread with the snapshot. Workers
+ * must not read the live presentation settings, even when only main writes. */
+#define GTE_CFG(g, name) ((g)->ctx ? (g)->ctx->name : name)
 
 /* PGXP calls from GTE command code: a draw context's own engine, else the
  * process-wide engine (unchanged main-context behaviour). */
@@ -78,19 +97,18 @@ namespace GTE {
 // inputs, which is enough to flip games' distance/intensity threshold branches
 // (e.g. Ape Escape's additive-glow CLUT semi-transparency bit). This is the
 // faithful hardware algorithm, shared by every RTPS/RTPT caller.
-static uint8_t s_gte_div_table[0x101];
-static bool    s_gte_div_table_init = false;
-static void gte_init_div_table() {
+static const std::array<uint8_t, 0x101> s_gte_div_table = [] {
+    std::array<uint8_t, 0x101> table{};
     for (uint32_t divisor = 0x8000; divisor < 0x10000; divisor += 0x80) {
         uint32_t xa = 512;
         for (unsigned i = 1; i < 5; i++)
             xa = (xa * (1024u * 512u - ((divisor >> 7) * xa))) >> 18;
-        s_gte_div_table[(divisor >> 7) & 0xFF] =
+        table[(divisor >> 7) & 0xFF] =
             (uint8_t)(((xa + 1) >> 1) - 0x101);
     }
-    s_gte_div_table[0x100] = s_gte_div_table[0xFF];
-    s_gte_div_table_init = true;
-}
+    table[0x100] = table[0xFF];
+    return table;
+}();
 static int32_t gte_calc_recip(uint16_t divisor) {
     int32_t x    = 0x101 + s_gte_div_table[(((divisor & 0x7FFF) + 0x40) >> 7)];
     int32_t tmp  = (((int32_t)divisor * -x) + 0x80) >> 8;
@@ -104,7 +122,6 @@ static inline unsigned gte_clz16(uint16_t v) {
     return n;
 }
 static int32_t gte_divide(uint16_t H, uint16_t SZ3, uint32_t& FLAG) {
-    if (!s_gte_div_table_init) gte_init_div_table();
     // Hardware: overflow flag + saturate when 2*SZ3 <= H (includes SZ3 == 0).
     if ((uint32_t)SZ3 * 2 <= (uint32_t)H) {
         FLAG |= FLAG_DIV_OVF;
@@ -719,11 +736,13 @@ extern "C" void gte_ws_configure_dome_sites(const uint32_t* sites, int count) {
     for (int i = 0; i < count; i++)
         s_ws_dome_call_sites[i] = sites[i] & 0x1FFFFFFFu;
 }
-static inline bool ws_dome_call_matches(uint32_t caller_ra) {
+static inline bool ws_dome_call_matches(uint32_t caller_ra, const PsxGteCtx *ctx) {
     // JAL writes pc+8 to RA; config records the call instruction itself.
     const uint32_t call_pc = (caller_ra - 8u) & 0x1FFFFFFFu;
-    for (int i = 0; i < s_ws_dome_call_sites_n; i++)
-        if (s_ws_dome_call_sites[i] == call_pc) return true;
+    const int count = ctx ? ctx->s_ws_dome_call_sites_n : s_ws_dome_call_sites_n;
+    const uint32_t *sites = ctx ? ctx->s_ws_dome_call_sites : s_ws_dome_call_sites;
+    for (int i = 0; i < count; i++)
+        if (sites[i] == call_pc) return true;
     return false;
 }
 #define DOME_PROBE_SLOTS 48
@@ -1098,11 +1117,11 @@ extern "C" void gte_set_fov_scale(int num, int den) {
 }
 
 static int32_t gte_h_scaled(const GTEState* gte) {
-    if (s_h_scale_num == s_h_scale_den) return gte->H;
+    if (GTE_CFG(gte, s_h_scale_num) == GTE_CFG(gte, s_h_scale_den)) return gte->H;
     if (gte->H == 0) return 0;   // a guest H of 0 is a real (degenerate) projection
     // Both peers must compute identical SXY/MAC/FLAG: the scale is a local
     // display option, so it is forced to identity for the whole netplay session.
-    if (psx_netplay_active()) {
+    if (!gte->ctx && psx_netplay_active()) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -1110,7 +1129,7 @@ static int32_t gte_h_scaled(const GTEState* gte) {
         }
         return gte->H;
     }
-    int64_t h = (int64_t)gte->H * s_h_scale_num / s_h_scale_den;
+    int64_t h = (int64_t)gte->H * GTE_CFG(gte, s_h_scale_num) / GTE_CFG(gte, s_h_scale_den);
     if (h < 1) h = 1;
     if (h > 0xFFFF) h = 0xFFFF;
     return (int32_t)h;
@@ -1131,7 +1150,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
 
     // Step 1: Matrix multiplication + translation
     auto dot = [&](int row, int mac_num) {
-        int64_t acc = ((int64_t)gte->TR[row] + (s_render_rotate ? 0 : s_render_view[row])) * 4096 +
+        int64_t acc = ((int64_t)gte->TR[row] + (GTE_CFG(gte, s_render_rotate) ? 0 : GTE_CFG(gte, s_render_view)[row])) * 4096 +
                       (int64_t)gte->RT[row][0] * V[0];
         acc = gte_mac44_stage(gte, acc, mac_num);
         acc += (int64_t)gte->RT[row][1] * V[1];
@@ -1141,14 +1160,14 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     int64_t mac1 = dot(0, 1);
     int64_t mac2 = dot(1, 2);
     int64_t mac3 = dot(2, 3);
-    if (s_render_rotate) {
+    if (GTE_CFG(gte, s_render_rotate)) {
         const int64_t v[3] = {mac1, mac2, mac3};
         int64_t result[3];
         for (int row = 0; row < 3; ++row) {
             int64_t sum = 0;
             for (int col = 0; col < 3; ++col)
-                sum += v[col] * s_render_pose.rotation_q12[row * 3 + col];
-            result[row] = (sum >> 12) + (int64_t)s_render_view[row] * 4096;
+                sum += v[col] * GTE_CFG(gte, s_render_pose).rotation_q12[row * 3 + col];
+            result[row] = (sum >> 12) + (int64_t)GTE_CFG(gte, s_render_view)[row] * 4096;
         }
         mac1 = result[0]; mac2 = result[1]; mac3 = result[2];
     }
@@ -1187,16 +1206,16 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     /* Horizontal factor applied to xterm below, for the exact-projection
      * shadow (pgxp_project_precise) to apply the same one. */
     int64_t x_num = 1, x_den = 1;
-    bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
+    bool do_squash = (GTE_CFG(gte, s_ws_xnum) != GTE_CFG(gte, s_ws_xden)) && !(gte->ctx ? gte->ctx->native_43 : gpu_ws_present_native_43());
     const bool dome_call = ws_dome_call_matches(
-        gte->ctx ? gte->ctx->caller_ra : s_gte_caller_ra);
+        gte->ctx ? gte->ctx->caller_ra : s_gte_caller_ra, gte->ctx);
     /* Host-only statistics, caches and probes: main context only. */
-    const bool side_off = s_gte_replay_sandbox || gte->ctx;
+    const bool side_off = gte->ctx || s_gte_replay_sandbox;
     // Curved backdrops are authored to cover the original 4:3 projection.
     // In classic widescreen, leave that projection intact and let the normal
     // final-frame stretch cover the wide output instead of shrinking it first.
     if (dome_call) do_squash = false;
-    if (do_squash && s_ws_suppress) {
+    if (do_squash && GTE_CFG(gte, s_ws_suppress)) {
         /* Depth-gated: un-squash only FAR geometry (the backdrop); keep near
          * props squashed so they stay aligned. Record SZ stats for tuning. */
         int32_t sz = gte->SZ[3];
@@ -1205,29 +1224,29 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
             if (sz > s_ws_sz_max) s_ws_sz_max = sz;
             s_ws_sz_n++;
         }
-        if (sz >= s_ws_far_threshold) {
+        if (sz >= GTE_CFG(gte, s_ws_far_threshold)) {
             do_squash = false;
             if (!side_off) s_ws_sz_far++;
         }
     }
     if (do_squash) {
-        xterm = xterm * s_ws_xnum / s_ws_xden;
-        x_num = s_ws_xnum;
-        x_den = s_ws_xden;
+        xterm = xterm * GTE_CFG(gte, s_ws_xnum) / GTE_CFG(gte, s_ws_xden);
+        x_num = GTE_CFG(gte, s_ws_xnum);
+        x_den = GTE_CFG(gte, s_ws_xden);
     }
     // Native-wide dome expansion remains a diagnostic-only depth probe.
-    else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
-             !gpu_ws_present_native_43()) {
+    else if (GTE_CFG(gte, s_ws_dome_on) && GTE_CFG(gte, s_ws_dome_num) != GTE_CFG(gte, s_ws_dome_den) &&
+             !(gte->ctx ? gte->ctx->native_43 : gpu_ws_present_native_43())) {
         int32_t sz = gte->SZ[3];
         if (!side_off) {
             if (sz < s_ws_sz_min) s_ws_sz_min = sz;
             if (sz > s_ws_sz_max) s_ws_sz_max = sz;
             s_ws_sz_n++;
         }
-        if (sz >= s_ws_far_threshold) {
-            xterm = xterm * s_ws_dome_num / s_ws_dome_den;
-            x_num = s_ws_dome_num;
-            x_den = s_ws_dome_den;
+        if (sz >= GTE_CFG(gte, s_ws_far_threshold)) {
+            xterm = xterm * GTE_CFG(gte, s_ws_dome_num) / GTE_CFG(gte, s_ws_dome_den);
+            x_num = GTE_CFG(gte, s_ws_dome_num);
+            x_den = GTE_CFG(gte, s_ws_dome_den);
             if (!side_off) s_ws_sz_far++;
         }
     }
@@ -1246,18 +1265,18 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
      * PGXP shadows below (precise projection, projection tracking) describe the
      * guest projection and are skipped under the override. SZ, MAC0/IR0 depth
      * cue and the divide flags still come from the guest division above. */
-    const bool proj_override = s_render_pose.projection && gte->SZ[3];
+    const bool proj_override = GTE_CFG(gte, s_render_pose).projection && gte->SZ[3];
     if (proj_override) {
-        sx16 = (int64_t)gte->OFX + s_render_pose.cx_delta_q16 +
-               (int64_t)gte->IR1 * s_render_pose.fx_q16 / gte->SZ[3];
-        sy16 = (int64_t)gte->OFY + s_render_pose.cy_delta_q16 +
-               (int64_t)gte->IR2 * s_render_pose.fy_q16 / gte->SZ[3];
-        if (s_render_pose.projection_h_ref) {
-            const int64_t h = gte_h_scaled(gte), ref = s_render_pose.projection_h_ref;
-            sx16 = (int64_t)gte->OFX + s_render_pose.cx_delta_q16 +
-                   ((int64_t)gte->IR1 * s_render_pose.fx_q16 / gte->SZ[3]) * h / ref;
-            sy16 = (int64_t)gte->OFY + s_render_pose.cy_delta_q16 +
-                   ((int64_t)gte->IR2 * s_render_pose.fy_q16 / gte->SZ[3]) * h / ref;
+        sx16 = (int64_t)gte->OFX + GTE_CFG(gte, s_render_pose).cx_delta_q16 +
+               (int64_t)gte->IR1 * GTE_CFG(gte, s_render_pose).fx_q16 / gte->SZ[3];
+        sy16 = (int64_t)gte->OFY + GTE_CFG(gte, s_render_pose).cy_delta_q16 +
+               (int64_t)gte->IR2 * GTE_CFG(gte, s_render_pose).fy_q16 / gte->SZ[3];
+        if (GTE_CFG(gte, s_render_pose).projection_h_ref) {
+            const int64_t h = gte_h_scaled(gte), ref = GTE_CFG(gte, s_render_pose).projection_h_ref;
+            sx16 = (int64_t)gte->OFX + GTE_CFG(gte, s_render_pose).cx_delta_q16 +
+                   ((int64_t)gte->IR1 * GTE_CFG(gte, s_render_pose).fx_q16 / gte->SZ[3]) * h / ref;
+            sy16 = (int64_t)gte->OFY + GTE_CFG(gte, s_render_pose).cy_delta_q16 +
+                   ((int64_t)gte->IR2 * GTE_CFG(gte, s_render_pose).fy_q16 / gte->SZ[3]) * h / ref;
         }
     }
     /* RTPS/RTPT reuse MAC0's overflow flags for each projected X/Y
@@ -1267,7 +1286,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
     int64_t sx = sx16 >> 16;
     int64_t sy = sy16 >> 16;
     gte->push_sxy(sx, sy);
-    if (!s_gte_replay_sandbox) {
+    if (gte->ctx || !s_gte_replay_sandbox) {
         /* Bound the 16.16 transport so an extreme projection cannot wrap an
          * int32 and masquerade as a valid on-screen shadow. */
         const int64_t kLim = (int64_t)4096 << 16;
@@ -1300,10 +1319,10 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
             const double z = (double)(mac3 >> 12);
             const double h_proj = (double)gte_h_scaled(gte);
             double hx = (double)gte->MAC1 * h_proj;
-            if (do_squash) hx = hx * s_ws_xnum / s_ws_xden;
-            else if (s_ws_dome_on && s_ws_dome_num != s_ws_dome_den &&
-                     !gpu_ws_present_native_43() && gte->SZ[3] >= s_ws_far_threshold)
-                hx = hx * s_ws_dome_num / s_ws_dome_den;
+            if (do_squash) hx = hx * GTE_CFG(gte, s_ws_xnum) / GTE_CFG(gte, s_ws_xden);
+            else if (GTE_CFG(gte, s_ws_dome_on) && GTE_CFG(gte, s_ws_dome_num) != GTE_CFG(gte, s_ws_dome_den) &&
+                     !(gte->ctx ? gte->ctx->native_43 : gpu_ws_present_native_43()) && gte->SZ[3] >= GTE_CFG(gte, s_ws_far_threshold))
+                hx = hx * GTE_CFG(gte, s_ws_dome_num) / GTE_CFG(gte, s_ws_dome_den);
             PGXPProjection projection = {
                 (float)(gte->OFX / 65536.0 * z + hx),
                 (float)(gte->OFY / 65536.0 * z + (double)gte->MAC2 * h_proj),
@@ -1455,7 +1474,8 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
      * speculative and replay passes record no shadows, so the overlay shadow
      * diff holds it off for its interpreter pass too and both passes see the
      * integer MAC0. FLAG keeps the integer result's overflow bits. */
-    if (s_geom_enabled && !s_gte_replay_sandbox && s_speculative_depth == 0 &&
+    if (GTE_CFG(gte, s_geom_enabled) &&
+        (gte->ctx || (!s_gte_replay_sandbox && s_speculative_depth == 0)) &&
         (gte->ctx || !psx_overlay_shadow_diff_active())) {
         const uint32_t words[3] = { (uint32_t)gte->SXY[0], (uint32_t)gte->SXY[1],
                                     (uint32_t)gte->SXY[2] };
@@ -1480,7 +1500,7 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
     N.previous_native = N.last_native;
     N.previous_precise_sign = N.last_precise_sign;
     N.previous_precise_valid = N.last_precise_valid &&
-        !s_gte_replay_sandbox && s_speculative_depth == 0;
+        (gte->ctx || (!s_gte_replay_sandbox && s_speculative_depth == 0));
     N.previous_horizontal_saturated = N.last_horizontal_saturated;
     N.previous_generation = N.last_generation;
     N.last_native = out;
@@ -1489,8 +1509,8 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
     /* Compute an exact 16.16 determinant for configured branch consumers, but
      * preserve native guest-visible MAC0 for every architectural reader. */
     int32_t px0, py0, px1, py1, px2, py2;
-    if (gpu_ws_precise_nclip_enabled() &&
-        !s_gte_replay_sandbox && s_speculative_depth == 0 &&
+    if ((gte->ctx ? gte->ctx->precise_nclip : gpu_ws_precise_nclip_enabled()) &&
+        (gte->ctx || (!s_gte_replay_sandbox && s_speculative_depth == 0)) &&
         GTE_PGXP(gte, get_gte_sxy_checked, 0, gte->SXY[0], 1, &px0, &py0) &&
         GTE_PGXP(gte, get_gte_sxy_checked, 1, gte->SXY[1], 1, &px1, &py1) &&
         GTE_PGXP(gte, get_gte_sxy_checked, 2, gte->SXY[2], 1, &px2, &py2)) {
@@ -1502,7 +1522,7 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
         const int64_t cross = dx10 * dy20 - dy10 * dx20;
         N.last_precise_sign = cross < 0 ? -1 : (cross > 0 ? 1 : 0);
         N.last_precise_valid = true;
-        N.last_generation = s_geom_generation;
+        N.last_generation = GTE_CFG(gte, s_geom_generation);
         /* Narrow rescue: exact Y still agrees with the architectural FIFO,
          * depth is outside the GTE near region, and at least one X exceeded
          * the matching saturation rail. Ordinary subpixel winding stays stock. */
@@ -1537,8 +1557,8 @@ void gte_nclip(GTEState* gte, uint32_t instr) {
                 e->saturated++;
             e->last_frame = (uint32_t)s_frame_count;
         }
-    } else if (gpu_ws_precise_nclip_enabled() && !gte->ctx &&
-               !s_gte_replay_sandbox && s_speculative_depth == 0) {
+    } else if ((gte->ctx ? gte->ctx->precise_nclip : gpu_ws_precise_nclip_enabled()) && !gte->ctx &&
+               (gte->ctx || (!s_gte_replay_sandbox && s_speculative_depth == 0))) {
         s_nclip_fallbacks++;
     }
 nclip_stats_done:
@@ -1847,7 +1867,7 @@ void gte_mvmva(GTEState* gte, uint32_t instr) {
     /* PGXP scalar tier: MVMVA used as a multiplier on tracked vertex halves
      * (CTC2'd matrix rows) - hand the engine the operands as used and the
      * results, so MFC2 of MAC / IR can carry the precise weighted sum. */
-    if (!s_gte_replay_sandbox) {
+    if (gte->ctx || !s_gte_replay_sandbox) {
         PGXPMvmva op;
         op.mx = mx; op.vv = vv; op.tv = tv; op.shift = shift;
         std::memcpy(op.m, M, sizeof op.m);
@@ -2820,19 +2840,32 @@ extern "C" PsxGteCtx* gte_ctx_create(PgxpCtxEngine* pgxp) {
 extern "C" void gte_ctx_destroy(PsxGteCtx* x) { delete x; }
 
 extern "C" void gte_ctx_snapshot_main(PsxGteCtx* out) {
+    using namespace PSXRecomp::GTE;
     out->pgxp = nullptr;
-    out->caller_ra = PSXRecomp::GTE::s_gte_caller_ra;
-    out->nclip = PSXRecomp::GTE::s_nclip;
+    out->caller_ra = s_gte_caller_ra;
+    out->nclip = s_nclip;
+#define SNAP_FIELD(name) out->name = name
+    SNAP_FIELD(s_ws_xnum); SNAP_FIELD(s_ws_xden);
+    SNAP_FIELD(s_ws_suppress); SNAP_FIELD(s_ws_far_threshold);
+    SNAP_FIELD(s_ws_dome_on); SNAP_FIELD(s_ws_dome_num); SNAP_FIELD(s_ws_dome_den);
+    SNAP_FIELD(s_ws_dome_call_sites_n);
+    std::memcpy(out->s_ws_dome_call_sites, s_ws_dome_call_sites, sizeof s_ws_dome_call_sites);
+    SNAP_FIELD(s_h_scale_num); SNAP_FIELD(s_h_scale_den);
+    /* FOV scale is already suppressed by the main GTE during netplay. */
+    if (psx_netplay_active()) out->s_h_scale_num = out->s_h_scale_den = 1;
+    SNAP_FIELD(s_render_pose); SNAP_FIELD(s_render_rotate);
+    std::memcpy(out->s_render_view, s_render_view, sizeof s_render_view);
+    SNAP_FIELD(s_geom_enabled); SNAP_FIELD(s_geom_generation);
+    SNAP_FIELD(s_nclip_exact_enabled);
+#undef SNAP_FIELD
+    out->native_43 = gpu_ws_present_native_43();
+    out->precise_nclip = gpu_ws_precise_nclip_enabled();
 }
 
 extern "C" void gte_ctx_begin(PsxGteCtx* x, const PsxGteCtx* snapshot) {
-    if (snapshot) {
-        x->caller_ra = snapshot->caller_ra;
-        x->nclip = snapshot->nclip;
-    } else {
-        x->caller_ra = 0;
-        x->nclip = GteNclipState();
-    }
+    PgxpCtxEngine *pgxp = x->pgxp;
+    *x = snapshot ? *snapshot : PsxGteCtx();
+    x->pgxp = pgxp;
 }
 
 extern "C" void gte_ctx_execute(PsxGteCtx* x, CPUState* cpu, uint32_t cmd) {
@@ -2863,7 +2896,7 @@ extern "C" int32_t gte_ctx_nclip_exact_sign(PsxGteCtx* x, int32_t native_mac0,
                                             uint32_t pc) {
     (void)pc;
     const int32_t native = native_mac0 < 0 ? -1 : (native_mac0 > 0 ? 1 : 0);
-    const bool usable = PSXRecomp::GTE::s_nclip_exact_enabled &&
+    const bool usable = x->s_nclip_exact_enabled &&
                         x->nclip.last_precise_valid &&
                         native_mac0 == x->nclip.last_native;
     return usable ? x->nclip.last_precise_sign : native;

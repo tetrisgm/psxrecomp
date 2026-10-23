@@ -3,6 +3,8 @@
 #include "hle_gte.h"
 #include "execution_profile.h"
 #include "pgxp.h"
+#include "gte_ctx.h"
+#include "pgxp_ctx.h"
 #include "projection_scale.hpp"
 #include "gte_view.h"
 #include "gte_nclip_stats.h"
@@ -15,6 +17,12 @@ extern "C" void gte_set_fov_scale(int, int);
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <atomic>
+
+extern "C" void gte_set_display_aspect(int, int);
+extern "C" void gte_ws_set_suppress(int);
+extern "C" void gte_ws_set_far_threshold(int);
 
 #define CHECK(expr) do { \
     if (!(expr)) { \
@@ -1352,7 +1360,62 @@ int test_projection_scale() {
     return 0;
 }
 
+int test_draw_context_frozen_configuration() {
+    CPUState input{};
+    input.gte_ctrl[0] = input.gte_ctrl[2] = input.gte_ctrl[4] = 4096;
+    input.gte_ctrl[7] = 1500;
+    input.gte_ctrl[26] = 300;
+    input.gte_data[0] = 0x00100064;
+    input.gte_data[1] = 64;
+    PSXModRenderView pose{};
+    pose.translation[0] = 17;
+    gte_render_pose_set(&pose);
+    gte_set_fov_scale(2, 3);
+    gte_set_display_aspect(16, 9);
+    gte_ws_set_suppress(0);
+    gte_geometry_correction_set(0);
+    pgxp_set_enabled(0);
+    PsxGteCtx *snapshot = gte_ctx_create(nullptr);
+    CHECK(snapshot);
+    gte_ctx_snapshot_main(snapshot);
+    CPUState expected = input;
+    gte_execute(&expected, 0x80001);
+    std::atomic<int> failures{0};
+    std::thread workers[4];
+    for (auto &worker : workers) worker = std::thread([&] {
+        PgxpCtxEngine *pgxp = pgxp_ctx_create();
+        PsxGteCtx *ctx = gte_ctx_create(pgxp);
+        if (!pgxp || !ctx) { ++failures; gte_ctx_destroy(ctx); pgxp_ctx_destroy(pgxp); return; }
+        for (int n = 0; n < 10000; ++n) {
+            gte_ctx_begin(ctx, snapshot);
+            CPUState actual = input;
+            gte_ctx_execute(ctx, &actual, 0x80001);
+            if (!same_gte(expected, actual)) ++failures;
+        }
+        gte_ctx_destroy(ctx);
+        pgxp_ctx_destroy(pgxp);
+    });
+    for (int n = 0; n < 10000; ++n) {
+        pose.translation[0] = n & 127;
+        gte_render_pose_set(&pose);
+        gte_set_fov_scale(1 + (n & 1), 1);
+        gte_set_display_aspect(n & 1 ? 4 : 21, n & 1 ? 3 : 9);
+        gte_ws_set_suppress(n & 1);
+        gte_ws_set_far_threshold(n & 1 ? 1 : 4000);
+    }
+    for (auto &worker : workers) worker.join();
+    gte_ctx_destroy(snapshot);
+    pose = {}; gte_render_pose_set(&pose);
+    gte_set_fov_scale(1, 1);
+    gte_set_display_aspect(4, 3);
+    gte_ws_set_suppress(0);
+    gte_ws_set_far_threshold(900);
+    CHECK(failures == 0);
+    return 0;
+}
+
 int main() {
+    if (int rc = test_draw_context_frozen_configuration()) return rc;
     if (int rc = test_projection_scale()) return rc;
     if (int rc = test_hardware_register_semantics()) return rc;
     if (int rc = test_canonicalizer()) return rc;

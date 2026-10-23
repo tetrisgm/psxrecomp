@@ -902,6 +902,7 @@ if(BUILD_TESTING)
 
     add_executable(gte_register_access_test
         tests/test_gte_register_access.cpp
+        tests/pgxp_test_mod_memory.cpp
         src/gte.cpp
         src/pgxp.cpp
         src/pgxp_ctx.cpp
@@ -915,7 +916,8 @@ if(BUILD_TESTING)
     add_test(NAME gte_register_access_test COMMAND gte_register_access_test)
     # Same ABI/result corpus for the native operation entry and the reference.
     add_executable(gte_hle_contract_test
-        tests/test_gte_register_access.cpp src/gte.cpp src/pgxp.cpp src/pgxp_ctx.cpp
+        tests/test_gte_register_access.cpp tests/pgxp_test_mod_memory.cpp
+        src/gte.cpp src/pgxp.cpp src/pgxp_ctx.cpp
         src/psx_ram_geometry.c)
     target_include_directories(gte_hle_contract_test PRIVATE include)
     target_compile_definitions(gte_hle_contract_test PRIVATE

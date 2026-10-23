@@ -21,7 +21,9 @@ typedef struct PsxGteCtx PsxGteCtx;
 
 PsxGteCtx *gte_ctx_create(struct PgxpCtxEngine *pgxp);
 void gte_ctx_destroy(PsxGteCtx *x);
-/* Copy the main context's per-command GTE side state into `out`. Main thread. */
+/* Copy main's GTE side state and presentation configuration into `out`.
+ * Main thread only. Workers retain this configuration when main changes FOV,
+ * aspect, view transforms, culling options or speculative execution state. */
 void gte_ctx_snapshot_main(PsxGteCtx *out);
 /* Start a pass from a snapshot taken with gte_ctx_snapshot_main. */
 void gte_ctx_begin(PsxGteCtx *x, const PsxGteCtx *snapshot);
