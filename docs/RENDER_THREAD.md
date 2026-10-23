@@ -413,3 +413,21 @@ frames produced/consumed, presents and `presents_stale` (skipped), acquires
 (sync points) with the 16 most recent reasons and wait times,
 backpressure / ring-full waits and time, render busy/idle time, ring high
 water. Reading it is not a sync point.
+
+### Dynamic resolution with variable generated work
+
+Reducing resolution can allow more timed outputs to finish while total work
+per guest VBlank remains unchanged. Cost-only verification misclassifies that
+improvement as a failed reduction. The controller now also accepts a down step
+when completed presenter throughput improves by more than 5%, two outputs per
+second, and one output's decision-window quantization. It does not train the
+fixed-work pixel-area model from that changed workload. Unchanged cadence,
+missing receipts, and small fluctuations retain the existing undo policy.
+
+The host samples completed presents, not queued submissions; stopped/reset
+presenters invalidate the receipt, and holds discard the window. The `dynres`
+diagnostic exposes `output_hz` and `output_valid`. Set
+`PSX_DYNRES_OUTPUT_VERIFY=0` to restore cost-only verification. Resolution floors
+and over-budget admission rules are unchanged. Synthetic variable-work, flat
+work, absent-receipt and noise cases pass on Windows and macOS. This is a
+controller correction, not a claim that a particular output rate is sustained.
