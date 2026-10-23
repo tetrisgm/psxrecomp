@@ -117,6 +117,10 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
                                  const uint16_t* words,
                                  size_t word_count,
                                  uint32_t* out_texture_hash);
+/* Render-owner tracking identity; unrelated writes leave it unchanged. */
+uint64_t hd_texture_pack_tracking_generation(const HdTexturePack* pack);
+int hd_texture_pack_invalidation_changes(const HdTexturePack* pack, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+
 void hd_texture_pack_invalidate(HdTexturePack* pack,
                                 uint16_t x,
                                 uint16_t y,

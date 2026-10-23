@@ -272,7 +272,14 @@ void upload(const fs::path& root) {
     check(duck_texture_pack_track_upload(pack.get(),66,257,4,2,vram.data(),vram.size()),"track post-write native upload");
     check(duck_texture_pack_match(pack.get(),&q,&match) == HD_TEXTURE_LOOKUP_FOUND && match.origin_u == 4 && match.origin_v == 1,
           "upload crop has correct source origin");
+    uint64_t tracking=duck_texture_pack_tracking_generation(pack.get());
+    check(!duck_texture_pack_invalidation_changes(pack.get(),700,400,8,8),"unrelated Duck draw leaves provenance alone");
+    duck_texture_pack_invalidate(pack.get(),700,400,8,8);
+    duck_texture_pack_clear_lookup_cache(pack.get());
+    check(duck_texture_pack_tracking_generation(pack.get())==tracking,"native-buffer rebind cache clear preserves tracking identity");
+    check(duck_texture_pack_invalidation_changes(pack.get(),66,257,1,1),"Duck overlap probe finds live fragment");
     duck_texture_pack_invalidate(pack.get(),66,257,1,1); /* outside replacement crop */
+    check(duck_texture_pack_tracking_generation(pack.get())!=tracking,"actual fragment overwrite advances identity");
     check(duck_texture_pack_match(pack.get(),&q,&match) == HD_TEXTURE_LOOKUP_NONE,"partial source overwrite drops entire upload identity");
     duck_texture_pack_track_upload(pack.get(),66,257,4,2,vram.data(),vram.size());
     duck_texture_pack_reset_tracking(pack.get());

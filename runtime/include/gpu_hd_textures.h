@@ -20,6 +20,10 @@ void gpu_hd_textures_set_dump_enabled(int enabled);
 int gpu_hd_textures_replacements_enabled(void);
 int gpu_hd_textures_dump_enabled(void);
 int gpu_hd_textures_active(void);
+/* Render-owner APIs: generation tracks residency/config changes, not cache
+ * bookkeeping. Probe is read-only and tests tracked source overlap. */
+uint64_t gpu_hd_textures_tracking_generation(void);
+int gpu_hd_textures_invalidation_changes(int x,int y,int width,int height);
 typedef struct GpuHdTextureDiag {
     const char* root;
     int active, replacements, dump, format;

@@ -362,6 +362,7 @@ struct DuckTexturePack {
     size_t queued_dumps = 0;
     size_t snapshot_budget = kMaxSnapshots, rect_cache_limit = kMaxRectCache;
     uint64_t revision = 1;
+    uint64_t tracking_generation = 1;
     std::string lifecycle_error;
     size_t ignored = 0, ambiguous = 0;
     bool geometry_limit_reported = false, dump_limit_reported = false;
@@ -620,6 +621,7 @@ std::shared_ptr<Source> capture_source(DuckTexturePack& p, Rect rect, const uint
         if (p.sources.empty()) return {};
         const auto victim = p.sources.front();
         if (!finalize_source(p,*victim)) return {};
+        ++p.tracking_generation;
         p.uploads.erase(std::remove_if(p.uploads.begin(),p.uploads.end(),[&](const Upload& u) { return u.source == victim; }),p.uploads.end());
         p.pages.erase(std::remove_if(p.pages.begin(),p.pages.end(),[&](const PageSource& u) { return u.source == victim; }),p.pages.end());
         p.snapshot_bytes -= victim->words.size()*sizeof(uint16_t); p.sources.pop_front();
@@ -822,6 +824,26 @@ void duck_texture_pack_get_info(const DuckTexturePack* p, DuckTexturePackInfo* o
 void duck_texture_pack_get_config(const DuckTexturePack* p, DuckTextureConfig* out) { if (out) *out = p ? p->config : DuckTextureConfig{}; }
 int duck_texture_pack_linear_filter(const DuckTexturePack* p) { return p && p->config.replacement_scale_linear_filter; }
 uint64_t duck_texture_pack_revision(const DuckTexturePack* p) { return p ? p->revision : 0; }
+void duck_texture_pack_clear_lookup_cache(DuckTexturePack* p) {
+    if (p) { p->rect_cache.clear(); p->match_cache.clear(); }
+}
+uint64_t duck_texture_pack_tracking_generation(const DuckTexturePack* p) { return p ? p->tracking_generation : 0; }
+int duck_texture_pack_invalidation_changes(const DuckTexturePack* p,uint16_t x,uint16_t y,uint16_t w,uint16_t h) {
+    if (!p || !w || !h) return 0;
+    if (w>1024 || h>512) return !p->uploads.empty() || !p->pages.empty();
+    unsigned px=x%1024,py=y%512,w0=std::min(unsigned(w),1024-px),h0=std::min(unsigned(h),512-py);
+    const Rect regions[]={{px,py,w0,h0},{0,py,unsigned(w)-w0,h0},
+                          {px,0,w0,unsigned(h)-h0},{0,0,unsigned(w)-w0,unsigned(h)-h0}};
+    for (const Rect& r:regions) if (r.w && r.h) {
+        for (const auto& u:p->uploads) if (intersects(u.active,r)) return 1;
+        for (const auto& page:p->pages) {
+            if (intersects(page.source->rect,r)) return 1;
+            for (const auto& record:page.source->records)
+                if (record.depth<2 && intersects({record.clut_x,record.clut_y,record.palette_size,1},r)) return 1;
+        }
+    }
+    return 0;
+}
 void duck_texture_pack_invalidate(DuckTexturePack* p, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     if (!p || !w || !h) return;
     if (w > 1024 || h > 512) { duck_texture_pack_reset_tracking(p); return; }
@@ -831,6 +853,7 @@ void duck_texture_pack_invalidate(DuckTexturePack* p, uint16_t x, uint16_t y, ui
     const std::array<Rect, 4> regions{{{px,py,w0,h0},{0,py,unsigned(w)-w0,h0},
                                     {px,0,w0,unsigned(h)-h0},{0,0,unsigned(w)-w0,unsigned(h)-h0}}};
     ++p->revision;
+    if (duck_texture_pack_invalidation_changes(p,x,y,w,h)) ++p->tracking_generation;
     bool released = false;   /* a residency record dropped or split */
     for (const auto& r : regions) if (r.w && r.h) {
         /* Most writes (render targets, CLUT animation) touch no tracked
@@ -879,6 +902,7 @@ void duck_texture_pack_invalidate(DuckTexturePack* p, uint16_t x, uint16_t y, ui
     } catch (...) {
         /* Allocation/finalization failure must never preserve stale residency
          * after a native write. Pending immutable observations remain owned. */
+        ++p->tracking_generation;
         p->uploads.clear(); p->pages.clear(); p->rect_cache.clear(); p->match_cache.clear();
     }
 }
@@ -887,7 +911,7 @@ void duck_texture_pack_reset_tracking(DuckTexturePack* p) {
     const bool flushed = duck_texture_pack_flush_dumps(p,nullptr,0) >= 0;
     p->uploads.clear(); p->pages.clear(); p->copy_updates.clear(); p->copy_pending = false;
     if (flushed) { p->sources.clear(); p->snapshot_bytes = 0; p->palette_records = 0; }
-    p->rect_cache.clear(); p->match_cache.clear(); ++p->revision;
+    p->rect_cache.clear(); p->match_cache.clear(); ++p->revision; ++p->tracking_generation;
 }
 int duck_texture_pack_copy_tracking(DuckTexturePack* destination, const DuckTexturePack* source) {
     if (!destination || !source) return 0;
@@ -917,7 +941,7 @@ int duck_texture_pack_copy_tracking(DuckTexturePack* destination, const DuckText
         destination->copy_updates.clear(); destination->copy_pending = false;
         destination->rect_cache.clear();
         destination->match_cache.clear();
-        ++destination->revision;
+        ++destination->revision; ++destination->tracking_generation;
         return 1;
     } catch (...) { return 0; }
 }
@@ -926,6 +950,7 @@ int duck_texture_pack_track_upload(DuckTexturePack* p, uint16_t x, uint16_t y, u
     if (!p) return 0;
     duck_texture_pack_invalidate(p, x, y, w, h);
     if (!vram || count < kWords || !valid_rect({x,y,w,h})) return 0;
+    ++p->tracking_generation;
     try {
         const Rect written{x,y,w,h};
         if (!p->uploads.empty()) {
@@ -950,6 +975,7 @@ int duck_texture_pack_begin_copy(DuckTexturePack* p, uint16_t sx, uint16_t sy, u
                                   uint16_t w, uint16_t h, const uint16_t* vram, size_t count) {
     if (!p || !vram || count < kWords) return 0;
     p->copy_updates.clear(); p->copy_pending = false;
+    ++p->tracking_generation;
     const Rect destination{dx,dy,w,h};
     if (!valid_rect({sx,sy,w,h}) || !valid_rect(destination)) { duck_texture_pack_invalidate(p,dx,dy,w,h); return 0; }
     try {
@@ -977,7 +1003,7 @@ int duck_texture_pack_end_copy(DuckTexturePack* p, const uint16_t* vram, size_t 
             if (!replacement) { p->copy_updates.clear(); return 0; }
             p->uploads.push_back({replacement,update.active,update.splits});
         }
-        p->copy_updates.clear(); p->match_cache.clear(); ++p->revision;
+        p->copy_updates.clear(); p->match_cache.clear(); ++p->revision; ++p->tracking_generation;
         return 1;
     } catch (...) { p->copy_updates.clear(); return 0; }
 }
@@ -1242,7 +1268,7 @@ int duck_texture_pack_dump_draw(DuckTexturePack* p, const HdTextureDrawQuery* q,
             if (existing != p->pages.end()) source = existing->source;
             else {
                 source = capture_source(*p,page,q->vram,DUCK_TEXTURE_PAGE);
-                if (source) p->pages.push_back({source,q->depth,q->clut_x,q->clut_y});
+                if (source) { p->pages.push_back({source,q->depth,q->clut_x,q->clut_y}); ++p->tracking_generation; }
             }
             if (source) changed = record_usage(*p,*source,rect,*q,st != 0);
         }

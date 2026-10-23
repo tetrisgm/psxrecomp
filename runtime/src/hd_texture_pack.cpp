@@ -665,6 +665,7 @@ struct HdTexturePack {
     size_t ambiguous_key_count = 0;
     size_t logical_mapping_count = 0;
     uint64_t next_upload_serial = 1;
+    uint64_t tracking_generation = 1;
     std::vector<Upload> uploads;
     std::array<std::vector<uint64_t>, kUploadIndexCells> upload_index;
     std::unordered_map<uint64_t, Upload*> upload_by_serial;
@@ -976,6 +977,18 @@ uint32_t hd_texture_hash_clut(const uint16_t* vram,
     return hd_texture_crc32_words_le(palette.data(), count);
 }
 
+uint64_t hd_texture_pack_tracking_generation(const HdTexturePack* p) { return p ? p->tracking_generation : 0; }
+int hd_texture_pack_invalidation_changes(const HdTexturePack* p, uint16_t x,uint16_t y,uint16_t w,uint16_t h) {
+    if (!p || !w || !h || p->uploads.empty()) return 0;
+    if (w>kVramWidth || h>kVramHeight) return 1;
+    for (const Rect& cut : physical_rects(x,y,w,h))
+        for (const Upload& upload : p->uploads)
+            if (intersects(upload.bounds,cut))
+                for (const Fragment& fragment : upload.fragments)
+                    if (intersects(fragment.rect,cut)) return 1;
+    return 0;
+}
+
 void hd_texture_pack_invalidate(HdTexturePack* pack,
                                 uint16_t x,
                                 uint16_t y,
@@ -985,6 +998,7 @@ void hd_texture_pack_invalidate(HdTexturePack* pack,
         width_words > kVramWidth || height > kVramHeight)
         return;
     bool erased_upload = false;
+    bool changed = false;
     if (pack->upload_bounds.width == 0 || pack->upload_bounds.height == 0)
         return;
     if ((unsigned{x} + width_words <= kVramWidth) &&
@@ -1012,6 +1026,7 @@ void hd_texture_pack_invalidate(HdTexturePack* pack,
                     next.push_back(fragment);
                     continue;
                 }
+                changed = true;
                 std::vector<Fragment> pieces = subtract_fragment(fragment, cut);
                 next.insert(next.end(), pieces.begin(), pieces.end());
             }
@@ -1034,6 +1049,7 @@ void hd_texture_pack_invalidate(HdTexturePack* pack,
      * pointer map.  Rebuild only on this uncommon path; ordinary primitive
      * invalidation updates only the few intersecting uploads. */
     if (erased_upload) upload_index_rebuild(pack);
+    if (changed) ++pack->tracking_generation;
 }
 
 int hd_texture_pack_track_upload(HdTexturePack* pack,
@@ -1073,6 +1089,7 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
         pack->upload_bounds.height = bottom - pack->upload_bounds.y;
     }
     pack->uploads.push_back(std::move(upload));
+    ++pack->tracking_generation;
     /* A push may reallocate the vector, so refresh all broad-phase pointers
      * after adding an upload.  Upload creation is far less frequent than GPU
      * primitive submission. */
@@ -1083,6 +1100,7 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
 
 void hd_texture_pack_reset_tracking(HdTexturePack* pack) {
     if (pack) {
+        if (!pack->uploads.empty()) ++pack->tracking_generation;
         pack->uploads.clear();
         upload_index_clear(pack);
         pack->upload_bounds = Rect{};
@@ -1189,6 +1207,7 @@ int hd_texture_pack_tracking_state_load(HdTexturePack* pack,
         if (pack) {
             pack->next_upload_serial = next_serial;
             pack->uploads.swap(uploads);
+            ++pack->tracking_generation;
             upload_index_rebuild(pack);
         }
         return 1;
