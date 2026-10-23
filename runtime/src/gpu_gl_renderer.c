@@ -12045,7 +12045,7 @@ static int gl_rth_eligible(void) {
     return s_raster_ok && s_ctx && !s_cpu_auth_dual && !s_depth24_skip_up &&
            !(s_hd_native_authority && s_rth_a0_open) &&
            !gpu_display_is_depth24() &&
-           (!s_interp_enabled || (s_rth_on ? s_pt_on : s_pt_want)) &&
+           (!s_interp_enabled || pass_queued_presenter() || (s_rth_on ? s_pt_on : s_pt_want)) &&
            (!s_pass_active || pass_queued_enabled()) &&
            !psx_netplay_active() && !psx_openxr_session_active() &&
            gr_backend() == GR_BACKEND_OPENGL;
