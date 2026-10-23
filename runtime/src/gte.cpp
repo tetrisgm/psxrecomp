@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <unordered_map>
 extern "C" int psx_netplay_active(void);
 
 extern "C" uint32_t psx_read_word(uint32_t addr);
@@ -47,9 +48,14 @@ struct GteNclipState {
  * guest-visible GTE registers are the context CPUState's; this holds what
  * gte.cpp otherwise keeps in process globals: the per-command projection
  * caller, NCLIP provenance, and the context's PGXP engine. Host caches and
- * statistics (geometry correction, frame-generation sources, projection
- * rings, the dome probe, counters) are main-context only. */
+ * statistics, frame-generation sources, projection rings and dome probes
+ * stay on main. Position fallback uses a private snapshot and cache. */
+struct CtxGeomVertex { int32_t x16, y16; uint32_t ambiguous; };
+
 struct PsxGteCtx {
+    std::unordered_map<uint32_t, CtxGeomVertex> geometry;
+    int geometry_record = 0;
+    bool geometry_failed = false;
     PgxpCtxEngine *pgxp = nullptr;
     uint32_t caller_ra = 0;
     GteNclipState nclip;
@@ -1331,6 +1337,19 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
         }
     }
     if (!gte->ctx) geom_note((uint32_t)gte->SXY[2], sx16, sy16);
+    else if (gte->ctx->geometry_record) {
+        const uint32_t packed = (uint32_t)gte->SXY[2];
+        const int x = (int16_t)packed, y = (int16_t)(packed >> 16);
+        if (x > -0x400 && x < 0x3ff && y > -0x400 && y < 0x3ff) {
+            try {
+                auto result = gte->ctx->geometry.emplace(packed,
+                    CtxGeomVertex{(int32_t)sx16, (int32_t)sy16, 0});
+                auto &entry = result.first->second;
+                if (!result.second && (entry.x16 != (int32_t)sx16 || entry.y16 != (int32_t)sy16))
+                    entry.ambiguous = 1;
+            } catch (const std::bad_alloc &) { gte->ctx->geometry_failed = true; }
+        }
+    }
 
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
     if (setMac0) {
@@ -2833,13 +2852,13 @@ extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
 // ---------------------------------------------------------------------------
 extern "C" PsxGteCtx* gte_ctx_create(PgxpCtxEngine* pgxp) {
     PsxGteCtx* x = new (std::nothrow) PsxGteCtx();
-    if (x) x->pgxp = pgxp;
+    if (x) { x->pgxp = pgxp; pgxp_ctx_set_geometry(pgxp, x); }
     return x;
 }
 
 extern "C" void gte_ctx_destroy(PsxGteCtx* x) { delete x; }
 
-extern "C" void gte_ctx_snapshot_main(PsxGteCtx* out) {
+extern "C" int gte_ctx_snapshot_main(PsxGteCtx* out) {
     using namespace PSXRecomp::GTE;
     out->pgxp = nullptr;
     out->caller_ra = s_gte_caller_ra;
@@ -2860,13 +2879,44 @@ extern "C" void gte_ctx_snapshot_main(PsxGteCtx* out) {
 #undef SNAP_FIELD
     out->native_43 = gpu_ws_present_native_43();
     out->precise_nclip = gpu_ws_precise_nclip_enabled();
+    out->geometry.clear();
+    out->geometry_failed = false;
+    out->geometry_record = !s_speculative_depth && !s_gte_replay_sandbox &&
+        s_geom_enabled && s_geom_cache && pgxp_position_fallback();
+    if (!s_speculative_depth && s_geom_enabled && s_geom_cache) {
+        try {
+            for (uint32_t i = 0; i < GEOM_CACHE_SIZE; ++i) {
+                const auto &v = s_geom_cache[i];
+                if (v.generation != s_geom_generation) continue;
+                /* geom_slot indexes y first, then x. */
+                const int x = (int)(i % GEOM_AXIS) - GEOM_BIAS;
+                const int y = (int)(i / GEOM_AXIS) - GEOM_BIAS;
+                const uint32_t packed = (uint16_t)x | ((uint32_t)(uint16_t)y << 16);
+                out->geometry.emplace(packed, CtxGeomVertex{v.x16, v.y16, v.ambiguous});
+            }
+        } catch (const std::bad_alloc &) { out->geometry.clear(); return 0; }
+    }
+    return 1;
 }
 
-extern "C" void gte_ctx_begin(PsxGteCtx* x, const PsxGteCtx* snapshot) {
+extern "C" int gte_ctx_begin(PsxGteCtx* x, const PsxGteCtx* snapshot) {
     PgxpCtxEngine *pgxp = x->pgxp;
-    *x = snapshot ? *snapshot : PsxGteCtx();
+    try { *x = snapshot ? *snapshot : PsxGteCtx(); }
+    catch (const std::bad_alloc &) { x->pgxp = pgxp; return 0; }
     x->pgxp = pgxp;
+    return 1;
 }
+
+extern "C" int gte_ctx_geometry_lookup(PsxGteCtx* x, uint32_t packed, int32_t* sx, int32_t* sy) {
+    if (!x || x->geometry_failed) return 0;
+    auto it = x->geometry.find(packed);
+    if (it == x->geometry.end() || it->second.ambiguous) return 0;
+    if (sx) *sx = it->second.x16;
+    if (sy) *sy = it->second.y16;
+    return 1;
+}
+
+extern "C" int gte_ctx_failed(const PsxGteCtx* x) { return x && x->geometry_failed; }
 
 extern "C" void gte_ctx_execute(PsxGteCtx* x, CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;

@@ -1459,7 +1459,50 @@ int test_draw_context_ram_precision_snapshot() {
     return 0;
 }
 
+int test_draw_context_geometry_fallback() {
+    const uint32_t packed = (80u << 16) | 160u;
+    const int32_t x16 = (160 << 16) + 1234, y16 = (80 << 16) + 5678;
+    pgxp_set_enabled(1); pgxp_set_position_fallback(1);
+    gte_geometry_correction_set(1);
+    gte_test_seed_geometry(packed, x16, y16);
+    auto *snapshot = gte_ctx_create(nullptr);
+    CHECK(snapshot && gte_ctx_snapshot_main(snapshot));
+    auto *precision = pgxp_ctx_export_main(); CHECK(precision);
+    std::atomic<int> failures{0};
+    std::thread workers[4];
+    for (auto &worker : workers) worker = std::thread([&] {
+        auto *pgxp = pgxp_ctx_create(); auto *ctx = gte_ctx_create(pgxp);
+        if (!pgxp || !ctx || pgxp_ctx_begin(pgxp, precision) < 0 || !gte_ctx_begin(ctx, snapshot)) {
+            ++failures;
+        } else {
+            for (int n = 0; n < 10000; ++n) {
+                int32_t x = 0, y = 0; uint16_t z = 99;
+                if (pgxp_ctx_get_precise_vertex(pgxp, 0xffffffffu, packed, 160, 80, &x, &y, &z)
+                    != PGXP_SRC_FALLBACK || x != x16 || y != y16 || z != 0) ++failures;
+            }
+            CPUState cpu{};
+            cpu.gte_ctrl[0] = cpu.gte_ctrl[2] = cpu.gte_ctrl[4] = 4096;
+            cpu.gte_ctrl[7] = 1500; cpu.gte_ctrl[26] = 300;
+            cpu.gte_data[0] = 0x00100064; cpu.gte_data[1] = 64;
+            gte_ctx_execute(ctx, &cpu, 0x80001);
+            if (!gte_ctx_geometry_lookup(ctx, cpu.gte_data[14], nullptr, nullptr)) ++failures;
+            const uint32_t projected = cpu.gte_data[14];
+            cpu.gte_data[0] += 1;
+            gte_ctx_execute(ctx, &cpu, 0x80001);
+            if (cpu.gte_data[14] != projected || gte_ctx_geometry_lookup(ctx, projected, nullptr, nullptr)) ++failures;
+            if (!gte_ctx_begin(ctx, snapshot) || gte_ctx_geometry_lookup(ctx, projected, nullptr, nullptr)) ++failures;
+        }
+        gte_ctx_destroy(ctx); pgxp_ctx_destroy(pgxp);
+    });
+    for (int n = 0; n < 10000; ++n) gte_test_seed_geometry(packed, x16 + n + 1, y16);
+    for (auto &worker : workers) worker.join();
+    gte_ctx_destroy(snapshot); pgxp_ctx_export_free(precision);
+    gte_geometry_correction_set(0); pgxp_set_enabled(0);
+    CHECK(failures == 0); return 0;
+}
+
 int main() {
+    if (int rc = test_draw_context_geometry_fallback()) return rc;
     if (int rc = test_draw_context_ram_precision_snapshot()) return rc;
     if (int rc = test_draw_context_frozen_configuration()) return rc;
     if (int rc = test_projection_scale()) return rc;

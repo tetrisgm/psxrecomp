@@ -52,7 +52,7 @@ concurrently from one snapshot; a context never writes main-context state.
 | Cycle model: `psx_cyc_step`, `psx_cyc_charge`, batch/defer globals, `psx_icache_fetch`, `psx_slice_block`, mult/div + GTE stalls (psx_cyc.h, psx_cycles.c, psx_icache.c) | compiled out (`PSX_ENABLE_BLOCK_CYCLES` undefined in the draw TU) |
 | Interrupt checks `psx_check_interrupts_at` → `psx_check_interrupts` → **savestate_poll / debug_server_poll / netplay / rewind** (interrupts.c) | no-op |
 | `g_debug_last_store_pc` breadcrumb, `debug_server_log_call_entry`, `debug_server_cyc_observe`, cosim | removed (emitter strips the store-PC write; macros) |
-| GTE side state in gte.cpp: projection caller RA, NCLIP provenance, geometry-correction cache, frame-gen sources, projection/INTPL rings, dome probe, ws SZ stats, last-projection globals, counters | `PsxGteCtx` (gte_ctx.h): own caller RA + NCLIP state, PGXP routed to the context's engine; host caches/stats/rings skipped. Config globals (widescreen squash, FOV scale, render pose) are read, not copied (see gaps) |
+| GTE side state in gte.cpp: projection caller RA, NCLIP provenance, geometry-correction cache, frame-gen sources, projection/INTPL rings, dome probe, ws SZ stats, last-projection globals, counters | `PsxGteCtx` (gte_ctx.h): own caller RA + NCLIP state and position-fallback cache; PGXP routed to the context's engine. Presentation configuration (widescreen squash, FOV scale, render pose) is frozen in the snapshot; host stats/rings skipped |
 | PGXP engine (pgxp.cpp): RAM/scratch/register shadows, generation, stats, rings, render-pass journal | the same engine body instantiated per context (`pgxp_engine.inc` included into `struct PgxpCtxEngine`, pgxp_ctx.cpp); config + register/scratch shadows imported from the snapshot, RAM shadow starts empty (O(1) generation bump) |
 | Mod hooks `psx_mod_function_entry`, `psx_mod_instruction`, `psx_mod_memory_address` (mod_runtime.cpp) | stripped (counted), except entry hooks registered with `psx_ctx_register_entry_hook` |
 | Stale-static text guard `psx_game_text_native_ok` (live text bitmaps) | `psx_dctx_text_ok`: exact compare of the clone's code ranges against the compiled reference image, on the context's RAM, cached per row |
@@ -207,3 +207,14 @@ branch `int/ctx-r4`, never pushed):
 * The debug command runs on the emulation thread; the live `$sp` there may be
   the kernel's — the bench uses `0x801FFF00` unless `sp` is given.
 * Old savestates do not load across this change (execution cookie).
+
+### Geometry fallback snapshots
+
+Draw snapshots retain the current main geometry-cache entries and frozen PGXP
+position-fallback setting. Each context copies these into its private sparse
+cache and records RTPS/RTPT projections with the same first-writer, ambiguity,
+and saturation rules as main. Main render-pass checkpoints preserve fallback,
+so disabling it in workers would change precision. Capture currently scans the
+main direct table; measuring and reducing that cost remains pending. Allocation
+failures reject the snapshot or draw pass. The four-thread GTE fixture checks
+fallback while main mutates its cache, new projections, ambiguity, and reset.
