@@ -9217,13 +9217,13 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
                              GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE))
         return pass_begin_refuse("backup_hr");
     s_pass_begin_diag.resource = "backup_raw";
-    if (!pass_make_color_fbo(&s_pb_raw_tex, NULL, &s_pb_raw_fbo,
+    if (!s_async_exec && !pass_make_color_fbo(&s_pb_raw_tex, NULL, &s_pb_raw_fbo,
                              &s_pb_raw_w, &s_pb_raw_h, w, h, PSXGL_R16UI,
                              PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT))
         return pass_begin_refuse("backup_raw");
     pass_blit(s_hr_fbo, s_pb_hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
               GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
-    pass_blit(s_raw_fbo, s_pb_raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
+    if (!s_async_exec) pass_blit(s_raw_fbo, s_pb_raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
     s_pb_wide_src = g_wide_w > 0 ? pass_wide_fbo_for(x) : 0;
     if (s_pb_wide_src) {
         s_pass_begin_diag.resource = "backup_wide";
@@ -9234,13 +9234,13 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         pass_blit(s_pb_wide_src, s_pb_wide_fbo, 0, y * S, 0, 0, g_wide_w * S,
                   h * S, GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT | pass_depth_bit());
     }
-    if (s_pb_cpu_cap < (size_t)w * (size_t)h) {
+    if (!s_async_exec && s_pb_cpu_cap < (size_t)w * (size_t)h) {
         free(s_pb_cpu);
         s_pb_cpu = (uint16_t *)malloc((size_t)w * (size_t)h * sizeof(uint16_t));
         s_pb_cpu_cap = s_pb_cpu ? (size_t)w * (size_t)h : 0;
         if (!s_pb_cpu) return pass_begin_refuse("backup_cpu");
     }
-    for (int row = 0; row < h; row++)
+    for (int row = 0; !s_async_exec && row < h; row++)
         memcpy(s_pb_cpu + (size_t)row * w, s_vram + (size_t)(y + row) * VRAM_W + x,
                (size_t)w * sizeof(uint16_t));
     s_pb_cpu_dirty = s_cpu_dirty;
@@ -9319,7 +9319,7 @@ static void transaction_restore_ex(int keep_color) {
     pass_snap_restore(s_pb_snap,s_pb_snap_present);
     s_pass_active = 0;
     s_pass_local = 0;
-    s_pb_valid = !keep_color;
+    s_pb_valid = !keep_color && !s_async_exec;
     if (keep_color) {
         /* The rect now differs from the backup and from the last present. */
         present_dirty_rect(s_pass_x, s_pass_y, s_pass_x + s_pass_w - 1,
@@ -9380,7 +9380,7 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
     X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue) \
     X(resource_scale) X(resource_epoch) X(resource_wide) X(resource_alloc) \
     X(resource_acquire) X(resource_hd) X(epoch_acquire) X(epoch_hd) \
-    X(reserve_ns) X(enter_ns) X(replay_ns) X(finish_ns) X(replay_count) \
+    X(reserve_ns) X(enter_ns) X(replay_ns) X(finish_ns) X(replay_count) X(flush_ns) X(capture_ns) X(rollback_ns) X(compose_ns) \
     X(present_calls) X(present_invalid) X(present_expired) X(present_mismatch) X(present_unready) X(present_refused)
 #define ASYNC_DECLARE(n) static _Atomic uint64_t s_async_count_##n;
 ASYNC_COUNTERS(ASYNC_DECLARE)
@@ -9492,7 +9492,9 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
     PassGen *g = &s_pgen[gi];
     s_pass_dead = 0;   /* however this pass ends, later records run */
     if (!s_pass_active) return;
+    uint64_t stage_start=s_async_exec?pt_clock_ns():0;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
+    if (s_async_exec) { atomic_fetch_add(&s_async_count_flush_ns,pt_clock_ns()-stage_start); stage_start=pt_clock_ns(); }
     /* Timed outputs are copied into a presenter-owned slot immediately.
      * Reuse the generation's one scratch image: high rates must not retain
      * one 8K texture per output while the presenter already owns its copy. */
@@ -9511,8 +9513,9 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
         }
         s_pgen_tex[gi][at] = t; g->phase[at] = alpha_q16; g->n++;
     }
-    if (s_async_exec) async_vram_leave();
+    if (s_async_exec) { atomic_fetch_add(&s_async_count_capture_ns,pt_clock_ns()-stage_start); stage_start=pt_clock_ns(); async_vram_leave(); }
     transaction_restore();
+    if (s_async_exec) atomic_fetch_add(&s_async_count_rollback_ns,pt_clock_ns()-stage_start);
 }
 
 static void async_vram_free(AsyncVram *v) {
@@ -15410,6 +15413,7 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
     if (g->source_path!=s_interp_source_path || g->tex_w!=s_interp_w || g->tex_h!=s_interp_h) {
         ASYNC_COUNT(present_mismatch); return;
     }
+    uint64_t compose_start=pt_clock_ns();
     PtTiming timing={output->epoch,output->deadline,output->expires,
                      output->generation,output->index,output->alpha_q16};
     if (gl_renderer_set_present_timing(&timing)) {
@@ -15421,6 +15425,7 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
         else ASYNC_COUNT(present_refused);
     } else ASYNC_COUNT(present_refused);
     memset(&s_pt_next_timing,0,sizeof s_pt_next_timing);
+    atomic_fetch_add(&s_async_count_compose_ns,pt_clock_ns()-compose_start);
 }
 
 static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {

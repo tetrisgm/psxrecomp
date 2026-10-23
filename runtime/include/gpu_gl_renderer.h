@@ -98,6 +98,7 @@ typedef struct GLRenderAsyncStats {
     uint64_t resource_scale, resource_epoch, resource_wide, resource_alloc;
     uint64_t resource_acquire, resource_hd, epoch_acquire, epoch_hd;
     uint64_t reserve_ns, enter_ns, replay_ns, finish_ns, replay_count;
+    uint64_t flush_ns, capture_ns, rollback_ns, compose_ns;
 } GLRenderAsyncStats;
 void gl_renderer_pass_async_stats(GLRenderAsyncStats *out);
 /* Main-thread discontinuity: cancel queued timed images and all outstanding
