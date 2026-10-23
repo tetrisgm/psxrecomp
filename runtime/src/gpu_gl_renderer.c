@@ -467,7 +467,7 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK, RTH_GROUP
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -492,6 +492,7 @@ static void rth_rebind_vram(uint16_t *vram) {
     sw_renderer_rebind_vram(vram);
     gpu_hd_textures_bind_vram(vram);
 }
+static int rth_group_flush(void);
 static int  rth_rec_ints(uint16_t op, uint16_t flags, int n, const int32_t *v);
 static uint16_t rth_prim_flags(void);
 static int  rth_record_present(uint16_t op, int n, const int32_t *v);
@@ -5360,6 +5361,7 @@ int gl_renderer_projective_supported(void) {
 void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
     uint16_t texpage, uint16_t cx, uint16_t cy, int raw, int semi, int perspective) {
     if (rth_record_mode()) {
+        rth_group_flush();
         uint8_t *p = (uint8_t *)rt_cmd_begin(RTH_PROJ_TRI, rth_prim_flags(),
                                              3u * sizeof(PSXProjectedVertex) + 24u);
         if (p) {
@@ -11213,12 +11215,49 @@ static int rth_mirror_wide_present_ok(int base_x) {
     return 0;
 }
 
-static int rth_rec_ints(uint16_t op, uint16_t flags, int n, const int32_t *v) {
+static int rth_rec_raw(uint16_t op, uint16_t flags, int n, const int32_t *v) {
     int32_t *p = (int32_t *)rt_cmd_begin(op, flags, (uint32_t)n * 4u);
     if (!p) return 0;
     memcpy(p, v, (size_t)n * 4u);
     rt_cmd_commit();
     return 1;
+}
+
+/* Keep the exact state-call order, but publish a triangle and its short setup
+ * sequence in one ring record. Non-integer payloads and context handoffs flush
+ * pending state first. The consumer expands the same logical records before
+ * profiling/frame-generation hooks, so their observations stay unchanged. */
+static int32_t s_rth_group[512];
+static unsigned s_rth_group_n;
+static int s_rth_group_enabled=-1;
+static int rth_group_on(void) {
+    if(s_rth_group_enabled<0) {
+        const char *e=getenv("PSX_RENDER_THREAD_GROUPS");
+        s_rth_group_enabled=!(e && !strcmp(e,"0"));
+    }
+    return s_rth_group_enabled;
+}
+static int rth_group_flush(void) {
+    if(!s_rth_group_n) return 1;
+    unsigned n=s_rth_group_n; s_rth_group_n=0;
+    return rth_rec_raw(RTH_GROUP,0,(int)n,s_rth_group);
+}
+static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
+    int setup=op==RTH_SEMI || op==RTH_MASK || op==RTH_TWIN || op==RTH_MOD ||
+        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC;
+    int triangle=op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI ||
+        op==RTH_TEX_TRI || op==RTH_SHADED_TEX_TRI;
+    if(!rth_group_on() || (!setup && !triangle) || n<0 || n>508) {
+        if(!rth_group_flush()) return 0;
+        return rth_rec_raw(op,flags,n,v);
+    }
+    if(s_rth_group_n+(unsigned)n+2u>512u && !rth_group_flush()) return 0;
+    unsigned at=s_rth_group_n;
+    s_rth_group[at]=(int32_t)((uint32_t)op|((uint32_t)flags<<16));
+    s_rth_group[at+1]=n;
+    memcpy(s_rth_group+at+2,v,(size_t)n*4u);
+    s_rth_group_n+=2u+(unsigned)n;
+    return triangle?rth_group_flush():1;
 }
 
 /* Native-wide stream state read by the fast-path gate (wide_fast_center_valid)
@@ -11267,6 +11306,7 @@ static void rth_hd_publish_private(void) {
 
 static void gl_rth_acquire(const char *reason) {
     if (!s_rth_on || rt_on_render_thread() || rt_held()) return;
+    rth_group_flush();
     rt_acquire(reason);
     rth_hd_publish_private();
     s_vram = s_rth_vram_pub;
@@ -11318,6 +11358,7 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
     size_t bytes = sizeof hd;
     for (int i = 0; i < 4; i++)
         if (hd.has & (1 << i)) bytes += (size_t)hd.w[i] * hd.h[i] * 4u;
+    if(!rth_group_flush()) return 0;
     uint8_t *p = (uint8_t *)rt_cmd_begin(op, 0, (uint32_t)bytes);
     if (!p) return 0;
     memcpy(p, &hd, sizeof hd);
@@ -14222,6 +14263,7 @@ static uint16_t rtb_vram_read(int x, int y) { GL_RT_SYNC("vram_read"); return gl
 static void rtb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) {
     if (rth_record_mode()) {
         size_t n = (w > 0 && h > 0) ? (size_t)w * (size_t)h : 0;
+        rth_group_flush();
         int32_t *p = (int32_t *)rt_cmd_begin(RTH_XFER_IN, 0, (uint32_t)(16u + n * 2u));
         if (p) {
             p[0] = x; p[1] = y; p[2] = w; p[3] = h;
@@ -14375,6 +14417,18 @@ static const GpuRenderBackend GL_RT_BACKEND = {
 
 /* ---- replay (render thread) ---------------------------------------------- */
 static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
+    if(c->op==RTH_GROUP) {
+        const int32_t *words=payload;
+        unsigned count=c->payload/4u, at=0;
+        while(at+2u<=count) {
+            uint32_t id=(uint32_t)words[at], n=(uint32_t)words[at+1];
+            if(n>count-at-2u || (uint16_t)id==RTH_GROUP) return;
+            RtCmd inner={sizeof(RtCmd)+n*4u,(uint16_t)id,(uint16_t)(id>>16),n*4u,c->seq};
+            gl_rth_exec(user,&inner,words+at+2);
+            at+=2u+n;
+        }
+        return;
+    }
     (void)user;
     const int32_t *v = (const int32_t *)payload;
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
@@ -14548,6 +14602,7 @@ int gl_renderer_render_thread_start(int max_frames) {
 void gl_renderer_render_thread_stop(void) {
     if (!s_rth_on) return;
     const int held = rt_held();
+    rth_group_flush();
     rt_stop();                       /* drains; the context is current here again */
     pt_end();
     /* Unheld, the private copy holds the final HD-authoritative draws. */
@@ -14576,6 +14631,7 @@ void gl_renderer_render_thread_frame_boundary(void) {
     /* The render thread's per-frame cost (dynamic resolution) ends here. */
     if (!rt_held() && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         RTH_REC(RTH_FRAME, 0, 0);
+    rth_group_flush();
     rt_frame_end();
 }
 
