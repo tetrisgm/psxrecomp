@@ -56,6 +56,18 @@ typedef struct PsxCtxGpuWord {
     PgxpCtxVertex vertex;
 } PsxCtxGpuWord;
 
+/* DMA receipts preserve empty OT nodes and packet bytes at consumption.
+ * A later draw may overwrite the same packet addresses in private RAM. */
+typedef struct PsxCtxGpuNode {
+    size_t word_offset;
+    uint32_t address, header;
+} PsxCtxGpuNode;
+typedef struct PsxCtxGpuMemWord { uint32_t address, word; } PsxCtxGpuMemWord;
+typedef struct PsxCtxGpuList {
+    size_t word_begin, word_end, node_begin, node_end, memory_begin, memory_end;
+    uint32_t root;
+} PsxCtxGpuList;
+
 typedef enum {
     PSX_CTX_OK = 0,
     PSX_CTX_FAULT_MISS,         /* transfer to a PC with no draw clone */
@@ -107,6 +119,10 @@ struct PsxExecCtx {
     int      in_call;
     PsxCtxGpuWord *gpu;
     size_t   gpu_n, gpu_cap;
+    PsxCtxGpuNode *gpu_nodes;
+    PsxCtxGpuMemWord *gpu_memory;
+    PsxCtxGpuList *gpu_lists;
+    size_t gpu_nodes_n,gpu_nodes_cap,gpu_memory_n,gpu_memory_cap,gpu_lists_n,gpu_lists_cap;
     uint32_t gpu_dma_dir;        /* GP1(04) */
     uint32_t gpustat;            /* snapshot GPUSTAT (ready bits forced) */
     uint32_t dma_madr[7], dma_bcr[7], dma_chcr[7];
@@ -152,6 +168,10 @@ uint32_t psx_ctx_read32(PsxExecCtx *x, uint32_t addr);
 void     psx_ctx_write32(PsxExecCtx *x, uint32_t addr, uint32_t value);
 
 /* Captured GPU command words since psx_ctx_begin. */
+/* Address lookup in one immutable DMA-list receipt. Returns 0 for absent
+ * bytes; caller may then read other memory from its snapshot, never live RAM. */
+int psx_ctx_gpu_list_read(const PsxExecCtx *x,size_t list,uint32_t address,
+                          unsigned width,uint32_t *out);
 const PsxCtxGpuWord *psx_ctx_gpu_words(const PsxExecCtx *x, size_t *count);
 /* PGXP precision of a captured word (pgxp_get_precise_vertex semantics on
  * the context's engine; int_x/int_y are the packet's 11-bit integers). */

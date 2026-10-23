@@ -265,6 +265,7 @@ void psx_ctx_destroy(PsxExecCtx *x) {
     pgxp_ctx_destroy(x->pgxp);
     free(x->ram);
     free(x->gpu);
+    free(x->gpu_nodes); free(x->gpu_lists); free(x->gpu_memory);
     free(x->text_ok);
     free(x);
 }
@@ -303,6 +304,7 @@ int psx_ctx_begin(PsxExecCtx *x, const PsxCtxSnapshot *s) {
     memcpy(x->timer_target, s->timer_target, sizeof x->timer_target);
     memset(x->timer_reads, 0, sizeof x->timer_reads);
     x->gpu_n = 0;
+    x->gpu_nodes_n=x->gpu_lists_n=x->gpu_memory_n=0;
     memset(&x->stats, 0, sizeof x->stats);
     x->status = PSX_CTX_OK;
     x->fault_pc = 0;
@@ -461,6 +463,38 @@ static void dma_complete(PsxExecCtx *x, int ch) {
     }
 }
 
+static void ctx_capture_grow(PsxExecCtx *x,void **data,size_t *capacity,size_t need,size_t unit) {
+    if (need<=*capacity) return;
+    size_t cap=*capacity ? *capacity : 256;
+    while (cap<need) {
+        if(cap>SIZE_MAX/2) psx_dctx_fault(&x->cpu,PSX_CTX_FAULT_RUNAWAY,0,"DMA receipt capacity");
+        cap*=2;
+    }
+    if(cap>SIZE_MAX/unit) psx_dctx_fault(&x->cpu,PSX_CTX_FAULT_RUNAWAY,0,"DMA receipt size");
+    void *next=realloc(*data,cap*unit);
+    if(!next) psx_dctx_fault(&x->cpu,PSX_CTX_FAULT_RUNAWAY,0,"DMA receipt allocation");
+    *data=next; *capacity=cap;
+}
+static int ctx_memory_compare(const void *a,const void *b) {
+    const PsxCtxGpuMemWord *x=a,*y=b;
+    return (x->address>y->address)-(x->address<y->address);
+}
+int psx_ctx_gpu_list_read(const PsxExecCtx *x,size_t list,uint32_t address,
+                          unsigned width,uint32_t *out) {
+    if(!x || !out || list>=x->gpu_lists_n || (width!=1 && width!=2 && width!=4) ||
+        (address&3u)+width>4) return 0;
+    const PsxCtxGpuList *g=&x->gpu_lists[list];
+    uint32_t key=address & x->ram_mask & ~3u;
+    size_t lo=g->memory_begin,hi=g->memory_end;
+    while(lo<hi) { size_t mid=lo+(hi-lo)/2;
+        if(x->gpu_memory[mid].address<key) lo=mid+1; else hi=mid;
+    }
+    if(lo==g->memory_end || x->gpu_memory[lo].address!=key) return 0;
+    *out=x->gpu_memory[lo].word >> (8u*(address&3u));
+    if(width<4) *out &= (1u<<(width*8u))-1u;
+    return 1;
+}
+
 static void dma_gpu(PsxExecCtx *x) {
     const uint32_t chcr = x->dma_chcr[2];
     const uint32_t mode = (chcr >> 9) & 3u;
@@ -469,18 +503,31 @@ static void dma_gpu(PsxExecCtx *x) {
     x->stats.dma_gpu++;
     if (mode == 2u) {
         uint32_t addr = x->dma_madr[2] & 0x00FFFFFCu;
+        ctx_capture_grow(x,(void **)&x->gpu_lists,&x->gpu_lists_cap,x->gpu_lists_n+1,sizeof(*x->gpu_lists));
+        PsxCtxGpuList *list=&x->gpu_lists[x->gpu_lists_n++];
+        *list=(PsxCtxGpuList){.word_begin=x->gpu_n,.node_begin=x->gpu_nodes_n,
+                            .memory_begin=x->gpu_memory_n,.root=addr};
         for (uint32_t nodes = 0;; nodes++) {
             if (nodes > CTX_DMA_NODE_LIMIT)
                 psx_dctx_fault(&x->cpu, PSX_CTX_FAULT_RUNAWAY, addr, "GPU linked list");
             const uint32_t header = ram32(x, addr);
             const uint32_t n = header >> 24;
+            ctx_capture_grow(x,(void **)&x->gpu_nodes,&x->gpu_nodes_cap,x->gpu_nodes_n+1,sizeof(*x->gpu_nodes));
+            x->gpu_nodes[x->gpu_nodes_n++]=(PsxCtxGpuNode){x->gpu_n,addr,header};
+            ctx_capture_grow(x,(void **)&x->gpu_memory,&x->gpu_memory_cap,x->gpu_memory_n+n+1,sizeof(*x->gpu_memory));
+            x->gpu_memory[x->gpu_memory_n++]=(PsxCtxGpuMemWord){addr & x->ram_mask,header};
             for (uint32_t i = 1; i <= n; i++) {
                 const uint32_t a = (addr + 4u * i) & 0x00FFFFFCu & x->ram_mask;
-                gpu_push(x, ram32(x, a), a);
+                uint32_t word=ram32(x,a);
+                x->gpu_memory[x->gpu_memory_n++]=(PsxCtxGpuMemWord){a,word};
+                gpu_push(x,word,a);
             }
             if (header & 0x00800000u) break;
             addr = header & 0x00FFFFFCu;
         }
+        list->word_end=x->gpu_n; list->node_end=x->gpu_nodes_n; list->memory_end=x->gpu_memory_n;
+        qsort(x->gpu_memory+list->memory_begin,list->memory_end-list->memory_begin,
+              sizeof(*x->gpu_memory),ctx_memory_compare);
         x->dma_madr[2] = 0x00FFFFFFu;
     } else {
         uint32_t words = x->dma_bcr[2] & 0xFFFFu;

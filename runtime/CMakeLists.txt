@@ -1138,6 +1138,21 @@ if(BUILD_TESTING)
     add_executable(native_wide_projection_test tests/test_native_wide_projection.c
         src/psx_video_timing.c
         src/gpu_timeline.c)
+    add_executable(ctx_gpu_receipts_test tests/test_ctx_gpu_receipts.c)
+    target_include_directories(ctx_gpu_receipts_test PRIVATE include src)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(ctx_gpu_receipts_test PRIVATE -ffunction-sections -fdata-sections)
+        if(APPLE)
+            target_link_options(ctx_gpu_receipts_test PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(ctx_gpu_receipts_test PRIVATE -Wl,--gc-sections)
+        endif()
+        if(MINGW)
+            target_compile_options(ctx_gpu_receipts_test PRIVATE -flto)
+            target_link_options(ctx_gpu_receipts_test PRIVATE -flto)
+        endif()
+    endif()
+    add_test(NAME ctx_gpu_receipts_test COMMAND ctx_gpu_receipts_test)
     add_executable(gpu_render_pass_provenance_test tests/test_gpu_render_pass_provenance.c
         src/ws_ui_group.c
         src/psx_video_timing.c
