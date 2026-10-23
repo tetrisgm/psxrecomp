@@ -9,6 +9,7 @@ struct State {
     std::atomic<uint64_t> now{100};
     std::atomic<unsigned> started{0}, disposed{0};
     std::atomic<bool> go{false};
+    std::atomic<int> result{0};
 };
 struct Payload { State *state; unsigned value; };
 static uint64_t clock_ns(void *user) { return ((State *)user)->now.load(); }
@@ -17,7 +18,7 @@ static int execute(void *user, unsigned slot, void *data) {
     ++s->started;
     while (!s->go.load()) std::this_thread::yield();
     ((Payload *)data)->value = slot + 42;
-    return 0;
+    return s->result.load();
 }
 static void dispose(void *data) {
     auto *p = (Payload *)data;
@@ -89,13 +90,31 @@ int main() {
     assert(!draw_worker_submit(pool, &expired));
     dispose(expired.payload);
 
+    // Admission expiry/cancellation must not hide a callback failure.
+    for (int cancel = 0; cancel < 2; ++cancel) {
+        s.now = 100; s.go = false; s.result = -3;
+        unsigned before = s.started.load();
+        auto failing = job(s, 0, 2 + cancel);
+        assert(draw_worker_submit(pool, &failing));
+        until([&] { return s.started == before + 1; });
+        if (cancel) draw_worker_set_epoch(pool, 4);
+        else s.now = 300;
+        s.go = true;
+        until([&] { return draw_worker_poll(pool, &r); });
+        assert(r.executed && r.execution_status == -3);
+        assert(r.status == (cancel ? DRAW_WORKER_CANCELLED : DRAW_WORKER_EXPIRED));
+        assert(!draw_worker_current(pool, &r, 7));
+        assert(draw_worker_release(pool, &r));
+        if (!cancel) draw_worker_set_epoch(pool, 3);
+    }
+    s.result = 0;
     // Teardown owns unclaimed results and cancels queued work without leaks.
     s.now = 100;
     for (unsigned i = 0; i < 4; ++i) {
-        auto j = job(s, i, 2);
+        auto j = job(s, i, 4);
         assert(draw_worker_submit(pool, &j));
     }
     draw_worker_destroy(pool);
-    assert(s.disposed == 12);
+    assert(s.disposed == 14);
     std::puts("PASS: four draw workers, backpressure, epochs, expiry, ownership");
 }

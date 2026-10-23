@@ -11,6 +11,8 @@ struct DrawSlot {
     DrawWorkerJob job{};
     uint64_t ticket = 0;
     int status = 0;
+    bool executed = false;
+    int execution_status = 0;
 };
 struct DrawWorkerPool {
     std::mutex mutex;
@@ -42,6 +44,8 @@ static void run(DrawWorkerPool *p, unsigned i) {
         lock.unlock();
         const int status = p->execute(p->user, i, payload);
         lock.lock();
+        s.executed = true;
+        s.execution_status = status;
         s.status = invalid(p, s.job);
         if (!s.status) s.status = status;
         s.state = READY;
@@ -67,6 +71,7 @@ extern "C" int draw_worker_submit(DrawWorkerPool *p, const DrawWorkerJob *job) {
     for (auto &s : p->slots) if (s.state == FREE) {
         if (++p->serial == 0) ++p->serial;
         s.job = *job; s.ticket = p->serial; s.state = QUEUED;
+        s.executed = false; s.execution_status = 0;
         p->wake.notify_all();
         return 1;
     }
@@ -86,7 +91,7 @@ extern "C" int draw_worker_poll(DrawWorkerPool *p, DrawWorkerResult *out) {
     const int stale = invalid(p, s.job);
     if (stale) s.status = stale;
     s.state = CLAIMED;
-    *out = {s.ticket, best, s.status, s.job};
+    *out = {s.ticket, best, s.status, s.job, s.executed, s.execution_status};
     return 1;
 }
 extern "C" int draw_worker_current(DrawWorkerPool *p, const DrawWorkerResult *r,
