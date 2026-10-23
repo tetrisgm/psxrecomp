@@ -890,7 +890,8 @@ typedef struct AsyncSeamPrepared {
     PgxpSnap *baseline;
     uint64_t epoch, generation, index, deadline;
     int baseline_present, ready;
-    struct AsyncSeamPrepared *next;
+    _Atomic int state, refs; /* 0 pending, 1 ready, 2 failed */
+    struct AsyncSeamPrepared *next, *work_next;
 } AsyncSeamPrepared;
 static AsyncSeamPrepared *s_async_seam_ready, *s_async_seam_active;
 static atomic_flag s_async_seam_ready_guard = ATOMIC_FLAG_INIT;
@@ -901,6 +902,8 @@ static _Atomic uint64_t s_async_seam_mismatch_count, s_async_seam_fallback_count
 static _Atomic uint64_t s_async_seam_collect_count, s_async_seam_candidate_count;
 static _Atomic uint64_t s_async_seam_invalid_count, s_async_seam_triangle_count;
 static _Atomic int s_async_seam_first_invalid_op;
+static _Atomic uint64_t s_async_seam_verify_tris, s_async_seam_verify_mismatch;
+static int s_async_seam_verify = -1;
 /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
  * and the seam expansion of opaque 3D polygons (0 off, 1 = 1 output px
@@ -4803,6 +4806,29 @@ static int seam_snap_measure(const int *xs, const int *ys) {
             atomic_fetch_add(&s_async_seam_mismatch_count, 1);
             return 0;
         }
+        if (s_async_seam_verify < 0) {
+            const char *e = getenv("PSX_SEAM_PREP_VERIFY");
+            s_async_seam_verify = e && *e && strcmp(e, "0") != 0;
+        }
+        if (s_async_seam_verify) {
+            if (!s_snap) {
+                s_snap = (PgxpSnap *)calloc(1, sizeof *s_snap);
+                if (s_snap) pgxp_snap_reset(s_snap);
+            }
+            if (!s_snap) { s_async_seam_failed = 1; return 0; }
+            if (s_snap->n_edges > PGXP_SNAP_MAX_EDGES - 3 ||
+                s_snap->n_links > PGXP_SNAP_MAX_LINKS - 4096)
+                pgxp_snap_reset(s_snap);
+            float reference[3];
+            int count = pgxp_snap_triangle(s_snap, ix, iy, fx, fy,
+                                           s_pz, word, reference);
+            atomic_fetch_add(&s_async_seam_verify_tris, 1);
+            if (count != n || memcmp(reference, s_snap_e, sizeof reference) != 0) {
+                atomic_fetch_add(&s_async_seam_verify_mismatch, 1);
+                s_async_seam_failed = 1;
+                return 0;
+            }
+        }
     } else {
         if (!s_snap) {
             s_snap = (PgxpSnap *)calloc(1, sizeof *s_snap);
@@ -8481,8 +8507,9 @@ static AsyncSeamBaseline s_async_seam_baseline[PASS_GENERATIONS];
 static atomic_flag s_async_seam_lock = ATOMIC_FLAG_INIT;
 static SDL_Thread *s_async_seam_worker;
 static SDL_mutex *s_async_seam_work_mutex;
-static SDL_cond *s_async_seam_work_cv, *s_async_seam_done_cv;
-static AsyncSeamPrepared *s_async_seam_work;
+static SDL_cond *s_async_seam_work_cv;
+static AsyncSeamPrepared *s_async_seam_work_head, *s_async_seam_work_tail;
+static unsigned s_async_seam_work_n;
 static int s_async_seam_work_stop;
 static void async_seam_lock(void) {
     while (atomic_flag_test_and_set_explicit(&s_async_seam_lock, memory_order_acquire)) {}
@@ -8618,10 +8645,15 @@ static void async_seam_prepared_free(AsyncSeamPrepared *p) {
     free(p->baseline);
     free(p);
 }
+static void async_seam_prepared_unref(AsyncSeamPrepared *p) {
+    if (p && atomic_fetch_sub_explicit(&p->refs, 1, memory_order_acq_rel) == 1)
+        async_seam_prepared_free(p);
+}
 static void async_seam_prepare_one(AsyncSeamPrepared *p) {
     p->baseline = (PgxpSnap *)calloc(1, sizeof *p->baseline);
     if (!p->baseline) return;
-    while (pt_clock_ns() < p->deadline) {
+    while (pt_clock_ns() < p->deadline &&
+           atomic_load_explicit(&p->refs, memory_order_acquire) > 1) {
         int32_t area[4];
         if (async_seam_baseline_copy(p->epoch, p->generation,
                                      p->baseline, &p->baseline_present, area)) {
@@ -8638,25 +8670,31 @@ static int async_seam_prepare_thread(void *arg) {
     (void)arg;
     SDL_LockMutex(s_async_seam_work_mutex);
     for (;;) {
-        while (!s_async_seam_work && !s_async_seam_work_stop)
+        while (!s_async_seam_work_head && !s_async_seam_work_stop)
             SDL_CondWait(s_async_seam_work_cv, s_async_seam_work_mutex);
-        if (s_async_seam_work_stop) break;
-        AsyncSeamPrepared *p = s_async_seam_work;
+        if (s_async_seam_work_stop && !s_async_seam_work_head) break;
+        AsyncSeamPrepared *p = s_async_seam_work_head;
+        s_async_seam_work_head = p->work_next;
+        if (!s_async_seam_work_head) s_async_seam_work_tail = NULL;
+        s_async_seam_work_n--;
         SDL_UnlockMutex(s_async_seam_work_mutex);
-        async_seam_prepare_one(p);
+        /* If render already fell back, this job has no consumer. */
+        if (atomic_load_explicit(&p->refs, memory_order_acquire) > 1)
+            async_seam_prepare_one(p);
+        atomic_store_explicit(&p->state, p->ready ? 1 : 2,
+                              memory_order_release);
+        if (p->ready) atomic_fetch_add(&s_async_seam_prepared_count, 1);
+        async_seam_prepared_unref(p);
         SDL_LockMutex(s_async_seam_work_mutex);
-        s_async_seam_work = NULL;
-        SDL_CondSignal(s_async_seam_done_cv);
     }
     SDL_UnlockMutex(s_async_seam_work_mutex);
     return 0;
 }
-static int async_seam_worker_prepare(AsyncSeamPrepared *p) {
+static int async_seam_worker_enqueue(AsyncSeamPrepared *p) {
     if (!s_async_seam_worker) {
         if (!s_async_seam_work_mutex) s_async_seam_work_mutex = SDL_CreateMutex();
         if (!s_async_seam_work_cv) s_async_seam_work_cv = SDL_CreateCond();
-        if (!s_async_seam_done_cv) s_async_seam_done_cv = SDL_CreateCond();
-        if (!s_async_seam_work_mutex || !s_async_seam_work_cv || !s_async_seam_done_cv)
+        if (!s_async_seam_work_mutex || !s_async_seam_work_cv)
             return 0;
         s_async_seam_work_stop = 0;
         s_async_seam_worker = SDL_CreateThread(async_seam_prepare_thread,
@@ -8664,12 +8702,19 @@ static int async_seam_worker_prepare(AsyncSeamPrepared *p) {
         if (!s_async_seam_worker) return 0;
     }
     SDL_LockMutex(s_async_seam_work_mutex);
-    s_async_seam_work = p;
+    if (s_async_seam_work_n >= 8) {
+        SDL_UnlockMutex(s_async_seam_work_mutex);
+        return 0;
+    }
+    atomic_fetch_add_explicit(&p->refs, 1, memory_order_relaxed);
+    p->work_next = NULL;
+    if (s_async_seam_work_tail) s_async_seam_work_tail->work_next = p;
+    else s_async_seam_work_head = p;
+    s_async_seam_work_tail = p;
+    s_async_seam_work_n++;
     SDL_CondSignal(s_async_seam_work_cv);
-    while (s_async_seam_work)
-        SDL_CondWait(s_async_seam_done_cv, s_async_seam_work_mutex);
     SDL_UnlockMutex(s_async_seam_work_mutex);
-    return p->ready;
+    return 1;
 }
 static void async_seam_worker_stop(void) {
     if (s_async_seam_worker) {
@@ -8681,11 +8726,11 @@ static void async_seam_worker_stop(void) {
         s_async_seam_worker = NULL;
     }
     if (s_async_seam_work_cv) SDL_DestroyCond(s_async_seam_work_cv);
-    if (s_async_seam_done_cv) SDL_DestroyCond(s_async_seam_done_cv);
     if (s_async_seam_work_mutex) SDL_DestroyMutex(s_async_seam_work_mutex);
-    s_async_seam_work_cv = s_async_seam_done_cv = NULL;
+    s_async_seam_work_cv = NULL;
     s_async_seam_work_mutex = NULL;
-    s_async_seam_work = NULL;
+    s_async_seam_work_head = s_async_seam_work_tail = NULL;
+    s_async_seam_work_n = 0;
 }
 static void async_seam_ready_lock(void) {
     while (atomic_flag_test_and_set_explicit(&s_async_seam_ready_guard, memory_order_acquire)) {}
@@ -8719,7 +8764,7 @@ static void async_seam_ready_clear(void) {
     async_seam_ready_unlock();
     while (p) {
         AsyncSeamPrepared *next = p->next;
-        async_seam_prepared_free(p);
+        async_seam_prepared_unref(p);
         p = next;
     }
 }
@@ -9306,7 +9351,7 @@ static void pass_resources_release(void) {
     stereo_resources_release();
     async_seam_worker_stop();
     async_seam_ready_clear();
-    async_seam_prepared_free(s_async_seam_active);
+    async_seam_prepared_unref(s_async_seam_active);
     s_async_seam_active = NULL;
     for(int gi=0;gi<PASS_GENERATIONS;++gi)pass_gen_release(gi);
     for (int gi=0; gi<PASS_GENERATIONS; ++gi) {
@@ -9653,7 +9698,7 @@ void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
      * render queue nor invalidate in-flight presentation generations. */
     rth_op_report();
     if (getenv("PSX_SEAM_PREP_STATS"))
-        fprintf(stderr, "seam_prep collect=%llu tris=%llu invalid=%llu first_op=%d candidates=%llu prepared=%llu used=%llu mismatch=%llu fallback=%llu\n",
+        fprintf(stderr, "seam_prep collect=%llu tris=%llu invalid=%llu first_op=%d candidates=%llu prepared=%llu used=%llu mismatch=%llu fallback=%llu verify_tris=%llu verify_mismatch=%llu\n",
             (unsigned long long)atomic_load(&s_async_seam_collect_count),
             (unsigned long long)atomic_load(&s_async_seam_triangle_count),
             (unsigned long long)atomic_load(&s_async_seam_invalid_count),
@@ -9662,7 +9707,9 @@ void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
             (unsigned long long)atomic_load(&s_async_seam_prepared_count),
             (unsigned long long)atomic_load(&s_async_seam_used_count),
             (unsigned long long)atomic_load(&s_async_seam_mismatch_count),
-            (unsigned long long)atomic_load(&s_async_seam_fallback_count));
+            (unsigned long long)atomic_load(&s_async_seam_fallback_count),
+            (unsigned long long)atomic_load(&s_async_seam_verify_tris),
+            (unsigned long long)atomic_load(&s_async_seam_verify_mismatch));
 #define ASYNC_LOAD(n) out->n=atomic_load(&s_async_count_##n);
     ASYNC_COUNTERS(ASYNC_LOAD)
 #undef ASYNC_LOAD
@@ -9671,6 +9718,7 @@ void gl_renderer_pass_async_invalidate(void) {
     uint64_t epoch=atomic_fetch_add(&s_pt_epoch,1)+1;
     if(!epoch) { epoch=1; atomic_store(&s_pt_epoch,epoch); }
     pt_set_epoch(epoch);
+    async_seam_ready_clear();
 }
 static int async_record(uint16_t op,const GLRenderAsyncToken *token) {
     void *p=rt_cmd_begin(op,0,sizeof(*token));
@@ -9760,34 +9808,33 @@ int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
         rth_group_flush(); rt_batch_discard(); return 0;
     }
     AsyncSeamPrepared *prepared = NULL;
-    if (!s_async_seam_stream.valid)
+    if (s_async_seam_stream.input && !s_async_seam_stream.valid)
         atomic_fetch_add(&s_async_seam_invalid_count, 1);
     if (s_async_seam_stream.count)
         atomic_fetch_add(&s_async_seam_candidate_count, s_async_seam_stream.count);
     if (s_async_seam_stream.valid && s_async_seam_stream.count) {
         prepared = (AsyncSeamPrepared *)calloc(1, sizeof *prepared);
         if (prepared) {
+            atomic_init(&prepared->refs, 1);
+            atomic_init(&prepared->state, 0);
             prepared->stream = s_async_seam_stream;
             memset(&s_async_seam_stream, 0, sizeof s_async_seam_stream);
             prepared->epoch = token->output.epoch;
             prepared->generation = token->output.generation;
             prepared->index = token->output.index;
-            uint64_t now = pt_clock_ns();
-            prepared->deadline = now + 2000000ull;
-            if (prepared->deadline > token->output.deadline)
-                prepared->deadline = token->output.deadline;
-            if (!async_seam_worker_prepare(prepared)) {
+            prepared->deadline = token->output.deadline;
+            if (!async_seam_worker_enqueue(prepared)) {
                 atomic_fetch_add(&s_async_seam_fallback_count, 1);
-                async_seam_prepared_free(prepared); prepared = NULL;
-            } else atomic_fetch_add(&s_async_seam_prepared_count, 1);
+                async_seam_prepared_unref(prepared); prepared = NULL;
+            }
         }
     }
     pgxp_rth_seam_stream_release(&s_async_seam_stream);
     if (prepared) async_seam_ready_insert(prepared);
     int ok=rt_batch_try_commit();
     if (!ok && prepared)
-        async_seam_prepared_free(async_seam_ready_take(prepared->epoch,
-                                 prepared->generation, prepared->index));
+        async_seam_prepared_unref(async_seam_ready_take(prepared->epoch,
+                                  prepared->generation, prepared->index));
     if (ok) { ASYNC_COUNT(submitted); s_async_last_index=token->output.index; s_async_has_index=1; }
     else ASYNC_COUNT(ring_full);
     return ok;
@@ -15966,11 +16013,11 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             if (s_pgen[k].valid && s_pgen[k].async_id==token.output.generation &&
                 s_pgen[k].async_epoch==token.output.epoch) gi=k;
         if (gi<0 || token.output.epoch!=gl_renderer_present_epoch()) {
-            async_seam_prepared_free(prepared);
+            async_seam_prepared_unref(prepared);
             ASYNC_COUNT(render_stale); s_pass_dead=1; break;
         }
         if (pt_clock_ns()>token.output.deadline) {
-            async_seam_prepared_free(prepared);
+            async_seam_prepared_unref(prepared);
             ASYNC_COUNT(render_late); s_pass_dead=1; break;
         }
         s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0; s_async_hd_copy=0;
@@ -15982,9 +16029,11 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
                 atomic_fetch_add(&s_pass_q_refused,1);
             } else {
                 gpu_hd_textures_suppress_dumps(1);
+                int ready = prepared &&
+                    atomic_load_explicit(&prepared->state, memory_order_acquire) == 1;
                 const PgxpSnap *live = s_snap ? s_snap :
-                    (prepared && !prepared->baseline_present ? prepared->baseline : NULL);
-                if (prepared && pgxp_snap_batch_preflight(&prepared->batch,
+                    (ready && !prepared->baseline_present ? prepared->baseline : NULL);
+                if (ready && pgxp_snap_batch_preflight(&prepared->batch,
                         live, token.output.generation, prepared->stream.input,
                         prepared->stream.count)) {
                     s_async_seam_active = prepared;
@@ -15995,7 +16044,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
                 } else if (prepared) atomic_fetch_add(&s_async_seam_fallback_count, 1);
             }
         } else { ASYNC_COUNT(capture); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
-        async_seam_prepared_free(prepared);
+        async_seam_prepared_unref(prepared);
         s_async_replay_started=pt_clock_ns();
         atomic_fetch_add(&s_async_count_enter_ns,s_async_replay_started-stage_start);
         break;
@@ -16011,12 +16060,23 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         break;
     case RTH_PASS_END: {
         uint64_t stage_start=pt_clock_ns();
+        if (s_async_seam_active && s_async_seam_verify &&
+            s_async_seam_active->batch.consumed != s_async_seam_active->batch.count)
+            fprintf(stderr, "seam_prep_count consumed=%zu expected=%zu\n",
+                s_async_seam_active->batch.consumed,
+                s_async_seam_active->batch.count);
         if (s_async_seam_active &&
             (s_async_seam_failed ||
              s_async_seam_active->batch.consumed != s_async_seam_active->batch.count))
             s_async_invalid = 1;
         if (s_async_exec) { ASYNC_COUNT(replay_count); atomic_fetch_add(&s_async_count_replay_ns,stage_start-s_async_replay_started); }
-        if (s_pass_dead) { s_pass_dead = 0; break; }
+        if (s_pass_dead) {
+            async_seam_prepared_unref(s_async_seam_active);
+            s_async_seam_active = NULL;
+            s_async_seam_failed = s_async_seam_reset_pending = 0;
+            s_pass_dead = 0;
+            break;
+        }
         if (s_async_exec && s_async_hd_copy) { ASYNC_COUNT(unsupported); s_async_invalid=1; }
         if (s_async_invalid || s_pass_leaks != s_pass_leaks_at_begin) {
             atomic_fetch_add(&s_pass_q_leaks, s_pass_leaks - s_pass_leaks_at_begin);
@@ -16035,7 +16095,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             s_async_exec=0; s_async_invalid=0; s_async_hd_copy=0; s_pgen_write=s_async_previous_write;
             atomic_fetch_add(&s_async_count_finish_ns,pt_clock_ns()-stage_start);
         }
-        async_seam_prepared_free(s_async_seam_active);
+        async_seam_prepared_unref(s_async_seam_active);
         s_async_seam_active = NULL;
         s_async_seam_failed = 0;
         s_async_seam_reset_pending = 0;
