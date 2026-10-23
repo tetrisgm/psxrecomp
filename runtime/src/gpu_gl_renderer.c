@@ -9708,7 +9708,9 @@ static int pass_gen_present_at(double p, int locked) {
     PassGen *g = &s_pgen[s_pgen_cur];
     uint32_t lo = 0, hi = 0;
     float t = 0.0f;
-    if (!g->valid || !g->promoted || (!locked && !(g->t_len > 0.0))) return 0;
+    /* Timed generations have one owner: never replay their images through
+     * the legacy flip clock after expiry or an epoch discontinuity. */
+    if (g->async_id || !g->valid || !g->promoted || (!locked && !(g->t_len > 0.0))) return 0;
     if (g->source_path != s_interp_source_path || g->tex_w != s_interp_w ||
         g->tex_h != s_interp_h)
         return 0;
@@ -9810,6 +9812,7 @@ static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
     uint64_t order[PASS_GENERATIONS];uint32_t matches=0;
     for(int i=0;i<PASS_GENERATIONS;++i) {
         PassGen* pend=&s_pgen[i];order[i]=pend->order;
+        if(pend->async_id && pend->async_epoch!=gl_renderer_present_epoch()) pend->valid=0;
         if(!pend->valid || pend->promoted)continue;
         if(psx_cycle_count<pend->created_cycle || psx_cycle_count-pend->created_cycle>
             (uint64_t)pend->period*g_psx_vblank_cycles*4u){pend->valid=0;continue;}
