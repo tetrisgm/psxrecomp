@@ -96,8 +96,8 @@ std::string draw_ctx_clone_text(const std::string& code,
         // Store-PC breadcrumb: the main context's debug attribution.
         if (c == 'g' && code.compare(i, kStorePc.size(), kStorePc) == 0 &&
             is_hex8(code, i + kStorePc.size()) &&
-            code.compare(i + kStorePc.size() + 8, 3, "u; ") == 0) {
-            i += kStorePc.size() + 8 + 3;
+            code.compare(i + kStorePc.size() + 8, 2, "u;") == 0) {
+            i += kStorePc.size() + 8 + 2;
             continue;
         }
         if (c == 'c') {
