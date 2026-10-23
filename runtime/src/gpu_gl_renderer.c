@@ -528,6 +528,16 @@ enum {
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
     RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_GROUP
 };
+/* Optional diagnostic, measured on the render owner without suspending GL.
+ * Costs include driver waits; use only to locate work, not benchmark FPS. */
+static int s_op_profile=-1;
+static uint64_t s_op_ns[RTH_GROUP+1], s_op_count[RTH_GROUP+1], s_op_async_ns[RTH_GROUP+1];
+static void rth_op_report(void) {
+    if (s_op_profile!=1) return;
+    for (unsigned op=1;op<RTH_GROUP;op++) if(s_op_count[op])
+        fprintf(stderr,"render_op op=%u count=%llu ms=%.3f async_ms=%.3f\n",op,
+            (unsigned long long)s_op_count[op],s_op_ns[op]*1e-6,s_op_async_ns[op]*1e-6);
+}
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
  * state: under HD authority the emulation thread holds the context from the
@@ -6874,6 +6884,7 @@ static void pass_resources_release(void);
 static void present_image_ring_gl_forget(void);
 void gl_renderer_shutdown(void) {
     gl_renderer_render_thread_stop();   /* drains; the context comes back to this thread */
+    rth_op_report();
     /* After the worker has stopped (it presents, and captures, on its own
      * thread) and before the context dies: forget the ring's GL names. */
     present_image_ring_gl_forget();
@@ -15428,7 +15439,19 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
     atomic_fetch_add(&s_async_count_compose_ns,pt_clock_ns()-compose_start);
 }
 
-static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
+static void gl_rth_exec_impl(void *user,const RtCmd *c,const void *payload);
+static void gl_rth_exec(void *user,const RtCmd *c,const void *payload) {
+    if (s_op_profile<0) {
+        const char *e=getenv("PSX_RENDER_OP_PROFILE"); s_op_profile=e && *e && *e!='0';
+    }
+    if (!s_op_profile || c->op==RTH_GROUP || c->op>RTH_GROUP) { gl_rth_exec_impl(user,c,payload); return; }
+    uint64_t begin=pt_clock_ns(); int async=s_async_exec;
+    gl_rth_exec_impl(user,c,payload);
+    uint64_t ns=pt_clock_ns()-begin;
+    s_op_ns[c->op]+=ns; s_op_count[c->op]++;
+    if(async) s_op_async_ns[c->op]+=ns;
+}
+static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
     if(c->op==RTH_GROUP) {
         const int32_t *words=payload;
         unsigned count=c->payload/4u, at=0;
