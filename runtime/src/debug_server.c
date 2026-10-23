@@ -9796,9 +9796,9 @@ static void handle_ctx_draw(int id, const char *json)
 {
     extern int psx_ctx_bench_json(CPUState *cpu, const char *calls,
                                   const char *writes, int threads, int reps,
-                                  int full, uint32_t sp, const char *dump_path,
+                                  int full, uint32_t sp, uint32_t ra, const char *dump_path,
                                   char *out, size_t cap);
-    static char calls[2048], writes[2048], dump[512], spbuf[32];
+    static char calls[2048], writes[2048], dump[512], spbuf[32], rabuf[32];
     static char out[32768];
     if (!s_cpu) { send_err(id, "no cpu"); return; }
     if (!json_get_str(json, "calls", calls, sizeof calls)) {
@@ -9808,11 +9808,12 @@ static void handle_ctx_draw(int id, const char *json)
     if (!json_get_str(json, "writes", writes, sizeof writes)) writes[0] = 0;
     if (!json_get_str(json, "dump", dump, sizeof dump)) dump[0] = 0;
     const uint32_t sp = json_get_str(json, "sp", spbuf, sizeof spbuf) ? hex_to_u32(spbuf) : 0u;
+    const uint32_t ra = json_get_str(json, "ra", rabuf, sizeof rabuf) ? hex_to_u32(rabuf) : 0u;
     out[0] = 0;
     const int ok = psx_ctx_bench_json(s_cpu, calls, writes,
                                       json_get_int(json, "threads", 4),
                                       json_get_int(json, "reps", 1),
-                                      json_get_int(json, "full", 0), sp, dump,
+                                      json_get_int(json, "full", 0), sp, ra, dump,
                                       out, sizeof out);
     send_fmt("{\"id\":%d,\"ok\":%s,%s}", id, ok ? "true" : "false", out);
 }
