@@ -548,6 +548,13 @@ int rt_start(const RtConfig *cfg) {
 #ifdef _WIN32
     R.thread = CreateThread(NULL, 0, render_main, NULL, 0, NULL);
     int ok = R.thread != NULL;
+    /* GL command replay is on the frame deadline. Match the present thread's
+     * priority under host CPU load; retain a diagnostic off switch. */
+    if (ok) {
+        const char *priority = getenv("PSX_RENDER_THREAD_PRIORITY");
+        if (!priority || *priority != '0')
+            SetThreadPriority(R.thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
 #else
     pthread_attr_t attr;
     pthread_attr_init(&attr);
