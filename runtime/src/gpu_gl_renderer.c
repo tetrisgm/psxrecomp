@@ -9400,6 +9400,9 @@ ASYNC_COUNTERS(ASYNC_DECLARE)
 static uint64_t s_async_replay_started;
 void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
     if (!out) return;
+    /* Diagnostic queries happen at the end of a bounded sample. Drain before
+     * reading owner-thread counters; ordinary stats never acquire GL here. */
+    if (s_op_profile==1) { GL_RT_SYNC("render_op_profile"); rth_op_report(); }
 #define ASYNC_LOAD(n) out->n=atomic_load(&s_async_count_##n);
     ASYNC_COUNTERS(ASYNC_LOAD)
 #undef ASYNC_LOAD
