@@ -6,6 +6,7 @@
 
 #include "pgxp.h"
 #include "pgxp_ctx.h"
+#include "gte_ctx.h"
 #include "pgxp_hooks.h"
 #include "cpu_state.h"
 #include "psx_memory.h"
@@ -26,6 +27,13 @@ extern "C" int gte_geometry_correction_lookup_probe(uint32_t packed,
 extern "C" int pgxp_main_export(PgxpExport *out);
 
 struct PgxpCtxEngine {
+    PsxGteCtx *geometry = nullptr;
+    int gte_geometry_correction_lookup(uint32_t p, int32_t *x, int32_t *y) {
+        return gte_ctx_geometry_lookup(geometry, p, x, y);
+    }
+    int gte_geometry_correction_lookup_probe(uint32_t p, int32_t *x, int32_t *y) {
+        return gte_ctx_geometry_lookup(geometry, p, x, y);
+    }
     uint32_t ram_mask = PSX_MAIN_RAM_RETAIL_BYTES - 1;
 #define psx_ram_canonical_offset(address) ((address) & ram_mask)
 #define PGXP_MEMBER_MODE 1
@@ -37,6 +45,8 @@ struct PgxpCtxEngine {
 #undef PGXP_MEMBER_MODE
 #undef psx_ram_canonical_offset
 };
+
+extern "C" void pgxp_ctx_set_geometry(PgxpCtxEngine *e, PsxGteCtx *g) { if (e) e->geometry = g; }
 
 struct PgxpCtxExport {
     PgxpExport state;
@@ -107,7 +117,7 @@ extern "C" int pgxp_ctx_begin(PgxpCtxEngine *e, const PgxpCtxExport *from) {
     e->s_enabled = 1;
     e->s_cpu_mode = m->cpu_mode;
     e->s_projection_tracking = m->projection_tracking;
-    e->s_position_fallback = 0;         /* the geometry cache is main-only */
+    e->s_position_fallback = m->position_fallback;
     e->s_preserve_projection = m->preserve_projection;
     e->s_culling = m->culling;
     e->s_tolerance = m->tolerance;

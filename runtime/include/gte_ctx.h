@@ -6,7 +6,7 @@
  * The command math is the same code the main context runs (gte.cpp); a
  * PsxGteCtx gives one draw context its own copy of the state gte.cpp keeps
  * per guest context (projection caller, NCLIP provenance) and routes PGXP to
- * the context's engine. Host caches and statistics are main-context only.
+ * the context's engine. Geometry fallback is private; statistics stay on main.
  * One PsxGteCtx is used by one thread at a time. */
 
 #include <stdint.h>
@@ -24,9 +24,13 @@ void gte_ctx_destroy(PsxGteCtx *x);
 /* Copy main's GTE side state and presentation configuration into `out`.
  * Main thread only. Workers retain this configuration when main changes FOV,
  * aspect, view transforms, culling options or speculative execution state. */
-void gte_ctx_snapshot_main(PsxGteCtx *out);
+int gte_ctx_snapshot_main(PsxGteCtx *out);
 /* Start a pass from a snapshot taken with gte_ctx_snapshot_main. */
-void gte_ctx_begin(PsxGteCtx *x, const PsxGteCtx *snapshot);
+int gte_ctx_begin(PsxGteCtx *x, const PsxGteCtx *snapshot);
+
+/* Allocation failures reject the snapshot/pass; workers never use main cache. */
+int gte_ctx_failed(const PsxGteCtx *x);
+int gte_ctx_geometry_lookup(PsxGteCtx *x, uint32_t packed, int32_t *sx, int32_t *sy);
 
 /* gte_execute / gte_write_data / gte_precision_store_word for a context.
  * No completion latency is armed: draw contexts run no cycle model. */

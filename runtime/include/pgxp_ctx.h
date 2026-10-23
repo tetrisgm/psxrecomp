@@ -15,8 +15,7 @@
  * scratchpad and live RAM shadows from an owned snapshot
  * (pgxp_ctx_export_main(), main thread). Prior context generations are
  * invalidated before importing the captured words. The
- * position-cache fallback tier (gte.cpp's main geometry cache) is off in
- * contexts. */
+ * position-cache fallback tier uses the associated private GTE cache. */
 
 #include <stdint.h>
 
@@ -27,8 +26,10 @@ extern "C" {
 #endif
 
 struct CPUState;
+struct PsxGteCtx;
 typedef struct PgxpCtxEngine PgxpCtxEngine;
 typedef struct PgxpCtxExport PgxpCtxExport;
+void pgxp_ctx_set_geometry(PgxpCtxEngine *engine, struct PsxGteCtx *geometry);
 
 /* Immutable precision at command consumption, including homogeneous
  * projection for clipping. Later RAM reuse must not change a queued draw. */

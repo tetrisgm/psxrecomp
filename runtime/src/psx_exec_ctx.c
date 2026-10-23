@@ -31,6 +31,7 @@ extern int psx_text_ref_ranges_match(const uint8_t *ctx_ram, uint32_t ram_mask,
 extern uint32_t i_stat;
 extern uint32_t i_mask;
 extern int psx_ws_x_margin(void);
+extern int g_psx_draw_distance_clamp;
 
 #define BIOS_ROM_BYTES (512u * 1024u)
 #define CTX_DEFAULT_STEP_LIMIT 50000000ull
@@ -174,6 +175,7 @@ struct PsxCtxSnapshot {
     PgxpCtxExport *pgxp;
     PsxGteCtx *gte;
     int32_t  ws_x_margin;
+    int      draw_distance_clamp;
     uint32_t gpustat;
     uint32_t dma_madr[7], dma_bcr[7], dma_chcr[7];
     uint32_t dpcr, dicr, i_stat, i_mask;
@@ -197,8 +199,9 @@ PsxCtxSnapshot *psx_ctx_snapshot_capture(const CPUState *cpu, unsigned flags) {
         s->pgxp = pgxp_ctx_export_main();
         if (!s->pgxp) { psx_ctx_snapshot_release(s); return NULL; }
     }
-    gte_ctx_snapshot_main(s->gte);
+    if (!gte_ctx_snapshot_main(s->gte)) { psx_ctx_snapshot_release(s); return NULL; }
     s->ws_x_margin = psx_ws_x_margin();
+    s->draw_distance_clamp = g_psx_draw_distance_clamp;
     s->gpustat = gpu_peek_gpustat();
     for (int ch = 0; ch < 7; ch++)
         dma_peek_channel(ch, &s->dma_madr[ch], &s->dma_bcr[ch], &s->dma_chcr[ch]);
@@ -283,8 +286,9 @@ int psx_ctx_begin(PsxExecCtx *x, const PsxCtxSnapshot *s) {
     x->snap = s;
     x->pgxp_active = pgxp_ctx_begin(x->pgxp, s->pgxp);
     if (x->pgxp_active < 0) { x->pgxp_active = 0; return 0; }
-    gte_ctx_begin(x->gte, s->gte);
+    if (!gte_ctx_begin(x->gte, s->gte)) return 0;
     x->ws_x_margin = s->ws_x_margin;
+    x->draw_distance_clamp = s->draw_distance_clamp;
     x->entry_hooks = s_hook_count;
     x->gpustat = s->gpustat;
     x->gpu_dma_dir = (s->gpustat >> 29) & 3u;
@@ -366,6 +370,8 @@ static void ctx_run(PsxExecCtx *x, uint32_t pc, uint32_t stop, uint32_t sp) {
         x->trail[x->trail_n++ & 15u] = pc;
         cpu->pc = row->resume;
         row->fn(cpu);
+        if (gte_ctx_failed(x->gte))
+            psx_dctx_fault(cpu, PSX_CTX_FAULT_RUNAWAY, pc, "geometry cache allocation");
         pc = cpu->pc;
     }
 }
