@@ -11663,11 +11663,21 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
+    uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
         interp_fbo, src_x, disp_y, w, h, linear, force_4_3, GL_PRES_VRAM,
         disp_x, disp_y,
         present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1));
     if (interp_pair) {
+        if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
+            float tw = (float)src_tw, th = (float)VRAM_H;
+            if (src_tex == s_hr_tex) {
+                tw = present_alloc_extent(src_tw, s_hr_scale);
+                th = present_alloc_extent(VRAM_H, s_hr_scale);
+            }
+            postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
+            postfx_capture_temporal_source(lx, ly, lw, lh);
+        }
         /* Temporal blending owns this stock frame interval. Capture hold-last
          * before pacing; every blend and Swap remains on this context/thread. */
         hold_capture_native_fbo(src_fbo, src_x, disp_y, w, h, force_4_3, linear);
@@ -11844,11 +11854,23 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
+    uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
         fbo, 0, disp_y, g_wide_w, disp_h, linear, 0, GL_PRES_WIDE,
         disp_x, disp_y,
         present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1));
     if (interp_pair) {
+        if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
+            const float wext = (wide_as > s_out_scale && s_out_scale >= 1)
+                                   ? (float)wide_as / (float)s_out_scale : 1.0f;
+            postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
+                               0, disp_y, g_wide_w, disp_h);
+            if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
+                postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
+                                   present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,
+                                   g_wide_w - 2 * g_wide_off, disp_h, g_wide_off, g_wide_w);
+            postfx_capture_temporal_source(lx, ly, lw, lh);
+        }
         hold_capture_native_fbo(fbo, 0, disp_y, g_wide_w, disp_h, 0, linear);
         interp_present_source_interval();
         gl_perf_present_exit(1);

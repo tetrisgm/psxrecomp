@@ -16,6 +16,8 @@ static void bloom_capture_hook(int gen);
 #include "test_gl_scale_invariance.c"
 #undef main
 void gpu_hd_textures_begin_upload(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
+int gpu_hd_textures_active(void){return 0;}
+void host_sampler_retarget_current(const char *name){(void)name;}
 void gpu_hd_textures_track_upload(int x,int y,int w,int h,const uint16_t* p){(void)x;(void)y;(void)w;(void)h;(void)p;}
 void gpu_hd_textures_invalidate(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
 void gpu_hd_textures_begin_copy(int sx,int sy,int x,int y,int w,int h){(void)sx;(void)sy;(void)x;(void)y;(void)w;(void)h;}
@@ -296,6 +298,31 @@ int main(int argc, char **argv) {
         }
     }
     gl_renderer_render_thread_stop();
+    /* A temporal source is not itself presented. Its queued outputs must
+     * nevertheless reuse exactly the mask a fresh real present would have
+     * resolved, including HUD occlusion, before the source can be redrawn. */
+    {
+        uint64_t h = 0;
+        free(frame(SC_PARTIAL, 1.5f, &h));
+        int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+        uint8_t *fresh = malloc((size_t)ww * wh);
+        uint8_t *temporal = malloc((size_t)ww * wh);
+        check(fresh && temporal && s_mask_ok, "fresh bloom mask available");
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_mask_fbo);
+        glReadPixels(0, 0, ww, wh, GL_RED, GL_UNSIGNED_BYTE, fresh);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+        s_mask_ok = 0;
+        postfx_note_source(s_hr_fbo, s_hr_tex, (float)VRAM_W, (float)VRAM_H,
+                           0, 0, FRAME_W, FRAME_H);
+        postfx_capture_temporal_source(0, 0, ww, wh);
+        check(s_mask_ok && !s_mask_src_valid, "temporal mask resolved before source reuse");
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_mask_fbo);
+        glReadPixels(0, 0, ww, wh, GL_RED, GL_UNSIGNED_BYTE, temporal);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+        check(memcmp(fresh, temporal, (size_t)ww * wh) == 0,
+              "temporal mask equals fresh mask byte for byte");
+        free(fresh); free(temporal);
+    }
     /* The executor leaves the GL state as it found it (capabilities both ways
      * round, the viewport, the clear colour; the window target bound), with
      * every stage on (bloom, an imported chain reading the mask, FXAA). */

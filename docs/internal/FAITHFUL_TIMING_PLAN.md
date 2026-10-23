@@ -213,6 +213,12 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-23 (`feat/queued-postfx-provenance`):** Queued interpolation now
+  resolves the real source's post-effect mask/depth before its surfaces can be
+  redrawn. This changes presentation only; guest cycle/IRQ behavior is
+  unchanged. The short R4 race check showed active bloom at 60 outputs/s and
+  zero dispatch misses.
+
 - **2026-10-23 (`feat/draw-isolation-gate`):** Added explicit main-context
   suspension of a draw span for synchronous side effects. Unit coverage checks
   RAM/GTE separation and interrupts during suspension. R4 uses this to keep

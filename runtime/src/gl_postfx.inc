@@ -682,6 +682,30 @@ static void postfx_present(int fresh, int with_aa, int lx, int ly, int lw, int l
     pfx_state_restore(&saved);
 }
 
+/* Temporal presents reuse the latest real frame's mask/depth, but the real
+ * frame may be captured into an interpolation texture without ever being
+ * composed through postfx_present(fresh=1). Resolve its provenance while the
+ * source depth-stencil surfaces are still authoritative. This allocates only
+ * the same mask/depth targets the next post-effect present would allocate;
+ * it never copies the full-resolution colour image. */
+static void postfx_capture_temporal_source(int lx, int ly, int lw, int lh) {
+    if ((!s_bcls_on && !s_pfx_depth_on) || !s_ctx) return;
+    if (!s_mask_src_valid || !post_clip_rect(&lx, &ly, &lw, &lh, 8)) {
+        /* A new source without usable provenance must not inherit the last
+         * frame's mask or depth. */
+        s_mask_ok = s_depth_ok = 0;
+        return;
+    }
+    PfxGlState saved;
+    pfx_state_save(&saved);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    if (s_bcls_on) (void)pfx_mask_build(1, lw, lh);
+    if (s_pfx_depth_on) (void)pfx_depth_build(1, lw, lh);
+    s_mask_src_valid = 0; s_mask_ctr_valid = 0;
+    pfx_state_restore(&saved);
+}
+
 /* Objects died with the context. */
 static void postfx_release(void) {
     for (int i = 0; i < PFX_NSTAGES; i++) {
