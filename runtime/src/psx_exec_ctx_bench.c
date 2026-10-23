@@ -59,6 +59,7 @@ typedef struct {
     uint32_t trail[16];
     int trail_n;
     uint32_t fault_ra;
+    uint32_t fault_gpr[32];
     PsxCtxStats stats;
 } BenchJob;
 
@@ -79,9 +80,10 @@ static double now_ms(void) {
 static uint64_t hash_words(const PsxCtxGpuWord *w, size_t n) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < n; i++) {
-        const uint32_t v[2] = { w[i].word, w[i].src };
-        const uint8_t *p = (const uint8_t *)v;
-        for (int k = 0; k < 8; k++) { h ^= p[k]; h *= 1099511628211ull; }
+        /* Captures are fully initialized, including precision/projection.
+         * Hash exactly the immutable receipt compared by memcmp below. */
+        const uint8_t *p = (const uint8_t *)&w[i];
+        for (size_t k = 0; k < sizeof w[i]; k++) { h ^= p[k]; h *= 1099511628211ull; }
     }
     return h;
 }
@@ -138,7 +140,11 @@ static void run_job(BenchJob *j) {
     double t = 0;
     for (int rep = 0; rep < p->reps; rep++) {
         const double t0 = now_ms();
-        psx_ctx_begin(j->ctx, j->snap);
+        if (!psx_ctx_begin(j->ctx, j->snap)) {
+            j->status = PSX_CTX_FAULT_BAD_ARG;
+            j->fault_what = "context snapshot import failed";
+            break;
+        }
         CPUState *cpu = psx_ctx_cpu(j->ctx);
         for (int i = 0; i < p->nwrites; i++)
             psx_ctx_write32(j->ctx, p->writes[i].addr, p->writes[i].value);
@@ -151,6 +157,7 @@ static void run_job(BenchJob *j) {
                 j->failed_call = i;
                 psx_ctx_status(j->ctx, &j->fault_pc, &j->fault_what);
                 j->trail_n = psx_ctx_trail(j->ctx, j->trail, 16, &j->fault_ra);
+                memcpy(j->fault_gpr, cpu->gpr, sizeof j->fault_gpr);
                 break;
             }
         }
@@ -177,6 +184,12 @@ static int emit_job(char *out, size_t cap, int pos, const char *name, const Benc
         tp += snprintf(trail + tp, sizeof trail - (size_t)tp, "%s\"0x%08X\"", i ? "," : "", j->trail[i]);
     pos += snprintf(out + pos, cap - (size_t)pos, "%s{\"trail\":[%s],\"fault_ra\":\"0x%08X\",",
                     name, trail, j->fault_ra);
+    if (j->status != PSX_CTX_OK) {
+        pos += snprintf(out + pos, cap - (size_t)pos, "\"fault_gpr\":[");
+        for (unsigned i = 0; i < 32; i++)
+            pos += snprintf(out + pos, cap - (size_t)pos, "%s\"0x%08X\"", i ? "," : "", j->fault_gpr[i]);
+        pos += snprintf(out + pos, cap - (size_t)pos, "],");
+    }
     name = "";
     return pos + snprintf(out + pos, cap - (size_t)pos,
         "%s\"status\":\"%s\",\"failed_call\":%d,\"fault_pc\":\"0x%08X\",\"fault\":\"%s\","
@@ -330,7 +343,7 @@ int psx_ctx_bench_json(CPUState *cpu, const char *calls, const char *writes,
                     jobs[0].ms / plan->reps, full >= 1 ? full_ms / plan->reps : -1.0);
     pos = emit_job(out, cap, pos, "\"serial\":", &jobs[0]);
     pos += snprintf(out + pos, cap - (size_t)pos, ",\"parallel\":[");
-    for (int i = 1; i <= threads && pos < (int)cap - 600; i++)
+    for (int i = 1; i <= threads && pos < (int)cap - 1200; i++)
         pos = emit_job(out, cap, pos, i > 1 ? "," : "", &jobs[i]);
     pos += snprintf(out + pos, cap - (size_t)pos, "]");
     ok = jobs[0].status == PSX_CTX_OK && identical;
