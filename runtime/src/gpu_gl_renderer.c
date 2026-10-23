@@ -8193,7 +8193,14 @@ static int interp_present_pair(GLuint a, GLuint b, float t, int blend_mode) {
         letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    /* Queued worker output arrives directly after guest rasterization; it
+     * must not inherit PSX blending, mask/depth tests, or write masks. */
     glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
     glViewport(0, 0, ww, wh);
     if (lx != 0 || ly != 0 || lw != ww || lh != wh) {
         glClearColor(0.f, 0.f, 0.f, 1.f);
