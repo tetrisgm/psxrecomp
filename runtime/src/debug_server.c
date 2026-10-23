@@ -9785,6 +9785,38 @@ static void handle_mmx6_freshfix(int id, const char *json)
              id, gpu_ws_mmx6_freshfix_get(), gpu_ws_mmx6_refill_cols(), total, bad);
 }
 
+/* {"cmd":"ctx_draw","calls":"fn:a0,a1;fn:a0","writes":"addr=val;...",
+ *  "threads":4,"reps":1,"full":0,"sp":"0x...","dump":"path"}
+ * Draw contexts (docs/THREADED_CONTEXTS.md): run the call sequence in lean
+ * draw clones from one snapshot, serially and on `threads` threads at once;
+ * ok iff every run succeeds with an identical captured GPU command list.
+ * full=1 also times the same calls with the full code on the main context
+ * (zero guest time, RAM restored; a throwaway-session measurement). */
+static void handle_ctx_draw(int id, const char *json)
+{
+    extern int psx_ctx_bench_json(CPUState *cpu, const char *calls,
+                                  const char *writes, int threads, int reps,
+                                  int full, uint32_t sp, const char *dump_path,
+                                  char *out, size_t cap);
+    static char calls[2048], writes[2048], dump[512], spbuf[32];
+    static char out[32768];
+    if (!s_cpu) { send_err(id, "no cpu"); return; }
+    if (!json_get_str(json, "calls", calls, sizeof calls)) {
+        send_err(id, "missing calls");
+        return;
+    }
+    if (!json_get_str(json, "writes", writes, sizeof writes)) writes[0] = 0;
+    if (!json_get_str(json, "dump", dump, sizeof dump)) dump[0] = 0;
+    const uint32_t sp = json_get_str(json, "sp", spbuf, sizeof spbuf) ? hex_to_u32(spbuf) : 0u;
+    out[0] = 0;
+    const int ok = psx_ctx_bench_json(s_cpu, calls, writes,
+                                      json_get_int(json, "threads", 4),
+                                      json_get_int(json, "reps", 1),
+                                      json_get_int(json, "full", 0), sp, dump,
+                                      out, sizeof out);
+    send_fmt("{\"id\":%d,\"ok\":%s,%s}", id, ok ? "true" : "false", out);
+}
+
 /* Save-state save/load via the debug server. Player-facing hotkeys route
  * through the F7 save-state menu; this command keeps the flow headless.
  * {"cmd":"savestate","op":"save"|
@@ -16483,6 +16515,7 @@ static const CmdEntry s_commands[] = {
     { "input_route_start", handle_input_route_start },
     { "input_route_stop",  handle_input_route_stop },
     { "input_route_status",handle_input_route_status },
+    { "ctx_draw",          handle_ctx_draw },
     { "savestate",         handle_savestate },
     { "savestate_status",  handle_savestate_status },
     { "snapshot_status",   handle_snapshot_status },
