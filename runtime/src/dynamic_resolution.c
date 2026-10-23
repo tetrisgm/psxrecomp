@@ -395,6 +395,7 @@ static void rt_window_reset(DynrtController *c) {
     c->win_period = c->win_wall = c->win_cost = c->win_bp = 0.0;
     c->win_generated_cost = 0.0;
     c->win_n = c->win_frames = 0;
+    c->win_outputs = 0.0; c->win_output_samples = 0;
 }
 
 static void rt_discard(DynrtController *c) {
@@ -433,6 +434,8 @@ static void rt_step(DynrtController *c, double now, int to, int down, double loa
     c->post_to = to;
     c->post_windows = 0;
     c->post_down = down;
+    c->post_output_hz = c->last_output_hz;
+    c->post_output_valid = c->last_output_valid;
     c->post_load_before = load;
     c->post_bp_before = bp_share;
     c->post_pred = dynrt_predict(c, load, from, to);
@@ -473,6 +476,8 @@ static int rt_close_window(DynrtController *c, double now) {
     const int n = c->win_n, frames = c->win_frames;
     const double wall = c->win_wall, cost = c->win_cost, bp = c->win_bp;
     const double real_cost = cost - c->win_generated_cost;
+    c->last_output_valid = c->win_output_samples == n && wall > 0.0;
+    c->last_output_hz = c->last_output_valid ? c->win_outputs / wall : 0.0;
     rt_window_reset(c);
     c->windows++;
     if (frames < 1 || (double)frames < c->p.min_coverage * (double)n) {
@@ -516,8 +521,16 @@ static int rt_close_window(DynrtController *c, double now) {
         const double want = c->post_load_before - c->post_pred;
         const double fell = c->post_load_before - load;
         const int bp_cleared = c->post_bp_before >= c->p.bp_strong && no_bp;
+        /* A faster renderer can spend the freed budget on additional outputs.
+         * Flat total cost is not evidence that a down step failed in that case.
+         * Require a material gain beyond single-frame window quantization. */
+        const double cadence_noise = wall > 0.0 ? 1.0 / wall : 0.0;
+        const double cadence_gain = c->last_output_hz - c->post_output_hz;
+        const int output_improved = c->post_output_valid && c->last_output_valid &&
+            cadence_gain > cadence_noise && cadence_gain > 2.0 &&
+            cadence_gain > c->post_output_hz * 0.05;
         const int failed = c->post_down && want > 0.0 &&
-                           fell < c->p.verify_fraction * want && !bp_cleared;
+                           fell < c->p.verify_fraction * want && !bp_cleared && !output_improved;
         if (failed) c->descent_armed = 0;   /* the model is off: single steps */
         if (failed && !c->verify_strikes) {
             /* One strike: the window before the step may have mixed lighter
@@ -552,7 +565,10 @@ static int rt_close_window(DynrtController *c, double now) {
             return c->level;
         } else {
             if (c->post_down) c->verify_strikes = 0;
-            rt_learn(c, c->post_load_before, load, c->post_from, c->post_to);
+            /* The area model needs comparable work, not a busier output mix. */
+            if (!output_improved)
+                rt_learn(c, c->post_load_before, load, c->post_from, c->post_to);
+            else { c->last_reason = "down step improved output cadence"; c->last_decision_t = now; }
         }
     }
     /* A strike is about the steps right after it. */
@@ -631,6 +647,9 @@ int dynrt_sample(DynrtController *c, double now_s, const DynrtSample *s) {
     c->win_period += s->period_s;
     c->win_wall += s->wall_s;
     c->win_n++;
+    if (s->output_valid && s->output_frames >= 0.0) {
+        c->win_outputs += s->output_frames; c->win_output_samples++;
+    }
     if (s->frames > 0 && s->cost_s >= 0.0) {
         c->win_frames += s->frames;
         c->win_cost += s->cost_s;

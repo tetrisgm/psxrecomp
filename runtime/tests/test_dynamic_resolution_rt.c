@@ -444,7 +444,30 @@ static void test_generation_window_mix(void) {
           "generation load can lower resolution without pretending real work alone is over budget");
 }
 
+/* Constant busy time, but reduced resolution admits additional timed outputs. */
+static void test_variable_output_work(void) {
+    for (int mode=0; mode<4; ++mode) {
+        DynrtController c; DynrtParams p; dynrt_default_params(&p);
+        p.window_s=0.25; p.descent_s=0; p.down_windows=1;
+        dynrt_init(&c,&p,3,12,12); c.descent_armed=0;
+        double now=0, carry=0; int min=12;
+        for(int i=0;i<900;i++) {
+            /* 24 -> 36 -> 48 -> 60... delivered fps at fixed 18ms/guest tick. */
+            double hz=mode==0 ? 24.0+12.0*(12-c.level) : mode==3 ? 30.5 : 30.0;
+            carry += hz*kPeriod; int output=(int)carry; carry-=output;
+            DynrtSample sample={kPeriod,kPeriod,1,0.018,0,0,0,output,mode!=2};
+            now+=kPeriod; dynrt_sample(&c,now,&sample);
+            if(c.level<min)min=c.level;
+        }
+        if(mode==0) {
+            CHECK(c.undos==0 && min==3,"cadence gains retain useful down steps (%llu undos, min%d)",c.undos,min);
+            CHECK(fabs(c.f-p.prior_scaled)<1e-9,"variable output mix does not train fixed-work area model");
+        } else CHECK(c.undos>0,"flat/no-receipt/noise output retains failed-step undo (mode%d)",mode);
+    }
+}
+
 int main(void) {
+    test_variable_output_work();
     test_generation_window_mix();
     test_fast_descent_from_ceiling();
     test_fast_descent_rearm();

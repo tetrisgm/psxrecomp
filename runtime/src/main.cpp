@@ -1419,6 +1419,8 @@ struct DynresHost {
     DynrtController rt{};
     GlRthCosts last_costs{};
     uint64_t last_bp_ns = 0;
+    uint64_t last_output_presents = 0;
+    bool last_output_valid = false;
     /* Smooth motion's generated frames (dynres_tick_rt). */
     uint64_t last_gen = 0, last_gen_meas = 0, last_gen_cost_ns = 0;
     double gen_mean_s = 0.0, gen_pending_s = 0.0;
@@ -10662,7 +10664,19 @@ static void dynres_tick_rt(double now_s, double wall, double period, int held,
     double gen_s = 0.0;
     if (frames > 0 && !held) { gen_s = g_dynres.gen_pending_s; g_dynres.gen_pending_s = 0.0; }
     if (held) g_dynres.gen_pending_s = 0.0;
-    DynrtSample smp{ period, wall, frames, cost + gen_s, bp, held, gen_s };
+    PtStats output_stats{};
+    pt_get_stats(&output_stats);
+    const bool output_running = pt_running() != 0;
+    static const bool output_verify = [] {
+        const char *e = std::getenv("PSX_DYNRES_OUTPUT_VERIFY");
+        return !e || e[0] != '0';
+    }();
+    const bool output_valid = output_verify && output_running && g_dynres.last_output_valid &&
+                              output_stats.presents >= g_dynres.last_output_presents;
+    const double outputs = output_valid ? (double)(output_stats.presents - g_dynres.last_output_presents) : 0.0;
+    g_dynres.last_output_presents = output_stats.presents;
+    g_dynres.last_output_valid = output_running;
+    DynrtSample smp{ period, wall, frames, cost + gen_s, bp, held, gen_s, outputs, output_valid };
     const int prev_level = c.level;
     const int level = dynrt_sample(&c, now_s, &smp);
     /* Frame generation only spends surplus: not while the real frames are
@@ -10794,6 +10808,7 @@ static void dynres_tick(void) {
             dynrt_init(&g_dynres.rt, &rp, g_dynres.ctl.floor, g_dynres.ctl.ceiling, st.level);
             if (forced) (void)dynrt_force(&g_dynres.rt, forced);
             gl_renderer_render_thread_costs(&g_dynres.last_costs);
+            g_dynres.last_output_valid = false;
             RtStats rs;
             rt_get_stats(&rs);
             g_dynres.last_bp_ns = rs.backpressure_ns + rs.ring_full_ns;
@@ -10887,7 +10902,7 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
             "\"steps\":%llu,\"last_from\":%d,\"last_to\":%d,\"last_ms\":%.3f,"
             "\"frames_measured\":%llu,\"gpu_frames\":%llu,\"frames_dropped\":%llu,"
             "\"down_blocked_s\":%.1f,\"up_blocked\":{%s},\"fast_downs\":%llu,"
-            "\"descent_armed\":%d",
+            "\"descent_armed\":%d,\"output_hz\":%.2f,\"output_valid\":%d",
             g_dynres.active ? 1 : 0, dynres_requested(), st.ceiling,
             g_dynres.active ? r.floor : 0, st.level, st.level * g_video_ref_lines, r.forced,
             r.last_load, 1.0 - r.p.margin, r.last_bp_share, r.last_hz, g_dynres.rt_win_cpu_ms,
@@ -10899,7 +10914,7 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
             (unsigned long long)co.frames, (unsigned long long)co.gpu_frames,
             (unsigned long long)co.dropped,
             r.down_block_until > now_s ? r.down_block_until - now_s : 0.0, blocked,
-            r.fast_downs, r.descent_armed);
+            r.fast_downs, r.descent_armed, r.last_output_hz, r.last_output_valid);
     }
     const DynresController &c = g_dynres.ctl;
     const double now_s = (double)SDL_GetPerformanceCounter() /

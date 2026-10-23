@@ -227,6 +227,8 @@ typedef struct DynrtSample {
     double bp_s;       /* emulation thread blocked on the queue bound */
     int    held;       /* the host holds: not a sample, the window restarts */
     double generated_cost_s; /* part of cost_s spent on generated frames; 0 without FG */
+    double output_frames; /* completed presenter outputs, not submissions */
+    int output_valid;     /* optional cadence receipt; zero keeps cost-only verification */
 } DynrtSample;
 
 typedef struct DynrtController {
@@ -236,9 +238,13 @@ typedef struct DynrtController {
     /* the window in progress */
     double win_period, win_wall, win_cost, win_bp, win_generated_cost;
     int    win_n, win_frames;
+    double win_outputs;
+    int win_output_samples;
     /* the last closed window */
     double last_load, last_bp_share, last_hz, last_real_load;
     int    last_valid, last_guest_bound, last_over;
+    double last_output_hz;
+    int last_output_valid;
     int    over_streak;
     double hold_until;
     double up_streak_s;
@@ -249,6 +255,8 @@ typedef struct DynrtController {
     double down_block_until, verify_dur, verify_last_fail;
     int    post_active, post_from, post_to, post_windows, post_down;
     double post_load_before, post_pred, post_bp_before;
+    double post_output_hz;
+    int post_output_valid;
     int    verify_strikes, strike_from;
     double strike_t;
     /* fast descent: armed; deadline (0 = starts at the next judged window) */
