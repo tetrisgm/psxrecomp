@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include "gpu_projective_clip.h"
 #include "present_thread.h"
+#include "render_pass_plan.h"
 
 struct SDL_Window;
 
@@ -76,6 +77,18 @@ void     gl_renderer_pass_force_refuse(int on);
 /* Phases the presenter will show for the frame the next flip displays. */
 /* Nonzero while passes are queued on the render thread (the emulation
  * thread records them instead of taking the GL context). */
+typedef struct GLRenderAsyncToken {
+    RenderPassOutput output;
+    uint16_t x, y, w, h;
+    uint32_t period_vblanks;
+} GLRenderAsyncToken;
+/* Main-thread only. All timestamps use pt_clock_ns(). Reserve records phase0;
+ * begin/end stage one completed stream atomically without acquiring GL. */
+uint32_t gl_renderer_pass_async_reserve(uint32_t period, uint64_t window_begin,
+    uint64_t window_end, uint16_t x,uint16_t y,uint16_t w,uint16_t h,
+    GLRenderAsyncToken *tokens,uint32_t max);
+int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token);
+int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep);
 int gl_renderer_pass_queued(void);
 /* Queued-pass counters: plans shed while the render thread was two frames
  * behind, begins the render thread refused, and out-of-rect writes. */

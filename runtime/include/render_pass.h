@@ -8,10 +8,18 @@
 
 #include "psx_cycle_freeze.h"   /* g_psx_render_pass_active, the time freeze */
 #include "gpu_gl_renderer.h"
+#include "gpu_replay.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef GLRenderAsyncToken RenderPassAsyncToken;
+uint32_t render_pass_async_reserve(uint32_t period,uint64_t window_begin_ns,
+    uint64_t window_end_ns,uint16_t x,uint16_t y,uint16_t w,uint16_t h,
+    RenderPassAsyncToken *tokens,uint32_t max);
+int render_pass_async_admit(const RenderPassAsyncToken *token,
+    const GpuReplayState *state,const GpuReplayProvider *provider);
 
 /* Stores a pass may not make (memory.c render_pass_store): they would escape
  * the restore, so they are dropped and counted per device class. */

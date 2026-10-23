@@ -4,15 +4,7 @@
 #include "test_gl_render_thread.c"
 #undef main
 
-void psx_video_telemetry_compose(int renderer, int scale, int sw, int sh,
-                                int dw, int dh, int vw, int vh) {
-    (void)renderer; (void)scale; (void)sw; (void)sh;
-    (void)dw; (void)dh; (void)vw; (void)vh;
-}
-void psx_video_telemetry_present(int result) { (void)result; }
-int psx_host_menu_overlay_image(const uint32_t **pixels, int *w, int *h) {
-    *pixels = NULL; *w = *h = 0; return 0;
-}
+void host_sampler_retarget_current(const char *thread) { (void)thread; }
 
 int main(void) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return 77;
@@ -70,6 +62,30 @@ int main(void) {
     check(!gl_renderer_set_present_timing(&timing), "stale epoch cannot arm a new swap");
     check(pt_clock_ns() - now < 1000000000u, "reset did not wait for future presentation");
     check(glGetError() == GL_NO_ERROR, "no GL errors after cancelled fence reuse");
+    /* Actual queued generation reservation/admission at a noninteger rate. */
+    s_interp_valid=1; s_interp_w=320; s_interp_h=240; s_interp_source_path=GL_PRES_VRAM;
+    s_interp_source=1; s_interp_source_hz=60; s_interp_target_hz=100;
+    rt_release();
+    GLRenderAsyncToken tokens[8];
+    now=pt_clock_ns();
+    uint32_t count=gl_renderer_pass_async_reserve(2,now+100000000u,now+133333333u,
+                                                0,0,320,240,tokens,8);
+    check(count>=3 && count<=4,"100Hz asynchronous outputs over 30Hz window");
+    if (count>1) {
+        check(gl_renderer_pass_async_begin(&tokens[1]),"begin reserved generation");
+        gr_set_draw_area(0,0,319,239);
+        gr_fill_rect(0,0,16,16,0x1F);
+        check(gl_renderer_pass_async_end(&tokens[1],1),"publish whole async transaction");
+        check(!gl_renderer_pass_async_begin(&tokens[1]),"duplicate completion rejected");
+        GLRenderAsyncToken stale=tokens[2]; stale.output.epoch++;
+        check(!gl_renderer_pass_async_begin(&stale),"old epoch rejected before recording");
+        gl_renderer_render_thread_sync("check async capture");
+        int found=0;
+        for(int i=0;i<PASS_GENERATIONS;++i)
+            if(s_pgen[i].async_id==tokens[1].output.generation && s_pgen[i].n==2) found++;
+        check(found==1,"completed output appended to original generation");
+        check(glGetError()==GL_NO_ERROR,"async GPU transaction clean");
+    }
     gl_renderer_shutdown();
     SDL_DestroyWindow(win);
     SDL_Quit();
