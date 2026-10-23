@@ -526,3 +526,6 @@ read callback before beginning its prepass. Fall back only to the captured
 snapshot for non-packet addresses. Final context RAM is insufficient when two
 submissions reuse one packet address. GPU checkpoint rollback now also restores
 an interrupted main linked-list rank.
+
+Canonical topic sources and explicit prerequisite commits are listed in
+[ASYNC_OUTPUT_DEPENDENCIES.md](ASYNC_OUTPUT_DEPENDENCIES.md).
