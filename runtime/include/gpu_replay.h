@@ -32,6 +32,8 @@ typedef struct GpuReplayProvider {
      * Return 0 if any active mod metadata is unavailable. A caller with no
      * relevant hooks must explicitly attest that with a successful callback. */
     int (*prepare_metadata)(void *user);
+    /* Flush events at count (trailing empty nodes/lists), still in scope. */
+    int (*finish)(void *user);
 } GpuReplayProvider;
 
 /* Call from provider.word while its read callback selects the corresponding

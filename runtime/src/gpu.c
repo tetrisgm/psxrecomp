@@ -8455,6 +8455,7 @@ int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *pro
             gpu_write_gp0(input.word);
         }
     }
+    if (!s_replay_fault && provider->finish && !provider->finish(provider->user)) s_replay_fault=1;
     gpu_ws_end_linked_list();
     int ok = !s_replay_fault && gp0_state == GP0_IDLE;
     s_replay = NULL;
