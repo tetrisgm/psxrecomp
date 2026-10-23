@@ -9352,7 +9352,7 @@ uint32_t gl_renderer_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t 
     if (rate<=0) return 0;
     if (s_async_timeline.epoch!=epoch || s_async_rate!=rate) {
         if (!render_pass_output_init(&s_async_timeline,1000000000u,(uint32_t)rate,1000,begin,epoch)) return 0;
-        s_async_rate=rate;
+        s_async_rate=rate; s_async_last_index=0; s_async_has_index=0;
     }
     RenderPassOutputTimeline next=s_async_timeline;
     RenderPassOutput outputs[RENDER_PASS_MAX_PHASES];
@@ -9362,11 +9362,12 @@ uint32_t gl_renderer_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t 
     GLRenderAsyncToken base={outputs[0],x,y,w,h,period};
     base.output.deadline=begin;
     base.output.expires=end; /* reserve carries the entire display window */
-    base.output.alpha_q16=0;
+    /* The reserved image is phase zero, but only show it when the output
+     * grid actually contains that phase. Other phases are worker outputs. */
     if (!async_record(RTH_ASYNC_RESERVE,&base) || !rt_batch_try_commit()) {
         ASYNC_COUNT(ring_full); rth_group_flush(); rt_batch_discard(); return 0;
     }
-    s_async_id++; s_async_last_index=0; s_async_has_index=0; s_async_timeline=next;
+    s_async_id++; s_async_timeline=next;
     for (int i=0;i<n;++i) tokens[i]=(GLRenderAsyncToken){outputs[i],x,y,w,h,period};
     return (uint32_t)n;
 }
@@ -9375,10 +9376,11 @@ int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
         ASYNC_COUNT(unavailable); return 0;
     }
     if (token->output.epoch!=gl_renderer_present_epoch() ||
-        token->output.epoch!=s_async_timeline.epoch || token->output.generation!=s_async_id) {
+        token->output.epoch!=s_async_timeline.epoch || (!token->output.generation || token->output.generation>s_async_id ||
+         s_async_id-token->output.generation>=PASS_GENERATIONS)) {
         ASYNC_COUNT(stale); return 0;
     }
-    if (!render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns())) {
+    if (!render_pass_output_current(&s_async_timeline,&token->output,token->output.generation,pt_clock_ns())) {
         ASYNC_COUNT(late); return 0;
     }
     if (s_async_has_index && token->output.index<=s_async_last_index) {
@@ -9400,7 +9402,7 @@ int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
     }
     RTH_REC(RTH_PASS_END,0,(int32_t)token->output.alpha_q16,keep);
     if (!keep || token->output.epoch!=gl_renderer_present_epoch() ||
-        !render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns())) {
+        !render_pass_output_current(&s_async_timeline,&token->output,token->output.generation,pt_clock_ns())) {
         if (keep) {
             if(token->output.epoch!=gl_renderer_present_epoch()) ASYNC_COUNT(stale);
             else ASYNC_COUNT(late);
@@ -15266,7 +15268,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
     if (s_fg_on) fg_capture(c, payload);
-    if(!s_async_exec && c->op==RTH_HD_NOTE)
+    if(!s_async_exec && c->op==RTH_HD_NOTE && gpu_hd_textures_active())
         atomic_fetch_add(&s_async_resource_epoch,1);
     if(s_async_exec && c->op==RTH_COPY) {
         if(v[0]==v[2] && v[1]==v[3] && !s_mask_set) return; /* identity copy */
@@ -15382,7 +15384,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
             RenderPassOutput first=token.output;
             uint64_t period=(uint64_t)(1e9/s_interp_target_hz);
             if(first.deadline+period<first.expires) first.expires=first.deadline+period;
-            async_present_slot(s_pgen_write,0,&first);
+            if (!token.output.alpha_q16) async_present_slot(s_pgen_write,0,&first);
         }
         break;
     }
