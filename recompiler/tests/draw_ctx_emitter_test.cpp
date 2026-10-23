@@ -37,5 +37,20 @@ int main() {
     config.roots={};
     check(emit_draw_ctx(unit,funcs,ranges,"test.h","test",config,out,report,error),"empty config");
     check(report.functions==0 && report.rows==0,"empty table");
+    funcs.resize(2);
+    funcs[0].function_name="func_80010000";
+    funcs[0].full_code="void psx_alias_body_80010000(CPUState* cpu, uint32_t entry) { cpu->pc = cpu->gpr[31]; }\n"
+        "void func_80010000(CPUState* cpu) { psx_alias_body_80010000(cpu, 0x80010000u); }";
+    funcs[1].function_name="func_80010010";
+    funcs[1].full_code="void func_80010010(CPUState* cpu) { psx_alias_body_80010000(cpu, 0x80010010u); }";
+    config.roots={0x80010000};
+    check(emit_draw_ctx(unit,funcs,ranges,"test.h","test",config,out,report,error),error.c_str());
+    check(report.functions==2 && report.rows==2,"selected alias body includes registered indirect entry wrappers");
+    check(out.find("{0x80010010u,")!=std::string::npos,"indirect alias has dispatch row");
+    check(out.find("void dctx_func_80010010(CPUState* cpu) {")!=std::string::npos,"indirect alias wrapper cloned");
+    config.exclude={0x80010010};
+    check(emit_draw_ctx(unit,funcs,ranges,"test.h","test",config,out,report,error),error.c_str());
+    check(report.functions==1 && report.rows==1,"explicit alias exclusion respected");
+    check(report.excluded_hits==std::vector<uint32_t>{0x80010010},"excluded alias reported");
     std::cout << "draw clone transform and closure passed\n";
 }
