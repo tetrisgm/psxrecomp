@@ -1,4 +1,4 @@
-"""Compile the context memcpy contract against the actual recompiled BIOS body.
+"""Compile the context memcpy/memset/rand contracts against the actual recompiled BIOS body.
 
 The reference is extracted unchanged from the checked-in generated BIOS, with
 only memory/timing hooks redirected by the test harness. No copied reference
@@ -15,7 +15,7 @@ a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
 source = (root / 'generated/OpenBIOS_full.c').read_text()
 references = []
-for address in ('1FC085D8', '1FC086C4'):
+for address in ('1FC085D8', '1FC086C4', '1FC060E4'):
     start = source.index(f'void OpenBIOS_func_{address}(CPUState* cpu) {{')
     end = source.index('\n}\n', start) + 3
     references.append(source[start:end])

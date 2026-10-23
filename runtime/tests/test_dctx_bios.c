@@ -16,7 +16,7 @@ static _Thread_local int in_memcpy;
 static void event(uint32_t kind, uint32_t i, uint32_t v, uint32_t a, uint32_t b) {
     /* Start after the qualified vector/dispatcher; the reference body starts
      * at memcpy itself. Compare every hook's instruction and operands. */
-    if (i == 0x00801025u) { event_hash=1469598103934665603ull; event_count=0; in_memcpy=1; }
+    if (i == 0x00801025u || i == 0x3C030001u) { event_hash=1469598103934665603ull; event_count=0; in_memcpy=1; }
     if (!in_memcpy) return;
     const uint32_t values[]={kind,i,v,a,b};
     for(unsigned k=0;k<5;k++) { event_hash ^= values[k]; event_hash *= 1099511628211ull; }
@@ -43,6 +43,15 @@ void pgxp_ctx_load(PgxpCtxEngine *e, CPUState *c, uint32_t i, uint32_t a, uint32
 void pgxp_ctx_store(PgxpCtxEngine *e, CPUState *c, uint32_t i, uint32_t a, uint32_t v) {
     (void)e;(void)c; event(2,i,v,a,0);
 }
+void pgxp_ctx_muldiv(PgxpCtxEngine *e, CPUState *c, uint32_t i, uint32_t hi, uint32_t lo, uint32_t a, uint32_t b) {
+    (void)e;(void)c; event(3,i,hi,lo,a); event(4,i,b,0,0);
+}
+static void reference_word(uint32_t a, uint32_t v) { psx_dctx_sw(reference_cpu, a, v); }
+#define psx_store_cycle_barrier() ((void)0)
+#define psx_unaligned_access(c,a,p) abort()
+#define psx_cyc_load_word(c,a,r,m) psx_dctx_lw(c,a)
+#undef PGXP_MULDIV
+#define PGXP_MULDIV(i,h,l,a,b) pgxp_ctx_muldiv(NULL,cpu,i,h,l,a,b)
 static void reference_store(uint32_t a, uint8_t v) { psx_dctx_sb(reference_cpu, a, v); }
 #define debug_server_log_call_entry(a) ((void)0)
 #define psx_check_interrupts_at(c,a) ((void)0)
@@ -94,6 +103,26 @@ static void *corpus(void *unused) {
         CHECK(x->cpu.gpr[10]==(service==0x2A ? 0xBFC085D8u : 0xBFC086C4u));
         destroy(x); destroy(r);
     }
+    const uint32_t seeds[]={0,1,0x7FFFFFFF,0x80000000,0xFFFFFFFF,0x12345678};
+    for(unsigned k=0;k<sizeof seeds/sizeof seeds[0];k++) {
+        PsxExecCtx *x=make_context(), *r=make_context();
+        psx_dctx_sw(&x->cpu,0x2BC,0xBFC060E4); psx_dctx_sw(&r->cpu,0x2BC,0xBFC060E4);
+        x->cpu.gpr[9]=r->cpu.gpr[9]=0x2F;
+        psx_dctx_sw(&x->cpu,0x8548,seeds[k]); psx_dctx_sw(&r->cpu,0x8548,seeds[k]);
+        reference_cpu=&r->cpu; r->cpu.write_word=reference_word;
+        for(unsigned n=0;n<100;n++) {
+            OpenBIOS_func_1FC060E4(&r->cpu);
+            const uint64_t h=event_hash, count=event_count; in_memcpy=0;
+            CHECK(psx_dctx_bios_call(&x->cpu,0xA0));
+            CHECK(event_hash==h && event_count==count);
+            CHECK(!memcmp(x->ram,r->ram,x->ram_mask+1u));
+            for(unsigned reg=0;reg<32;reg++) if(reg!=8 && reg!=10) CHECK(x->cpu.gpr[reg]==r->cpu.gpr[reg]);
+            CHECK(x->cpu.hi==r->cpu.hi && x->cpu.lo==r->cpu.lo && x->cpu.pc==r->cpu.pc);
+        }
+        psx_dctx_sw(&x->cpu,0x2BC,0xBFC060E8); CPUState before=x->cpu;
+        CHECK(!psx_dctx_bios_call(&x->cpu,0xA0)); CHECK(!memcmp(&before,&x->cpu,sizeof before));
+        destroy(x); destroy(r);
+    }
     PsxExecCtx *x=make_context();
     CPUState before=x->cpu;
     x->ram[0xA0]^=1; CHECK(!psx_dctx_bios_call(&x->cpu,0xA0)); CHECK(!memcmp(&before,&x->cpu,sizeof before));
@@ -109,5 +138,5 @@ int main(int argc,char **argv) {
     corpus(NULL); pthread_t threads[4];
     for(unsigned i=0;i<4;i++) CHECK(!pthread_create(&threads[i],NULL,corpus,NULL));
     for(unsigned i=0;i<4;i++) CHECK(!pthread_join(threads[i],NULL));
-    puts("draw BIOS memory/ABI corpus: serial and four threads passed against recompiled OpenBIOS");
+    puts("draw BIOS memory/rand/ABI corpus: serial and four threads passed against recompiled OpenBIOS");
 }
