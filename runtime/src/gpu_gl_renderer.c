@@ -14866,7 +14866,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
     if (s_fg_on) fg_capture(c, payload);
-    if(!s_async_exec && (c->op==RTH_HD_NOTE || c->op==RTH_DYN_STEP))
+    if(!s_async_exec && c->op==RTH_HD_NOTE)
         atomic_fetch_add(&s_async_resource_epoch,1);
     if(s_async_exec && c->op==RTH_COPY) {
         if(v[0]==v[2] && v[1]==v[3] && !s_mask_set) return; /* identity copy */
