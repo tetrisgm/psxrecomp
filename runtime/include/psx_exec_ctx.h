@@ -108,7 +108,7 @@ struct PsxExecCtx {
     uint32_t gpustat;            /* snapshot GPUSTAT (ready bits forced) */
     uint32_t dma_madr[7], dma_bcr[7], dma_chcr[7];
     uint32_t dpcr, dicr, i_stat, i_mask;
-    uint32_t timer_counter[3], timer_mode[3], timer_target[3];
+    uint32_t timer_counter[3], timer_mode[3], timer_target[3], timer_reads[3];
     uint8_t *text_ok;            /* per draw-table row: 0 unknown, 1 ok, 2 bad */
     size_t   text_ok_n;
     uint64_t step_limit, block_limit;

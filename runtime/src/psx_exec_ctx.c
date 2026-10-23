@@ -33,7 +33,7 @@ extern int psx_ws_x_margin(void);
 
 #define BIOS_ROM_BYTES (512u * 1024u)
 #define CTX_DEFAULT_STEP_LIMIT 50000000ull
-#define CTX_DEFAULT_BLOCK_LIMIT 400000000ull
+#define CTX_DEFAULT_BLOCK_LIMIT 50000000ull
 #define CTX_DMA_NODE_LIMIT     (1u << 22)
 
 /* ---- draw table ----------------------------------------------------------- */
@@ -292,6 +292,7 @@ int psx_ctx_begin(PsxExecCtx *x, const PsxCtxSnapshot *s) {
     memcpy(x->timer_counter, s->timer_counter, sizeof x->timer_counter);
     memcpy(x->timer_mode, s->timer_mode, sizeof x->timer_mode);
     memcpy(x->timer_target, s->timer_target, sizeof x->timer_target);
+    memset(x->timer_reads, 0, sizeof x->timer_reads);
     x->gpu_n = 0;
     memset(&x->stats, 0, sizeof x->stats);
     x->status = PSX_CTX_OK;
@@ -525,13 +526,17 @@ static uint32_t mmio_read32(PsxExecCtx *x, uint32_t phys) {
     }
     if (phys == 0x1F801814u) return ctx_gpustat(x);
     /* Root counters: guest time does not run in a draw context. A counter
-     * read returns the snapshot value advanced by one per read, so a polling
-     * loop (libgpu's DMA wait timeout) always makes progress and every
-     * context sees the same values for the same reads. */
+     * read returns the snapshot value advanced by one every 64 reads of it:
+     * consecutive reads mostly agree (VSync(-1) re-reads until two match),
+     * a loop polling for a change still makes progress, and every context
+     * sees the same values for the same reads. */
     if (phys >= 0x1F801100u && phys < 0x1F801130u && (phys & 0xFu) < 0xCu) {
         const uint32_t t = (phys - 0x1F801100u) >> 4;
         switch (phys & 0xCu) {
-        case 0x0u: return x->timer_counter[t]++ & 0xFFFFu;
+        case 0x0u: {
+            const uint32_t v = (x->timer_counter[t] + (x->timer_reads[t]++ >> 6)) & 0xFFFFu;
+            return v;
+        }
         case 0x4u: {
             const uint32_t m = x->timer_mode[t];
             x->timer_mode[t] &= ~(3u << 11);    /* reached-flags clear on read */
