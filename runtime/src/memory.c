@@ -1156,6 +1156,8 @@ extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 extern void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width);
+/* Draw-isolation gate (draw_isolation.c): NULL unless isolating. */
+void (*g_psx_mmio_observer)(uint32_t addr, int is_write);
 /* Targeted main-RAM read watch (debug_server.c). Flag gates the hot read path. */
 extern int  g_ram_read_watch_active;
 extern void debug_server_trace_ram_read_watch(uint32_t phys, uint32_t val);
@@ -1356,6 +1358,7 @@ static uint32_t mmio_read32_impl(uint32_t addr) {
  * the device read executes exactly once. */
 static uint32_t mmio_read32(uint32_t addr) {
     if (g_psx_render_pass_active && !render_pass_mmio_read_allowed(addr, 4)) return 0;
+    if (g_psx_mmio_observer) g_psx_mmio_observer(addr, 0);
     psx_devices_mmio_sync();
     uint32_t v = mmio_read32_impl(addr);
     debug_server_trace_mmio_read(addr, v, 4);
@@ -1364,6 +1367,7 @@ static uint32_t mmio_read32(uint32_t addr) {
 
 static void mmio_write32(uint32_t addr, uint32_t val) {
     psx_devices_mmio_sync();
+    if (g_psx_mmio_observer) g_psx_mmio_observer(addr, 1);
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, val, 4);
     /* Memory control: 0x1F801000..0x1F801020 */
@@ -1479,6 +1483,7 @@ static uint16_t mmio_read16_impl(uint32_t addr) {
 
 static uint16_t mmio_read16(uint32_t addr) {
     if (g_psx_render_pass_active && !render_pass_mmio_read_allowed(addr, 2)) return 0;
+    if (g_psx_mmio_observer) g_psx_mmio_observer(addr, 0);
     psx_devices_mmio_sync();
     uint16_t v = mmio_read16_impl(addr);
     debug_server_trace_mmio_read(addr, (uint32_t)v, 2);
@@ -1487,6 +1492,7 @@ static uint16_t mmio_read16(uint32_t addr) {
 
 static void mmio_write16(uint32_t addr, uint16_t val) {
     psx_devices_mmio_sync();
+    if (g_psx_mmio_observer) g_psx_mmio_observer(addr, 1);
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 2);
     /* Memory control: 0x1F801000..0x1F80103C — halfword lane RMW. */
@@ -1599,6 +1605,7 @@ static uint8_t mmio_read8_impl(uint32_t addr) {
 
 static uint8_t mmio_read8(uint32_t addr) {
     if (g_psx_render_pass_active && !render_pass_mmio_read_allowed(addr, 1)) return 0;
+    if (g_psx_mmio_observer) g_psx_mmio_observer(addr, 0);
     psx_devices_mmio_sync();
     uint8_t v = mmio_read8_impl(addr);
     debug_server_trace_mmio_read(addr, (uint32_t)v, 1);
@@ -1607,6 +1614,7 @@ static uint8_t mmio_read8(uint32_t addr) {
 
 static void mmio_write8(uint32_t addr, uint8_t val) {
     psx_devices_mmio_sync();
+    if (g_psx_mmio_observer) g_psx_mmio_observer(addr, 1);
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
     /* Memory control: 0x1F801000..0x1F80103C — byte lane RMW. Tomba2's late

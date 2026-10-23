@@ -213,6 +213,11 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-23 (`feat/draw-isolation-gate`):** Added explicit main-context
+  suspension of a draw span for synchronous side effects. Unit coverage checks
+  RAM/GTE separation and interrupts during suspension. R4 uses this to keep
+  object sound calls on main; full-race isolation verification remains pending.
+
 - **2026-10-21 (`feat/render-60fps`):** Admit opt-in render passes with HD
   CPU-authoritative textures and give opted-in netplay temporal passes the
   restored own-view scope. Sandbox tests and hidden GL pass fixture pass.

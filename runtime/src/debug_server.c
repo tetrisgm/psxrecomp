@@ -5053,8 +5053,20 @@ static void handle_frame(int id, const char *json)
  * (for example with and without a presentation mod) compare frame by frame
  * from that guest point on, independent of what happened before the load. */
 static int s_fp_reset_on_load = 0;
+/* input_route_start on_load=K: the queued route starts K frames after the
+ * next savestate load completes, so runs that load one state replay the same
+ * input on the same guest frames (the frame counter is host state). */
+static int s_input_route_on_load = -1;
+static void input_route_arm_after_load(void);
+static int s_rec_on_load = -1;   /* record_frame after_load=K */
 void debug_server_note_savestate_loaded(void)
 {
+    input_route_arm_after_load();
+    if (s_rec_on_load >= 0) {
+        s_rec_count = 0; s_rec_overflow = 0;
+        s_rec_frame = (int64_t)s_frame_count + s_rec_on_load;
+        s_rec_on_load = -1;
+    }
     if (!s_fp_reset_on_load) return;
     s_fp_reset_on_load = 0;
     s_fp = (PsxFrameFingerprint)PSX_FRAME_FINGERPRINT_INIT;
@@ -5117,6 +5129,10 @@ static void handle_frame_fingerprint(int id, const char *json)
 static void handle_record_frame(int id, const char *json)
 {
     int f = json_get_int(json, "frame", -1);
+    /* after_load=K: record the K-th frame after the next savestate load
+     * completes (frame numbers are host state; this pins a guest point). */
+    s_rec_on_load = json_get_int(json, "after_load", -1);
+    if (s_rec_on_load >= 0) f = -1;
     s_rec_count = 0; s_rec_overflow = 0;
     s_rec_frame = (f < 0) ? -1 : (int64_t)f;
     send_fmt("{\"id\":%d,\"ok\":true,\"armed_frame\":%lld,\"cur_frame\":%llu}",
@@ -8464,15 +8480,25 @@ static void handle_input_route_start(int id, const char *json)
     s_input_route_remaining = s_input_route[0].frames;
     const int at = json_get_int(json, "at_frame", 0);
     s_input_route_start_frame = at > 0 && (uint64_t)at > s_frame_count ? (uint64_t)at : 0u;
-    s_input_route_active = 1;
+    s_input_route_on_load = json_get_int(json, "on_load", -1);
+    s_input_route_active = s_input_route_on_load < 0;
     send_fmt("{\"id\":%d,\"ok\":true,\"steps\":%u,\"start_frame\":%llu}\n",
              id, (unsigned)s_input_route_count,
              (unsigned long long)(s_input_route_start_frame ? s_input_route_start_frame
                                                             : s_frame_count));
 }
 
+static void input_route_arm_after_load(void)
+{
+    if (s_input_route_on_load < 0 || s_input_route_count == 0) return;
+    s_input_route_start_frame = s_frame_count + (uint64_t)s_input_route_on_load;
+    s_input_route_on_load = -1;
+    s_input_route_active = 1;
+}
+
 static void handle_input_route_stop(int id, const char *json)
 {
+    s_input_route_on_load = -1;
     (void)json;
     s_input_route_active = 0;
     s_input_route_remaining = 0;
@@ -11811,6 +11837,11 @@ static void handle_card_trace_dump(int id, const char *json)
  * Iterates up to 8 ranges; records if any match.
  * The always-on catch-all ring is recorded UNCONDITIONALLY first so
  * late-connecting probes can still see recent writes without arming. */
+/* Draw-isolation gate (draw_isolation.c): sees every guest RAM and
+ * scratchpad store (CPU and DMA), so main-context stores are known exactly.
+ * NULL unless isolating. */
+void (*g_psx_ram_write_observer)(uint32_t phys, uint32_t width);
+
 void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                     uint32_t new_val, uint8_t width)
 {
@@ -11818,6 +11849,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     (void)phys; (void)old_val; (void)new_val; (void)width;
     return;
 #endif
+    if (g_psx_ram_write_observer) g_psx_ram_write_observer(phys, width);
     /* Render passes are rolled back; keep them out of the live timeline's
      * fingerprints and write traces (docs/RENDER_PASSES.md). */
     if (g_psx_render_pass_active) return;
