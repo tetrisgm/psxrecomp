@@ -325,6 +325,18 @@ static PFN_glWaitSync   p_glWaitSync;
 static PFN_glDeleteSync p_glDeleteSync;
 static PFN_glBindFramebuffer p_glBindFramebuffer_raw;
 static int    s_pt_on = 0;               /* redirect active (present thread running) */
+static _Atomic uint64_t s_pt_epoch = 1;
+static PtTiming s_pt_next_timing;        /* GL owning thread, one swap only */
+
+uint64_t gl_renderer_present_epoch(void) { return atomic_load(&s_pt_epoch); }
+int gl_renderer_set_present_timing(const PtTiming *timing) {
+    memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
+    if (!s_pt_on || !timing || timing->epoch != atomic_load(&s_pt_epoch) ||
+        timing->expires_ns <= timing->not_before_ns ||
+        pt_clock_ns() >= timing->expires_ns) return 0;
+    s_pt_next_timing = *timing;
+    return 1;
+}
 static volatile int s_pt_interval_gen = 0; /* bumped per swap-interval change */
 static GLuint pt_target_fbo(void);
 static void APIENTRY gl_bind_fb_redirect(GLenum target, GLuint fb) {
@@ -7659,6 +7671,10 @@ void gl_renderer_set_ws_ablate(int mode) {
 int  gl_renderer_get_ws_ablate(void)     { return s_ws_ablate; }
 
 static void interp_reset_history_unlocked(void) {
+    uint64_t epoch = atomic_fetch_add(&s_pt_epoch, 1) + 1;
+    if (!epoch) { epoch = 1; atomic_store(&s_pt_epoch, epoch); }
+    memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
+    pt_set_epoch(epoch);
     s_interp_valid = 0;
     s_interp_w = s_interp_h = 0;
     s_interp_src_w = s_interp_src_h = 0;
@@ -7958,14 +7974,33 @@ static void interp_present_source_interval(void) {
     while (frame_interpolation_schedule_next(
                &s_interp_schedule, SDL_GetPerformanceCounter(),
                &deadline, &alpha)) {
-        interp_wait_until(deadline, frequency);
+        if (s_pt_on) {
+            /* Convert the SDL clock to the present core's monotonic clock.
+             * Its origin is platform-specific; only a sampled delta crosses
+             * the boundary. The presenter owns all output-deadline waits. */
+            const uint64_t source_now = SDL_GetPerformanceCounter();
+            const uint64_t host_now = pt_clock_ns();
+            const double delta_ns = ((double)deadline - (double)source_now) *
+                                    1e9 / (double)frequency;
+            const double not_before = (double)host_now + delta_ns;
+            const double expires = not_before +
+                s_interp_schedule.target_period * 1e9 / (double)frequency;
+            PtTiming timing = { atomic_load(&s_pt_epoch),
+                not_before > 0.0 ? (uint64_t)not_before : 0,
+                expires > 0.0 ? (uint64_t)expires : 0 };
+            if (!gl_renderer_set_present_timing(&timing)) continue;
+        } else {
+            interp_wait_until(deadline, frequency);
+        }
         latency_ring_mark(LAT_SWAP_BEGIN);
         if (!pass_gen_present(deadline))
             (void)interp_present(alpha);
         latency_ring_mark(LAT_SWAP_END);
+        memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
     }
-    interp_wait_until(frame_interpolation_schedule_end(&s_interp_schedule),
-                      frequency);
+    if (!s_pt_on)
+        interp_wait_until(frame_interpolation_schedule_end(&s_interp_schedule),
+                          frequency);
 
     now = SDL_GetPerformanceCounter();
     if (!diag_start) {
@@ -9848,6 +9883,7 @@ static int pt_begin(void) {
         return 0;
     }
     s_pt_on = 1;
+    pt_set_epoch(atomic_load(&s_pt_epoch));
     fprintf(stdout, "psxrecomp: present thread on (%d slots)\n", s_pt_slots);
     return 1;
 }
@@ -9858,6 +9894,7 @@ static void pt_end(void) {
     glFlush();
     pt_stop();
     s_pt_on = 0;
+    memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
     for (int i = 0; i < PT_MAX_SLOTS; i++) {
         if (s_pts_fbo[i]) {
             p_glDeleteFramebuffers(1, &s_pts_fbo[i]);
@@ -9880,7 +9917,19 @@ static void gl_present_swap(void) {
     void *ready = p_glFenceSync(PT_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
     void *done = NULL;
-    (void)pt_submit(ready, &done, NULL);
+    if (s_pt_next_timing.epoch) {
+        PtTiming timing = s_pt_next_timing;
+        memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
+        if (pt_try_submit_at(ready, &timing, &done) < 0) {
+            /* Refusal leaves this composing slot owned by this context.
+             * Its commands remain ordered here; no cross-context reader
+             * owns the fence or image. Drop only the optional output. */
+            if (ready) p_glDeleteSync(ready);
+            return;
+        }
+    } else {
+        (void)pt_submit(ready, &done, NULL);
+    }
     if (done) { p_glWaitSync(done, 0, PT_TIMEOUT_IGNORED); p_glDeleteSync(done); }
     /* Whatever is bound as the window now means the new slot. */
     GLint d = 0, r = 0;
@@ -9898,11 +9947,12 @@ int gl_renderer_present_thread_json(char *out, size_t cap) {
     return snprintf(out, cap,
         "\"present_thread\":{\"active\":%d,\"slots\":%d,\"submits\":%llu,\"presents\":%llu,"
         "\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
-        "\"queued_high\":%d}",
+        "\"queued_high\":%d,\"timed_dropped\":%llu,\"timed_refused\":%llu}",
         s_pt_on, st.slots, (unsigned long long)st.submits, (unsigned long long)st.presents,
         (unsigned long long)st.waits, st.wait_ns / 1e6,
         st.presents ? (double)st.present_ns / (double)st.presents / 1e6 : 0.0,
-        st.present_max_ns / 1e6, st.queued_high);
+        st.present_max_ns / 1e6, st.queued_high,
+        (unsigned long long)st.timed_dropped, (unsigned long long)st.timed_refused);
 }
 static void gl_swap_now(int generated);
 static int  fg_keep_real(void);      /* frame generation */

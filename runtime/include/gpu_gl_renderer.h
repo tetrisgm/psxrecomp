@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "gpu_projective_clip.h"
+#include "present_thread.h"
 
 struct SDL_Window;
 
@@ -38,6 +39,14 @@ int gl_renderer_hd_texture_cached(uint64_t key, uint64_t generation,
  * Safe before or after context creation; applies live when a context exists. */
 void gl_renderer_set_swap_interval(int interval);
 int gl_renderer_get_swap_interval(void); /* Actual driver interval, -2 if unavailable. */
+
+/* Asynchronous output composition: capture the epoch when a job is planned,
+ * then arm its immediately following swap on the GL owning thread. Times use
+ * pt_clock_ns(). Returns 0 if no present thread, stale epoch or expired time;
+ * callers then drop the optional output. History/rate reset retires the epoch.
+ * Accepted timing is consumed by one swap and never blocks the producer. */
+uint64_t gl_renderer_present_epoch(void);
+int gl_renderer_set_present_timing(const PtTiming *timing);
 
 /* Presentation-only temporal blending. High-refresh sub-presents blend the two
  * most recent stable display images on the owning render thread/context; this
