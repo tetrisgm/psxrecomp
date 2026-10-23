@@ -72,9 +72,20 @@ int main(void) {
     uint32_t count=gl_renderer_pass_async_reserve(2,now+100000000u,now+133333333u,
                                                 0,0,320,240,tokens,8);
     check(count>=3 && count<=4,"100Hz asynchronous outputs over 30Hz window");
+    GLRenderAsyncToken next_tokens[8];
+    uint32_t next_count=gl_renderer_pass_async_reserve(2,now+145000000u,now+178333333u,
+                                                     0,0,320,240,next_tokens,8);
+    check(next_count>0 && next_tokens[0].output.alpha_q16>0,
+          "second window begins between output-grid timestamps");
+    rt_drain();
+    GLRenderAsyncStats reserved_stats; gl_renderer_pass_async_stats(&reserved_stats);
+    check(reserved_stats.presented_to_queue==1,
+          "only the grid-aligned reservation presents its phase-zero capture");
     if (count>1) {
         gr_fill_rect(384,0,16,16,0x3E0); /* live texture changes before worker returns */
-        check(gl_renderer_pass_async_begin(&tokens[1]),"begin reserved generation");
+        rtb_hd_texture_note(GR_HD_NOTE_INVALIDATE,384,0,16,16,0,0);
+        check(gl_renderer_pass_async_begin(&tokens[1]),
+              "older reserved generation remains admissible with bounded lookahead");
         gr_set_depth_triangle(1,10,11,12);
         GLRenderAsyncToken wrong=tokens[1]; wrong.output.index++;
         check(!gl_renderer_pass_async_end(&wrong,1) && !s_rth_group_n,
@@ -92,6 +103,9 @@ int main(void) {
         gr_draw_textured_rect(0,0,16,16,0,0,0,0,0x106);
         check(gl_renderer_pass_async_end(&tokens[2],1),"second output transaction committed");
         gl_renderer_render_thread_sync("check async capture");
+        GLRenderAsyncStats base_stats; gl_renderer_pass_async_stats(&base_stats);
+        check(base_stats.presented_to_queue<=3 && !base_stats.resource,
+              "no off-grid phase0 or inactive HD-note cancellation");
         int found=0;
         for(int i=0;i<PASS_GENERATIONS;++i)
             if(s_pgen[i].async_id==tokens[1].output.generation && s_pgen[i].n==2) found++;
