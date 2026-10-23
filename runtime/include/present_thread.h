@@ -65,11 +65,29 @@ int  pt_current(void);
  * if none); *wait_ns the time spent blocked. Returns the new current slot, or
  * -1 when not running. */
 int  pt_submit(void *ready, void **next_done, uint64_t *wait_ns);
+/* Independent output scheduling. Times are monotonic nanoseconds from
+ * pt_clock_ns(). Set a new nonzero epoch after a rate/session/clock reset.
+ * Invalidating an epoch wakes the presenter and retires queued timed outputs;
+ * untimed submissions retain their existing FIFO behavior. */
+typedef struct PtTiming {
+    uint64_t epoch, not_before_ns, expires_ns;
+} PtTiming;
+uint64_t pt_clock_ns(void);
+void pt_set_epoch(uint64_t epoch);
+/* Producer: submit only if another slot is already free, the epoch matches,
+ * and the output has not expired. Never waits for a slot or deadline.
+ * Returns new slot, -1 when stopped, -2 on refusal. On refusal the producer
+ * keeps its current slot AND ready token; next_done is NULL. Accepted timed
+ * outputs wait on the present thread, and drop if expired/reset before use.
+ * A dropped ready token returns as done so GPU work is still fenced on reuse.
+ * Stop discards timed pending outputs rather than waiting on future times. */
+int pt_try_submit_at(void *ready, const PtTiming *timing, void **next_done);
 /* Producer: wait until nothing is queued or presenting. */
 void pt_drain(void);
 
 typedef struct PtStats {
     uint64_t submits, presents, waits, wait_ns, present_ns, present_max_ns;
+    uint64_t timed_dropped, timed_refused;
     int      slots, queued_high;
 } PtStats;
 void pt_get_stats(PtStats *out);
