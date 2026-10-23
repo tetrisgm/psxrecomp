@@ -818,6 +818,12 @@ dynamic_resolution = true
 dynamic_resolution_min = "display"
 ```
 
+`dynamic_resolution_start_min = true` starts at that floor and lets the
+controller raise resolution when it measures headroom. It is opt-in; the
+default starts at the ceiling. Use it when steady output cadence matters more
+than the first few frames at the maximum scale. It does not change the floor,
+ceiling, or the player's dynamic-resolution toggle.
+
 `antialiasing_mode` filters the composed game image on OpenGL: after the game
 quad (4:3, native-wide, Smooth motion and generated frames alike) and before
 hold-last capture, the OSD, screenshots and the swap. It reads only output

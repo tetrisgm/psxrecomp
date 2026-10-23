@@ -465,6 +465,7 @@ struct RuntimeConfig {
     // internal_resolution (720 = "720p"; 1 = native).
     bool                  video_dynamic_resolution = false;
     int                   video_dynamic_resolution_min = 720;
+    bool                  video_dynamic_resolution_start_min = false;
     // resolution_reference_lines: the title's usual display height, which a
     // preset divides into (S = ceil(target / reference)). 240 for NTSC
     // 320x240 games; 120..1024.

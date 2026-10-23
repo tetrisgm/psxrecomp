@@ -1391,6 +1391,7 @@ static int           g_video_internal_res_env = PSX_IR_UNSET;
  * PSX_DYNRES=0/1 and PSX_DYNRES_MIN win for one run, never persisted. */
 static int           g_video_dynres = 0;
 static int           g_video_dynres_min = 720;
+static int           g_video_dynres_start_min = 0;
 static int           g_video_dynres_env = -1;
 static int           g_video_dynres_min_env = PSX_IR_UNSET;
 /* The controller and its per-interval books (dynres_tick). */
@@ -1716,6 +1717,7 @@ static void quality_apply_video_globals(const PSXRecompV4::RuntimeConfig& r) {
     g_video_internal_res = r.video_internal_resolution;
     g_video_dynres       = r.video_dynamic_resolution ? 1 : 0;
     g_video_dynres_min   = r.video_dynamic_resolution_min;
+    g_video_dynres_start_min = r.video_dynamic_resolution_start_min ? 1 : 0;
     g_video_aa           = r.video_antialiasing;
     g_video_post_aa      = r.video_antialiasing_mode;
     g_video_ss_milli     = r.video_supersample_milli;
@@ -10261,11 +10263,13 @@ static void dynres_setup(void) {
     if (floor_s > ceiling) floor_s = ceiling;
     DynresParams params;
     dynres_default_params(&params);
-    dynres_init(&g_dynres.ctl, &params, floor_s, ceiling, ceiling);
+    const int start = g_video_dynres_start_min && dynres_requested() ? floor_s : ceiling;
+    dynres_init(&g_dynres.ctl, &params, floor_s, ceiling, start);
     DynrtParams rtp;
     dynrt_default_params(&rtp);
-    dynrt_init(&g_dynres.rt, &rtp, floor_s, ceiling, ceiling);
+    dynrt_init(&g_dynres.rt, &rtp, floor_s, ceiling, start);
     g_dynres.active = floor_s < ceiling;
+    if (start != ceiling) (void)gl_renderer_step_internal_scale_now(start);
     if (const char* e = std::getenv("PSX_DYNRES_FORCE")) {
         const int n = std::atoi(e);
         if (n > 0) {
@@ -18017,6 +18021,7 @@ int main(int argc, char** argv) {
             g_video_ss_disable_at_lines = gc.runtime.video_supersample_disable_at_lines;
             g_video_dynres       = gc.runtime.video_dynamic_resolution ? 1 : 0;
             g_video_dynres_min   = gc.runtime.video_dynamic_resolution_min;
+            g_video_dynres_start_min = gc.runtime.video_dynamic_resolution_start_min ? 1 : 0;
             if (gc.runtime.video_window_width > 0) {
                 g_video_win_w = gc.runtime.video_window_width;
             }

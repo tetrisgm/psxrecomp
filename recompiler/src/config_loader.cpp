@@ -746,6 +746,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("dynamic_resolution")) {
             rt.video_dynamic_resolution = toml::find<bool>(video, "dynamic_resolution");
         }
+        if (video.contains("dynamic_resolution_start_min")) {
+            rt.video_dynamic_resolution_start_min =
+                toml::find<bool>(video, "dynamic_resolution_start_min");
+        }
         if (video.contains("dynamic_resolution_min")) {
             const toml::value& ir = toml::find(video, "dynamic_resolution_min");
             int value = 0;

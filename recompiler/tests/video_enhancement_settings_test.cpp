@@ -433,6 +433,20 @@ static void test_present_thread() {
     fs::remove(q);
 }
 
+static void test_dynamic_resolution_start_min() {
+    fs::path p = write_game_toml("psxrecomp_dynres_start_default.toml", "");
+    auto gc = PSXRecompV4::load_game_config(p);
+    check(!gc.runtime.video_dynamic_resolution_start_min, "dynamic resolution starts at ceiling by default");
+    fs::remove(p);
+    fs::path q = write_game_toml("psxrecomp_dynres_start_min.toml",
+        "[video]\n"
+        "dynamic_resolution = true\n"
+        "dynamic_resolution_start_min = true\n");
+    auto gq = PSXRecompV4::load_game_config(q);
+    check(gq.runtime.video_dynamic_resolution_start_min, "minimum starting scale is opt-in");
+    fs::remove(q);
+}
+
 /* [video] frame_generation (docs/FRAME_GENERATION.md): opt-in, off by default. */
 static void test_frame_generation() {
     fs::path p = write_game_toml("psxrecomp_fg_default.toml", "");
@@ -617,6 +631,7 @@ int main() {
     test_render_thread();
     test_frame_generation();
     test_present_thread();
+    test_dynamic_resolution_start_min();
     test_pipeline_user_settings();
     test_pgxp_title_keys();
     test_timing_gate();
