@@ -140,6 +140,9 @@ static struct {
     uint16_t pend_op, pend_flags;
     uint32_t pend_payload;
     int      pending;
+    uint8_t *batch;
+    uint64_t batch_used, batch_records;
+    int batch_active, batch_failed;
     uint64_t unwoken_bytes, unwoken_records;
     uint32_t seq;
     int      held;
@@ -343,7 +346,17 @@ static int pred_released(uint64_t unused) { (void)unused; return atomic_load(&R.
 void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes) {
     if (!rt_running() || R.pending || op == OP_PAD) return NULL;
     uint64_t size = align_up(sizeof(RtCmd) + (uint64_t)payload_bytes);
-    if (size > R.cap / 2) { R.oversize++; return NULL; }
+    if (size > R.cap / 2) { R.oversize++; if (R.batch_active) R.batch_failed = 1; return NULL; }
+    if (R.batch_active) {
+        if (R.batch_failed || size > R.cap / 2 - R.batch_used) {
+            R.batch_failed = 1; return NULL;
+        }
+        RtCmd *c = (RtCmd *)(R.batch + R.batch_used);
+        c->size = (uint32_t)size; c->op = op; c->flags = flags;
+        c->payload = payload_bytes; c->seq = R.seq++;
+        R.pend_size = size; R.pending = 1;
+        return (uint8_t *)c + sizeof(*c);
+    }
     uint64_t w = R.wlocal;
     uint64_t off = w & R.mask;
     uint64_t pad = (off + size > R.cap) ? R.cap - off : 0;
@@ -375,6 +388,7 @@ void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes) {
 void rt_cmd_commit(void) {
     if (!R.pending) return;
     R.pending = 0;
+    if (R.batch_active) { R.batch_used += R.pend_size; R.batch_records++; return; }
     uint64_t end = R.pend_start + R.pend_size;
     R.unpub_bytes += end - R.wlocal;   /* includes a pad record before it */
     R.unpub_records++;
@@ -389,6 +403,38 @@ void rt_cmd_commit(void) {
     if (R.unpub_records >= R.publish_records || R.unpub_bytes >= PUBLISH_BYTES)
         publish();
     wake_render(0);
+}
+
+int rt_batch_active(void) { return R.batch_active; }
+int rt_batch_begin(void) {
+    if (!rt_running() || R.held || R.pending || R.batch_active) return 0;
+    if (!R.batch) R.batch = malloc((size_t)R.cap / 2);
+    if (!R.batch) return 0;
+    R.batch_used = R.batch_records = 0; R.batch_failed = 0; R.batch_active = 1;
+    return 1;
+}
+void rt_batch_discard(void) {
+    if (!R.batch_active) return;
+    R.pending = 0; R.batch_active = 0; R.batch_used = R.batch_records = 0;
+}
+int rt_batch_try_commit(void) {
+    if (!R.batch_active || R.pending) return 0;
+    uint64_t w = R.wlocal, off = w & R.mask, size = R.batch_used;
+    uint64_t pad = off + size > R.cap ? R.cap - off : 0;
+    if (R.batch_failed || !pred_space(w + pad + size)) { rt_batch_discard(); return 0; }
+    if (pad) {
+        RtCmd *c = (RtCmd *)(R.ring + off);
+        *c = (RtCmd){.size=(uint32_t)pad,.op=OP_PAD}; off = 0;
+    }
+    memcpy(R.ring + off, R.batch, (size_t)size);
+    R.wlocal += pad + size;
+    R.unpub_bytes += pad + size; R.unpub_records += R.batch_records;
+    R.records += R.batch_records; R.bytes += size;
+    R.unwoken_bytes += size; R.unwoken_records += R.batch_records;
+    uint64_t depth = R.wlocal - R.rcache;
+    if (depth > R.high_water) R.high_water = depth;
+    rt_batch_discard(); publish(); wake_render(1);
+    return 1;
 }
 
 static void commit_marker(uint16_t flags) {
@@ -517,7 +563,8 @@ int rt_start(const RtConfig *cfg) {
     if (!ok) {
         atomic_store(&R.running, 0);
         R.ctx(R.user, 1);
-        free(R.ring);
+        free(R.batch); R.batch = NULL;
+    free(R.ring);
         R.ring = NULL;
         return 0;
     }
@@ -542,6 +589,7 @@ void rt_stop(void) {
     atomic_store(&R.running, 0);
     R.held = 0;
     if (!was_held) R.ctx(R.user, 1);
+    free(R.batch); R.batch = NULL;
     free(R.ring);
     R.ring = NULL;
 }

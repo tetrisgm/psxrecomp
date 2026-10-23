@@ -220,6 +220,20 @@ uint64_t gpu_pass_state_hash(void) { return 42; }
 static int s_checkpoint_ok = 1;
 int gpu_pass_checkpoint_save(void) { return s_checkpoint_ok; }
 void gpu_pass_checkpoint_restore(void) {}
+
+static int async_test_keep, async_test_calls;
+uint32_t gl_renderer_pass_async_reserve(uint32_t p,uint64_t b,uint64_t e,
+    uint16_t x,uint16_t y,uint16_t w,uint16_t h,GLRenderAsyncToken *t,uint32_t m) {
+    (void)p;(void)b;(void)e;(void)x;(void)y;(void)w;(void)h;(void)t;(void)m; return 0;
+}
+int gl_renderer_pass_async_begin(const GLRenderAsyncToken *t) { return t!=NULL; }
+int gl_renderer_pass_async_end(const GLRenderAsyncToken *t,int keep) {
+    (void)t; async_test_keep=keep; return keep;
+}
+int gpu_replay_last_error(void) { return 0; }
+int gpu_replay_execute(const GpuReplayState *s,const GpuReplayProvider *p) {
+    (void)s;(void)p; async_test_calls++; return g_psx_render_pass_active;
+}
 static uint64_t s_ticks;
 uint64_t gl_renderer_perf_ticks(void) { return s_ticks += 1000; }
 uint64_t gl_renderer_perf_frequency(void) { return 1000000000u; }
@@ -1156,7 +1170,28 @@ static void test_queued_budget(void) {
     s_plan_one = 0;
 }
 
+static void test_async_wrapper(void) {
+    RenderPassAsyncToken token={0}; GpuReplayProvider provider={0}; char opaque;
+    render_pass_reset_session(); s_gl_status=PSX_MOD_RENDER_PASS_READY;
+    CHECK(render_pass_async_admit(&token,(const GpuReplayState *)&opaque,&provider),
+          "async wrapper invokes stream in render-pass scope");
+    CHECK(async_test_calls==1 && async_test_keep && !g_psx_render_pass_active,
+          "async wrapper closes scope before publishing");
+    s_checkpoint_ok=0;
+    CHECK(!render_pass_async_admit(&token,(const GpuReplayState *)&opaque,&provider) &&
+          async_test_calls==1 && !async_test_keep,"failed checkpoint discards batch");
+    s_checkpoint_ok=1; g_psx_render_pass_active=1;
+    CHECK(!render_pass_async_admit(&token,(const GpuReplayState *)&opaque,&provider),
+          "nested async admission refused");
+    g_psx_render_pass_active=0;
+    RenderPassStats stats; render_pass_get_stats(&stats);
+    CHECK(stats.async_attempts==3 && stats.async_admitted==1 &&
+          stats.async_checkpoint_refused==1 && stats.async_status_refused==1,
+          "async diagnostic counts distinguish scope and checkpoint refusal");
+}
+
 int main(void) {
+    test_async_wrapper();
     test_store_policy();
     test_pass();
     test_ram_8mb();

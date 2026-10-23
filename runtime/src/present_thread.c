@@ -18,6 +18,10 @@ static void mtx_lock(pt_mutex *m) { AcquireSRWLockExclusive(m); }
 static void mtx_unlock(pt_mutex *m) { ReleaseSRWLockExclusive(m); }
 static void cnd_init(pt_cond *c) { InitializeConditionVariable(c); }
 static void cnd_wait(pt_cond *c, pt_mutex *m) { SleepConditionVariableSRW(c, m, INFINITE, 0); }
+static void cnd_wait_ns(pt_cond *c, pt_mutex *m, uint64_t ns) {
+    DWORD ms = ns / 1000000u >= 1000u ? 1000u : (DWORD)((ns + 999999u) / 1000000u);
+    SleepConditionVariableSRW(c, m, ms, 0);
+}
 static void cnd_bcast(pt_cond *c) { WakeAllConditionVariable(c); }
 static uint64_t now_ns(void) {
     LARGE_INTEGER f, t;
@@ -39,6 +43,15 @@ static void mtx_lock(pt_mutex *m) { pthread_mutex_lock(m); }
 static void mtx_unlock(pt_mutex *m) { pthread_mutex_unlock(m); }
 static void cnd_init(pt_cond *c) { pthread_cond_init(c, NULL); }
 static void cnd_wait(pt_cond *c, pt_mutex *m) { pthread_cond_wait(c, m); }
+static void cnd_wait_ns(pt_cond *c, pt_mutex *m, uint64_t ns) {
+    struct timespec ts;
+    if (ns > 1000000000u) ns = 1000000000u;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ns += (uint64_t)ts.tv_nsec;
+    ts.tv_sec += (time_t)(ns / 1000000000u);
+    ts.tv_nsec = (long)(ns % 1000000000u);
+    pthread_cond_timedwait(c, m, &ts);
+}
 static void cnd_bcast(pt_cond *c) { pthread_cond_broadcast(c); }
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -59,6 +72,8 @@ static struct {
     int      state[PT_MAX_SLOTS];
     void    *ready[PT_MAX_SLOTS];
     void    *done[PT_MAX_SLOTS];
+    PtTiming timing[PT_MAX_SLOTS];
+    uint64_t epoch;
     int      queue[PT_MAX_SLOTS];
     int      q_head, q_len;
     int      current;
@@ -77,6 +92,14 @@ static void *present_loop(void) {
         while (!P.q_len && !P.stop) cnd_wait(&P.cv, &P.mtx);
         if (!P.q_len) break;                 /* stop with nothing queued */
         const int slot = P.queue[P.q_head];
+        const PtTiming *timing = &P.timing[slot];
+        const uint64_t now = now_ns();
+        int drop = timing->epoch && (P.stop || timing->epoch != P.epoch ||
+                                      now >= timing->expires_ns);
+        if (timing->epoch && !drop && now < timing->not_before_ns) {
+            cnd_wait_ns(&P.cv, &P.mtx, timing->not_before_ns - now);
+            continue;  /* recheck stop/epoch/expiry after every wake */
+        }
         P.q_head = (P.q_head + 1) % PT_MAX_SLOTS;
         P.q_len--;
         P.state[slot] = S_PRESENTING;
@@ -84,12 +107,15 @@ static void *present_loop(void) {
         P.ready[slot] = NULL;
         mtx_unlock(&P.mtx);
         const uint64_t t0 = now_ns();
-        void *done = P.cfg.present(P.cfg.user, slot, ready);
+        void *done = drop ? ready : P.cfg.present(P.cfg.user, slot, ready);
         const uint64_t dt = now_ns() - t0;
         mtx_lock(&P.mtx);
-        P.st.presents++;
-        P.st.present_ns += dt;
-        if (dt > P.st.present_max_ns) P.st.present_max_ns = dt;
+        if (drop) P.st.timed_dropped++;
+        else {
+            P.st.presents++;
+            P.st.present_ns += dt;
+            if (dt > P.st.present_max_ns) P.st.present_max_ns = dt;
+        }
         P.done[slot] = done;
         P.state[slot] = S_FREE;
         cnd_bcast(&P.cv);
@@ -118,6 +144,8 @@ int pt_start(const PtConfig *cfg) {
     P.cfg = *cfg;
     P.stop = P.init_done = P.init_ok = 0;
     P.q_head = P.q_len = 0;
+    P.epoch = 0;
+    memset(P.timing, 0, sizeof P.timing);
     for (int i = 0; i < PT_MAX_SLOTS; i++) {
         P.state[i] = S_FREE;
         P.ready[i] = P.done[i] = NULL;
@@ -183,6 +211,7 @@ int pt_submit(void *ready, void **next_done, uint64_t *wait_ns) {
     if (!P.running) return -1;
     mtx_lock(&P.mtx);
     const int cur = P.current;
+    memset(&P.timing[cur], 0, sizeof P.timing[cur]);
     P.ready[cur] = ready;
     P.state[cur] = S_QUEUED;
     P.queue[(P.q_head + P.q_len) % PT_MAX_SLOTS] = cur;
@@ -212,6 +241,52 @@ int pt_submit(void *ready, void **next_done, uint64_t *wait_ns) {
     if (next_done) *next_done = P.done[next];
     else if (P.done[next] && P.cfg.dispose) P.cfg.dispose(P.cfg.user, P.done[next]);
     P.done[next] = NULL;
+    mtx_unlock(&P.mtx);
+    return next;
+}
+
+uint64_t pt_clock_ns(void) { return now_ns(); }
+
+void pt_set_epoch(uint64_t epoch) {
+    if (!P.running) return;
+    mtx_lock(&P.mtx);
+    P.epoch = epoch;
+    cnd_bcast(&P.cv);
+    mtx_unlock(&P.mtx);
+}
+
+int pt_try_submit_at(void *ready, const PtTiming *timing, void **next_done) {
+    int next = -1;
+    if (next_done) *next_done = NULL;
+    if (!P.running) return -1;
+    mtx_lock(&P.mtx);
+    if (!P.stop && timing && timing->epoch && timing->epoch == P.epoch &&
+        timing->expires_ns > timing->not_before_ns &&
+        now_ns() < timing->expires_ns) {
+        for (int k = 1; k < P.cfg.slots; ++k) {
+            const int slot = (P.current + k) % P.cfg.slots;
+            if (P.state[slot] == S_FREE) { next = slot; break; }
+        }
+    }
+    if (next < 0) {
+        P.st.timed_refused++;
+        mtx_unlock(&P.mtx);
+        return -2;
+    }
+    const int cur = P.current;
+    P.timing[cur] = *timing;
+    P.ready[cur] = ready;
+    P.state[cur] = S_QUEUED;
+    P.queue[(P.q_head + P.q_len) % PT_MAX_SLOTS] = cur;
+    P.q_len++;
+    P.st.submits++;
+    if (P.q_len > P.st.queued_high) P.st.queued_high = P.q_len;
+    P.state[next] = S_COMPOSING;
+    P.current = next;
+    if (next_done) *next_done = P.done[next];
+    else if (P.done[next] && P.cfg.dispose) P.cfg.dispose(P.cfg.user, P.done[next]);
+    P.done[next] = NULL;
+    cnd_bcast(&P.cv);
     mtx_unlock(&P.mtx);
     return next;
 }

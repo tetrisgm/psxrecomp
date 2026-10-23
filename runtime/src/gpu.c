@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "gpu_replay.h"
 #include "gpu_gl_renderer.h"
 #include "mod_texture_banks.h"
 #include "display_scanout.h"
@@ -64,6 +65,29 @@ extern uint16_t psx_read_half(uint32_t addr);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint32_t psx_read_word(uint32_t addr);
 
+static const GpuReplayProvider *s_replay;
+static int s_replay_fault;
+static uint64_t s_replay_frame;
+static int s_replay_world_scene, s_replay_native_scene, s_replay_retained_scene;
+static GpuReplayVertex s_replay_next_vertex, s_replay_vertices[16];
+static uint32_t replay_read(uint32_t address, unsigned width) {
+    uint32_t value = 0;
+    if (!s_replay->read(s_replay->user, address, width, &value)) s_replay_fault = GPU_REPLAY_MEMORY;
+    return value;
+}
+static uint32_t gpu_input_read_word(uint32_t a) {
+    return s_replay ? replay_read(a, 4) : psx_read_word(a);
+}
+static uint16_t gpu_input_read_half(uint32_t a) {
+    return s_replay ? (uint16_t)replay_read(a, 2) : psx_read_half(a);
+}
+static uint8_t gpu_input_read_byte(uint32_t a) {
+    return s_replay ? (uint8_t)replay_read(a, 1) : psx_read_byte(a);
+}
+#define psx_read_word gpu_input_read_word
+#define psx_read_half gpu_input_read_half
+#define psx_read_byte gpu_input_read_byte
+
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
 
@@ -86,6 +110,46 @@ static int      gp0_words_needed;
 static uint32_t gp0_next_source_addr = 0xFFFFFFFFu;
 static uint32_t gp0_cmd_source_addr  = 0xFFFFFFFFu;
 static uint16_t gp0_ot_rank = 0xFFFFu;
+
+static const GpuReplayVertex *replay_vertex(uint32_t address, uint32_t word) {
+    for (unsigned i = 0; i < (unsigned)gp0_words_needed; ++i) {
+        uint32_t expected = gp0_cmd_source_addr == UINT32_MAX ? UINT32_MAX :
+                            gp0_cmd_source_addr + i * 4u;
+        if (GPU_RAM_KEY(expected) == GPU_RAM_KEY(address) && gp0_cmd_buf[i] == word)
+            return &s_replay_vertices[i];
+    }
+    s_replay_fault = GPU_REPLAY_PRECISION;
+    return NULL;
+}
+static int gpu_input_precise(uint32_t a, uint32_t w, int32_t x, int32_t y,
+                              int32_t *px, int32_t *py, uint16_t *z) {
+    if (!s_replay) return pgxp_get_precise_vertex(a, w, x, y, px, py, z);
+    const GpuReplayVertex *v = replay_vertex(a, w);
+    if (!v) return PGXP_SRC_NATIVE;
+    *px = v->x16; *py = v->y16; *z = v->sz;
+    return v->source;
+}
+static int gpu_input_probe(uint32_t a, uint32_t w, int32_t x, int32_t y) {
+    if (!s_replay) return pgxp_probe_precise_vertex(a, w, x, y);
+    const GpuReplayVertex *v = replay_vertex(a, w);
+    return v ? v->source : PGXP_SRC_NATIVE;
+}
+static float gpu_input_depth(uint32_t a, uint32_t w) {
+    if (!s_replay) return pgxp_get_unclamped_depth(a, w);
+    const GpuReplayVertex *v = replay_vertex(a, w);
+    return v ? v->unclamped_depth : 0.0f;
+}
+static int gpu_input_projection(uint32_t a, uint32_t w, PGXPProjection *out) {
+    if (!s_replay) return pgxp_load_projection(a, w, out);
+    const GpuReplayVertex *v = replay_vertex(a, w);
+    if (!v || !v->projection_valid) return 0;
+    *out = v->projection;
+    return 1;
+}
+#define pgxp_get_precise_vertex gpu_input_precise
+#define pgxp_probe_precise_vertex gpu_input_probe
+#define pgxp_get_unclamped_depth gpu_input_depth
+#define pgxp_load_projection gpu_input_projection
 #ifndef PSX_NO_DEBUG_TOOLS
 static GpuCommandTap s_command_tap;
 static void *s_command_tap_user;
@@ -95,7 +159,7 @@ void gpu_set_command_tap(GpuCommandTap tap, void *user) {
     s_command_tap_user = user;
 }
 static void gpu_tap_command(uint32_t word, uint32_t source) {
-    if (s_command_tap && !s_command_tap_active) {
+    if (s_command_tap && !s_command_tap_active && !s_replay) {
         s_command_tap_active = 1;
         s_command_tap(word, source, s_command_tap_user);
         s_command_tap_active = 0;
@@ -264,6 +328,8 @@ static WsRepeatRectTag ws_feedback_rect_tags[WS_REPEAT_RECT_TAG_TABLE_SIZE];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
 static uint32_t ws_last_3d_stamp  = (uint32_t)-1000; /* frame of newest shaded prim (diagnostic) */
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
+static uint64_t gpu_input_frame(void) { return s_replay ? s_replay_frame : s_frame_count; }
+#define s_frame_count gpu_input_frame()
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
 static int ws_configured(void) { return ws_xnum != ws_xden; }
@@ -443,7 +509,7 @@ void psx_mod_set_world_scene_predicate(PSXModWorldScenePredicate predicate) {
     s_ws_world_scene_predicate = predicate;
 }
 static int ws_mod_world_scene(void) {
-    return ws_mode == 2 && s_ws_world_scene_predicate && s_ws_world_scene_predicate();
+    return ws_mode == 2 && s_ws_world_scene_predicate && (s_replay ? s_replay_world_scene : s_ws_world_scene_predicate());
 }
 static int ws_game_mode(void) {
     if (ws_mod_world_scene()) return 1;
@@ -534,7 +600,7 @@ void gpu_ws_set_native_scene_predicate(int (*predicate)(void)) {
 
 int gpu_ws_present_native_43(void) {
     if (!ws_engaged()) return 0;
-    if (s_ws_native_scene_predicate && s_ws_native_scene_predicate())
+    if (s_ws_native_scene_predicate && (s_replay ? s_replay_native_scene : s_ws_native_scene_predicate()))
         return 1;
     int game_mode = ws_game_mode();
     if (!game_mode) ws_scene_latch.confirmed = 0;
@@ -549,7 +615,7 @@ int gpu_ws_present_native_43(void) {
     }
     if (hold_enabled)
         return ws_scene_hold_classify(&s_ws_scene_hold,
-            s_ws_retained_scene_predicate(), native_43, s_ws_fmv_cached,
+            (s_replay ? s_replay_retained_scene : s_ws_retained_scene_predicate()), native_43, s_ws_fmv_cached,
             ws_display_origin());
     return s_ws_fmv_cached;
 }
@@ -4619,6 +4685,17 @@ static int s_native_wide_projection_correction = 0;
 static uint64_t s_native_wide_projection_vertices = 0;
 extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
                                    int32_t *x16, int32_t *y16, uint16_t *z);
+static int gpu_input_raw(uint32_t a, uint32_t w, int32_t *x, int32_t *y, uint16_t *z) {
+    if (!s_replay) return gte_precision_load_word(a, w, x, y, z);
+    const GpuReplayVertex *v = replay_vertex(a, w);
+    if (!v || !v->raw_valid) return 0;
+    if (x) *x = v->raw_x16;
+    if (y) *y = v->raw_y16;
+    if (z) *z = v->raw_sz;
+    return 1;
+}
+#define gte_precision_load_word gpu_input_raw
+
 
 /* Arm the PGXP dataflow transport for any consumer. Exact NCLIP is an internal
  * sign source only; this does not enable geometry or texture correction. */
@@ -6995,6 +7072,7 @@ extern uint8_t *memory_get_ram_ptr(void); /* raw 2MB main-RAM base (no lockstep)
 uint32_t g_gp0_last_copy_sp = 0;   /* diag: raw guest $sp at last op-0x80 copy */
 static void gp0_capture_builder_chain(uint32_t out[6]) {
     for (int i = 0; i < 6; i++) out[i] = 0;
+    if (s_replay) return; /* Never unwind the live CPU during replay. */
     uint8_t *ram = memory_get_ram_ptr();
     if (!ram) return;
     const uint32_t RMASK = g_psx_ram_mask;          /* live RAM, mirror-folded */
@@ -7678,6 +7756,7 @@ static void gpu_write_gp0_body(uint32_t val) {
 
     /* State: collecting words for a multi-word command */
     if (gp0_state == GP0_COLLECTING) {
+        if (s_replay) s_replay_vertices[gp0_words_collected] = s_replay_next_vertex;
         gp0_cmd_buf[gp0_words_collected++] = val;
         if (gp0_words_collected >= gp0_words_needed) {
             gp0_state = GP0_IDLE;
@@ -7719,6 +7798,7 @@ static void gpu_write_gp0_body(uint32_t val) {
         return;
     }
 
+    if (s_replay) s_replay_vertices[0] = s_replay_next_vertex;
     gp0_cmd_buf[0] = val;
     gp0_cmd_source_addr = gp0_next_source_addr;
 
@@ -8128,6 +8208,7 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
  * The renderer's mirrored draw state (area, offset, texture window,
  * mask bits, native-wide target) is re-synced exactly as GP0(E2..E6) would. */
 typedef struct {
+    uint16_t gp0_ot_rank;
     WsTag ws_tags[WS_TAG_BUCKETS];
     WsHudAnchorTag ws_hud_anchor_tags[WS_HUD_ANCHOR_TABLE_SIZE];
     WsHudAnchorTag ws_background_tags[WS_HUD_ANCHOR_TABLE_SIZE];
@@ -8163,15 +8244,16 @@ static GpuPassPresentationState s_pass_presentation;
 /* One transfer list keeps save and restore symmetric. The prepass arrays are
  * read only through their counts, so copy just their populated prefixes.
  * Counters/rings remain cumulative; configuration and callbacks are unchanged. */
-static void gpu_pass_provenance_transfer(int restore) {
+static void gpu_pass_provenance_transfer(GpuPassPresentationState *state, int restore) {
 #define PASS_ARRAY(name) do { \
-    if (restore) memcpy(name, s_pass_presentation.name, sizeof(name)); \
-    else memcpy(s_pass_presentation.name, name, sizeof(name)); \
+    if (restore) memcpy(name, state->name, sizeof(name)); \
+    else memcpy(state->name, name, sizeof(name)); \
 } while (0)
 #define PASS_VALUE(name) do { \
-    if (restore) name = s_pass_presentation.name; \
-    else s_pass_presentation.name = name; \
+    if (restore) name = state->name; \
+    else state->name = name; \
 } while (0)
+    PASS_VALUE(gp0_ot_rank);
     PASS_ARRAY(ws_tags);
     PASS_ARRAY(ws_hud_anchor_tags);
     PASS_ARRAY(ws_background_tags);
@@ -8192,24 +8274,24 @@ static void gpu_pass_provenance_transfer(int restore) {
     PASS_VALUE(s_bg_phase_frame);
     PASS_VALUE(s_bg_phase_over);
     if (restore) {
-        memcpy(ws_ui_prepass, s_pass_presentation.ws_ui_prepass,
+        memcpy(ws_ui_prepass, state->ws_ui_prepass,
                ws_ui_prepass_count * sizeof(ws_ui_prepass[0]));
-        memcpy(ws_ui_prepass_nodes, s_pass_presentation.ws_ui_prepass_nodes,
+        memcpy(ws_ui_prepass_nodes, state->ws_ui_prepass_nodes,
                ws_ui_prepass_node_count * sizeof(ws_ui_prepass_nodes[0]));
     } else {
-        memcpy(s_pass_presentation.ws_ui_prepass, ws_ui_prepass,
+        memcpy(state->ws_ui_prepass, ws_ui_prepass,
                ws_ui_prepass_count * sizeof(ws_ui_prepass[0]));
-        memcpy(s_pass_presentation.ws_ui_prepass_nodes, ws_ui_prepass_nodes,
+        memcpy(state->ws_ui_prepass_nodes, ws_ui_prepass_nodes,
                ws_ui_prepass_node_count * sizeof(ws_ui_prepass_nodes[0]));
     }
 #undef PASS_ARRAY
 #undef PASS_VALUE
 }
 
-static void gpu_pass_scene_transfer(int restore) {
+static void gpu_pass_scene_transfer(GpuPassPresentationState *state, int restore) {
 #define PASS_VALUE(name) do { \
-    if (restore) name = s_pass_presentation.name; \
-    else s_pass_presentation.name = name; \
+    if (restore) name = state->name; \
+    else state->name = name; \
 } while (0)
     PASS_VALUE(ws_gte_frame);
     PASS_VALUE(ws_gte_count);
@@ -8249,8 +8331,8 @@ int gpu_pass_checkpoint_save(void) {
     s_pass_doff_max = g_doff_max_this;
     s_pass_doff_cnt = g_doff_cnt_this;
     s_pass_split_this = split_trace_this;
-    gpu_pass_provenance_transfer(0);
-    gpu_pass_scene_transfer(0);
+    gpu_pass_provenance_transfer(&s_pass_presentation, 0);
+    gpu_pass_scene_transfer(&s_pass_presentation, 0);
     return 1;
 }
 
@@ -8264,8 +8346,8 @@ void gpu_pass_checkpoint_restore(void) {
     g_doff_max_this = s_pass_doff_max;
     g_doff_cnt_this = s_pass_doff_cnt;
     split_trace_this = s_pass_split_this;
-    gpu_pass_provenance_transfer(1);
-    gpu_pass_scene_transfer(1);
+    gpu_pass_provenance_transfer(&s_pass_presentation, 1);
+    gpu_pass_scene_transfer(&s_pass_presentation, 1);
     gr_set_texture_window(texture_window_value);
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
@@ -8275,7 +8357,7 @@ void gpu_pass_checkpoint_restore(void) {
     ws_nw_sync_target();
     /* Target sync may classify the scene before render_pass.c restores RAM.
      * Do not retain history learned from the synthetic draw or that query. */
-    gpu_pass_scene_transfer(1);
+    gpu_pass_scene_transfer(&s_pass_presentation, 1);
     s_pass_regs_len = 0;
 }
 
@@ -8295,3 +8377,105 @@ uint64_t gpu_pass_state_hash(void) {
 
 uint16_t* gpu_get_vram_ptr(void){ return vram; }
 uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }
+
+int gpu_replay_list_begin(uint32_t root) {
+    if(!s_replay) return 0;
+    gpu_ws_begin_linked_list(); gpu_ws_prepass_linked_list(root);
+    return !s_replay_fault;
+}
+int gpu_replay_list_node(uint32_t address,uint32_t header) {
+    if(!s_replay) return 0;
+    gpu_ws_validate_linked_list_header(address,header);
+    gpu_ws_validate_linked_list_node(address,header>>24);
+    gpu_set_gp0_linked_list_node(address,header>>24);
+    return !s_replay_fault;
+}
+int gpu_replay_list_end(void) {
+    if(!s_replay) return 0;
+    gpu_ws_end_linked_list(); return !s_replay_fault;
+}
+
+/* Immutable GPU inputs for completed draw-context streams. */
+struct GpuReplayState {
+    GpuPassPresentationState presentation;
+    uint8_t regs[512];
+    uint32_t regs_len;
+    uint64_t frame;
+    int world_scene, native_scene, retained_scene;
+};
+GpuReplayState *gpu_replay_capture(void) {
+    if (s_replay || gp0_state != GP0_IDLE || gl_renderer_frame_generation()) return NULL;
+    GpuReplayState *state = calloc(1, sizeof(*state));
+    if (!state) return NULL;
+    state->regs_len = gpu_snapshot_bytes();
+    if (state->regs_len > sizeof state->regs) { free(state); return NULL; }
+    PstW w; pst_w_init(&w, state->regs, state->regs_len);
+    if (!gpu_snap_emit(&w)) { free(state); return NULL; }
+    state->frame = s_frame_count;
+    state->world_scene = s_ws_world_scene_predicate && s_ws_world_scene_predicate();
+    state->native_scene = s_ws_native_scene_predicate && s_ws_native_scene_predicate();
+    state->retained_scene = s_ws_retained_scene_predicate && s_ws_retained_scene_predicate();
+    gpu_pass_provenance_transfer(&state->presentation, 0);
+    gpu_pass_scene_transfer(&state->presentation, 0);
+    /* Avoid consulting the live decoder during deferred scene classification. */
+    GpuDisplayInfo di; gpu_get_display_info(&di);
+    state->presentation.s_ws_fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
+    state->presentation.s_ws_fmv_frame_cache = (uint32_t)state->frame;
+    return state;
+}
+void gpu_replay_release(GpuReplayState *state) { free(state); }
+int gpu_replay_last_error(void) { return s_replay_fault; }
+int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *provider) {
+    s_replay_fault = GPU_REPLAY_ARGUMENT;
+    if (!state || !provider || !provider->word || !provider->read ||
+        !provider->prepare_metadata || s_replay || !s_pass_regs_len ||
+        gl_renderer_frame_generation()) return 0;
+    s_replay = provider; s_replay_fault = 0; s_replay_frame = state->frame;
+    s_replay_world_scene = state->world_scene;
+    s_replay_native_scene = state->native_scene;
+    s_replay_retained_scene = state->retained_scene;
+    PstR r; pst_r_init(&r, state->regs, state->regs_len);
+    if (!gpu_snap_parse(&r)) s_replay_fault = GPU_REPLAY_SNAPSHOT;
+    gpu_pass_provenance_transfer((GpuPassPresentationState *)&state->presentation, 1);
+    gpu_pass_scene_transfer((GpuPassPresentationState *)&state->presentation, 1);
+    gr_set_texture_window(texture_window_value);
+    gr_set_draw_area(draw_area_left, draw_area_top, draw_area_right, draw_area_bottom);
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
+    gr_set_mask_bits(set_mask_bit, check_mask_bit);
+    gr_set_dither(dither_enabled);
+    if (!provider->prepare_metadata(provider->user)) s_replay_fault = GPU_REPLAY_METADATA;
+    ws_nw_sync_target();
+    for (size_t i = 0; i < provider->count && !s_replay_fault; ++i) {
+        GpuReplayWord input;
+        if (!provider->word(provider->user, i, &input)) { s_replay_fault = GPU_REPLAY_WORD; break; }
+        if (input.source == UINT32_MAX - 1u) {
+            /* Draw streams may set DMA direction, not reset/display/read state. */
+            if ((input.word >> 24) != 4u) { s_replay_fault = GPU_REPLAY_UNSUPPORTED; break; }
+            gpu_write_gp1(input.word);
+        } else {
+            unsigned op = input.word >> 24;
+            if (gp0_state == GP0_IDLE &&
+                (!gp0_command_word_count(op) || op == 0x1F || (op >= 0xA0 && op <= 0xDF))) {
+                s_replay_fault = GPU_REPLAY_UNSUPPORTED; break;
+            }
+            s_replay_next_vertex = input.vertex;
+            gpu_set_gp0_source(input.source);
+            gpu_write_gp0(input.word);
+        }
+    }
+    if (!s_replay_fault && provider->finish && !provider->finish(provider->user)) s_replay_fault=GPU_REPLAY_METADATA;
+    gpu_ws_end_linked_list();
+    if (!s_replay_fault && gp0_state != GP0_IDLE) s_replay_fault=GPU_REPLAY_INCOMPLETE;
+    int ok = !s_replay_fault;
+    s_replay = NULL;
+    return ok;
+}
+#undef psx_read_word
+#undef psx_read_half
+#undef psx_read_byte
+#undef pgxp_get_precise_vertex
+#undef pgxp_probe_precise_vertex
+#undef pgxp_get_unclamped_depth
+#undef pgxp_load_projection
+#undef gte_precision_load_word
+#undef s_frame_count

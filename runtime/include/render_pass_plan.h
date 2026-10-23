@@ -28,6 +28,46 @@ extern "C" {
 
 #define RENDER_PASS_MAX_PHASES 16u
 
+/* Independent output clock for asynchronous draws. All times use one host
+ * monotonic clock. A window maps two simulation snapshots to display time;
+ * choosing interpolation latency is the caller's job, not a simulation-rate
+ * change. Reset with a NEW nonzero epoch on session/rate/clock changes. */
+typedef struct RenderPassOutputTimeline {
+    uint64_t epoch, origin, period_numerator, next_index;
+    uint32_t rate_numerator;
+} RenderPassOutputTimeline;
+
+typedef struct RenderPassOutput {
+    uint64_t epoch, generation, index, deadline, expires;
+    uint32_t alpha_q16;
+} RenderPassOutput;
+
+/* Rational Hz = rate_numerator / rate_denominator. Returns 0 on invalid or
+ * unrepresentable inputs, leaving the old timeline unchanged. */
+int render_pass_output_init(RenderPassOutputTimeline *timeline,
+                            uint64_t frequency, uint32_t rate_numerator,
+                            uint32_t rate_denominator, uint64_t origin,
+                            uint64_t epoch);
+
+/* Plan deadlines in [window_begin, window_end), excluding deadlines < now.
+ * Unlike the synchronous pass planner, phase 0 is included and no near-zero
+ * phase is discarded. A bounded pool may request at most capacity outputs;
+ * subsequent calls resume at the next deadline. No sleeps or guest time.
+ * Returns count, or -1 on invalid/unrepresentable input (timeline unchanged).
+ * Generation identifies the immutable snapshot pair backing these outputs.
+ * expires is the next clock deadline: completed work must arrive by deadline,
+ * while a presenter admitted before then may show it until expires. */
+int render_pass_output_plan(RenderPassOutputTimeline *timeline,
+                            uint64_t window_begin, uint64_t window_end,
+                            uint64_t now, uint64_t generation,
+                            RenderPassOutput *outputs, uint32_t capacity);
+
+/* Check a completed job before replay; generation must still be retained by
+ * the caller. Recheck on the consumer thread as well as at queue admission. */
+int render_pass_output_current(const RenderPassOutputTimeline *timeline,
+                               const RenderPassOutput *output,
+                               uint64_t generation, uint64_t now);
+
 typedef struct RenderPassPlanInput {
     double next_deadline;   /* the presenter's next output deadline (ticks) */
     double target_period;   /* ticks per output frame; <= 0 = unknown */

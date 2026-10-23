@@ -85,6 +85,14 @@ int  rt_on_render_thread(void);
  * rt_* call. op 0 is reserved. */
 void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes);
 void  rt_cmd_commit(void);
+/* Optional producer transaction. Records stay private until try_commit;
+ * overflow or insufficient ring space drops the entire batch without waiting.
+ * No frame markers/context acquisition inside a batch. A NULL cmd_begin while
+ * batching is a dropped record, never permission to execute it directly. */
+int rt_batch_begin(void);
+int rt_batch_active(void);
+int rt_batch_try_commit(void);
+void rt_batch_discard(void);
 
 /* Close a guest frame: enqueue a frame marker, then block while more than
  * max_frames closed frames are unconsumed. */

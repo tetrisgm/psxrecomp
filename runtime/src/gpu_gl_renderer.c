@@ -368,6 +368,19 @@ static PFN_glWaitSync   p_glWaitSync;
 static PFN_glDeleteSync p_glDeleteSync;
 static PFN_glBindFramebuffer p_glBindFramebuffer_raw;
 static int    s_pt_on = 0;               /* redirect active (present thread running) */
+static int    s_pt_want = 0;
+static _Atomic uint64_t s_pt_epoch = 1;
+static PtTiming s_pt_next_timing;        /* GL owning thread, one swap only */
+
+uint64_t gl_renderer_present_epoch(void) { return atomic_load(&s_pt_epoch); }
+int gl_renderer_set_present_timing(const PtTiming *timing) {
+    memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
+    if (!s_pt_on || !timing || timing->epoch != atomic_load(&s_pt_epoch) ||
+        timing->expires_ns <= timing->not_before_ns ||
+        pt_clock_ns() >= timing->expires_ns) return 0;
+    s_pt_next_timing = *timing;
+    return 1;
+}
 static volatile int s_pt_interval_gen = 0; /* bumped per swap-interval change */
 static GLuint pt_target_fbo(void);
 static void APIENTRY gl_bind_fb_redirect(GLenum target, GLuint fb) {
@@ -513,7 +526,7 @@ enum {
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
-    RTH_PASS_BEGIN, RTH_PASS_END
+    RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_GROUP
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -538,6 +551,7 @@ static void rth_rebind_vram(uint16_t *vram) {
     sw_renderer_rebind_vram(vram);
     gpu_hd_textures_bind_vram(vram);
 }
+static int rth_group_flush(void);
 static int  rth_rec_ints(uint16_t op, uint16_t flags, int n, const int32_t *v);
 static uint16_t rth_prim_flags(void);
 static int  rth_record_present(uint16_t op, int n, const int32_t *v);
@@ -726,6 +740,7 @@ static int pass_gen_present(uint64_t deadline);
 static int pass_queued_enabled(void);
 static int pass_vblank_locked_rate(void);
 static int pass_queued_presenter(void);
+static int async_display_active(void);
 static int pass_locked_present(void);
 static int stereo_present(int w, int h);
 static int xr_mirror_mode(void);
@@ -5633,6 +5648,7 @@ int gl_renderer_projective_supported(void) {
 void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
     uint16_t texpage, uint16_t cx, uint16_t cy, int raw, int semi, int perspective) {
     if (rth_record_mode()) {
+        rth_group_flush();
         uint8_t *p = (uint8_t *)rt_cmd_begin(RTH_PROJ_TRI, rth_prim_flags(),
                                              3u * sizeof(PSXProjectedVertex) + 24u);
         if (p) {
@@ -5642,6 +5658,7 @@ void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
             rt_cmd_commit();
             return;
         }
+        if (rt_batch_active()) return;
         gl_rth_acquire("projected_oversize");
     }
     PSXProjectedVertex polygon[12];
@@ -7938,6 +7955,10 @@ void gl_renderer_set_ws_ablate(int mode) {
 int  gl_renderer_get_ws_ablate(void)     { return s_ws_ablate; }
 
 static void interp_reset_history_unlocked(void) {
+    uint64_t epoch = atomic_fetch_add(&s_pt_epoch, 1) + 1;
+    if (!epoch) { epoch = 1; atomic_store(&s_pt_epoch, epoch); }
+    memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
+    pt_set_epoch(epoch);
     s_interp_valid = 0;
     s_interp_w = s_interp_h = 0;
     s_interp_src_w = s_interp_src_h = 0;
@@ -8233,6 +8254,7 @@ static void interp_present_source_interval(void) {
             s_interp_phase_lo, s_interp_phase_hi))
         return;
     pass_apply_promotion();
+    if (async_display_active()) return; /* token outputs own this host window */
     if (pass_queued_presenter() && s_rth_on && rt_on_render_thread()) {
         /* Queued passes: exactly one output for this guest VBlank, now. The
          * guest's own pacer sets the cadence; the image is the one for this
@@ -8251,14 +8273,33 @@ static void interp_present_source_interval(void) {
     while (frame_interpolation_schedule_next(
                &s_interp_schedule, SDL_GetPerformanceCounter(),
                &deadline, &alpha)) {
-        interp_wait_until(deadline, frequency);
+        if (s_pt_on) {
+            /* Convert the SDL clock to the present core's monotonic clock.
+             * Its origin is platform-specific; only a sampled delta crosses
+             * the boundary. The presenter owns all output-deadline waits. */
+            const uint64_t source_now = SDL_GetPerformanceCounter();
+            const uint64_t host_now = pt_clock_ns();
+            const double delta_ns = ((double)deadline - (double)source_now) *
+                                    1e9 / (double)frequency;
+            const double not_before = (double)host_now + delta_ns;
+            const double expires = not_before +
+                s_interp_schedule.target_period * 1e9 / (double)frequency;
+            PtTiming timing = { atomic_load(&s_pt_epoch),
+                not_before > 0.0 ? (uint64_t)not_before : 0,
+                expires > 0.0 ? (uint64_t)expires : 0 };
+            if (!gl_renderer_set_present_timing(&timing)) continue;
+        } else {
+            interp_wait_until(deadline, frequency);
+        }
         latency_ring_mark(LAT_SWAP_BEGIN);
         if (!pass_gen_present(deadline))
             (void)interp_present(alpha);
         latency_ring_mark(LAT_SWAP_END);
+        memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
     }
-    interp_wait_until(frame_interpolation_schedule_end(&s_interp_schedule),
-                      frequency);
+    if (!s_pt_on)
+        interp_wait_until(frame_interpolation_schedule_end(&s_interp_schedule),
+                          frequency);
 
     now = SDL_GetPerformanceCounter();
     if (!diag_start) {
@@ -8304,7 +8345,7 @@ static void interp_present_source_interval(void) {
 typedef struct PassGen {
     int      valid;
     int      promoted;
-    uint64_t order,created_cycle;
+    uint64_t order,created_cycle,async_id,async_epoch;
     int      x, y, w, h;          /* captured VRAM rect (what is presented) */
     int      rx, ry, rw, rh;      /* the plugin's pass rect (backed up)     */
     int      tex_w, tex_h;        /* slot size (hr pixels; wide band if wide) */
@@ -8318,6 +8359,29 @@ typedef struct PassGen {
 static int      s_pass_flip_shown = 0;
 static PassGen  s_pgen[PASS_GENERATIONS];
 static uint64_t s_pgen_order;
+static RenderPassOutputTimeline s_async_timeline;
+static uint64_t s_async_id, s_async_last_index;
+static int s_async_rate, s_async_exec, s_async_previous_write, s_async_has_index;
+static GLRenderAsyncToken s_async_recording, s_async_executing;
+static uint64_t s_async_display_until, s_async_display_epoch;
+/* Generation-local native texture bytes and initial destination surfaces. */
+typedef struct AsyncVram {
+    GLuint raw_tex,raw_fbo,hr_tex,hr_rb,hr_fbo,wide_tex,wide_rb,wide_fbo;
+    int raw_w,raw_h,hr_w,hr_h,wide_w,wide_h,scale;
+    uint16_t *cpu;
+    uint64_t resource_epoch;
+} AsyncVram;
+static AsyncVram s_async_vram[PASS_GENERATIONS],s_async_work;
+static _Atomic uint64_t s_async_resource_epoch=1;
+static GLuint s_async_live_raw_tex,s_async_live_raw_fbo;
+static uint16_t *s_async_live_cpu;
+static int s_async_vram_bound,s_async_invalid;
+static void async_vram_release(int gi);
+static int async_vram_capture(int gi);
+static int async_vram_enter(int gi);
+static void async_vram_leave(void);
+
+static int async_display_active(void);
 /* Double-buffer complete pairs: the unpublished set may be overwritten while
  * the last complete pair remains visible. No temporal phases or generation. */
 typedef struct StereoPair {
@@ -8426,7 +8490,7 @@ static int pass_vblank_locked_rate(void) {
 /* Emulation thread: record this pass instead of taking the context. */
 static int pass_queued(void) {
     return pass_queued_enabled() && s_rth_on && !rt_on_render_thread() &&
-           !rt_held() && pass_vblank_locked_rate();
+           !rt_held() && (pass_vblank_locked_rate() || s_pt_on);
 }
 int gl_renderer_pass_queued(void) { return pass_queued(); }
 /* The presenter queued passes need: flip source, hold blend, one output per
@@ -8734,6 +8798,7 @@ static int pass_make_color_fbo(GLuint *tex, GLuint *rb, GLuint *fbo,
 }
 
 static void pass_gen_release(int gi) {
+    async_vram_release(gi);
     if (s_ctx && s_pgen_alloc_n[gi])
         glDeleteTextures((GLsizei)s_pgen_alloc_n[gi], s_pgen_tex[gi]);
     memset(s_pgen_tex[gi], 0, sizeof s_pgen_tex[gi]);
@@ -8805,6 +8870,66 @@ static void pass_capture_into(GLuint tex, const PassGen *g) {
     }
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
 }
+
+#ifndef PSX_NO_DEBUG_TOOLS
+size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
+    uint32_t *width,uint32_t *height,int *wide) {
+    GL_RT_SYNC("pass_debug_capture");
+    if(!s_pass_active || s_pass_local || !s_ctx) {
+        fprintf(stderr,"pass_debug_capture: inactive active=%d dead=%d local=%d context=%d begin=%s\n",
+            s_pass_active,s_pass_dead,s_pass_local,s_ctx!=NULL,
+            s_pass_begin_diag.reason?s_pass_begin_diag.reason:""); return 0;
+    }
+    const PassGen *g=&s_pgen[s_pgen_write];
+    int is_wide=g->source_path==GL_PRES_WIDE, S=s_hr_scale;
+    GLuint source=is_wide ? pass_wide_fbo_for(g->x) : s_hr_fbo;
+    if(!g->valid || !source || g->tex_w<=0 || g->tex_h<=0) {
+        fprintf(stderr,"pass_debug_capture: source valid=%d source=%u size=%dx%d scale=%d\n",
+            g->valid,(unsigned)source,g->tex_w,g->tex_h,S); return 0;
+    }
+    size_t bytes=(size_t)g->tex_w*g->tex_h*4u;
+    if(width) *width=(uint32_t)g->tex_w;
+    if(height) *height=(uint32_t)g->tex_h;
+    if(wide) *wide=is_wide;
+    if(!rgba) return bytes;
+    if(capacity<bytes) return 0;
+    flush_flat_batch(); flush_tex_batch(); flush_cpu_upload(); hiw_flush_queue();
+    GLint read_fbo,draw_fbo,texture,pack,unpack,alignment,row,skip_rows,skip_pixels;
+    glGetIntegerv(0x8CAA,&read_fbo);
+    glGetIntegerv(0x8CA6,&draw_fbo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);
+    glGetIntegerv(0x88ED,&pack); glGetIntegerv(0x88EF,&unpack);
+    glGetIntegerv(GL_PACK_ALIGNMENT,&alignment); glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+    glGetIntegerv(GL_PACK_SKIP_ROWS,&skip_rows); glGetIntegerv(GL_PACK_SKIP_PIXELS,&skip_pixels);
+    GLuint temp=0; glGenTextures(1,&temp);
+    p_glBindBuffer(0x88EB,0); p_glBindBuffer(0x88EC,0);
+    glBindTexture(GL_TEXTURE_2D,temp);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,g->tex_w,g->tex_h,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,source);
+    glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,is_wide?0:g->x*S,g->y*S,g->tex_w,g->tex_h);
+    if(is_wide && wide_center_is_canonical()) {
+        int native_w=g_wide_w-2*g_wide_off;
+        if(native_w>0) {
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_hr_fbo);
+            glCopyTexSubImage2D(GL_TEXTURE_2D,0,g_wide_off*S,0,g->x*S,g->y*S,native_w*S,g->tex_h);
+        }
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
+    glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,rgba);
+    GLenum error=glGetError();
+    int ok=temp && error==GL_NO_ERROR;
+    if(!ok) fprintf(stderr,"pass_debug_capture: GL error=0x%X texture=%u size=%dx%d scale=%d wide=%d rect=%d,%d,%d,%d\n",
+        (unsigned)error,(unsigned)temp,g->tex_w,g->tex_h,S,is_wide,g->x,g->y,g->w,g->h);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)texture); glDeleteTextures(1,&temp);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,(GLuint)read_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,(GLuint)draw_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT,alignment); glPixelStorei(GL_PACK_ROW_LENGTH,row);
+    glPixelStorei(GL_PACK_SKIP_ROWS,skip_rows); glPixelStorei(GL_PACK_SKIP_PIXELS,skip_pixels);
+    p_glBindBuffer(0x88EB,(GLuint)pack); p_glBindBuffer(0x88EC,(GLuint)unpack);
+    return ok?bytes:0;
+}
+#endif
 
 static void pass_blit(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
                       int w, int h, GLbitfield mask) {
@@ -9012,7 +9137,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         g->phase[0] = 0;
         g->n = 1;
         g->valid = 1;
-    } else if (!g->valid || g->promoted || g->rx != x || g->ry != y ||
+    } else if (!g->valid || (g->promoted && !s_async_exec) || g->rx != x || g->ry != y ||
                g->rw != w || g->rh != h) {
         return pass_begin_refuse("generation_state");
     }
@@ -9182,6 +9307,97 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
     s_pass_dead = 0;
     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
 }
+#define ASYNC_COUNTERS(X) X(unavailable) X(stale) X(late) X(duplicate) X(ring_full) \
+    X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue)
+#define ASYNC_DECLARE(n) static _Atomic uint64_t s_async_count_##n;
+ASYNC_COUNTERS(ASYNC_DECLARE)
+#undef ASYNC_DECLARE
+#define ASYNC_COUNT(n) atomic_fetch_add(&s_async_count_##n,1)
+void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
+    if (!out) return;
+#define ASYNC_LOAD(n) out->n=atomic_load(&s_async_count_##n);
+    ASYNC_COUNTERS(ASYNC_LOAD)
+#undef ASYNC_LOAD
+}
+void gl_renderer_pass_async_invalidate(void) {
+    uint64_t epoch=atomic_fetch_add(&s_pt_epoch,1)+1;
+    if(!epoch) { epoch=1; atomic_store(&s_pt_epoch,epoch); }
+    pt_set_epoch(epoch);
+}
+static int async_record(uint16_t op,const GLRenderAsyncToken *token) {
+    void *p=rt_cmd_begin(op,0,sizeof(*token));
+    if (!p) return 0;
+    memcpy(p,token,sizeof(*token)); rt_cmd_commit(); return 1;
+}
+uint32_t gl_renderer_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t end,
+    uint16_t x,uint16_t y,uint16_t w,uint16_t h,GLRenderAsyncToken *tokens,uint32_t max) {
+    if (!tokens || !max || !period || !w || !h || x+w>VRAM_W || y+h>VRAM_H ||
+        !pass_queued() || !s_pt_on || rt_batch_active()) return 0;
+    uint64_t epoch=gl_renderer_present_epoch();
+    int rate=(int)llround(s_interp_target_hz*1000.0);
+    if (rate<=0) return 0;
+    if (s_async_timeline.epoch!=epoch || s_async_rate!=rate) {
+        if (!render_pass_output_init(&s_async_timeline,1000000000u,(uint32_t)rate,1000,begin,epoch)) return 0;
+        s_async_rate=rate;
+    }
+    RenderPassOutputTimeline next=s_async_timeline;
+    RenderPassOutput outputs[RENDER_PASS_MAX_PHASES];
+    if (max>RENDER_PASS_MAX_PHASES) max=RENDER_PASS_MAX_PHASES;
+    int n=render_pass_output_plan(&next,begin,end,pt_clock_ns(),s_async_id+1,outputs,max);
+    if (n<=0 || !rth_group_flush() || !rt_batch_begin()) return 0;
+    GLRenderAsyncToken base={outputs[0],x,y,w,h,period};
+    base.output.deadline=begin;
+    base.output.expires=end; /* reserve carries the entire display window */
+    base.output.alpha_q16=0;
+    if (!async_record(RTH_ASYNC_RESERVE,&base) || !rt_batch_try_commit()) {
+        ASYNC_COUNT(ring_full); rth_group_flush(); rt_batch_discard(); return 0;
+    }
+    s_async_id++; s_async_last_index=0; s_async_has_index=0; s_async_timeline=next;
+    for (int i=0;i<n;++i) tokens[i]=(GLRenderAsyncToken){outputs[i],x,y,w,h,period};
+    return (uint32_t)n;
+}
+int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
+    if (!token || !pass_queued() || !s_pt_on || rt_batch_active()) {
+        ASYNC_COUNT(unavailable); return 0;
+    }
+    if (token->output.epoch!=gl_renderer_present_epoch() ||
+        token->output.epoch!=s_async_timeline.epoch || token->output.generation!=s_async_id) {
+        ASYNC_COUNT(stale); return 0;
+    }
+    if (!render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns())) {
+        ASYNC_COUNT(late); return 0;
+    }
+    if (s_async_has_index && token->output.index<=s_async_last_index) {
+        ASYNC_COUNT(duplicate); return 0;
+    }
+    if (!rth_group_flush() || !rt_batch_begin()) { ASYNC_COUNT(ring_full); return 0; }
+    s_async_recording=*token;
+    if (!async_record(RTH_ASYNC_BEGIN,token)) { ASYNC_COUNT(ring_full); rth_group_flush(); rt_batch_discard(); return 0; }
+    return 1;
+}
+int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
+    if (!rt_batch_active()) return 0;
+    if (!token || token->output.epoch!=s_async_recording.output.epoch ||
+        token->output.generation!=s_async_recording.output.generation ||
+        token->output.index!=s_async_recording.output.index ||
+        token->output.deadline!=s_async_recording.output.deadline ||
+        token->output.alpha_q16!=s_async_recording.output.alpha_q16) {
+        rth_group_flush(); rt_batch_discard(); return 0;
+    }
+    RTH_REC(RTH_PASS_END,0,(int32_t)token->output.alpha_q16,keep);
+    if (!keep || token->output.epoch!=gl_renderer_present_epoch() ||
+        !render_pass_output_current(&s_async_timeline,&token->output,s_async_id,pt_clock_ns())) {
+        if (keep) {
+            if(token->output.epoch!=gl_renderer_present_epoch()) ASYNC_COUNT(stale);
+            else ASYNC_COUNT(late);
+        }
+        rth_group_flush(); rt_batch_discard(); return 0;
+    }
+    int ok=rt_batch_try_commit();
+    if (ok) { ASYNC_COUNT(submitted); s_async_last_index=token->output.index; s_async_has_index=1; }
+    else ASYNC_COUNT(ring_full);
+    return ok;
+}
 int gl_renderer_stereo_begin(int x, int y, int w, int h, int reuse) {
     GL_RT_SYNC("stereo_begin");
     return transaction_begin(x, y, w, h, 0, 0, reuse, 1);
@@ -9201,7 +9417,11 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
     s_pass_dead = 0;   /* however this pass ends, later records run */
     if (!s_pass_active) return;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
-    if (keep && alpha_q16 && g->valid && !g->promoted && g->n < PASS_SLOTS &&
+    /* Timed outputs are copied into a presenter-owned slot immediately.
+     * Reuse the generation's one scratch image: high rates must not retain
+     * one 8K texture per output while the presenter already owns its copy. */
+    if (s_async_exec && keep && alpha_q16 && g->valid) g->n=1;
+    if (keep && alpha_q16 && g->valid && (!g->promoted || s_async_exec) && g->n < PASS_SLOTS &&
         g->n < pass_slot_cap(g->tex_w, g->tex_h) &&
         pass_gen_reserve(gi, g->n + 1u, g->tex_w, g->tex_h)) {
         uint32_t slot = g->n, at = g->n;
@@ -9215,7 +9435,71 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
         }
         s_pgen_tex[gi][at] = t; g->phase[at] = alpha_q16; g->n++;
     }
+    if (s_async_exec) async_vram_leave();
     transaction_restore();
+}
+
+static void async_vram_free(AsyncVram *v) {
+    if(s_ctx) {
+        GLuint tex[3]={v->raw_tex,v->hr_tex,v->wide_tex};
+        GLuint fbo[3]={v->raw_fbo,v->hr_fbo,v->wide_fbo};
+        GLuint rb[2]={v->hr_rb,v->wide_rb};
+        glDeleteTextures(3,tex); p_glDeleteFramebuffers(3,fbo); p_glDeleteRenderbuffers(2,rb);
+    }
+    free(v->cpu); memset(v,0,sizeof(*v));
+}
+static void async_vram_release(int gi) {
+    async_vram_free(&s_async_vram[gi]);
+    /* The work texture is shared, and only needs freeing at history teardown. */
+    if(gi==PASS_GENERATIONS-1 && !s_async_vram_bound) async_vram_free(&s_async_work);
+}
+static int async_raw_allocate(AsyncVram *v) {
+    if(!v->cpu) v->cpu=malloc((size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
+    return v->cpu && pass_make_color_fbo(&v->raw_tex,NULL,&v->raw_fbo,
+        &v->raw_w,&v->raw_h,VRAM_W,VRAM_H,PSXGL_R16UI,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT);
+}
+static int async_vram_capture(int gi) {
+    AsyncVram *v=&s_async_vram[gi];
+    if(!async_raw_allocate(v) ||
+       !pass_make_color_fbo(&v->hr_tex,&v->hr_rb,&v->hr_fbo,&v->hr_w,&v->hr_h,
+          s_pb_hr_w,s_pb_hr_h,GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE)) return 0;
+    if(s_pb_wide_src && !pass_make_color_fbo(&v->wide_tex,&v->wide_rb,&v->wide_fbo,
+        &v->wide_w,&v->wide_h,s_pb_wide_w,s_pb_wide_h,GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE)) return 0;
+    /* Flush before copying: the CPU mirror may intentionally be stale when
+     * native-authority raster is off, but the integer texture is coherent. */
+    pack_flush();
+    pass_blit(s_raw_fbo,v->raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
+    pass_blit(s_pb_hr_fbo,v->hr_fbo,0,0,0,0,s_pb_hr_w,s_pb_hr_h,
+              GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    if(s_pb_wide_src) pass_blit(s_pb_wide_fbo,v->wide_fbo,0,0,0,0,s_pb_wide_w,s_pb_wide_h,
+                               GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    memcpy(v->cpu,s_vram,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
+    v->scale=s_hr_scale; v->resource_epoch=atomic_load(&s_async_resource_epoch);
+    return 1;
+}
+static int async_vram_enter(int gi) {
+    AsyncVram *v=&s_async_vram[gi];
+    if(!v->raw_fbo || v->scale!=s_hr_scale ||
+        v->resource_epoch!=atomic_load(&s_async_resource_epoch) || !async_raw_allocate(&s_async_work)) return 0;
+    if(s_pb_wide_src && (!v->wide_fbo || v->wide_w!=s_pb_wide_w || v->wide_h!=s_pb_wide_h)) return 0;
+    pass_blit(v->raw_fbo,s_async_work.raw_fbo,0,0,0,0,VRAM_W,VRAM_H,GL_COLOR_BUFFER_BIT);
+    pass_blit(v->hr_fbo,s_hr_fbo,0,0,s_pass_x*s_hr_scale,s_pass_y*s_hr_scale,
+              v->hr_w,v->hr_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    if(s_pb_wide_src) {
+        pass_blit(v->wide_fbo,s_pb_wide_src,0,0,0,s_pass_y*s_hr_scale,
+                  v->wide_w,v->wide_h,GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    }
+    memcpy(s_async_work.cpu,v->cpu,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
+    s_async_live_cpu=s_vram; s_async_live_raw_tex=s_raw_tex; s_async_live_raw_fbo=s_raw_fbo;
+    s_vram=s_async_work.cpu; s_raw_tex=s_async_work.raw_tex; s_raw_fbo=s_async_work.raw_fbo;
+    rth_rebind_vram(s_vram); s_async_vram_bound=1;
+    rect_clear(&s_cpu_dirty); rect_clear(&s_pack_dirty); s_gpu_dirty=0; s_up_nrects=0;
+    return 1;
+}
+static void async_vram_leave(void) {
+    if(!s_async_vram_bound) return;
+    s_vram=s_async_live_cpu; s_raw_tex=s_async_live_raw_tex; s_raw_fbo=s_async_live_raw_fbo;
+    rth_rebind_vram(s_vram); s_async_vram_bound=0;
 }
 
 uint32_t gl_renderer_stereo_unavailable(void) {
@@ -9717,7 +10001,9 @@ static int pass_gen_present_at(double p, int locked) {
     PassGen *g = &s_pgen[s_pgen_cur];
     uint32_t lo = 0, hi = 0;
     float t = 0.0f;
-    if (!g->valid || !g->promoted || (!locked && !(g->t_len > 0.0))) return 0;
+    /* Timed generations have one owner: never replay their images through
+     * the legacy flip clock after expiry or an epoch discontinuity. */
+    if (g->async_id || !g->valid || !g->promoted || (!locked && !(g->t_len > 0.0))) return 0;
     if (g->source_path != s_interp_source_path || g->tex_w != s_interp_w ||
         g->tex_h != s_interp_h)
         return 0;
@@ -9819,7 +10105,8 @@ static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
     uint64_t order[PASS_GENERATIONS];uint32_t matches=0;
     for(int i=0;i<PASS_GENERATIONS;++i) {
         PassGen* pend=&s_pgen[i];order[i]=pend->order;
-        if(!pend->valid || pend->promoted)continue;
+        if(pend->async_id && pend->async_epoch!=gl_renderer_present_epoch()) pend->valid=0;
+        if(!pend->valid || pend->promoted || pend->async_id)continue;
         if(psx_cycle_count<pend->created_cycle || psx_cycle_count-pend->created_cycle>
             (uint64_t)pend->period*g_psx_vblank_cycles*4u){pend->valid=0;continue;}
         if(render_pass_gen_flip_matches(pend->shown,pend->x,pend->y,
@@ -9828,8 +10115,10 @@ static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
     s_pgen_promote=render_pass_generation_oldest(matches,order,PASS_GENERATIONS);
     if(s_pgen_promote<0) {
         if (s_pgen[s_pgen_cur].valid) s_pgen_unmatched++;
-        s_pgen[s_pgen_cur].valid = 0;
-        s_pgen[s_pgen_cur].promoted = 0;
+        if (!s_pgen[s_pgen_cur].async_id) {
+            s_pgen[s_pgen_cur].valid = 0;
+            s_pgen[s_pgen_cur].promoted = 0;
+        }
     }
 }
 
@@ -10098,7 +10387,7 @@ static uint64_t s_swaps_total = 0;   /* every swap, real or generated (diagnosti
  * composing side waits only while every slot is queued or on screen. */
 #define PT_SYNC_GPU_COMMANDS_COMPLETE 0x9117
 #define PT_TIMEOUT_IGNORED 0xFFFFFFFFFFFFFFFFull
-static int           s_pt_want = 0, s_pt_slots = 3;
+static int           s_pt_slots = 3;
 static GLenum        s_pt_format = GL_RGBA8;   /* the window's: no alpha -> GL_RGB8 */
 static SDL_GLContext s_pt_ctx = NULL;
 static GLuint        s_pts_tex[PT_MAX_SLOTS], s_pts_rb[PT_MAX_SLOTS], s_pts_fbo[PT_MAX_SLOTS];
@@ -10263,6 +10552,7 @@ static int pt_begin(void) {
         return 0;
     }
     s_pt_on = 1;
+    pt_set_epoch(atomic_load(&s_pt_epoch));
     fprintf(stdout, "psxrecomp: present thread on (%d slots)\n", s_pt_slots);
     return 1;
 }
@@ -10273,6 +10563,7 @@ static void pt_end(void) {
     glFlush();
     pt_stop();
     s_pt_on = 0;
+    memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
     for (int i = 0; i < PT_MAX_SLOTS; i++) {
         if (s_pts_fbo[i]) {
             p_glDeleteFramebuffers(1, &s_pts_fbo[i]);
@@ -10296,15 +10587,22 @@ static void gl_present_swap(void) {
     void *ready = p_glFenceSync(PT_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
     void *done = NULL;
-    (void)pt_submit(ready, &done, NULL);
+    if (s_pt_next_timing.epoch) {
+        PtTiming timing = s_pt_next_timing;
+        memset(&s_pt_next_timing, 0, sizeof s_pt_next_timing);
+        if (pt_try_submit_at(ready, &timing, &done) < 0) {
+            /* Refusal leaves this composing slot owned by this context.
+             * Its commands remain ordered here; no cross-context reader
+             * owns the fence or image. Drop only the optional output. */
+            if (ready) p_glDeleteSync(ready);
+            return;
+        }
+    } else {
+        (void)pt_submit(ready, &done, NULL);
+    }
     if (done) {
-        /* The GPU waits here for the present thread to finish reading this
-         * slot, which the compositor can hold for up to a refresh when every
-         * VBlank is presented. That is not this frame's render work: keep it
-         * out of dynamic resolution's GPU timer. */
         rthf_gpu_gap(1);
-        p_glWaitSync(done, 0, PT_TIMEOUT_IGNORED);
-        p_glDeleteSync(done);
+        p_glWaitSync(done,0,PT_TIMEOUT_IGNORED); p_glDeleteSync(done);
         rthf_gpu_gap(0);
     }
     /* Whatever is bound as the window now means the new slot. */
@@ -10323,11 +10621,12 @@ int gl_renderer_present_thread_json(char *out, size_t cap) {
     return snprintf(out, cap,
         "\"present_thread\":{\"active\":%d,\"slots\":%d,\"submits\":%llu,\"presents\":%llu,"
         "\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
-        "\"queued_high\":%d}",
+        "\"queued_high\":%d,\"timed_dropped\":%llu,\"timed_refused\":%llu}",
         s_pt_on, st.slots, (unsigned long long)st.submits, (unsigned long long)st.presents,
         (unsigned long long)st.waits, st.wait_ns / 1e6,
         st.presents ? (double)st.present_ns / (double)st.presents / 1e6 : 0.0,
-        st.present_max_ns / 1e6, st.queued_high);
+        st.present_max_ns / 1e6, st.queued_high,
+        (unsigned long long)st.timed_dropped, (unsigned long long)st.timed_refused);
 }
 static void gl_swap_now(int generated);
 static int  fg_keep_real(void);      /* frame generation */
@@ -11671,12 +11970,49 @@ static int rth_mirror_wide_present_ok(int base_x) {
     return 0;
 }
 
-static int rth_rec_ints(uint16_t op, uint16_t flags, int n, const int32_t *v) {
+static int rth_rec_raw(uint16_t op, uint16_t flags, int n, const int32_t *v) {
     int32_t *p = (int32_t *)rt_cmd_begin(op, flags, (uint32_t)n * 4u);
-    if (!p) return 0;
+    if (!p) return rt_batch_active();
     memcpy(p, v, (size_t)n * 4u);
     rt_cmd_commit();
     return 1;
+}
+
+/* Keep the exact state-call order, but publish a triangle and its short setup
+ * sequence in one ring record. Non-integer payloads and context handoffs flush
+ * pending state first. The consumer expands the same logical records before
+ * profiling/frame-generation hooks, so their observations stay unchanged. */
+static int32_t s_rth_group[512];
+static unsigned s_rth_group_n;
+static int s_rth_group_enabled=-1;
+static int rth_group_on(void) {
+    if(s_rth_group_enabled<0) {
+        const char *e=getenv("PSX_RENDER_THREAD_GROUPS");
+        s_rth_group_enabled=!(e && !strcmp(e,"0"));
+    }
+    return s_rth_group_enabled;
+}
+static int rth_group_flush(void) {
+    if(!s_rth_group_n) return 1;
+    unsigned n=s_rth_group_n; s_rth_group_n=0;
+    return rth_rec_raw(RTH_GROUP,0,(int)n,s_rth_group);
+}
+static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
+    int setup=op==RTH_SEMI || op==RTH_MASK || op==RTH_TWIN || op==RTH_MOD ||
+        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC;
+    int triangle=op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI ||
+        op==RTH_TEX_TRI || op==RTH_SHADED_TEX_TRI;
+    if(!rth_group_on() || (!setup && !triangle) || n<0 || n>508) {
+        if(!rth_group_flush()) return 0;
+        return rth_rec_raw(op,flags,n,v);
+    }
+    if(s_rth_group_n+(unsigned)n+2u>512u && !rth_group_flush()) return 0;
+    unsigned at=s_rth_group_n;
+    s_rth_group[at]=(int32_t)((uint32_t)op|((uint32_t)flags<<16));
+    s_rth_group[at+1]=n;
+    memcpy(s_rth_group+at+2,v,(size_t)n*4u);
+    s_rth_group_n+=2u+(unsigned)n;
+    return triangle?rth_group_flush():1;
 }
 
 /* Native-wide stream state read by the fast-path gate (wide_fast_center_valid)
@@ -11709,7 +12045,7 @@ static int gl_rth_eligible(void) {
     return s_raster_ok && s_ctx && !s_cpu_auth_dual && !s_depth24_skip_up &&
            !(s_hd_native_authority && s_rth_a0_open) &&
            !gpu_display_is_depth24() &&
-           (!s_interp_enabled || pass_queued_presenter()) &&
+           (!s_interp_enabled || (s_rth_on ? s_pt_on : s_pt_want)) &&
            (!s_pass_active || pass_queued_enabled()) &&
            !psx_netplay_active() && !psx_openxr_session_active() &&
            gr_backend() == GR_BACKEND_OPENGL;
@@ -11727,7 +12063,9 @@ static void rth_hd_publish_private(void) {
 
 static void gl_rth_acquire(const char *reason) {
     if (!s_rth_on || rt_on_render_thread() || rt_held()) return;
+    rth_group_flush();
     rt_acquire(reason);
+    atomic_fetch_add(&s_async_resource_epoch,1); /* direct GL/config/resource changes */
     rth_hd_publish_private();
     s_vram = s_rth_vram_pub;
     rth_rebind_vram(s_rth_vram_pub);
@@ -11778,6 +12116,7 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
     size_t bytes = sizeof hd;
     for (int i = 0; i < 4; i++)
         if (hd.has & (1 << i)) bytes += (size_t)hd.w[i] * hd.h[i] * 4u;
+    if(!rth_group_flush()) return 0;
     uint8_t *p = (uint8_t *)rt_cmd_begin(op, 0, (uint32_t)bytes);
     if (!p) return 0;
     memcpy(p, &hd, sizeof hd);
@@ -14706,6 +15045,7 @@ static uint16_t rtb_vram_read(int x, int y) { GL_RT_SYNC("vram_read"); return gl
 static void rtb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) {
     if (rth_record_mode()) {
         size_t n = (w > 0 && h > 0) ? (size_t)w * (size_t)h : 0;
+        rth_group_flush();
         int32_t *p = (int32_t *)rt_cmd_begin(RTH_XFER_IN, 0, (uint32_t)(16u + n * 2u));
         if (p) {
             p[0] = x; p[1] = y; p[2] = w; p[3] = h;
@@ -14713,6 +15053,7 @@ static void rtb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) 
             rt_cmd_commit();
             return;
         }
+        if (rt_batch_active()) return;
         gl_rth_acquire("oversize_upload");
     }
     glb_vram_transfer_in(x, y, w, h, d);
@@ -14858,7 +15199,38 @@ static const GpuRenderBackend GL_RT_BACKEND = {
 };
 
 /* ---- replay (render thread) ---------------------------------------------- */
+static int async_display_active(void) {
+    return s_async_display_epoch==gl_renderer_present_epoch() &&
+           pt_clock_ns()<s_async_display_until;
+}
+static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *output) {
+    PassGen *g=&s_pgen[gi];
+    if (!g->valid || slot>=g->n || output->epoch!=gl_renderer_present_epoch() ||
+        pt_clock_ns()>=output->expires || g->source_path!=s_interp_source_path ||
+        g->tex_w!=s_interp_w || g->tex_h!=s_interp_h) return;
+    PtTiming timing={output->epoch,output->deadline,output->expires};
+    if (gl_renderer_set_present_timing(&timing)) {
+        PtStats before,after; pt_get_stats(&before);
+        (void)interp_present_pair(s_pgen_tex[gi][slot],s_pgen_tex[gi][slot],0.0f,s_interp_blend_mode);
+        pt_get_stats(&after);
+        if(after.submits>before.submits) ASYNC_COUNT(presented_to_queue);
+    }
+    memset(&s_pt_next_timing,0,sizeof s_pt_next_timing);
+}
+
 static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
+    if(c->op==RTH_GROUP) {
+        const int32_t *words=payload;
+        unsigned count=c->payload/4u, at=0;
+        while(at+2u<=count) {
+            uint32_t id=(uint32_t)words[at], n=(uint32_t)words[at+1];
+            if(n>count-at-2u || (uint16_t)id==RTH_GROUP) return;
+            RtCmd inner={sizeof(RtCmd)+n*4u,(uint16_t)id,(uint16_t)(id>>16),n*4u,c->seq};
+            gl_rth_exec(user,&inner,words+at+2);
+            at+=2u+n;
+        }
+        return;
+    }
     (void)user;
     const int32_t *v = (const int32_t *)payload;
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
@@ -14874,6 +15246,17 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
     if (s_fg_on) fg_capture(c, payload);
+    if(!s_async_exec && c->op==RTH_HD_NOTE)
+        atomic_fetch_add(&s_async_resource_epoch,1);
+    if(s_async_exec && c->op==RTH_COPY) {
+        if(v[0]==v[2] && v[1]==v[3] && !s_mask_set) return; /* identity copy */
+        if(v[0]<s_pass_x || v[1]<s_pass_y || v[0]+v[4]>s_pass_x+s_pass_w ||
+            v[1]+v[5]>s_pass_y+s_pass_h) { ASYNC_COUNT(unsupported); s_async_invalid=1; return; }
+    }
+    if(s_async_exec && c->op==RTH_WIDE_FEEDBACK &&
+        (v[0]!=s_pass_x || v[2]<s_pass_y || v[2]+v[6]>s_pass_y+s_pass_h)) {
+        ASYNC_COUNT(unsupported); s_async_invalid=1; return;
+    }
     switch (c->op) {
     case RTH_SEMI:      glb_set_semi_transparency(v[0], v[1]); break;
     case RTH_DITHER:    glb_set_dither(v[0]); break;
@@ -14963,7 +15346,49 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         (void)dyn_apply(v[0]);
         s_dyn_rth_disp_valid = 0;
         break;
+    case RTH_ASYNC_RESERVE: {
+        GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
+        if (token.output.epoch!=gl_renderer_present_epoch() || pt_clock_ns()>token.output.expires) break;
+        if (transaction_begin(token.x,token.y,token.w,token.h,1,token.period_vblanks,0,0)) {
+            if(!async_vram_capture(s_pgen_write)) {
+                ASYNC_COUNT(capture);
+                s_pgen[s_pgen_write].valid=0; pass_end_now(0,0); break;
+            }
+            s_pgen[s_pgen_write].async_id=token.output.generation;
+            s_pgen[s_pgen_write].async_epoch=token.output.epoch;
+            pass_end_now(0,0);
+            s_async_display_until=token.output.expires;
+            s_async_display_epoch=token.output.epoch;
+            RenderPassOutput first=token.output;
+            uint64_t period=(uint64_t)(1e9/s_interp_target_hz);
+            if(first.deadline+period<first.expires) first.expires=first.deadline+period;
+            async_present_slot(s_pgen_write,0,&first);
+        }
+        break;
+    }
+    case RTH_ASYNC_BEGIN: {
+        GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
+        int gi=-1;
+        for (int k=0;k<PASS_GENERATIONS;++k)
+            if (s_pgen[k].valid && s_pgen[k].async_id==token.output.generation &&
+                s_pgen[k].async_epoch==token.output.epoch) gi=k;
+        if (gi<0 || token.output.epoch!=gl_renderer_present_epoch()) {
+            ASYNC_COUNT(render_stale); s_pass_dead=1; break;
+        }
+        if (pt_clock_ns()>token.output.deadline) { ASYNC_COUNT(render_late); s_pass_dead=1; break; }
+        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0;
+        if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
+            s_pass_leaks_at_begin=s_pass_leaks;
+            if(!async_vram_enter(gi)) {
+                ASYNC_COUNT(resource);
+                pass_end_now(0,0); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write;
+                atomic_fetch_add(&s_pass_q_refused,1);
+            }
+        } else { ASYNC_COUNT(capture); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
+        break;
+    }
     case RTH_PASS_BEGIN:
+        s_async_invalid=0;
         if (transaction_begin(v[0], v[1], v[2], v[3], v[4], (uint32_t)v[5], v[6], 0)) {
             s_pass_leaks_at_begin = s_pass_leaks;
         } else {
@@ -14973,11 +15398,20 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         break;
     case RTH_PASS_END:
         if (s_pass_dead) { s_pass_dead = 0; break; }
-        if (s_pass_leaks != s_pass_leaks_at_begin) {
+        if (s_async_invalid || s_pass_leaks != s_pass_leaks_at_begin) {
             atomic_fetch_add(&s_pass_q_leaks, s_pass_leaks - s_pass_leaks_at_begin);
             pass_end_now(0, 0);
         } else {
             pass_end_now((uint32_t)v[0], v[1]);
+        }
+        if (s_async_exec) {
+            if (v[1] && !s_async_invalid && s_pass_leaks==s_pass_leaks_at_begin) {
+                PassGen *g=&s_pgen[s_pgen_write];
+                for(uint32_t k=1;k<g->n;++k)
+                    if(g->phase[k]==s_async_executing.output.alpha_q16)
+                        async_present_slot(s_pgen_write,k,&s_async_executing.output);
+            }
+            s_async_exec=0; s_async_invalid=0; s_pgen_write=s_async_previous_write;
         }
         break;
     case RTH_PEEK: {
@@ -15043,7 +15477,7 @@ int gl_renderer_render_thread_start(int max_frames) {
     cfg.tick = fg_tick;
     fg_invalidate();
     (void)pt_begin();   /* [video] present_thread; falls back to direct swaps */
-    if (!rt_start(&cfg)) {
+    if ((s_interp_enabled && !s_pt_on) || !rt_start(&cfg)) {
         pt_end();
         s_rth_on = 0;
         s_vram = s_rth_vram_pub;
@@ -15059,6 +15493,7 @@ int gl_renderer_render_thread_start(int max_frames) {
 void gl_renderer_render_thread_stop(void) {
     if (!s_rth_on) return;
     const int held = rt_held();
+    rth_group_flush();
     rt_stop();                       /* drains; the context is current here again */
     pt_end();
     /* Unheld, the private copy holds the final HD-authoritative draws. */
@@ -15089,6 +15524,7 @@ void gl_renderer_render_thread_frame_boundary(void) {
     /* The render thread's per-frame cost (dynamic resolution) ends here. */
     if (!rt_held() && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         RTH_REC(RTH_FRAME, 0, 0);
+    rth_group_flush();
     rt_frame_end();
 }
 

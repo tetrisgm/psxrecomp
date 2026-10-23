@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "gpu_projective_clip.h"
+#include "present_thread.h"
+#include "render_pass_plan.h"
 
 struct SDL_Window;
 
@@ -39,6 +41,14 @@ int gl_renderer_hd_texture_cached(uint64_t key, uint64_t generation,
 void gl_renderer_set_swap_interval(int interval);
 int gl_renderer_get_swap_interval(void); /* Actual driver interval, -2 if unavailable. */
 
+/* Asynchronous output composition: capture the epoch when a job is planned,
+ * then arm its immediately following swap on the GL owning thread. Times use
+ * pt_clock_ns(). Returns 0 if no present thread, stale epoch or expired time;
+ * callers then drop the optional output. History/rate reset retires the epoch.
+ * Accepted timing is consumed by one swap and never blocks the producer. */
+uint64_t gl_renderer_present_epoch(void);
+int gl_renderer_set_present_timing(const PtTiming *timing);
+
 /* Presentation-only temporal blending. High-refresh sub-presents blend the two
  * most recent stable display images on the owning render thread/context; this
  * does not generate motion vectors or true intermediate object positions. */
@@ -67,6 +77,36 @@ void     gl_renderer_pass_force_refuse(int on);
 /* Phases the presenter will show for the frame the next flip displays. */
 /* Nonzero while passes are queued on the render thread (the emulation
  * thread records them instead of taking the GL context). */
+typedef struct GLRenderAsyncToken {
+    RenderPassOutput output;
+    uint16_t x, y, w, h;
+    uint32_t period_vblanks;
+} GLRenderAsyncToken;
+/* Main-thread only. All timestamps use pt_clock_ns(). Reserve records phase0;
+ * begin/end stage one completed stream atomically without acquiring GL. */
+uint32_t gl_renderer_pass_async_reserve(uint32_t period, uint64_t window_begin,
+    uint64_t window_end, uint16_t x,uint16_t y,uint16_t w,uint16_t h,
+    GLRenderAsyncToken *tokens,uint32_t max);
+int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token);
+int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep);
+/* Lifetime counters, sampled without GL acquisition or queue waits. */
+typedef struct GLRenderAsyncStats {
+    uint64_t unavailable, stale, late, duplicate, ring_full;
+    uint64_t render_stale, render_late, resource, unsupported, capture;
+    uint64_t submitted, presented_to_queue;
+} GLRenderAsyncStats;
+void gl_renderer_pass_async_stats(GLRenderAsyncStats *out);
+/* Main-thread discontinuity: cancel queued timed images and all outstanding
+ * tokens immediately, without acquiring GL or waiting for workers. */
+void gl_renderer_pass_async_invalidate(void);
+#ifndef PSX_NO_DEBUG_TOOLS
+/* Diagnostic-only, blocking readback inside an active temporal pass, before
+ * rollback. NULL rgba queries tightly packed RGBA8 bytes and full internal
+ * dimensions. Wide capture includes the canonical centre, exactly as present.
+ * Returns zero for no active pass/error/short capacity. No pixel writes. */
+size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
+    uint32_t *width,uint32_t *height,int *wide);
+#endif
 int gl_renderer_pass_queued(void);
 /* Queued-pass counters: plans shed while the render thread was two frames
  * behind, begins the render thread refused, and out-of-rect writes. */
