@@ -241,3 +241,21 @@ worker cache entries can become ambiguous together. An ordered geometry-event
 reduction or equivalent two-phase design must preserve first-writer semantics.
 No partition should be enabled before complete receipt equality, including
 precision and OT ordering, is demonstrated.
+
+### Explicit owner-thread calls
+
+`runtime/include/draw_call_gate.h` supplies a single-request rendezvous for
+explicitly classified side-effect calls. The worker blocks with its native
+stack and payload intact; the creating thread polls `service`, executes the
+adapter callback, and publishes its reply. The claim deadline cancels only
+unclaimed requests. A claimed callback must finish before the worker returns,
+including after the deadline, so stack payloads cannot escape their lifetime.
+Close wakes pending requests; recursive service and foreign owner calls are
+refused. No call gate is installed automatically.
+
+The title adapter owns scalar register transfer, guest-memory write ownership,
+cycle accounting and frame publication. Initial replay-journal or wait/service
+proofs establish ordering only; they do not establish overlap or speedup. The
+standalone test covers ordered replies, live stack lifetime past the claim
+deadline, busy/owner/recursive refusals, timeout, exception and close paths on
+Windows and macOS in under a second.
