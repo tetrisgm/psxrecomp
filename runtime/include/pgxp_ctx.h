@@ -37,6 +37,11 @@ typedef struct PgxpCtxVertex {
     uint16_t sz, source;
     uint32_t projection_valid;
     PGXPProjection projection;
+    uint32_t raw_valid;
+    int32_t raw_x16, raw_y16;
+    uint16_t raw_sz;
+    uint16_t reserved;
+    float unclamped_depth;
 } PgxpCtxVertex;
 void pgxp_ctx_capture_vertex(PgxpCtxEngine *e, uint32_t addr, uint32_t word,
                               PgxpCtxVertex *out);

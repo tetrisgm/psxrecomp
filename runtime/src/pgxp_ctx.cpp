@@ -148,6 +148,9 @@ extern "C" void pgxp_ctx_capture_vertex(PgxpCtxEngine *e, uint32_t addr,
     if (!e || !e->s_enabled || addr == 0xFFFFFFFFu) return;
     out->source = (uint16_t)e->pgxp_get_precise_vertex(addr, word, ix, iy,
                                                        &out->x16, &out->y16, &out->sz);
+    out->raw_valid = e->pgxp_load_precise_word(addr, word,
+                                               &out->raw_x16, &out->raw_y16, &out->raw_sz);
+    out->unclamped_depth = e->pgxp_get_unclamped_depth(addr, word);
     const PGXPValue *pv = e->pgxp_ptr(addr);
     if (pv && pv->gen == e->s_gen && pv->value == word &&
         (pv->flags & PGXP_F_PROJECTION)) {
