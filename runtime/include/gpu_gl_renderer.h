@@ -352,6 +352,14 @@ void gl_renderer_set_pgxp_color_perspective(int on);
 int  gl_renderer_get_pgxp_color_perspective(void);
 void gl_renderer_set_pgxp_seam(int mode);
 int  gl_renderer_get_pgxp_seam(void);
+/* PGXP seam snapping (src/pgxp_seam_snap.h): force on (1) / off (0) or
+ * follow [video] pgxp_seam (-1); whether it runs; cumulative counters
+ * (triangles measured, with a gap, edges with a gap, strip triangles). */
+void gl_renderer_set_seam_snap(int mode);
+int  gl_renderer_seam_snap_active(void);
+void gl_renderer_seam_snap_stats(uint64_t *tris, uint64_t *snapped_tris,
+                                 uint64_t *snapped_edges, uint64_t *strip_tris);
+uint64_t gl_renderer_seam_snap_us(void);
 void gl_renderer_set_pgxp_depth_threshold(float sz);
 /* Cumulative depth clears by cause: config, drawing-area change, fill,
  * average-SZ jump-back threshold, displayed frame. */
