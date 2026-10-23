@@ -8873,11 +8873,18 @@ static void pass_capture_into(GLuint tex, const PassGen *g) {
 size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
     uint32_t *width,uint32_t *height,int *wide) {
     GL_RT_SYNC("pass_debug_capture");
-    if(!s_pass_active || s_pass_local || !s_ctx) return 0;
+    if(!s_pass_active || s_pass_local || !s_ctx) {
+        fprintf(stderr,"pass_debug_capture: inactive active=%d dead=%d local=%d context=%d begin=%s\n",
+            s_pass_active,s_pass_dead,s_pass_local,s_ctx!=NULL,
+            s_pass_begin_diag.reason?s_pass_begin_diag.reason:""); return 0;
+    }
     const PassGen *g=&s_pgen[s_pgen_write];
     int is_wide=g->source_path==GL_PRES_WIDE, S=s_hr_scale;
     GLuint source=is_wide ? pass_wide_fbo_for(g->x) : s_hr_fbo;
-    if(!g->valid || !source || g->tex_w<=0 || g->tex_h<=0) return 0;
+    if(!g->valid || !source || g->tex_w<=0 || g->tex_h<=0) {
+        fprintf(stderr,"pass_debug_capture: source valid=%d source=%u size=%dx%d scale=%d\n",
+            g->valid,(unsigned)source,g->tex_w,g->tex_h,S); return 0;
+    }
     size_t bytes=(size_t)g->tex_w*g->tex_h*4u;
     if(width) *width=(uint32_t)g->tex_w;
     if(height) *height=(uint32_t)g->tex_h;
@@ -8908,7 +8915,10 @@ size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
     glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
     glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
     glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,rgba);
-    int ok=temp && glGetError()==GL_NO_ERROR;
+    GLenum error=glGetError();
+    int ok=temp && error==GL_NO_ERROR;
+    if(!ok) fprintf(stderr,"pass_debug_capture: GL error=0x%X texture=%u size=%dx%d scale=%d wide=%d rect=%d,%d,%d,%d\n",
+        (unsigned)error,(unsigned)temp,g->tex_w,g->tex_h,S,is_wide,g->x,g->y,g->w,g->h);
     glBindTexture(GL_TEXTURE_2D,(GLuint)texture); glDeleteTextures(1,&temp);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,(GLuint)read_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,(GLuint)draw_fbo);
