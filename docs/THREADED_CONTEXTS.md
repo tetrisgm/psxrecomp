@@ -100,6 +100,33 @@ them only in the draw TU; the main context keeps them.
 
 ## State (2026-10-22)
 
+### Follow-up (2026-10-22, PC/Mac)
+
+* `743f8e6f`: A0:2A memcpy runs on private context memory after matching the
+  live vector, dispatch stub, table destination and complete OpenBIOS routine
+  bytes. Patched/unknown code fails closed. Zero-length, unaligned, overlap,
+  RAM aliases, scratchpad and budget cases compare against the actual
+  recompiled BIOS function, serially and on four threads (PC and Mac pass).
+  `83d0114d` also compares the exact PGXP hook event stream to that reference.
+* The minimal ClearOTagR x2 / PutDrawEnv / DrawOTag sequence now completes,
+  with serial and four parallel context command streams identical. This is
+  context determinism, not a stock-frame identity result.
+* `acf03128`: registered emitter closure/transform tests cover return links,
+  unknown targets, bounded closure and private stores; fixed removal of the
+  shared store-PC breadcrumb when no space follows its semicolon. PC and Mac
+  CTests pass. BIOS regenerated; native BIOS C unchanged, stamp refreshed.
+* `a4982b8d`: GTE presentation config is captured per snapshot. Four workers
+  remain identical while the main thread changes projection config (PC/Mac).
+* R4 context probe: `tools/draw_ctx_check.py --seq min|course|gp`. The first
+  course miss was `0x80061078`, called from `0x80060F94`; this root plus the
+  GP sequence produces 322 clone bodies / 2,987 rows. Main generated C is
+  unchanged. Full course/GP completion and full-code/stock identity remain
+  unverified; do not merge on command-stream parallel equality alone.
+
+The earlier notes below describe the starting point, not the remaining BIOS
+blocker. The active remaining work is course/GP coverage, complete PGXP
+snapshot/command provenance, mod hook effects, and identity/performance gates.
+
 Built and run on the PC against R4 (r4/main + this branch, local integration
 branch `int/ctx-r4`, never pushed):
 
