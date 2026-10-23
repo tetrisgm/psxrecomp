@@ -32,6 +32,7 @@
 #include <stdint.h>
 
 #include "cpu_state.h"
+#include "pgxp_ctx.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,6 +53,7 @@ typedef struct PsxExecCtx PsxExecCtx;
 typedef struct PsxCtxGpuWord {
     uint32_t word;
     uint32_t src;
+    PgxpCtxVertex vertex;
 } PsxCtxGpuWord;
 
 typedef enum {

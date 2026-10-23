@@ -193,7 +193,10 @@ PsxCtxSnapshot *psx_ctx_snapshot_capture(const CPUState *cpu, unsigned flags) {
     memcpy(s->scratch, memory_get_scratchpad_ptr(), sizeof s->scratch);
     s->cpu = *cpu;
     s->cpu.ctx = NULL;
-    if (flags & PSX_CTX_SNAP_PGXP) s->pgxp = pgxp_ctx_export_main();
+    if (flags & PSX_CTX_SNAP_PGXP) {
+        s->pgxp = pgxp_ctx_export_main();
+        if (!s->pgxp) { psx_ctx_snapshot_release(s); return NULL; }
+    }
     gte_ctx_snapshot_main(s->gte);
     s->ws_x_margin = psx_ws_x_margin();
     s->gpustat = gpu_peek_gpustat();
@@ -278,6 +281,7 @@ int psx_ctx_begin(PsxExecCtx *x, const PsxCtxSnapshot *s) {
     wire_cpu(x);
     x->snap = s;
     x->pgxp_active = pgxp_ctx_begin(x->pgxp, s->pgxp);
+    if (x->pgxp_active < 0) { x->pgxp_active = 0; return 0; }
     gte_ctx_begin(x->gte, s->gte);
     x->ws_x_margin = s->ws_x_margin;
     x->entry_hooks = s_hook_count;
@@ -346,7 +350,7 @@ static void ctx_run(PsxExecCtx *x, uint32_t pc, uint32_t stop, uint32_t sp) {
             psx_dctx_fault(cpu, PSX_CTX_FAULT_MISS, 0u, "transfer to PC 0");
         }
         size_t index = 0;
-        if (psx_dctx_bios_call(cpu, pc)) {
+        if ((pc & 0x1FFFFFFFu) == 0xA0u && psx_dctx_bios_call(cpu, pc)) {
             pc = cpu->pc;
             continue;
         }
@@ -419,6 +423,8 @@ static void gpu_push(PsxExecCtx *x, uint32_t word, uint32_t src) {
     }
     x->gpu[x->gpu_n].word = word;
     x->gpu[x->gpu_n].src = src;
+    pgxp_ctx_capture_vertex(x->pgxp, src >= PSX_CTX_SRC_GP1 ? 0xFFFFFFFFu : src,
+                            word, &x->gpu[x->gpu_n].vertex);
     x->gpu_n++;
     x->stats.gpu_words++;
 }
@@ -649,9 +655,15 @@ const PsxCtxGpuWord *psx_ctx_gpu_words(const PsxExecCtx *x, size_t *count) {
 
 int psx_ctx_precise_vertex(PsxExecCtx *x, const PsxCtxGpuWord *w, int32_t int_x,
                            int32_t int_y, int32_t *x16, int32_t *y16, uint16_t *sz) {
-    if (!x || !w || !x->pgxp_active) return 0;
-    const uint32_t addr = w->src >= PSX_CTX_SRC_GP1 ? 0xFFFFFFFFu : (0x80000000u | w->src);
-    return pgxp_ctx_get_precise_vertex(x->pgxp, addr, w->word, int_x, int_y, x16, y16, sz);
+    if (!x || !w || !x16 || !y16 || !sz) return 0;
+    const int32_t ix = (int32_t)((w->word & 0x7ffu) ^ 0x400u) - 0x400;
+    const int32_t iy = (int32_t)(((w->word >> 16) & 0x7ffu) ^ 0x400u) - 0x400;
+    if (int_x != ix || int_y != iy) {
+        *x16 = int_x * 65536; *y16 = int_y * 65536; *sz = 0;
+        return 0;
+    }
+    *x16 = w->vertex.x16; *y16 = w->vertex.y16; *sz = w->vertex.sz;
+    return w->vertex.source;
 }
 
 const PsxCtxStats *psx_ctx_stats(const PsxExecCtx *x) { return x ? &x->stats : NULL; }

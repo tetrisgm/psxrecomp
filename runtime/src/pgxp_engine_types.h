@@ -63,16 +63,21 @@ struct PGXPScalar {
     uint32_t value;      /* the register value it describes                   */
     uint32_t gen;
 };
-/* Main-engine state a draw-context snapshot carries (pgxp_main_export,
- * pgxp_ctx_begin): the configuration the main engine runs with and its
- * register shadows. The RAM shadow is not part of it: a context starts with
- * an empty RAM shadow and tracks the words its own pass writes
- * (docs/THREADED_CONTEXTS.md, "PGXP"). */
+struct PgxpRamShadow {
+    uint32_t index;
+    PGXPValue value;
+};
+
+/* Main-engine state a draw-context snapshot owns. Only live RAM shadows are
+ * copied: old generations and untracked slots have no observable precision.
+ * The context memory map currently supports RAM and scratchpad, not mod RAM. */
 struct PgxpExport {
     int      enabled, cpu_mode, projection_tracking, position_fallback;
     int      preserve_projection, culling, active;
     float    tolerance;
     uint32_t gen;
+    uint32_t ram_mask, ram_count;
+    PgxpRamShadow *ram;
     PGXPValue  scratch[PGXP_SCRATCH_WORDS];
     PGXPValue  gpr[34], gte[32], gtc[32];
     PGXPScalar gpr_s[34], gte_s[32], gtc_s[32];

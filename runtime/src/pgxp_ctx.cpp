@@ -23,9 +23,11 @@ extern "C" int gte_geometry_correction_lookup_probe(uint32_t packed,
 
 #include "pgxp_engine_types.h"
 
-extern "C" void pgxp_main_export(PgxpExport *out);
+extern "C" int pgxp_main_export(PgxpExport *out);
 
 struct PgxpCtxEngine {
+    uint32_t ram_mask = PSX_MAIN_RAM_RETAIL_BYTES - 1;
+#define psx_ram_canonical_offset(address) ((address) & ram_mask)
 #define PGXP_MEMBER_MODE 1
 #define PGXP_S
 #define PGXP_API
@@ -33,6 +35,7 @@ struct PgxpCtxEngine {
 #undef PGXP_S
 #undef PGXP_API
 #undef PGXP_MEMBER_MODE
+#undef psx_ram_canonical_offset
 };
 
 struct PgxpCtxExport {
@@ -41,11 +44,14 @@ struct PgxpCtxExport {
 
 extern "C" PgxpCtxExport *pgxp_ctx_export_main(void) {
     PgxpCtxExport *e = new (std::nothrow) PgxpCtxExport();
-    if (e) pgxp_main_export(&e->state);
+    if (e && !pgxp_main_export(&e->state)) { delete e; return nullptr; }
     return e;
 }
 
-extern "C" void pgxp_ctx_export_free(PgxpCtxExport *e) { delete e; }
+extern "C" void pgxp_ctx_export_free(PgxpCtxExport *e) {
+    if (e) std::free(e->state.ram);
+    delete e;
+}
 
 extern "C" int pgxp_ctx_export_active(const PgxpCtxExport *e) {
     return e && e->state.active;
@@ -95,7 +101,7 @@ extern "C" int pgxp_ctx_begin(PgxpCtxEngine *e, const PgxpCtxExport *from) {
         if (!e->s_ram) {
             e->s_enabled = 0;
             e->recompute_active();
-            return 0;
+            return -1;
         }
     }
     e->s_enabled = 1;
@@ -105,9 +111,12 @@ extern "C" int pgxp_ctx_begin(PgxpCtxEngine *e, const PgxpCtxExport *from) {
     e->s_preserve_projection = m->preserve_projection;
     e->s_culling = m->culling;
     e->s_tolerance = m->tolerance;
+    e->ram_mask = m->ram_mask;
     /* O(1): every RAM shadow from an earlier pass is dead now. */
     e->pgxp_invalidate_all();
     const uint32_t gen = e->s_gen;
+    for (uint32_t i = 0; i < m->ram_count; ++i)
+        import_value(&e->s_ram[m->ram[i].index], &m->ram[i].value, m->gen, gen);
     for (unsigned i = 0; i < PGXP_SCRATCH_WORDS; ++i)
         import_value(&e->s_scratch[i], &m->scratch[i], m->gen, gen);
     for (unsigned i = 0; i < 34; ++i) {
@@ -127,6 +136,24 @@ extern "C" int pgxp_ctx_begin(PgxpCtxEngine *e, const PgxpCtxExport *from) {
 
 extern "C" int pgxp_ctx_active(const PgxpCtxEngine *e) {
     return e && e->g_pgxp_active;
+}
+
+extern "C" void pgxp_ctx_capture_vertex(PgxpCtxEngine *e, uint32_t addr,
+                                         uint32_t word, PgxpCtxVertex *out) {
+    std::memset(out, 0, sizeof *out);
+    const int32_t ix = (int32_t)((word & 0x7ffu) ^ 0x400u) - 0x400;
+    const int32_t iy = (int32_t)(((word >> 16) & 0x7ffu) ^ 0x400u) - 0x400;
+    out->x16 = ix * 65536;
+    out->y16 = iy * 65536;
+    if (!e || !e->s_enabled || addr == 0xFFFFFFFFu) return;
+    out->source = (uint16_t)e->pgxp_get_precise_vertex(addr, word, ix, iy,
+                                                       &out->x16, &out->y16, &out->sz);
+    const PGXPValue *pv = e->pgxp_ptr(addr);
+    if (pv && pv->gen == e->s_gen && pv->value == word &&
+        (pv->flags & PGXP_F_PROJECTION)) {
+        out->projection_valid = 1;
+        out->projection = pv->projection;
+    }
 }
 
 extern "C" void pgxp_ctx_load(PgxpCtxEngine *e, CPUState *cpu, uint32_t instr,

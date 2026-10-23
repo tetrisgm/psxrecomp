@@ -60,9 +60,25 @@ extern "C" int gte_geometry_correction_lookup_probe(uint32_t packed,
 #undef PGXP_S
 #undef PGXP_API
 /* Draw-context snapshot (pgxp_ctx.cpp, docs/THREADED_CONTEXTS.md): the main
- * engine's configuration and register/scratchpad shadows. Main thread only,
+ * engine's configuration and live RAM/register/scratchpad shadows. Main thread only,
  * at a snapshot point; reads only. */
-extern "C" void pgxp_main_export(PgxpExport *out) {
+extern "C" int pgxp_main_export(PgxpExport *out) {
+    out->ram_mask = g_psx_ram_mask;
+    out->ram_count = 0;
+    out->ram = nullptr;
+    const uint32_t words = psx_ram_live_bytes() >> 2;
+    if (s_enabled && s_ram) {
+        for (uint32_t i = 0; i < words; ++i)
+            if (s_ram[i].gen == s_gen && s_ram[i].flags) ++out->ram_count;
+        if (out->ram_count) {
+            out->ram = (PgxpRamShadow *)std::malloc(out->ram_count * sizeof(PgxpRamShadow));
+            if (!out->ram) return 0;
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < words; ++i)
+                if (s_ram[i].gen == s_gen && s_ram[i].flags)
+                    out->ram[n++] = {i, s_ram[i]};
+        }
+    }
     out->enabled = s_enabled;
     out->cpu_mode = s_cpu_mode;
     out->projection_tracking = s_projection_tracking;
@@ -79,4 +95,5 @@ extern "C" void pgxp_main_export(PgxpExport *out) {
     std::memcpy(out->gpr_s, s_gpr_s, sizeof s_gpr_s);
     std::memcpy(out->gte_s, s_gte_s, sizeof s_gte_s);
     std::memcpy(out->gtc_s, s_gtc_s, sizeof s_gtc_s);
+    return 1;
 }

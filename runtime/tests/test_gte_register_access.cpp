@@ -1414,7 +1414,53 @@ int test_draw_context_frozen_configuration() {
     return 0;
 }
 
+int test_draw_context_ram_precision_snapshot() {
+    const uint32_t addr = 0x80100000, word = (20u << 16) | 10u;
+    pgxp_set_enabled(1);
+    pgxp_set_cpu_mode(1);
+    pgxp_test_seed_gte_sxy(2, word, 10 * 65536 + 16384, 20 * 65536 + 32768, 300, 1);
+    pgxp_store_gte_reg(addr, 14);
+    PgxpCtxExport *snapshot = pgxp_ctx_export_main();
+    CHECK(snapshot);
+    /* Main reuses precisely the same integer word with different provenance. */
+    pgxp_invalidate_all();
+    pgxp_test_seed_gte_sxy(2, word, 10 * 65536 + 49152, 20 * 65536, 900, 1);
+    pgxp_store_gte_reg(addr, 14);
+    std::atomic<int> failures{0};
+    std::thread workers[4];
+    for (auto &worker : workers) worker = std::thread([&] {
+        PgxpCtxEngine *ctx = pgxp_ctx_create();
+        if (!ctx || pgxp_ctx_begin(ctx, snapshot) != 1) {
+            ++failures; pgxp_ctx_destroy(ctx); return;
+        }
+        PgxpCtxVertex recorded{};
+        /* Retail mirror mapping is retained in the captured engine. */
+        pgxp_ctx_capture_vertex(ctx, addr + 0x200000, word, &recorded);
+        if (recorded.source != PGXP_SRC_DATAFLOW || recorded.sz != 300 ||
+            recorded.x16 != 10 * 65536 + 16384 || recorded.y16 != 20 * 65536 + 32768)
+            ++failures;
+        pgxp_ctx_invalidate_word(ctx, addr);
+        PgxpCtxVertex reused{};
+        pgxp_ctx_capture_vertex(ctx, addr, word, &reused);
+        if (reused.source != PGXP_SRC_NATIVE || reused.sz || recorded.sz != 300)
+            ++failures;
+        /* Reusing a context must re-import the snapshot, not retain its writes. */
+        if (pgxp_ctx_begin(ctx, snapshot) != 1) ++failures;
+        pgxp_ctx_capture_vertex(ctx, addr, word, &reused);
+        if (std::memcmp(&recorded, &reused, sizeof recorded)) ++failures;
+        pgxp_ctx_destroy(ctx);
+    });
+    for (auto &worker : workers) worker.join();
+    pgxp_ctx_export_free(snapshot);
+    pgxp_invalidate_all();
+    pgxp_set_cpu_mode(0);
+    pgxp_set_enabled(0);
+    CHECK(failures == 0);
+    return 0;
+}
+
 int main() {
+    if (int rc = test_draw_context_ram_precision_snapshot()) return rc;
     if (int rc = test_draw_context_frozen_configuration()) return rc;
     if (int rc = test_projection_scale()) return rc;
     if (int rc = test_hardware_register_semantics()) return rc;

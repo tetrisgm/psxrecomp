@@ -12,10 +12,9 @@
  * thread at a time.
  *
  * pgxp_ctx_begin() takes the main engine's configuration and register and
- * scratchpad shadows from a snapshot (pgxp_ctx_export_main(), main thread)
- * and invalidates the engine's RAM shadow in O(1). The RAM shadow then tracks
- * only the words the context itself stores: a vertex word the pass loads
- * from RAM written before the snapshot draws at its integer position. The
+ * scratchpad and live RAM shadows from an owned snapshot
+ * (pgxp_ctx_export_main(), main thread). Prior context generations are
+ * invalidated before importing the captured words. The
  * position-cache fallback tier (gte.cpp's main geometry cache) is off in
  * contexts. */
 
@@ -31,6 +30,17 @@ struct CPUState;
 typedef struct PgxpCtxEngine PgxpCtxEngine;
 typedef struct PgxpCtxExport PgxpCtxExport;
 
+/* Immutable precision at command consumption, including homogeneous
+ * projection for clipping. Later RAM reuse must not change a queued draw. */
+typedef struct PgxpCtxVertex {
+    int32_t x16, y16;
+    uint16_t sz, source;
+    uint32_t projection_valid;
+    PGXPProjection projection;
+} PgxpCtxVertex;
+void pgxp_ctx_capture_vertex(PgxpCtxEngine *e, uint32_t addr, uint32_t word,
+                              PgxpCtxVertex *out);
+
 /* Main engine state for a snapshot. Main thread only. */
 PgxpCtxExport *pgxp_ctx_export_main(void);
 void pgxp_ctx_export_free(PgxpCtxExport *e);
@@ -38,7 +48,8 @@ int  pgxp_ctx_export_active(const PgxpCtxExport *e);
 
 PgxpCtxEngine *pgxp_ctx_create(void);
 void pgxp_ctx_destroy(PgxpCtxEngine *e);
-/* Reset to `from` (NULL: disabled). Returns whether the engine is active. */
+/* Reset to `from` (NULL: disabled). Returns active (1), disabled (0), or -1
+ * on allocation failure; callers must refuse the pass on failure. */
 int  pgxp_ctx_begin(PgxpCtxEngine *e, const PgxpCtxExport *from);
 int  pgxp_ctx_active(const PgxpCtxEngine *e);
 
