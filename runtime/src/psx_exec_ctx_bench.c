@@ -10,6 +10,7 @@
 
 #include "psx_exec_ctx.h"
 #include "psx_cycle_freeze.h"
+#include "gpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,41 @@ typedef struct {
     uint32_t fault_gpr[32];
     PsxCtxStats stats;
 } BenchJob;
+
+typedef struct {
+    PsxCtxGpuWord *words;
+    size_t count, capacity;
+    int failed, identical;
+    size_t mismatch;
+    uint64_t hash;
+} BenchReference;
+
+#ifndef PSX_NO_DEBUG_TOOLS
+static void reference_word(uint32_t word, uint32_t src, void *user) {
+    BenchReference *r = (BenchReference *)user;
+    if (r->failed) return;
+    if (r->count == r->capacity) {
+        size_t capacity = r->capacity ? r->capacity * 2 : 4096;
+        if (capacity > (1u << 22)) { r->failed = 1; return; }
+        void *p = realloc(r->words, capacity * sizeof *r->words);
+        if (!p) { r->failed = 1; return; }
+        r->words = p; r->capacity = capacity;
+    }
+    PsxCtxGpuWord *w = &r->words[r->count++];
+    memset(w, 0, sizeof *w);
+    w->word = word;
+    w->src = src >= PSX_CTX_SRC_GP1 ? src : src & 0x1FFFFFFFu;
+    PgxpCtxVertex *v = &w->vertex;
+    const int32_t ix = (int32_t)((word & 0x7ffu) ^ 0x400u) - 0x400;
+    const int32_t iy = (int32_t)(((word >> 16) & 0x7ffu) ^ 0x400u) - 0x400;
+    v->x16 = ix * 65536; v->y16 = iy * 65536;
+    if (!pgxp_enabled() || src >= PSX_CTX_SRC_GP1) return;
+    v->source = (uint16_t)pgxp_get_precise_vertex(w->src, word, ix, iy, &v->x16, &v->y16, &v->sz);
+    v->raw_valid = pgxp_load_precise_word(w->src, word, &v->raw_x16, &v->raw_y16, &v->raw_sz);
+    v->unclamped_depth = pgxp_get_unclamped_depth(w->src, word);
+    v->projection_valid = pgxp_load_projection(w->src, word, &v->projection);
+}
+#endif
 
 static double now_ms(void) {
 #ifdef _WIN32
@@ -210,7 +246,8 @@ static int emit_job(char *out, size_t cap, int pos, const char *name, const Benc
  * RAM and scratchpad restored. Device state the calls touch (GPU commands,
  * DMA registers) is not restored: the game rebuilds it every frame, but run
  * this on a throwaway session. */
-static double run_full(CPUState *cpu, const BenchPlan *p, uint32_t ram_bytes) {
+static double run_full(CPUState *cpu, const BenchPlan *p, uint32_t ram_bytes,
+                       BenchReference *reference) {
     uint8_t *ram = memory_get_ram_ptr(), *spad = memory_get_scratchpad_ptr();
     uint8_t *ram_save = (uint8_t *)malloc(ram_bytes);
     uint8_t spad_save[1024];
@@ -224,8 +261,16 @@ static double run_full(CPUState *cpu, const BenchPlan *p, uint32_t ram_bytes) {
             const uint32_t a = p->writes[i].addr & 0x1FFFFFFFu;
             if (a < ram_bytes) memcpy(ram + a, &p->writes[i].value, 4);
             else if ((a & 0xFFFFFC00u) == 0x1F800000u) memcpy(spad + (a & 0x3FFu), &p->writes[i].value, 4);
+            pgxp_invalidate_word(p->writes[i].addr & ~3u);
         }
         const double t0 = now_ms();
+#ifndef PSX_NO_DEBUG_TOOLS
+        /* Only the first pass starts with the snapshot's PGXP/GTE side state.
+         * Later repetitions are timing samples, never identity references. */
+        if (rep == 0) gpu_set_command_tap(reference_word, reference);
+#else
+        reference->failed = 1;
+#endif
         for (int i = 0; i < p->ncalls; i++) {
             const BenchCall *c = &p->calls[i];
             cpu->gpr[29] = p->sp;
@@ -233,6 +278,9 @@ static double run_full(CPUState *cpu, const BenchPlan *p, uint32_t ram_bytes) {
             (void)psx_mod_call_guest_uncharged(cpu, c->fn, PSX_CTX_STOP_PC,
                 c->args[0], c->args[1], c->args[2], c->args[3], 0x7FFFFFFFu, &charged);
         }
+#ifndef PSX_NO_DEBUG_TOOLS
+        if (rep == 0) gpu_set_command_tap(NULL, NULL);
+#endif
         total += now_ms() - t0;
         memcpy(ram, ram_save, ram_bytes);
         memcpy(spad, spad_save, sizeof spad_save);
@@ -249,6 +297,7 @@ int psx_ctx_bench_json(CPUState *cpu, const char *calls, const char *writes,
     BenchJob *jobs = (BenchJob *)calloc(BENCH_MAX_THREADS + 1, sizeof *jobs);
     PsxExecCtx *ctxs[BENCH_MAX_THREADS + 1] = {0};
     PsxCtxSnapshot *snap = NULL;
+    BenchReference reference = {0};
     int pos = 0, ok = 0;
     if (!plan || !jobs) { snprintf(out, cap, "\"error\":\"alloc\""); goto done; }
     if (!parse_calls(calls, plan) || !parse_writes(writes, plan)) {
@@ -328,11 +377,31 @@ int psx_ctx_bench_json(CPUState *cpu, const char *calls, const char *writes,
     }
 
     double full_ms = -1.0;
-    if (full) {
+    if (full && jobs[0].status == PSX_CTX_OK) {
         uint32_t ram_bytes = 0;
         (void)psx_ctx_snapshot_ram(snap, &ram_bytes);
-        full_ms = run_full(cpu, plan, ram_bytes);
+        full_ms = run_full(cpu, plan, ram_bytes, &reference);
+        size_t count = 0;
+        const PsxCtxGpuWord *expected = psx_ctx_gpu_words(ctxs[0], &count);
+        reference.identical = full_ms >= 0 && !reference.failed && reference.count == count;
+        const size_t common = count < reference.count ? count : reference.count;
+        reference.mismatch = common;
+        for (size_t i = 0; i < common; i++) {
+            if (memcmp(&expected[i], &reference.words[i], sizeof *expected)) {
+                reference.identical = 0;
+                reference.mismatch = i;
+                break;
+            }
+        }
+        reference.hash = hash_words(reference.words, reference.count);
     }
+
+    if (full)
+        pos += snprintf(out + pos, cap - (size_t)pos,
+            "\"full_reference_identical\":%s,\"full_reference_failed\":%s,"
+            "\"full_words\":%u,\"full_hash\":\"%016llx\",\"full_first_difference\":%u,",
+            reference.identical ? "true" : "false", reference.failed ? "true" : "false",
+            (unsigned)reference.count, (unsigned long long)reference.hash, (unsigned)reference.mismatch);
 
     pos += snprintf(out + pos, cap - (size_t)pos,
                     "\"threads\":%d,\"reps\":%d,\"calls\":%d,\"sp\":\"0x%08X\","
@@ -346,9 +415,10 @@ int psx_ctx_bench_json(CPUState *cpu, const char *calls, const char *writes,
     for (int i = 1; i <= threads && pos < (int)cap - 1200; i++)
         pos = emit_job(out, cap, pos, i > 1 ? "," : "", &jobs[i]);
     pos += snprintf(out + pos, cap - (size_t)pos, "]");
-    ok = jobs[0].status == PSX_CTX_OK && identical;
+    ok = jobs[0].status == PSX_CTX_OK && identical && (!full || reference.identical);
 
 done:
+    free(reference.words);
     for (int i = 0; i <= BENCH_MAX_THREADS; i++) psx_ctx_destroy(ctxs[i]);
     psx_ctx_snapshot_release(snap);
     free(jobs);

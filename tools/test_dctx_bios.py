@@ -14,11 +14,14 @@ p.add_argument('--cc', default='cc')
 a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
 source = (root / 'generated/OpenBIOS_full.c').read_text()
-start = source.index('void OpenBIOS_func_1FC085D8(CPUState* cpu) {')
-end = source.index('\n}\n', start) + 3
+references = []
+for address in ('1FC085D8', '1FC086C4'):
+    start = source.index(f'void OpenBIOS_func_{address}(CPUState* cpu) {{')
+    end = source.index('\n}\n', start) + 3
+    references.append(source[start:end])
 with tempfile.TemporaryDirectory(prefix='dctx-bios-') as directory:
     tmp = Path(directory)
-    (tmp / 'dctx_bios_reference.inc').write_text(source[start:end])
+    (tmp / 'dctx_bios_reference.inc').write_text('\n'.join(references))
     binary = tmp / 'test_dctx_bios.exe'
     subprocess.run([a.cc, '-std=c11', '-O2', '-pthread', '-I' + str(root / 'runtime/include'),
                     '-I' + str(tmp), str(root / 'runtime/tests/test_dctx_bios.c'),

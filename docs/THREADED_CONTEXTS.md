@@ -4,6 +4,17 @@ Status: **work in progress** (branch `feat/threaded-contexts`, not merged into
 `r4/main`). This file is the design, the inventory it rests on, what works,
 what was measured, and the exact remaining steps.
 
+Current qualification (2026-10-23): `7b11578f` handles the exact live OpenBIOS
+A0 memcpy/memset bodies with private memory and matching register/PGXP effects.
+`tools/test_dctx_bios.py` compares both against unchanged generated BIOS bodies,
+serially and on four threads. Course closure now runs in R4; complete Grand Prix
+coverage remains in progress. `9939ae48` makes `ctx_draw full=1` compare the first
+main execution's GPU words and immutable precision receipts with the private run;
+later repetitions are timing only. This is separate from whole-race isolation.
+Snapshots now include GTE presentation config and live PGXP RAM shadows, and GPU
+receipts preserve precision at consumption time (`a4982b8d`, `d842fc4f`, `8cac15a9`).
+Older starting-point measurements below are historical, not current validation.
+
 ## Goal
 
 Run a game's recompiled *draw* functions on several host threads at once
