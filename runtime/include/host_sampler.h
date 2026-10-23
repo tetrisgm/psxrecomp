@@ -15,11 +15,18 @@ extern "C" {
 typedef struct HostSample {
     uint64_t rva;      /* instruction pointer minus the executable's base */
     uint32_t frame;    /* guest frame (s_frame_count) */
-    uint32_t in_pass;  /* 1 while a render pass ran */
+    uint16_t in_pass;  /* 1 while a render pass ran */
+    uint16_t phase;    /* the emulation thread's g_exec_phase at the sample
+                          (0 other, 1 interp, 2 native, 3 static, 4 GP0) */
+    uint64_t caller;   /* PSX_HOST_SAMPLER_CALLERS (Windows): for a pc outside
+                          the executable, its innermost exe caller (rva), else 0 */
 } HostSample;
 
 /* Start sampling the calling thread (the emulation thread). Idempotent. */
 void host_sampler_start(void);
+/* Windows: when PSX_HOST_SAMPLER_THREAD equals `name`, sample the calling
+ * thread from now on ("render": the render thread). No-op elsewhere. */
+void host_sampler_retarget_current(const char *name);
 int host_sampler_supported(void);
 /* Total samples recorded; the ring holds the newest HOST_SAMPLER_CAP. */
 uint64_t host_sampler_seq(void);

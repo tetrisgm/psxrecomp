@@ -45,6 +45,7 @@ extern uint32_t iso_sector_count(void* handle);
 extern uint32_t iso_cdda_sector_count(void* handle);
 extern int iso_read_cdda_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
 extern void iso_close(void* handle);
+extern void iso_prefetch_stats(void* handle, uint64_t* hits, uint64_t* misses);
 /* Multi-track TOC accessors (CD-DA / multi-track discs). track is 1-based. */
 extern int iso_cdda_track_count(void* handle);
 extern int iso_track_count(void* handle);
@@ -742,6 +743,10 @@ static void exec_command(uint8_t cmd);
 
 /* ISO reader */
 static void* iso_handle = NULL;
+/* Disc read-ahead hits / misses (iso_reader_c.cpp; debug server cd_prefetch). */
+void cdrom_prefetch_stats(uint64_t *hits, uint64_t *misses) {
+    iso_prefetch_stats(iso_handle, hits, misses);
+}
 
 /* Multi-disc roster, registered at launch from game.toml [game] discs.
  * It lives here because the mount lives here, which keeps the disc-change
