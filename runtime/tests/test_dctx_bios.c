@@ -65,6 +65,7 @@ static PsxExecCtx *make_context(void) {
     const uint32_t dispatch[]={0x3C080000,0x25080200,0x00095080,0x01485020,0x8D4A0000,0x240800A0,0x01400008,0};
     memcpy(x->ram+0xA0,vector,sizeof vector); memcpy(x->ram+0x2A80,dispatch,sizeof dispatch);
     psx_dctx_sw(&x->cpu,0x2A8,0xBFC085D8);
+    psx_dctx_sw(&x->cpu,0x2AC,0xBFC086C4);
     x->cpu.gpr[9]=0x2A; x->cpu.gpr[31]=0x80010000;
     return x;
 }
@@ -75,18 +76,22 @@ static void *corpus(void *unused) {
         {0x80011001,0x80011000,127},{0x80011000,0x80011001,127},
         {0x801FFFF0,0x80011000,64},{0x1F800001,0x80011000,500},
         {0x80011000,0x1F800003,500},{0xA0011000,0x80011000,32}};
+    for (unsigned service=0x2A;service<=0x2B;service++)
     for (unsigned k=0;k<sizeof cases/sizeof cases[0];k++) {
         PsxExecCtx *x=make_context(), *r=make_context();
+        x->cpu.gpr[9]=r->cpu.gpr[9]=service;
         for(unsigned i=0;i<3;i++) x->cpu.gpr[4+i]=r->cpu.gpr[4+i]=cases[k][i];
         reference_cpu=&r->cpu; r->cpu.write_byte=reference_store;
-        OpenBIOS_func_1FC085D8(&r->cpu);
+        if(service==0x2A) OpenBIOS_func_1FC085D8(&r->cpu);
+        else OpenBIOS_func_1FC086C4(&r->cpu);
         const uint64_t expected_hash=event_hash, expected_count=event_count;
         in_memcpy=0;
         CHECK(psx_dctx_bios_call(&x->cpu,0xA0));
         CHECK(event_hash==expected_hash && event_count==expected_count);
         CHECK(!memcmp(x->ram,r->ram,x->ram_mask+1u)); CHECK(!memcmp(x->scratch,r->scratch,1024));
         for(unsigned reg=0;reg<32;reg++) if(reg!=8 && reg!=10) CHECK(x->cpu.gpr[reg]==r->cpu.gpr[reg]);
-        CHECK(x->cpu.pc==r->cpu.pc); CHECK(x->cpu.gpr[8]==0xA0); CHECK(x->cpu.gpr[10]==0xBFC085D8);
+        CHECK(x->cpu.pc==r->cpu.pc); CHECK(x->cpu.gpr[8]==0xA0);
+        CHECK(x->cpu.gpr[10]==(service==0x2A ? 0xBFC085D8u : 0xBFC086C4u));
         destroy(x); destroy(r);
     }
     PsxExecCtx *x=make_context();
