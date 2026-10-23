@@ -516,3 +516,13 @@ immutable admission, duplicate/stale rejection, bounded scratch reuse and timed
 presentation. `test_gpu_render_pass_provenance.c` covers private input replay,
 PGXP/raw depth, missing metadata, truncated/control streams and state rollback.
 `test_render_thread.c` covers atomic batch publication and failed-batch discard.
+
+DMA-list replay additionally requires ordered list/node events: call
+`gpu_replay_list_begin(root)`, `gpu_replay_list_node(address,header)` and
+`gpu_replay_list_end()` from the word callback at their recorded word offsets.
+The context's `gpu_lists`/`gpu_nodes` retain empty OT nodes; its sorted immutable
+packet map is queried with `psx_ctx_gpu_list_read`. Select that list's map in the
+read callback before beginning its prepass. Fall back only to the captured
+snapshot for non-packet addresses. Final context RAM is insufficient when two
+submissions reuse one packet address. GPU checkpoint rollback now also restores
+an interrupted main linked-list rank.
