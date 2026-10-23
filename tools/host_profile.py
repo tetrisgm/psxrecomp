@@ -9,7 +9,11 @@ address to the function containing it, using the image's own symbol table
   host_profile.py --port 4531 --exe game.exe --frames 300 [--pass 1] [--top 40]
 
 --frames N: the last N guest frames. --pass 1 / 0: only samples inside /
-outside render passes. Prints per-function sample counts and shares.
+outside render passes. --callers: charge samples outside the exe (driver,
+OS waits) to their innermost exe caller; needs the runtime started with
+PSX_HOST_SAMPLER_CALLERS=1 (Windows). PSX_HOST_SAMPLER_THREAD=render samples
+the render thread instead of the emulation thread. Prints per-function
+sample counts and shares.
 """
 import argparse
 import bisect
@@ -90,6 +94,9 @@ def main():
     ap.add_argument("--since", type=int, default=-1)
     ap.add_argument("--pass", dest="in_pass", type=int, default=-1)
     ap.add_argument("--top", type=int, default=40)
+    ap.add_argument("--callers", action="store_true")
+    ap.add_argument("--phase", type=int, default=-1,
+                    help="only samples in this emulation-thread phase (4 = GP0)")
     ap.add_argument("--nm")
     a = ap.parse_args()
     kw = {"top": 400}
@@ -99,6 +106,10 @@ def main():
         kw["since"] = a.since
     if a.in_pass >= 0:
         kw["pass"] = a.in_pass
+    if a.callers:
+        kw["callers"] = 1
+    if a.phase >= 0:
+        kw["phase"] = a.phase
     r = query(a.port, **kw)
     if not r.get("ok") or not r.get("supported"):
         sys.exit("sampler unavailable: %s" % r)
@@ -115,8 +126,9 @@ def main():
             name = table[i][1]
         per[name] = per.get(name, 0) + n
     total = r["samples"] or 1
-    print("samples %d (binned top 400 addresses; %d not binned) seq %d" %
-          (r["samples"], r["unbinned"], r["seq"]))
+    print("samples %d (binned top 400 addresses; %d not binned) seq %d%s" %
+          (r["samples"], r["unbinned"], r["seq"],
+           " via_callers %d" % r.get("via_callers", 0) if a.callers else ""))
     for name, n in sorted(per.items(), key=lambda kv: -kv[1])[:a.top]:
         print("%6d %5.1f%%  %s" % (n, 100.0 * n / total, name))
 

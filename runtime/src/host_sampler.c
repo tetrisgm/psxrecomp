@@ -20,9 +20,11 @@
 #include "host_sampler.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 extern int g_psx_render_pass_active;
+extern int g_exec_phase;
 extern uint64_t s_frame_count;
 
 static HostSample s_ring[HOST_SAMPLER_CAP];
@@ -31,12 +33,14 @@ static uintptr_t s_image_base;
 static int s_supported;
 
 #ifndef PSX_NO_DEBUG_TOOLS
-static void record(uintptr_t pc) {
+static void record(uintptr_t pc, uintptr_t caller) {
     const uint64_t n = s_seq;
     HostSample *e = &s_ring[n % HOST_SAMPLER_CAP];
     e->rva = (pc >= s_image_base) ? (uint64_t)(pc - s_image_base) : 0;
+    e->caller = (caller >= s_image_base) ? (uint64_t)(caller - s_image_base) : 0;
     e->frame = (uint32_t)s_frame_count;
     e->in_pass = g_psx_render_pass_active ? 1u : 0u;
+    e->phase = (uint16_t)g_exec_phase;
     s_seq = n + 1;
 }
 #endif
@@ -49,6 +53,44 @@ void host_sampler_start(void) {}
 #include <windows.h>
 
 static HANDLE s_target;
+static uintptr_t s_image_end;               /* base + SizeOfImage */
+static ULONG_PTR s_stack_lo, s_stack_hi;    /* the target thread's stack */
+static int s_callers = -1;                  /* PSX_HOST_SAMPLER_CALLERS: 0, 1, 2 */
+
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0602
+WINBASEAPI VOID WINAPI GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high);  /* Windows 8+ */
+#endif
+static void note_current_stack(void) {
+    GetCurrentThreadStackLimits(&s_stack_lo, &s_stack_hi);
+}
+
+/* PSX_HOST_SAMPLER_CALLERS=1: a sample outside the executable (driver, OS
+ * wait, C library) is unwound to its innermost caller inside it, so time in
+ * nvoglv64.dll or a kernel wait is charged to the exe function that made the
+ * call. PSX_HOST_SAMPLER_CALLERS=2 records every sample's caller: the first
+ * exe frame above the sampled function (who calls a hot helper). Opt-in: the
+ * unwinder takes the process's function-table lock while the target is
+ * suspended, which could deadlock if the target held it. */
+#if defined(_M_X64) || defined(__x86_64__)
+static uintptr_t exe_caller(const CONTEXT *start) {
+    CONTEXT c = *start;
+    for (int k = 0; k < 64; k++) {
+        DWORD64 ib = 0;
+        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &ib, NULL);
+        if (fe) {
+            PVOID hd = NULL; DWORD64 est = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, c.Rip, fe, &c, &hd, &est, NULL);
+        } else {
+            if (c.Rsp < s_stack_lo || c.Rsp + 8 > s_stack_hi) return 0;
+            c.Rip = *(const DWORD64 *)(uintptr_t)c.Rsp;
+            c.Rsp += 8;
+        }
+        if (!c.Rip || c.Rsp < s_stack_lo || c.Rsp > s_stack_hi) return 0;
+        if (c.Rip >= s_image_base && c.Rip < s_image_end) return (uintptr_t)c.Rip;
+    }
+    return 0;
+}
+#endif
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -72,18 +114,23 @@ static DWORD WINAPI sampler_main(LPVOID arg) {
     for (;;) {
         if (timer) WaitForSingleObject(timer, INFINITE);
         else Sleep(1);
-        if (SuspendThread(s_target) == (DWORD)-1) continue;
+        HANDLE target = s_target;
+        if (SuspendThread(target) == (DWORD)-1) continue;
         CONTEXT ctx;
         memset(&ctx, 0, sizeof ctx);
-        ctx.ContextFlags = CONTEXT_CONTROL;
-        if (GetThreadContext(s_target, &ctx)) {
+        ctx.ContextFlags = s_callers ? CONTEXT_CONTROL | CONTEXT_INTEGER : CONTEXT_CONTROL;
+        if (GetThreadContext(target, &ctx)) {
 #if defined(_M_X64) || defined(__x86_64__)
-            record((uintptr_t)ctx.Rip);
+            uintptr_t caller = 0;
+            if (s_callers == 2 ||
+                (s_callers && (ctx.Rip < s_image_base || ctx.Rip >= s_image_end)))
+                caller = exe_caller(&ctx);
+            record((uintptr_t)ctx.Rip, caller);
 #elif defined(_M_ARM64) || defined(__aarch64__)
-            record((uintptr_t)ctx.Pc);
+            record((uintptr_t)ctx.Pc, 0);
 #endif
         }
-        ResumeThread(s_target);
+        ResumeThread(target);
     }
     return 0;
 }
@@ -91,6 +138,16 @@ static DWORD WINAPI sampler_main(LPVOID arg) {
 void host_sampler_start(void) {
     if (s_supported) return;
     s_image_base = (uintptr_t)GetModuleHandleW(NULL);
+    {
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)s_image_base;
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(s_image_base + (uintptr_t)dos->e_lfanew);
+        s_image_end = s_image_base + nt->OptionalHeader.SizeOfImage;
+    }
+    {
+        const char *e = getenv("PSX_HOST_SAMPLER_CALLERS");
+        s_callers = (e && *e) ? atoi(e) : 0;
+    }
+    note_current_stack();
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
                          GetCurrentProcess(), &s_target,
                          THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -102,6 +159,22 @@ void host_sampler_start(void) {
     SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL);
     CloseHandle(t);
     s_supported = 1;
+}
+
+/* PSX_HOST_SAMPLER_THREAD=render: the render thread calls this when it
+ * starts and the sampler follows it instead of the emulation thread. */
+void host_sampler_retarget_current(const char *name) {
+    const char *e = getenv("PSX_HOST_SAMPLER_THREAD");
+    if (!s_supported || !e || !name || strcmp(e, name) != 0) return;
+    HANDLE h;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                         GetCurrentProcess(), &h,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                             THREAD_QUERY_INFORMATION,
+                         FALSE, 0))
+        return;
+    note_current_stack();
+    s_target = h;   /* the sampler reads it once per sample; the old handle leaks, once */
 }
 
 #elif defined(__linux__) || defined(__APPLE__)
@@ -140,13 +213,13 @@ static void on_prof(int sig, siginfo_t *si, void *uc_) {
     if (!pthread_equal(pthread_self(), s_thread)) return;
 #endif
 #if defined(__linux__) && defined(__x86_64__)
-    record((uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+    record((uintptr_t)uc->uc_mcontext.gregs[REG_RIP], 0);
 #elif defined(__linux__) && defined(__aarch64__)
-    record((uintptr_t)uc->uc_mcontext.pc);
+    record((uintptr_t)uc->uc_mcontext.pc, 0);
 #elif defined(__APPLE__) && defined(__x86_64__)
-    record((uintptr_t)uc->uc_mcontext->__ss.__rip);
+    record((uintptr_t)uc->uc_mcontext->__ss.__rip, 0);
 #elif defined(__APPLE__) && defined(__aarch64__)
-    record((uintptr_t)uc->uc_mcontext->__ss.__pc);
+    record((uintptr_t)uc->uc_mcontext->__ss.__pc, 0);
 #else
     (void)uc;
 #endif
@@ -192,3 +265,7 @@ int host_sampler_get(uint64_t seq, HostSample *out) {
     *out = s_ring[seq % HOST_SAMPLER_CAP];
     return 1;
 }
+
+#if defined(PSX_NO_DEBUG_TOOLS) || !defined(_WIN32)
+void host_sampler_retarget_current(const char *name) { (void)name; }
+#endif
