@@ -29,6 +29,7 @@
  * VRAM at the end), hires (frame at internal resolution), wide (native-wide
  * surface), and with the thread on its record/acquire counters.
  * Original source-owned scene; no retail payload. */
+#define PSX_TEST_HD_TRACKING 1
 #include "gpu_gl_renderer.c"
 #include "gpu_hd_texture_stubs.inc"
 #include "mod_texture_banks.c"
@@ -36,14 +37,19 @@
 #include "gl_batch_policy_hle.c"
 #include "gl_batch_policy_select.c"
 /* gpu_render.c (the facade) observes draws for HD texture packs: no pack here. */
-int gpu_hd_textures_active(void){return 0;}
+static int test_hd_active, test_hd_overlap;
+static uint64_t test_hd_tracking;
+uint64_t gpu_hd_textures_tracking_generation(void){return test_hd_tracking;}
+int gpu_hd_textures_invalidation_changes(int x,int y,int w,int h){
+    (void)x;(void)y;(void)w;(void)h;return test_hd_overlap;}
+int gpu_hd_textures_active(void){return test_hd_active;}
 int gpu_hd_textures_dump_enabled(void){return 0;}
 void gpu_hd_textures_observe_draw(uint16_t tp,uint16_t cx,uint16_t cy,const int l[4],
     uint32_t w,int semi){(void)tp;(void)cx;(void)cy;(void)l;(void)w;(void)semi;}
 void gpu_hd_textures_set_vram(const uint16_t* v){(void)v;}
 void gpu_hd_textures_track_upload(int x,int y,int w,int h,const uint16_t* words){
     (void)x;(void)y;(void)w;(void)h;(void)words;}
-void gpu_hd_textures_invalidate(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
+void gpu_hd_textures_invalidate(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;if(test_hd_overlap)++test_hd_tracking;}
 void gpu_hd_textures_begin_upload(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
 void gpu_hd_textures_begin_copy(int sx,int sy,int dx,int dy,int w,int h){
     (void)sx;(void)sy;(void)dx;(void)dy;(void)w;(void)h;}

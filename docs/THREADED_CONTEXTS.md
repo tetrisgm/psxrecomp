@@ -274,3 +274,24 @@ compares 100 successive calls for each of six signed-boundary seeds, including
 RAM, registers, HI/LO and every PGXP event, serially and on four threads. A
 changed routine target refuses without CPU changes. Windows GCC and macOS
 Clang pass this corpus together with the existing memory-service cases.
+
+### HD texture provenance during asynchronous replay
+
+A native VRAM write invalidates an asynchronous resource lease only when it
+changes HD upload tracking. Notifications outside every tracked source leave
+the lease intact. Pack reloads and renderer resource changes retain their
+separate synchronization invalidation.
+
+Generated frames own private VRAM but do not own the live upload tracker.
+An invalidate/begin-upload notification proven to leave tracking unchanged
+is skipped. A potentially overlapping write or another provenance operation
+refuses that generated frame before modifying live tracking; normal render
+transaction rollback discards its pixels. Private tracking snapshots are
+required before those cases can be supported. Lookup caches must not survive
+rebinding the reusable private VRAM buffer with different contents.
+
+The hidden-GL output timing fixture checks no-op and actual-change leases,
+private overlap and copy refusal without shared mutation. Windows NVIDIA GL
+and macOS Metal GL pass all 42 assertions with the tracking API test doubles.
+The pack implementation's mutation and lookup-cache tests are a separate
+dependency; a moving-game measurement still must validate the combined build.

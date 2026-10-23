@@ -95,6 +95,25 @@ int main(void) {
     gl_renderer_note_present_depth24(0);
     check(!rt_held() && atomic_load(&s_async_resource_epoch)==lease,
           "unchanged display depth preserves asynchronous lease and thread ownership");
+    /* A notification without residency changes must preserve the lease. */
+    rt_acquire("HD policy test");
+    test_hd_active=1; test_hd_overlap=0;
+    hd_note_exec(GR_HD_NOTE_INVALIDATE,0,0,16,16,0,0);
+    check(atomic_load(&s_async_resource_epoch)==lease,"unrelated HD note preserves resource epoch");
+    test_hd_overlap=1;
+    hd_note_exec(GR_HD_NOTE_INVALIDATE,0,0,16,16,0,0);
+    check(atomic_load(&s_async_resource_epoch)==lease+1,"changed HD residency invalidates resource epoch");
+    const uint64_t tracking=test_hd_tracking;
+    s_async_exec=1; s_async_invalid=0;
+    hd_note_exec(GR_HD_NOTE_INVALIDATE,0,0,16,16,0,0);
+    check(s_async_invalid && test_hd_tracking==tracking,"private overlapping note refuses without live metadata mutation");
+    test_hd_overlap=0; s_async_invalid=0;
+    hd_note_exec(GR_HD_NOTE_INVALIDATE,0,0,16,16,0,0);
+    check(!s_async_invalid && test_hd_tracking==tracking,"private unrelated note preserves live metadata");
+    hd_note_exec(GR_HD_NOTE_BEGIN_COPY,0,0,16,16,0,0);
+    check(s_async_invalid && test_hd_tracking==tracking,"private copy provenance refuses without mutation");
+    s_async_exec=0; s_async_invalid=0; test_hd_active=0;
+    rt_release();
     GLRenderAsyncToken tokens[8];
     now=pt_clock_ns();
     uint32_t count=gl_renderer_pass_async_reserve(2,now+100000000u,now+133333333u,
