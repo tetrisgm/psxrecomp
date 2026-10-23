@@ -277,6 +277,9 @@ void upload(const fs::path& root) {
     duck_texture_pack_invalidate(pack.get(),700,400,8,8);
     duck_texture_pack_clear_lookup_cache(pack.get());
     check(duck_texture_pack_tracking_generation(pack.get())==tracking,"native-buffer rebind cache clear preserves tracking identity");
+    check(duck_texture_pack_begin_copy(pack.get(),0,0,700,400,8,8,vram.data(),vram.size()),"untracked framebuffer copy begins");
+    check(duck_texture_pack_end_copy(pack.get(),vram.data(),vram.size()),"untracked framebuffer copy ends");
+    check(duck_texture_pack_tracking_generation(pack.get())==tracking,"untracked framebuffer copy preserves tracking identity");
     check(duck_texture_pack_invalidation_changes(pack.get(),66,257,1,1),"Duck overlap probe finds live fragment");
     duck_texture_pack_invalidate(pack.get(),66,257,1,1); /* outside replacement crop */
     check(duck_texture_pack_tracking_generation(pack.get())!=tracking,"actual fragment overwrite advances identity");

@@ -975,7 +975,6 @@ int duck_texture_pack_begin_copy(DuckTexturePack* p, uint16_t sx, uint16_t sy, u
                                   uint16_t w, uint16_t h, const uint16_t* vram, size_t count) {
     if (!p || !vram || count < kWords) return 0;
     p->copy_updates.clear(); p->copy_pending = false;
-    ++p->tracking_generation;
     const Rect destination{dx,dy,w,h};
     if (!valid_rect({sx,sy,w,h}) || !valid_rect(destination)) { duck_texture_pack_invalidate(p,dx,dy,w,h); return 0; }
     try {
@@ -985,6 +984,7 @@ int duck_texture_pack_begin_copy(DuckTexturePack* p, uint16_t sx, uint16_t sy, u
                 if (contains(upload.active,destination))
                     p->copy_updates.push_back({upload.source->rect,upload.active,upload.splits});
             }
+            if (!p->copy_updates.empty()) ++p->tracking_generation;
             p->uploads.erase(std::remove_if(p->uploads.begin(),p->uploads.end(),[&](const Upload& upload) {
                 return contains(upload.active,destination);
             }),p->uploads.end());
@@ -1002,8 +1002,9 @@ int duck_texture_pack_end_copy(DuckTexturePack* p, const uint16_t* vram, size_t 
             auto replacement = capture_source(*p,update.original,vram,DUCK_TEXTURE_UPLOAD);
             if (!replacement) { p->copy_updates.clear(); return 0; }
             p->uploads.push_back({replacement,update.active,update.splits});
+            ++p->tracking_generation;
         }
-        p->copy_updates.clear(); p->match_cache.clear(); ++p->revision; ++p->tracking_generation;
+        p->copy_updates.clear(); p->match_cache.clear(); ++p->revision;
         return 1;
     } catch (...) { p->copy_updates.clear(); return 0; }
 }
