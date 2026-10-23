@@ -8869,6 +8869,56 @@ static void pass_capture_into(GLuint tex, const PassGen *g) {
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
+size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
+    uint32_t *width,uint32_t *height,int *wide) {
+    GL_RT_SYNC("pass_debug_capture");
+    if(!s_pass_active || s_pass_local || !s_ctx) return 0;
+    const PassGen *g=&s_pgen[s_pgen_write];
+    int is_wide=g->source_path==GL_PRES_WIDE, S=s_hr_scale;
+    GLuint source=is_wide ? pass_wide_fbo_for(g->x) : s_hr_fbo;
+    if(!g->valid || !source || g->tex_w<=0 || g->tex_h<=0) return 0;
+    size_t bytes=(size_t)g->tex_w*g->tex_h*4u;
+    if(width) *width=(uint32_t)g->tex_w;
+    if(height) *height=(uint32_t)g->tex_h;
+    if(wide) *wide=is_wide;
+    if(!rgba) return bytes;
+    if(capacity<bytes) return 0;
+    flush_flat_batch(); flush_tex_batch(); flush_cpu_upload(); hiw_flush_queue();
+    GLint read_fbo,draw_fbo,texture,pack,unpack,alignment,row,skip_rows,skip_pixels;
+    glGetIntegerv(0x8CAA,&read_fbo);
+    glGetIntegerv(0x8CA6,&draw_fbo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);
+    glGetIntegerv(0x88ED,&pack); glGetIntegerv(0x88EF,&unpack);
+    glGetIntegerv(GL_PACK_ALIGNMENT,&alignment); glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+    glGetIntegerv(GL_PACK_SKIP_ROWS,&skip_rows); glGetIntegerv(GL_PACK_SKIP_PIXELS,&skip_pixels);
+    GLuint temp=0; glGenTextures(1,&temp);
+    p_glBindBuffer(0x88EB,0); p_glBindBuffer(0x88EC,0);
+    glBindTexture(GL_TEXTURE_2D,temp);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,g->tex_w,g->tex_h,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,source);
+    glCopyTexSubImage2D(GL_TEXTURE_2D,0,0,0,is_wide?0:g->x*S,g->y*S,g->tex_w,g->tex_h);
+    if(is_wide && wide_center_is_canonical()) {
+        int native_w=g_wide_w-2*g_wide_off;
+        if(native_w>0) {
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_hr_fbo);
+            glCopyTexSubImage2D(GL_TEXTURE_2D,0,g_wide_off*S,0,g->x*S,g->y*S,native_w*S,g->tex_h);
+        }
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
+    glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,rgba);
+    int ok=temp && glGetError()==GL_NO_ERROR;
+    glBindTexture(GL_TEXTURE_2D,(GLuint)texture); glDeleteTextures(1,&temp);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,(GLuint)read_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,(GLuint)draw_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT,alignment); glPixelStorei(GL_PACK_ROW_LENGTH,row);
+    glPixelStorei(GL_PACK_SKIP_ROWS,skip_rows); glPixelStorei(GL_PACK_SKIP_PIXELS,skip_pixels);
+    p_glBindBuffer(0x88EB,(GLuint)pack); p_glBindBuffer(0x88EC,(GLuint)unpack);
+    return ok?bytes:0;
+}
+#endif
+
 static void pass_blit(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
                       int w, int h, GLbitfield mask) {
     hiw_flush_queue();   /* queued wide mirrors land before a copy reads or writes */

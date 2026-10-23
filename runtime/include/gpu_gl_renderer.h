@@ -99,6 +99,14 @@ void gl_renderer_pass_async_stats(GLRenderAsyncStats *out);
 /* Main-thread discontinuity: cancel queued timed images and all outstanding
  * tokens immediately, without acquiring GL or waiting for workers. */
 void gl_renderer_pass_async_invalidate(void);
+#ifndef PSX_NO_DEBUG_TOOLS
+/* Diagnostic-only, blocking readback inside an active temporal pass, before
+ * rollback. NULL rgba queries tightly packed RGBA8 bytes and full internal
+ * dimensions. Wide capture includes the canonical centre, exactly as present.
+ * Returns zero for no active pass/error/short capacity. No pixel writes. */
+size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
+    uint32_t *width,uint32_t *height,int *wide);
+#endif
 int gl_renderer_pass_queued(void);
 /* Queued-pass counters: plans shed while the render thread was two frames
  * behind, begins the render thread refused, and out-of-rect writes. */
