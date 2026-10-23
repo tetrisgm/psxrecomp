@@ -79,12 +79,18 @@ int main(void) {
         check(!gl_renderer_pass_async_begin(&tokens[1]),"duplicate completion rejected");
         GLRenderAsyncToken stale=tokens[2]; stale.output.epoch++;
         check(!gl_renderer_pass_async_begin(&stale),"old epoch rejected before recording");
+        check(gl_renderer_pass_async_begin(&tokens[2]),"second completed output accepted");
+        gr_fill_rect(0,0,16,16,0x3E0);
+        check(gl_renderer_pass_async_end(&tokens[2],1),"second output transaction committed");
         gl_renderer_render_thread_sync("check async capture");
         int found=0;
         for(int i=0;i<PASS_GENERATIONS;++i)
             if(s_pgen[i].async_id==tokens[1].output.generation && s_pgen[i].n==2) found++;
         check(found==1,"completed output appended to original generation");
         check(glGetError()==GL_NO_ERROR,"async GPU transaction clean");
+        pt_drain(); pt_get_stats(&st);
+        check(st.presents>=3,"phase0 and completed draw consumed by presenter");
+        check(pt_clock_ns()>=tokens[1].output.deadline,"async output honored its own timestamp");
     }
     gl_renderer_shutdown();
     SDL_DestroyWindow(win);

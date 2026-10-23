@@ -739,6 +739,7 @@ static int pass_gen_present(uint64_t deadline);
 static int pass_queued_enabled(void);
 static int pass_vblank_locked_rate(void);
 static int pass_queued_presenter(void);
+static int async_display_active(void);
 static int pass_locked_present(void);
 static int stereo_present(int w, int h);
 static int xr_mirror_mode(void);
@@ -8251,6 +8252,7 @@ static void interp_present_source_interval(void) {
             s_interp_phase_lo, s_interp_phase_hi))
         return;
     pass_apply_promotion();
+    if (async_display_active()) return; /* token outputs own this host window */
     if (pass_queued_presenter() && s_rth_on && rt_on_render_thread()) {
         /* Queued passes: exactly one output for this guest VBlank, now. The
          * guest's own pacer sets the cadence; the image is the one for this
@@ -8358,7 +8360,9 @@ static uint64_t s_pgen_order;
 static RenderPassOutputTimeline s_async_timeline;
 static uint64_t s_async_id, s_async_last_index;
 static int s_async_rate, s_async_exec, s_async_previous_write, s_async_has_index;
-static GLRenderAsyncToken s_async_recording;
+static GLRenderAsyncToken s_async_recording, s_async_executing;
+static uint64_t s_async_display_until, s_async_display_epoch;
+static int async_display_active(void);
 /* Double-buffer complete pairs: the unpublished set may be overwritten while
  * the last complete pair remains visible. No temporal phases or generation. */
 typedef struct StereoPair {
@@ -9245,7 +9249,9 @@ uint32_t gl_renderer_pass_async_reserve(uint32_t period,uint64_t begin,uint64_t 
     int n=render_pass_output_plan(&next,begin,end,pt_clock_ns(),s_async_id+1,outputs,max);
     if (n<=0 || !rt_batch_begin()) return 0;
     GLRenderAsyncToken base={outputs[0],x,y,w,h,period};
-    base.output.expires=end; /* generation remains useful after its first output */
+    base.output.deadline=begin;
+    base.output.expires=end; /* reserve carries the entire display window */
+    base.output.alpha_q16=0;
     if (!async_record(RTH_ASYNC_RESERVE,&base) || !rt_batch_try_commit()) {
         rt_batch_discard(); return 0;
     }
@@ -9300,6 +9306,10 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
     s_pass_dead = 0;   /* however this pass ends, later records run */
     if (!s_pass_active) return;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
+    /* Timed outputs are copied into a presenter-owned slot immediately.
+     * Reuse the generation's one scratch image: high rates must not retain
+     * one 8K texture per output while the presenter already owns its copy. */
+    if (s_async_exec && keep && alpha_q16 && g->valid) g->n=1;
     if (keep && alpha_q16 && g->valid && (!g->promoted || s_async_exec) && g->n < PASS_SLOTS &&
         g->n < pass_slot_cap(g->tex_w, g->tex_h) &&
         pass_gen_reserve(gi, g->n + 1u, g->tex_w, g->tex_h)) {
@@ -14974,6 +14984,21 @@ static const GpuRenderBackend GL_RT_BACKEND = {
 };
 
 /* ---- replay (render thread) ---------------------------------------------- */
+static int async_display_active(void) {
+    return s_async_display_epoch==gl_renderer_present_epoch() &&
+           pt_clock_ns()<s_async_display_until;
+}
+static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *output) {
+    PassGen *g=&s_pgen[gi];
+    if (!g->valid || slot>=g->n || output->epoch!=gl_renderer_present_epoch() ||
+        pt_clock_ns()>=output->expires || g->source_path!=s_interp_source_path ||
+        g->tex_w!=s_interp_w || g->tex_h!=s_interp_h) return;
+    PtTiming timing={output->epoch,output->deadline,output->expires};
+    if (gl_renderer_set_present_timing(&timing))
+        (void)interp_present_pair(s_pgen_tex[gi][slot],s_pgen_tex[gi][slot],0.0f,s_interp_blend_mode);
+    memset(&s_pt_next_timing,0,sizeof s_pt_next_timing);
+}
+
 static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     (void)user;
     const int32_t *v = (const int32_t *)payload;
@@ -15086,6 +15111,12 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
             s_pgen[s_pgen_write].async_id=token.output.generation;
             s_pgen[s_pgen_write].async_epoch=token.output.epoch;
             pass_end_now(0,0);
+            s_async_display_until=token.output.expires;
+            s_async_display_epoch=token.output.epoch;
+            RenderPassOutput first=token.output;
+            uint64_t period=(uint64_t)(1e9/s_interp_target_hz);
+            if(first.deadline+period<first.expires) first.expires=first.deadline+period;
+            async_present_slot(s_pgen_write,0,&first);
         }
         break;
     }
@@ -15097,7 +15128,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
                 s_pgen[k].async_epoch==token.output.epoch) gi=k;
         if (gi<0 || token.output.epoch!=gl_renderer_present_epoch() ||
             pt_clock_ns()>token.output.deadline) { s_pass_dead=1; break; }
-        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1;
+        s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token;
         if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
             s_pass_leaks_at_begin=s_pass_leaks;
         } else { s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
@@ -15119,7 +15150,15 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         } else {
             pass_end_now((uint32_t)v[0], v[1]);
         }
-        if (s_async_exec) { s_async_exec=0; s_pgen_write=s_async_previous_write; }
+        if (s_async_exec) {
+            if (v[1] && s_pass_leaks==s_pass_leaks_at_begin) {
+                PassGen *g=&s_pgen[s_pgen_write];
+                for(uint32_t k=1;k<g->n;++k)
+                    if(g->phase[k]==s_async_executing.output.alpha_q16)
+                        async_present_slot(s_pgen_write,k,&s_async_executing.output);
+            }
+            s_async_exec=0; s_pgen_write=s_async_previous_write;
+        }
         break;
     case RTH_PEEK: {
         uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);
