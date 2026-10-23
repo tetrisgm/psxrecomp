@@ -171,6 +171,11 @@ static void frame(int f, int buf_x) {
         int w = 4 + (int)(rnd() % 40), h = 4 + (int)(rnd() % 30);
         uint16_t c = (uint16_t)(rnd() & 0x7fff);
         gr_set_semi_transparency((int)(rnd() % 4 == 0), (int)(rnd() % 4));
+        /* Exercise the exact setup sequence folded into a triangle record. */
+        gr_set_precise_triangle(i%3==0,x*65536+8192,y*65536,
+            (x+w)*65536,y*65536+8192,x*65536,(y+h)*65536);
+        gr_set_depth_triangle(i%3==0,100.0f,110.0f,120.0f);
+        gr_set_perspective_triangle(i%3==0,1.0f,0.9f,0.8f);
         switch (i % 7) {
         case 0: gr_draw_flat_rect(x, y, w, h, c); break;
         case 1: gr_draw_gouraud_triangle(x, y, c, x + w, y + 3, (uint16_t)(c ^ 0x1f), x + 2, y + h, (uint16_t)(c ^ 0x3e0)); break;
@@ -184,6 +189,8 @@ static void frame(int f, int buf_x) {
         g_prim_id = -1;   /* the next GP0 command is in flight: no tags */
     }
     gr_set_semi_transparency(0, 0);
+    gr_set_precise_triangle(0,0,0,0,0,0,0);
+    gr_set_depth_triangle(0,0,0,0); gr_set_perspective_triangle(0,0,0,0);
     /* Mask set, then mask check over it. */
     mask_bits(1, 0);
     gr_draw_flat_rect(buf_x + 40, 40, 30, 30, 0x4210);
@@ -233,6 +240,15 @@ static void frame(int f, int buf_x) {
     gl_renderer_render_thread_frame_boundary();
 }
 
+int psx_host_menu_overlay_image(const uint32_t **pixels,int *w,int *h) {
+    (void)pixels;(void)w;(void)h;return 0;
+}
+void psx_video_telemetry_present(int result) {(void)result;}
+void psx_video_telemetry_compose(int renderer,int scale,int source_w,int source_h,
+    int drawable_w,int drawable_h,int viewport_w,int viewport_h) {
+    (void)renderer;(void)scale;(void)source_w;(void)source_h;
+    (void)drawable_w;(void)drawable_h;(void)viewport_w;(void)viewport_h;
+}
 int main(int argc, char **argv) {
     int scale = argc > 1 ? atoi(argv[1]) : 1;
     int threaded = argc > 2 && argv[2][0] == '1';
