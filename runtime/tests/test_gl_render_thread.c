@@ -65,6 +65,7 @@ volatile int32_t g_gte_last_h, g_gte_last_ofx, g_gte_last_ofy;
  * none here. */
 int psx_host_menu_overlay_image(const uint32_t **pixels, int *w, int *h){(void)pixels;(void)w;(void)h;return 0;}
 void psx_video_telemetry_present(int result){(void)result;}
+void host_sampler_retarget_current(const char *name){(void)name;}
 void psx_video_telemetry_compose(int renderer, int scale, int source_w, int source_h,
                                int drawable_w, int drawable_h, int viewport_w, int viewport_h){
     (void)renderer;(void)scale;(void)source_w;(void)source_h;(void)drawable_w;(void)drawable_h;
