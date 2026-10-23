@@ -10532,6 +10532,65 @@ static GLuint pt_target_fbo(void) {
     return s_pts_fbo[i];
 }
 
+/* Opt-in presenter-local receipt: one 8x8 downsample/readback, never an 8K
+ * download. Changed sample hashes are a lower bound on distinct images. */
+static FILE *s_pt_trace;
+static int s_pt_trace_init;
+static GLuint s_pt_trace_tex,s_pt_trace_fbo;
+static uint64_t s_pt_trace_start,s_pt_trace_second,s_pt_trace_hash;
+static unsigned s_pt_trace_frames,s_pt_trace_changes;
+static int s_pt_trace_has_hash;
+static int pt_trace_sample(int slot,uint64_t *hash) {
+    if(!s_pt_trace_init) {
+        s_pt_trace_init=1;
+        const char *path=getenv("PSX_PRESENT_TRACE");
+        if(path && *path) s_pt_trace=fopen(path,"wb");
+        if(s_pt_trace) fprintf(s_pt_trace,"time_ns,epoch,generation,index,alpha_q16,deadline_ns,expires_ns,sample_hash,changed\n");
+    }
+    if(!s_pt_trace) return 0;
+    GLint read=0,draw=0,tex=0,pack=0,row=0;
+    glGetIntegerv(0x8CAA,&read); glGetIntegerv(0x8CA6,&draw);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&tex);
+    glGetIntegerv(GL_PACK_ALIGNMENT,&pack); glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+    if(!s_pt_trace_fbo) {
+        glGenTextures(1,&s_pt_trace_tex); glBindTexture(GL_TEXTURE_2D,s_pt_trace_tex);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,8,8,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        p_glGenFramebuffers(1,&s_pt_trace_fbo);
+        p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
+        p_glFramebufferTexture2D(PSXGL_DRAW_FRAMEBUFFER,PSXGL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s_pt_trace_tex,0);
+    }
+    p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_ptp_fbo[slot]);
+    p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
+    p_glBlitFramebuffer(0,0,s_pts_w[slot],s_pts_h[slot],0,0,8,8,GL_COLOR_BUFFER_BIT,GL_LINEAR);
+    p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_pt_trace_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    uint8_t pixels[8*8*4]; glReadPixels(0,0,8,8,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    *hash=1469598103934665603ull;
+    for(size_t i=0;i<sizeof pixels;i++) *hash=(*hash^pixels[i])*1099511628211ull;
+    glPixelStorei(GL_PACK_ALIGNMENT,pack); glPixelStorei(GL_PACK_ROW_LENGTH,row);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)tex);
+    p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,(GLuint)read);
+    p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,(GLuint)draw);
+    return 1;
+}
+static void pt_trace_record(int slot,uint64_t hash) {
+    PtTiming timing={0}; (void)pt_present_timing((unsigned)slot,&timing);
+    uint64_t now=pt_clock_ns();
+    if(!s_pt_trace_start) s_pt_trace_start=now;
+    uint64_t second=(now-s_pt_trace_start)/1000000000u;
+    if(second!=s_pt_trace_second) {
+        fprintf(stderr,"present_trace second=%llu presented=%u sample_changes=%u\n",
+                (unsigned long long)s_pt_trace_second,s_pt_trace_frames,s_pt_trace_changes);
+        fflush(s_pt_trace); s_pt_trace_frames=s_pt_trace_changes=0; s_pt_trace_second=second;
+    }
+    int changed=!s_pt_trace_has_hash || hash!=s_pt_trace_hash;
+    s_pt_trace_has_hash=1; s_pt_trace_hash=hash; s_pt_trace_frames++; s_pt_trace_changes+=changed;
+    fprintf(s_pt_trace,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%016llX,%d\n",
+            (unsigned long long)now,(unsigned long long)timing.epoch,
+            (unsigned long long)timing.generation,(unsigned long long)timing.index,timing.alpha_q16,
+            (unsigned long long)timing.not_before_ns,(unsigned long long)timing.expires_ns,
+            (unsigned long long)hash,changed);
+}
 static int pt_cb_ctx(void *user, int current) {
     (void)user;
     if (current) {
@@ -10544,6 +10603,11 @@ static int pt_cb_ctx(void *user, int current) {
         s_ptp_fbo[i] = 0;
         s_ptp_gen[i] = 0;
     }
+    if(s_pt_trace) { fflush(s_pt_trace); fclose(s_pt_trace); s_pt_trace=NULL; }
+    if(s_pt_trace_fbo) p_glDeleteFramebuffers(1,&s_pt_trace_fbo);
+    if(s_pt_trace_tex) glDeleteTextures(1,&s_pt_trace_tex);
+    s_pt_trace_fbo=s_pt_trace_tex=0; s_pt_trace_init=0;
+    s_pt_trace_start=s_pt_trace_second=0; s_pt_trace_frames=s_pt_trace_changes=0; s_pt_trace_has_hash=0;
     glFinish();
     SDL_GL_MakeCurrent(s_win, NULL);
     return 1;
@@ -10593,8 +10657,10 @@ static void *pt_cb_present(void *user, int slot, void *ready) {
 #ifdef GL_PRESENT_THREAD_TEST_HOOK
     GL_PRESENT_THREAD_TEST_HOOK(slot);
 #endif
+    uint64_t trace_hash=0; int traced=pt_trace_sample(slot,&trace_hash);
     void *done = p_glFenceSync(PT_SYNC_GPU_COMMANDS_COMPLETE, 0);
     gl_window_swap();
+    if(traced) pt_trace_record(slot,trace_hash);
     return done;
 }
 
@@ -15309,7 +15375,8 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
     if (g->source_path!=s_interp_source_path || g->tex_w!=s_interp_w || g->tex_h!=s_interp_h) {
         ASYNC_COUNT(present_mismatch); return;
     }
-    PtTiming timing={output->epoch,output->deadline,output->expires};
+    PtTiming timing={output->epoch,output->deadline,output->expires,
+                     output->generation,output->index,output->alpha_q16};
     if (gl_renderer_set_present_timing(&timing)) {
         PtStats before,after; pt_get_stats(&before);
         int drew=interp_present_pair(s_pgen_tex[gi][slot],s_pgen_tex[gi][slot],0.0f,s_interp_blend_mode);

@@ -71,6 +71,8 @@ int  pt_submit(void *ready, void **next_done, uint64_t *wait_ns);
  * untimed submissions retain their existing FIFO behavior. */
 typedef struct PtTiming {
     uint64_t epoch, not_before_ns, expires_ns;
+    uint64_t generation, index; /* optional diagnostic provenance */
+    uint32_t alpha_q16;
 } PtTiming;
 uint64_t pt_clock_ns(void);
 void pt_set_epoch(uint64_t epoch);
@@ -82,6 +84,8 @@ void pt_set_epoch(uint64_t epoch);
  * A dropped ready token returns as done so GPU work is still fenced on reuse.
  * Stop discards timed pending outputs rather than waiting on future times. */
 int pt_try_submit_at(void *ready, const PtTiming *timing, void **next_done);
+/* Callback: read provenance only while this slot is being presented. */
+int pt_present_timing(unsigned slot, PtTiming *out);
 /* Producer: wait until nothing is queued or presenting. */
 void pt_drain(void);
 

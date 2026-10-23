@@ -315,6 +315,15 @@ void pt_drain(void) {
     mtx_unlock(&P.mtx);
 }
 
+int pt_present_timing(unsigned slot, PtTiming *out) {
+    if (!s_pt_inited || !out || slot >= PT_MAX_SLOTS) return 0;
+    mtx_lock(&P.mtx);
+    int ok = P.running && P.state[slot] == S_PRESENTING;
+    if (ok) *out = P.timing[slot];
+    mtx_unlock(&P.mtx);
+    return ok;
+}
+
 void pt_get_stats(PtStats *out) {
     if (!out) return;
     if (!s_pt_inited) { memset(out, 0, sizeof *out); return; }
