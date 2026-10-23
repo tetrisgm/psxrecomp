@@ -56,6 +56,9 @@ typedef struct {
     size_t words;
     uint64_t hash;
     double ms;           /* total over reps */
+    uint32_t trail[16];
+    int trail_n;
+    uint32_t fault_ra;
     PsxCtxStats stats;
 } BenchJob;
 
@@ -147,6 +150,7 @@ static void run_job(BenchJob *j) {
                 j->status = s;
                 j->failed_call = i;
                 psx_ctx_status(j->ctx, &j->fault_pc, &j->fault_what);
+                j->trail_n = psx_ctx_trail(j->ctx, j->trail, 16, &j->fault_ra);
                 break;
             }
         }
@@ -166,8 +170,16 @@ static void *job_thread(void *arg) { run_job((BenchJob *)arg); return NULL; }
 #endif
 
 static int emit_job(char *out, size_t cap, int pos, const char *name, const BenchJob *j) {
+    char trail[16 * 13 + 4];
+    int tp = 0;
+    trail[0] = 0;
+    for (int i = 0; i < j->trail_n; i++)
+        tp += snprintf(trail + tp, sizeof trail - (size_t)tp, "%s\"0x%08X\"", i ? "," : "", j->trail[i]);
+    pos += snprintf(out + pos, cap - (size_t)pos, "%s{\"trail\":[%s],\"fault_ra\":\"0x%08X\",",
+                    name, trail, j->fault_ra);
+    name = "";
     return pos + snprintf(out + pos, cap - (size_t)pos,
-        "%s{\"status\":\"%s\",\"failed_call\":%d,\"fault_pc\":\"0x%08X\",\"fault\":\"%s\","
+        "%s\"status\":\"%s\",\"failed_call\":%d,\"fault_pc\":\"0x%08X\",\"fault\":\"%s\","
         "\"words\":%u,\"hash\":\"%016llx\",\"ms\":%.3f,\"dispatches\":%llu,"
         "\"dma_gpu\":%llu,\"dma_otc\":%llu,\"gp0_port\":%llu,\"gp1\":%llu,"
         "\"dropped_writes\":%llu,\"hooks_stripped\":%llu}",

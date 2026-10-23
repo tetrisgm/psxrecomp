@@ -80,6 +80,7 @@ std::string draw_ctx_clone_text(const std::string& code,
     std::string out;
     out.reserve(code.size() + code.size() / 16);
     size_t i = 0;
+    static const std::string kTick = " PSX_DCTX_TICK();";
     static const std::string kStorePc = "g_debug_last_store_pc = 0x";
     static const std::pair<const char*, const char*> kStores[] = {
         {"cpu->write_word(", "psx_dctx_sw(cpu, "},
@@ -107,6 +108,17 @@ std::string draw_ctx_clone_text(const std::string& code,
                 }
             }
             if (replaced) continue;
+        }
+        // Block labels count against the context's block budget: a guest
+        // loop waiting for an interrupt or device that a draw context does
+        // not run (VSync, DrawSync) faults instead of spinning forever.
+        if (c == 'b' && (i == 0 || code[i - 1] == '\n') &&
+            code.compare(i, 6, "block_") == 0 && is_hex8(code, i + 6) &&
+            code.compare(i + 14, 2, ":\n") == 0) {
+            out.append(code, i, 15);
+            out += kTick;
+            i += 15;
+            continue;
         }
         if ((c == 'f' || c == 'p') && (i == 0 || !ident_char(code[i - 1]))) {
             const char* prefix = c == 'f' ? "func_" : "psx_alias_body_";

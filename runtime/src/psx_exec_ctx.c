@@ -33,6 +33,7 @@ extern int psx_ws_x_margin(void);
 
 #define BIOS_ROM_BYTES (512u * 1024u)
 #define CTX_DEFAULT_STEP_LIMIT 50000000ull
+#define CTX_DEFAULT_BLOCK_LIMIT 400000000ull
 #define CTX_DMA_NODE_LIMIT     (1u << 22)
 
 /* ---- draw table ----------------------------------------------------------- */
@@ -104,6 +105,7 @@ void psx_dctx_fault(CPUState *cpu, int status, uint32_t pc, const char *what) {
     PsxExecCtx *x = cpu->ctx;
     x->status = (PsxCtxStatus)status;
     x->fault_pc = pc;
+    x->fault_ra = cpu->gpr[31];
     x->fault_what = what;
     longjmp(x->abort, 1);
 }
@@ -244,6 +246,7 @@ PsxExecCtx *psx_ctx_create(void) {
     x->gte = gte_ctx_create(x->pgxp);
     if (x->slot < 0 || !x->pgxp || !x->gte) { psx_ctx_destroy(x); return NULL; }
     x->step_limit = CTX_DEFAULT_STEP_LIMIT;
+    x->block_limit = CTX_DEFAULT_BLOCK_LIMIT;
     wire_cpu(x);
     return x;
 }
@@ -348,6 +351,7 @@ static void ctx_run(PsxExecCtx *x, uint32_t pc, uint32_t stop, uint32_t sp) {
         if (++steps > x->step_limit)
             psx_dctx_fault(cpu, PSX_CTX_FAULT_RUNAWAY, pc, "dispatch budget");
         x->stats.dispatches++;
+        x->trail[x->trail_n++ & 15u] = pc;
         cpu->pc = row->resume;
         row->fn(cpu);
         pc = cpu->pc;
@@ -363,6 +367,8 @@ PsxCtxStatus psx_ctx_call(PsxExecCtx *x, uint32_t fn, const uint32_t *args,
     for (int i = 0; i < nargs; i++) cpu->gpr[4 + i] = args[i];
     cpu->gpr[31] = stop_pc ? stop_pc : PSX_CTX_STOP_PC;
     x->status = PSX_CTX_OK;
+    x->block_budget = x->block_limit;
+    x->trail_n = 0;
     x->in_call = 1;
     if (setjmp(x->abort)) {
         x->in_call = 0;
@@ -639,6 +645,21 @@ int psx_ctx_precise_vertex(PsxExecCtx *x, const PsxCtxGpuWord *w, int32_t int_x,
 }
 
 const PsxCtxStats *psx_ctx_stats(const PsxExecCtx *x) { return x ? &x->stats : NULL; }
+
+int psx_ctx_trail(const PsxExecCtx *x, uint32_t *out, int cap, uint32_t *fault_ra) {
+    if (fault_ra) *fault_ra = x ? x->fault_ra : 0u;
+    if (!x) return 0;
+    const uint32_t n = x->trail_n < 16u ? x->trail_n : 16u;
+    int k = 0;
+    for (uint32_t i = x->trail_n - n; i < x->trail_n && k < cap; i++)
+        out[k++] = x->trail[i & 15u];
+    return k;
+}
+
+void psx_ctx_set_budget(PsxExecCtx *x, uint64_t dispatches, uint64_t blocks) {
+    x->step_limit = dispatches ? dispatches : CTX_DEFAULT_STEP_LIMIT;
+    x->block_limit = blocks ? blocks : CTX_DEFAULT_BLOCK_LIMIT;
+}
 
 PsxCtxStatus psx_ctx_status(const PsxExecCtx *x, uint32_t *fault_pc, const char **what) {
     if (fault_pc) *fault_pc = x ? x->fault_pc : 0u;

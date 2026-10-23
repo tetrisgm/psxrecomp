@@ -86,6 +86,7 @@ struct PsxExecCtx {
     int32_t  ws_x_margin;        /* psx_ws_x_margin() of the snapshot */
     int      pgxp_active;
     int      entry_hooks;        /* registered draw-context entry hooks */
+    uint64_t block_budget;       /* clone blocks left in this call */
     struct PgxpCtxEngine *pgxp;
     struct PsxGteCtx *gte;
     uint8_t  scratch[1024];
@@ -95,6 +96,9 @@ struct PsxExecCtx {
     const PsxCtxSnapshot *snap;
     PsxCtxStatus status;
     uint32_t fault_pc;           /* PC / address the fault names */
+    uint32_t fault_ra;           /* $ra at the fault */
+    uint32_t trail[16];          /* last dispatched PCs, newest at trail_n-1 */
+    uint32_t trail_n;
     const char *fault_what;
     jmp_buf  abort;
     int      in_call;
@@ -107,7 +111,7 @@ struct PsxExecCtx {
     uint32_t timer_counter[3], timer_mode[3], timer_target[3];
     uint8_t *text_ok;            /* per draw-table row: 0 unknown, 1 ok, 2 bad */
     size_t   text_ok_n;
-    uint64_t step_limit;
+    uint64_t step_limit, block_limit;
     PsxCtxStats stats;
 };
 
@@ -154,6 +158,11 @@ int psx_ctx_precise_vertex(PsxExecCtx *x, const PsxCtxGpuWord *w,
 const PsxCtxStats *psx_ctx_stats(const PsxExecCtx *x);
 PsxCtxStatus psx_ctx_status(const PsxExecCtx *x, uint32_t *fault_pc,
                             const char **what);
+/* The last dispatched PCs before a fault, oldest first; returns the count. */
+int psx_ctx_trail(const PsxExecCtx *x, uint32_t *out, int cap, uint32_t *fault_ra);
+/* Per-call budgets (0 keeps the default): trampoline dispatches and clone
+ * blocks. Exhausting either faults the call as PSX_CTX_FAULT_RUNAWAY. */
+void psx_ctx_set_budget(PsxExecCtx *x, uint64_t dispatches, uint64_t blocks);
 const char *psx_ctx_status_name(PsxCtxStatus s);
 
 /* Entry hooks a draw context runs (the draw-pass plugin hooks a lean clone

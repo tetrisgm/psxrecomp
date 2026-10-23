@@ -31,6 +31,12 @@
 #define PSX_DCTX_FAULT_MISS        1
 
 /* ---- control flow / interrupts / debug ---------------------------------- */
+/* Every block label of a clone: the context's block budget. */
+#define PSX_DCTX_TICK()                                                  \
+    do {                                                                 \
+        if (__builtin_expect(--cpu->ctx->block_budget == 0, 0))         \
+            psx_dctx_fault(cpu, 7, 0u, "block budget (a wait loop?)");   \
+    } while (0)
 #undef  debug_server_log_call_entry
 #define debug_server_log_call_entry(a)       ((void)0)
 #undef  debug_server_cyc_observe
