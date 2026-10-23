@@ -66,7 +66,10 @@ Pieces, with file:line on `feat/render-thread`:
   before re-checking, the waker publishes its position before reading the
   flag). The consumer spins briefly before sleeping; the producer wakes a
   sleeping consumer every 128 KiB / 256 records and always at a frame end,
-  drain or sync point. On macOS the thread is created with
+  drain or sync point. Committed records are published (one store of the
+  write position) every 32 records / 16 KiB and before every wait, frame end,
+  drain or sync point, and the two sides write separate cache lines
+  (docs/HOST_THREADING.md; `PSX_RENDER_THREAD_PUBLISH=1` publishes per record). On macOS the thread is created with
   `QOS_CLASS_USER_INTERACTIVE`: with the default QoS a busy host scheduled
   it onto efficiency cores and it fell behind the emulation thread (R4 4K
   race on a host at load average ~40: 40 Hz with the default class, 60 Hz
