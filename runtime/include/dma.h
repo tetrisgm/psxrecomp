@@ -25,6 +25,7 @@ extern "C" {
 
 void     dma_init(void);
 uint32_t dma_read(uint32_t addr);
+void dma_peek_channel(int ch, uint32_t *madr, uint32_t *bcr, uint32_t *chcr);
 void     dma_write(uint32_t addr, uint32_t val);
 void     dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask);
 void     dma_advance(uint32_t cycles);

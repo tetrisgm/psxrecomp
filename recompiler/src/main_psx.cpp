@@ -24,6 +24,7 @@
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
 #include "write_if_changed.h"
+#include "draw_ctx_emitter.h"
 
 /* Baked emitter-source hash (recompiler/CMakeLists.txt custom command; same
  * hash_codegen.cmake + canonical source list as the runtime's overlay cache
@@ -248,6 +249,7 @@ static int psxrecomp_game_main(int argc, char** argv) {
     std::vector<PSXRecompV4::WidescreenCullScaleSite> ws_cull_scale;
     std::vector<PSXRecompV4::WidescreenAngleSite> ws_cull_angle;
     std::vector<PSXRecompV4::DrawDistanceClampSite> draw_distance_clamps; // [[draw_distance.clamp]]
+    PSXRecomp::DrawCtxConfig threaded_draw;                // [threaded_draw]
     PSXRecompV4::WidescreenAspectConeConfig ws_aspect_cone;
     int                   ws_cull_activation_guard_pixels = 0;
     std::vector<uint32_t> ws_cull_w_imms = { 0x140, 0x141 }; // [widescreen.cull] screen_w_imms
@@ -328,6 +330,9 @@ static int psxrecomp_game_main(int argc, char** argv) {
         ws_cull_scale = cfg.ws_cull_scale_sites;
         ws_cull_angle = cfg.ws_cull_angle_sites;
         draw_distance_clamps = cfg.draw_distance_clamp_sites;
+        threaded_draw.roots = cfg.threaded_draw_roots;
+        threaded_draw.exclude = cfg.threaded_draw_exclude;
+        threaded_draw.max_functions = cfg.threaded_draw_max_functions;
         ws_aspect_cone = cfg.ws_aspect_cone;
         ws_cull_activation_guard_pixels =
             cfg.ws_cull_activation_guard_pixels;
@@ -1859,6 +1864,32 @@ static int psxrecomp_game_main(int argc, char** argv) {
             fmt::print("✓ Dispatch table unchanged ({} entries{})\n\n",
                        dispatch_addrs.size(), variant_note);
         }
+    }
+
+    // Lean draw-context clones (docs/THREADED_CONTEXTS.md). Always written for
+    // a game compile so the build can glob it; empty without [threaded_draw].
+    if (!overlay_mode) {
+        std::filesystem::path draw_filename = out_dir / (exe_stem + "_draw.c");
+        std::string draw_source, draw_error;
+        PSXRecomp::DrawCtxReport draw_report;
+        if (!PSXRecomp::emit_draw_ctx(dispatch_units.front(), all_gen_funcs,
+                                      ranges_manifest, exe_stem + "_decls.h",
+                                      exe_stem, threaded_draw, draw_source,
+                                      draw_report, draw_error)) {
+            fmt::print(stderr, "ERROR: [threaded_draw]: {}\n", draw_error);
+            return 1;
+        }
+        const bool wrote = write_file_if_changed(draw_filename, draw_source);
+        fmt::print("Draw-context clones {} ({} functions, {} rows, {} lines)\n",
+                   wrote ? "written" : "unchanged", draw_report.functions,
+                   draw_report.rows, draw_report.lines);
+        for (uint32_t t : draw_report.unresolved)
+            fmt::print("  draw clones: transfer to 0x{:08X} has no compiled owner "
+                       "(a pass reaching it faults)\n", t);
+        for (uint32_t t : draw_report.excluded_hits)
+            fmt::print("  draw clones: excluded 0x{:08X} is reachable (a pass "
+                       "reaching it faults)\n", t);
+        fmt::print("\n");
     }
 
     return 0;

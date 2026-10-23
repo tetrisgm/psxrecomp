@@ -3992,6 +3992,12 @@ uint32_t gpu_read_gpustat(void) {
         }
     }
 
+    return gpu_peek_gpustat();
+}
+
+/* GPUSTAT as a read would return it, without the read's poll bookkeeping:
+ * a pure observation for draw-context snapshots (psx_exec_ctx.c). */
+uint32_t gpu_peek_gpustat(void) {
     uint32_t stat = 0;
 
     stat |= (texpage_x & 0xF);

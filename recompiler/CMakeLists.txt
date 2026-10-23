@@ -110,6 +110,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/config_loader.cpp
     src/recompiler_patch.cpp
     src/game_dispatch_emitter.cpp
+    src/draw_ctx_emitter.cpp
     src/segment_variants.cpp
     src/main_psx.cpp
 )

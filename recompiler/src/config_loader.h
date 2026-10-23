@@ -1525,6 +1525,13 @@ struct GameConfig {
     // [[draw_distance.clamp]] -- opt-in "keep far geometry" clamps. Empty by
     // default; inert until a mod switches them on; regen required.
     std::vector<DrawDistanceClampSite> draw_distance_clamp_sites;
+    // [threaded_draw] -- lean draw-context clones (docs/THREADED_CONTEXTS.md).
+    // roots: guest functions draw passes call; their static callee closure is
+    // cloned into <stem>_draw.c. exclude: functions the closure must not
+    // follow into (a transfer to one faults the pass). Empty: no clones.
+    std::vector<uint32_t> threaded_draw_roots;
+    std::vector<uint32_t> threaded_draw_exclude;
+    uint32_t threaded_draw_max_functions = 4096;
     // [quality.low/medium/high/ultra] -- graphics presets, lowest first. Empty:
     // the title has no presets and [video] alone applies (unchanged).
     std::vector<QualityPreset> quality_presets;

@@ -271,8 +271,22 @@ uint16_t psx_cyc_load_half_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint3
 
 /* Overlay DLLs route timed loads through the host callback shim so they share
  * runtime timing and memory state. Normal generated code keeps the main-RAM
- * fast path inline. */
-#if defined(PSX_OVERLAY_DLL_BUILD)
+ * fast path inline. Lean draw clones (PSX_DRAW_CTX_BUILD, generated
+ * <stem>_draw.c) load from their draw context's private memory with no
+ * timing at all (docs/THREADED_CONTEXTS.md). */
+#if defined(PSX_DRAW_CTX_BUILD)
+#include "psx_dctx_mem.h"
+static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
+                                          uint32_t rt, uint32_t reg_mask) {
+    (void)rt; (void)reg_mask;
+    return psx_dctx_lw(cpu, addr);
+}
+static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
+                                          uint32_t rt, uint32_t reg_mask) {
+    (void)rt; (void)reg_mask;
+    return psx_dctx_lh(cpu, addr);
+}
+#elif defined(PSX_OVERLAY_DLL_BUILD)
 uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
                            uint32_t rt, uint32_t reg_mask);
 uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
