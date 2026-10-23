@@ -288,7 +288,60 @@ static void test_auto_ui_prepass(void) {
 }
 
 
-float pgxp_get_unclamped_depth(uint32_t a, uint32_t w) { (void)a; (void)w; return 0; }
+float pgxp_get_unclamped_depth(uint32_t a,uint32_t w) { (void)a;(void)w;return 0; }
+static uint32_t immutable_hud[5];
+static int list_read(void *u,uint32_t address,unsigned width,uint32_t *out) {
+    (void)u; unsigned shift=8u*(address&3u);
+    address &= 0x1FFFFFFCu;
+    if(address==0xFF00) *out=command_addr-4;
+    else if(address==command_addr-4) *out=(5u<<24)|0xFFFFFFu;
+    else if(address>=command_addr && address<command_addr+20) *out=immutable_hud[(address-command_addr)/4];
+    else *out=0; /* remaining captured RAM/scratchpad is zero */
+    *out >>= shift; if(width<4) *out &= (1u<<(8u*width))-1u;
+    return 1;
+}
+static int list_metadata(void *u) { (void)u; return 1; }
+static int list_word(void *u,size_t index,GpuReplayWord *out) {
+    (void)u;
+    if(index==0) {
+        assert(gpu_replay_list_begin(0xFF00));
+        assert(gpu_replay_list_node(0xFF00,command_addr-4));
+        assert(gpu_replay_list_node(command_addr-4,(5u<<24)|0xFFFFFFu));
+        assert(gp0_ot_rank==0);
+    }
+    memset(out,0,sizeof(*out)); out->word=immutable_hud[index];
+    out->source=command_addr+(uint32_t)index*4;
+    return 1;
+}
+static void test_replay_ot_identity(void) {
+    start_scene(); ws_mode=1; ws_xnum=3; ws_xden=4;
+    gpu_ws_set_auto_ui_squash(1); gp0_state=GP0_IDLE;
+    uint32_t hud[5]={0x28802040u,pack_vertex(20,20),pack_vertex(40,20),
+                    pack_vertex(20,32),pack_vertex(40,32)};
+    memcpy(immutable_hud,hud,sizeof hud); packet_to_ram(hud,5);
+    test_ram[(command_addr-4)/4]=(5u<<24)|0xFFFFFFu;
+    test_ram[0xFF00/4]=command_addr-4;
+    gp0_ot_rank=7;
+    GpuReplayState *capture=gpu_replay_capture(); assert(capture);
+    assert(gpu_pass_checkpoint_save());
+    gpu_exec_reset_triangles();
+    gpu_ws_begin_linked_list(); gpu_ws_prepass_linked_list(0xFF00);
+    gpu_set_gp0_linked_list_node(0xFF00,0);
+    for(unsigned i=0;i<5;++i) { gpu_set_gp0_source(command_addr+4*i); gpu_write_gp0(hud[i]); }
+    unsigned char expected[sizeof gpu_exec_triangles];
+    memcpy(expected,&gpu_exec_triangles,sizeof expected);
+    assert(gpu_exec_triangles.calls==2);
+    gpu_pass_checkpoint_restore(); assert(gp0_ot_rank==7);
+    /* Both live packet bytes and rank now disagree with the captured DMA. */
+    memset(&test_ram[command_addr/4],0,20); test_ram[0xFF00/4]=0;
+    assert(gpu_pass_checkpoint_save()); gpu_exec_reset_triangles();
+    GpuReplayProvider provider={NULL,5,list_word,list_read,list_metadata};
+    assert(gpu_replay_execute(capture,&provider));
+    assert(memcmp(expected,&gpu_exec_triangles,sizeof expected)==0);
+    gpu_pass_checkpoint_restore(); assert(gp0_ot_rank==7);
+    gpu_replay_release(capture); gpu_ws_set_auto_ui_squash(0);
+}
+
 static GpuReplayWord replay_word;
 static int replay_metadata_ok;
 static int fixture_replay_word(void *u, size_t i, GpuReplayWord *out) {
@@ -343,6 +396,7 @@ static void test_immutable_replay(void) {
 }
 
 int main(void) {
+    test_replay_ot_identity();
     test_immutable_replay();
     test_retagged_canonical_packet();
     test_pass_only_tags_and_phase();

@@ -8202,6 +8202,7 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
  * The renderer's mirrored draw state (area, offset, texture window,
  * mask bits, native-wide target) is re-synced exactly as GP0(E2..E6) would. */
 typedef struct {
+    uint16_t gp0_ot_rank;
     WsTag ws_tags[WS_TAG_BUCKETS];
     WsHudAnchorTag ws_hud_anchor_tags[WS_HUD_ANCHOR_TABLE_SIZE];
     WsHudAnchorTag ws_background_tags[WS_HUD_ANCHOR_TABLE_SIZE];
@@ -8246,6 +8247,7 @@ static void gpu_pass_provenance_transfer(GpuPassPresentationState *state, int re
     if (restore) name = state->name; \
     else state->name = name; \
 } while (0)
+    PASS_VALUE(gp0_ot_rank);
     PASS_ARRAY(ws_tags);
     PASS_ARRAY(ws_hud_anchor_tags);
     PASS_ARRAY(ws_background_tags);
@@ -8370,6 +8372,23 @@ uint64_t gpu_pass_state_hash(void) {
 uint16_t* gpu_get_vram_ptr(void){ return vram; }
 uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }
 
+int gpu_replay_list_begin(uint32_t root) {
+    if(!s_replay) return 0;
+    gpu_ws_begin_linked_list(); gpu_ws_prepass_linked_list(root);
+    return !s_replay_fault;
+}
+int gpu_replay_list_node(uint32_t address,uint32_t header) {
+    if(!s_replay) return 0;
+    gpu_ws_validate_linked_list_header(address,header);
+    gpu_ws_validate_linked_list_node(address,header>>24);
+    gpu_set_gp0_linked_list_node(address,header>>24);
+    return !s_replay_fault;
+}
+int gpu_replay_list_end(void) {
+    if(!s_replay) return 0;
+    gpu_ws_end_linked_list(); return !s_replay_fault;
+}
+
 /* Immutable GPU inputs for completed draw-context streams. */
 struct GpuReplayState {
     GpuPassPresentationState presentation;
@@ -8436,6 +8455,7 @@ int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *pro
             gpu_write_gp0(input.word);
         }
     }
+    gpu_ws_end_linked_list();
     int ok = !s_replay_fault && gp0_state == GP0_IDLE;
     s_replay = NULL;
     return ok;

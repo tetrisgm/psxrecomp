@@ -34,6 +34,12 @@ typedef struct GpuReplayProvider {
     int (*prepare_metadata)(void *user);
 } GpuReplayProvider;
 
+/* Call from provider.word while its read callback selects the corresponding
+ * immutable DMA-list memory. Preserve begin/node/end order at word offsets. */
+int gpu_replay_list_begin(uint32_t root);
+int gpu_replay_list_node(uint32_t address,uint32_t header);
+int gpu_replay_list_end(void);
+
 /* Capture on main at snapshot creation; no machine mutation. Captures GPU
  * registers, scene predicates and packet tag tables, not textures/VRAM.
  * VRAM must still belong to this generation when the caller admits replay. */
