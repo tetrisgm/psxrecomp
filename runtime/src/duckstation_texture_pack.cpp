@@ -852,6 +852,29 @@ void duck_texture_pack_invalidate(DuckTexturePack* p, uint16_t x, uint16_t y, ui
     const unsigned w0 = std::min(unsigned(w), 1024 - px), h0 = std::min(unsigned(h), 512 - py);
     const std::array<Rect, 4> regions{{{px,py,w0,h0},{0,py,unsigned(w)-w0,h0},
                                     {px,0,w0,unsigned(h)-h0},{0,0,unsigned(w)-w0,unsigned(h)-h0}}};
+    /* Under HD authority every native draw lands here, almost always on the
+     * frame buffer, which no tracked texture overlaps: leave without touching
+     * (or allocating) anything when no residency or cache entry intersects. */
+    const auto touches = [&](const Rect& x) {
+        for (const auto& r : regions) if (r.w && r.h && intersects(x,r)) return true;
+        return false;
+    };
+    bool hit = false;
+    for (const auto& upload : p->uploads) if (touches(upload.active)) { hit = true; break; }
+    if (!hit) for (const auto& page : p->pages) {
+        if (touches(page.source->rect)) { hit = true; break; }
+        for (const auto& record : page.source->records)
+            if (record.depth < 2 && touches({record.clut_x,record.clut_y,record.palette_size,1})) { hit = true; break; }
+        if (hit) break;
+    }
+    if (!hit) for (const auto& v : p->rect_cache) if (touches(v.rect)) { hit = true; break; }
+    if (!hit) for (const auto& c : p->match_cache) {
+        const auto& q = c.query;
+        const Rect page{q.page_x,q.page_y,256 / expansion(q.depth),256};
+        const Rect clut{q.clut_x,q.clut_y,std::min(q.depth == 0 ? 16u : 256u,1024u-q.clut_x),1};
+        if (touches(page) || (q.depth < 2 && touches(clut))) { hit = true; break; }
+    }
+    if (!hit) return;
     ++p->revision;
     if (duck_texture_pack_invalidation_changes(p,x,y,w,h)) ++p->tracking_generation;
     bool released = false;   /* a residency record dropped or split */
@@ -1169,17 +1192,37 @@ int duck_texture_pack_preload(DuckTexturePack* p, size_t max_bytes, unsigned max
     if (!p) return -1;
     try {
         namespace tp = psx_texpreload;
+        Worker& w = p->worker;
         std::vector<uint64_t> ids;
-        for (size_t i = 0; i < p->entries.size(); ++i)
-            if (!p->entries[i].ambiguous) ids.push_back(i + 1);
         size_t per_image = 0;
         {
-            std::lock_guard<std::mutex> lock(p->worker.mutex);
-            per_image = p->worker.budget;
+            std::lock_guard<std::mutex> lock(w.mutex);
+            per_image = w.budget;
+            /* The cap and result describe the pack's total pinned residency,
+             * including earlier successful calls or publication prefixes. */
+            for (const auto& item : w.decoded)
+                if (item.second.pinned && item.second.image)
+                    r.bytes += item.second.image->rgba.size();
+            for (size_t i = 0; i < p->entries.size(); ++i) {
+                if (p->entries[i].ambiguous) continue;
+                ++r.requested;
+                const auto it = w.decoded.find(i + 1);
+                if (it != w.decoded.end() && it->second.pinned) ++r.loaded;
+            }
+            if (r.bytes > max_bytes) {
+                r.failed = r.requested - r.loaded;
+                if (out) *out = r;
+                return -1;  /* A smaller cap cannot discard live pinned data. */
+            }
+            for (size_t i = 0; i < p->entries.size(); ++i) {
+                if (p->entries[i].ambiguous) continue;
+                const auto it = w.decoded.find(i + 1);
+                if (it == w.decoded.end() || !it->second.pinned) ids.push_back(i + 1);
+            }
         }
         std::vector<std::shared_ptr<Image>> images(ids.size());
         std::vector<unsigned char> status(ids.size(), tp::kPending);
-        tp::Budget budget(max_bytes);
+        tp::Budget budget(max_bytes - r.bytes);
         r.worker_errors = static_cast<int>(tp::run(ids.size(), max_threads, [&](size_t k) {
             status[k] = tp::kFailed;
             const std::string& path = p->entries[ids[k] - 1].path;
@@ -1206,8 +1249,7 @@ int duck_texture_pack_preload(DuckTexturePack* p, size_t max_bytes, unsigned max
             reservation.keep = true;
             status[k] = tp::kLoaded;
         }));
-        r.requested = static_cast<int>(ids.size());
-        Worker& w = p->worker; std::lock_guard<std::mutex> lock(w.mutex);
+        std::lock_guard<std::mutex> lock(w.mutex);
         for (size_t k = 0; k < ids.size(); ++k) {
             if (status[k] == tp::kOverBudget) { ++r.over_budget; continue; }
             if (status[k] != tp::kLoaded) continue;
@@ -1216,20 +1258,31 @@ int duck_texture_pack_preload(DuckTexturePack* p, size_t max_bytes, unsigned max
                 /* Already pinned, or an on-demand decode in flight: leave it. */
                 if (it->second.pinned || it->second.status == DecodeStatus::Queued ||
                     it->second.status == DecodeStatus::Loading) continue;
-                if (it->second.image) w.used -= it->second.image->rgba.size();
             }
-            Decode& entry = w.decoded[ids[k]];
+            const size_t previous_bytes = it != w.decoded.end() && it->second.image
+                ? it->second.image->rgba.size() : 0;
+            Decode entry;
+            /* Prepare throwing metadata before touching an existing entry. */
             entry.path = p->entries[ids[k] - 1].path;
-            r.bytes += images[k]->rgba.size();
             entry.image = std::move(images[k]); entry.status = DecodeStatus::Ready;
             entry.pinned = true; entry.use = ++w.tick;
+            const size_t bytes = entry.image->rgba.size();
+            if (it == w.decoded.end()) w.decoded.emplace(ids[k], std::move(entry));
+            else it->second = std::move(entry);
+            w.used -= previous_bytes;
+            r.bytes += bytes;
             ++w.pinned_count; ++r.loaded;
+            ++w.decoded_images;
+            tp::after_publish(r.loaded);
         }
-        w.decoded_images += static_cast<uint64_t>(r.loaded);
         r.failed = r.requested - r.loaded - r.over_budget;
         if (out) *out = r;
         return r.loaded == r.requested ? 1 : 0;
-    } catch (...) { return -1; }
+    } catch (...) {
+        r.failed = r.requested - r.loaded - r.over_budget;
+        if (out) *out = r;  /* Account the pinned prefix even on publication failure. */
+        return -1;
+    }
 }
 int duck_texture_pack_acquire_decoded(DuckTexturePack* p, uint64_t id, DuckTexturePixels* out) {
     if (out) *out = {};

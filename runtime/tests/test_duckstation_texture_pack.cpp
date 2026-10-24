@@ -130,6 +130,11 @@ void preload(const fs::path& root) {
               pixels.width == 16,"preloaded image is resident without a decode request");
         duck_texture_pixels_release(&pixels);
         duck_texture_pack_set_decode_budget(pack.get(),1);
+        check(duck_texture_pack_preload(pack.get(),256,1,&r) == 1 && r.loaded == 1 &&
+              r.failed == 0 && r.bytes == 256 && r.worker_errors == 0,
+              "repeat counts existing residency without decoding under the reduced budget");
+        check(duck_texture_pack_preload(pack.get(),255,1,&r) == -1 && r.bytes == 256,
+              "a smaller lifetime cap rejects without hiding pinned residency");
         check(duck_texture_pack_acquire_decoded(pack.get(),match.entry_id,&pixels) == HD_TEXTURE_LOOKUP_FOUND,
               "a preloaded image survives budget eviction");
         duck_texture_pixels_release(&pixels);
@@ -153,6 +158,18 @@ void preload(const fs::path& root) {
         tp::fault_mode() = 0;
         check(status == 0 && r.worker_errors == 1 && r.failed == 1 && r.loaded == 0,
               "a throwing decode is caught and reported as a partial preload");
+    }
+    {   /* Publication can fail after retaining a pinned prefix. */
+        auto pack = create(root);
+        tp::fault_mode() = 3;
+        HdTexturePreloadResult r{};
+        const int status = duck_texture_pack_preload(pack.get(),size_t(64)<<20,4,&r);
+        tp::fault_mode() = 0;
+        check(status == -1 && r.loaded == 1 && r.bytes == 16*4*4,
+              "publication failure still reports every retained byte");
+        check(duck_texture_pack_preload(pack.get(),256,1,&r) == 1 &&
+              r.loaded == 1 && r.failed == 0 && r.bytes == 256,
+              "publication retry accounts the retained prefix without decoding again");
     }
     {   /* Malformed image: failed, not pinned, async decode reports failure. */
         std::ofstream(root/"replacements"/name,std::ios::binary|std::ios::trunc) << "not a png";
@@ -626,6 +643,26 @@ void split_coalesce_copy_parts(const fs::path& root) {
     check(duck_texture_pack_match_draw(pack.get(),&q,0,&match) == HD_TEXTURE_LOOKUP_NONE,"single-cover API preserves native fallback for composed draw");
 }
 
+void release_while_another_source_splits(const fs::path& root) {
+    config(root,"MaxVRAMWriteSplits: 4\nDumpC16Textures: true\nDumpTextureWidthThreshold: 1\nDumpTextureHeightThreshold: 1\n");
+    std::vector<uint16_t> vram(1024*512);
+    place(vram,0,0,4,words(16)); place(vram,8,0,8,words(64));
+    auto pack=create(root); char error[512]{};
+    duck_texture_pack_track_upload(pack.get(),0,0,4,4,vram.data(),vram.size());
+    duck_texture_pack_track_upload(pack.get(),8,0,8,8,vram.data(),vram.size());
+    auto first=query(vram,0,0,2,0,3,0,3);
+    auto second=query(vram,0,0,2,8,15,0,7);
+    duck_texture_pack_dump_draw(pack.get(),&first,0,error,sizeof error);
+    duck_texture_pack_dump_draw(pack.get(),&second,0,error,sizeof error);
+    DuckTexturePackInfo before{},after{}; duck_texture_pack_get_info(pack.get(),&before);
+    check(before.pending_dump_sources==2,"both independent source observations are pending");
+    // Retires the first upload entirely, while the second keeps right and lower clips.
+    duck_texture_pack_invalidate(pack.get(),0,0,12,4);
+    duck_texture_pack_get_info(pack.get(),&after);
+    check(after.pending_dump_sources==1 && after.queued_dump_count==1,
+          "released source finalizes even when surviving upload splits keep the total count steady");
+}
+
 void resident_checkpoint(const fs::path& root) {
     std::vector<uint16_t> vram(1024*512);
     place(vram,0,0,8,std::vector<uint16_t>(8*16,0x3210));
@@ -693,6 +730,7 @@ int main(int argc, char** argv) {
         official_binary_oracle(root/"official-oracle"); defaults_and_options(root/"defaults");
         immutable_palettes_and_pages(root/"snapshots"); split_coalesce_copy_parts(root/"lifecycle"); copied_pack_ownership(root/"ownership");
         resident_checkpoint(root/"resident"); preload(root/"preload"); preload_pool();
+        release_while_another_source_splits(root/"release-split");
         /* Every artifact is created beneath this fresh, explicitly named test
          * root. No user-provided paths participate in recursive cleanup. */
         if (argc > 1 && !std::strcmp(argv[1],"--keep-artifacts")) std::printf("ARTIFACT_ROOT: %s\n",root.u8string().c_str());

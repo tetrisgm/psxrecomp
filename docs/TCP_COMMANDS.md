@@ -493,9 +493,9 @@ between Play and TCP availability.
 
 ## Complete command index (generated)
 
-**389 commands registered** — 376 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
+**392 commands registered** — 379 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
 
-85 of 389 have prose above; **304 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
+85 of 392 have prose above; **307 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
 
 Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this block has drifted from the code.
 
@@ -632,6 +632,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `frame_trace` | ✓ |  |  |
 | `frame_wall_ring` | ✓ |  |  |
 | `freeze_check` | ✓ |  |  |
+| `func_override` | ✓ |  |  |
 | `game_options` | ✓ |  |  |
 | `gcp_ring` | ✓ |  | ✓ |
 | `geom_correction` | ✓ |  | ✓ |
@@ -660,6 +661,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `gte_state` | ✓ |  |  |
 | `guest_tty_dump` | ✓ |  |  |
 | `hd_textures` | ✓ |  | ✓ |
+| `hd_uploads` | ✓ |  |  |
 | `history` | ✓ | ✓ | ✓ |
 | `hle_dump` | ✓ |  | ✓ |
 | `host_button` | ✓ |  |  |
@@ -738,6 +740,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `pc_probe_arm` | ✓ |  |  |
 | `pc_probe_clear` | ✓ |  |  |
 | `pc_probe_dump` | ✓ |  |  |
+| `perf` | ✓ |  |  |
 | `pgxp` | ✓ |  | ✓ |
 | `pgxp_miss_ring` | ✓ |  |  |
 | `pgxp_shadow` | ✓ |  |  |

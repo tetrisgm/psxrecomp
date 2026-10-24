@@ -115,6 +115,10 @@ bool parse_key_text(const std::string& text,
     const size_t dash = text.find('-');
     if (dash == std::string::npos || text.find('-', dash + 1) != std::string::npos)
         return false;
+    if (ascii_lower(text.substr(dash + 1)) == "index") {
+        *palette_hash = HD_TEXTURE_PALETTE_INDEXED;
+        return parse_hex_component(text.substr(0, dash), texture_hash);
+    }
     return parse_hex_component(text.substr(0, dash), texture_hash) &&
            parse_hex_component(text.substr(dash + 1), palette_hash);
 }
@@ -1098,6 +1102,35 @@ int hd_texture_pack_track_upload(HdTexturePack* pack,
     return 1;
 }
 
+/* Debug: uploads whose live fragments cover VRAM (x, y), newest first, as
+ * JSON objects: serial, texture hash, size, fragment rect and source offset,
+ * and whether the pack holds any replacement for that hash. */
+int hd_texture_pack_debug_uploads_at(const HdTexturePack* pack, unsigned x, unsigned y,
+                                     char* out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    size_t pos = 0;
+    int n = 0;
+    out[0] = '\0';
+    if (!pack) return 0;
+    for (auto it = pack->uploads.rbegin(); it != pack->uploads.rend(); ++it) {
+        for (const Fragment& f : it->fragments) {
+            if (x < f.rect.x || x >= f.rect.x + f.rect.width ||
+                y < f.rect.y || y >= f.rect.y + f.rect.height) continue;
+            const int w = std::snprintf(out + pos, cap - pos,
+                "%s{\"serial\":%llu,\"hash\":\"%08x\",\"w\":%u,\"h\":%u,"
+                "\"rect\":[%u,%u,%u,%u],\"src\":[%u,%u],\"in_pack\":%d}",
+                n ? "," : "", (unsigned long long)it->serial, it->hash,
+                it->width, it->height, f.rect.x, f.rect.y, f.rect.width, f.rect.height,
+                f.source_x, f.source_y, pack->texture_hashes.count(it->hash) ? 1 : 0);
+            if (w < 0 || (size_t)w >= cap - pos) return n;
+            pos += (size_t)w;
+            ++n;
+            break;
+        }
+    }
+    return n;
+}
+
 void hd_texture_pack_reset_tracking(HdTexturePack* pack) {
     if (pack) {
         if (!pack->uploads.empty()) ++pack->tracking_generation;
@@ -1242,7 +1275,9 @@ int hd_texture_pack_match(HdTexturePack* pack,
         if (indexed == pack->upload_by_serial.end() || !indexed->second)
             continue;
         const Upload& upload = *indexed->second;
-        const auto record = pack->entries.find(make_key(upload.hash, palette_hash));
+        auto record = pack->entries.find(make_key(upload.hash, palette_hash));
+        if (record == pack->entries.end() && query->depth != HD_TEXTURE_DEPTH_16BPP)
+            record = pack->entries.find(make_key(upload.hash, HD_TEXTURE_PALETTE_INDEXED));
         if (record == pack->entries.end()) continue;
         if (!covered_by_upload(upload, wanted)) continue;
         if (record->second.ambiguous) return HD_TEXTURE_LOOKUP_AMBIGUOUS;
@@ -1324,17 +1359,33 @@ int hd_texture_pack_preload(HdTexturePack* pack, size_t max_bytes, unsigned max_
     try {
         namespace tp = psx_texpreload;
         std::vector<std::pair<uint64_t, std::string>> work_items;
-        for (const auto& entry : pack->entries)
-            if (!entry.second.ambiguous)
-                work_items.emplace_back(entry.first, entry.second.replacement_path);
         size_t per_image = 0;
         {
             std::lock_guard<std::mutex> lock(pack->decode.mutex);
             per_image = pack->decode.budget;
+            for (const auto& item : pack->decode.items)
+                if (item.second.pinned) r.bytes += item.second.bytes;
+            for (const auto& entry : pack->entries) {
+                if (entry.second.ambiguous) continue;
+                ++r.requested;
+                const auto it = pack->decode.items.find(entry.first);
+                if (it != pack->decode.items.end() && it->second.pinned) ++r.loaded;
+            }
+            if (r.bytes > max_bytes) {
+                r.failed = r.requested - r.loaded;
+                if (out) *out = r;
+                return -1;
+            }
+            for (const auto& entry : pack->entries) {
+                if (entry.second.ambiguous) continue;
+                const auto it = pack->decode.items.find(entry.first);
+                if (it == pack->decode.items.end() || !it->second.pinned)
+                    work_items.emplace_back(entry.first, entry.second.replacement_path);
+            }
         }
         std::vector<std::shared_ptr<DecodedImage>> images(work_items.size());
         std::vector<unsigned char> status(work_items.size(), tp::kPending);
-        tp::Budget budget(max_bytes);
+        tp::Budget budget(max_bytes - r.bytes);
         r.worker_errors = static_cast<int>(tp::run(work_items.size(), max_threads, [&](size_t k) {
             status[k] = tp::kFailed;
             std::ifstream input(work_items[k].second, std::ios::binary | std::ios::ate);
@@ -1372,7 +1423,6 @@ int hd_texture_pack_preload(HdTexturePack* pack, size_t max_bytes, unsigned max_
             reservation.keep = true;
             status[k] = tp::kLoaded;
         }));
-        r.requested = static_cast<int>(work_items.size());
         std::lock_guard<std::mutex> lock(pack->decode.mutex);
         for (size_t k = 0; k < work_items.size(); ++k) {
             if (status[k] == tp::kOverBudget) { ++r.over_budget; continue; }
@@ -1382,20 +1432,32 @@ int hd_texture_pack_preload(HdTexturePack* pack, size_t max_bytes, unsigned max_
                 /* Already pinned, or an on-demand decode in flight: leave it. */
                 if (it->second.pinned || it->second.state == DecodeState::Queued ||
                     it->second.state == DecodeState::Loading) continue;
-                if (it->second.state == DecodeState::Ready) pack->decode.used -= it->second.bytes;
             }
-            DecodeItem& item = pack->decode.items[work_items[k].first];
+            const size_t previous_bytes = it != pack->decode.items.end() &&
+                it->second.state == DecodeState::Ready ? it->second.bytes : 0;
+            DecodeItem item;
+            /* Prepare throwing metadata before touching an existing entry. */
             item.path = work_items[k].second;
             item.bytes = images[k]->rgba.size();
             item.image = std::move(images[k]);
             item.state = DecodeState::Ready; item.pinned = true;
             item.last_used = ++pack->decode.tick;
-            r.bytes += item.bytes; ++r.loaded;
+            const size_t bytes = item.bytes;
+            if (it == pack->decode.items.end())
+                pack->decode.items.emplace(work_items[k].first, std::move(item));
+            else it->second = std::move(item);
+            pack->decode.used -= previous_bytes;
+            r.bytes += bytes; ++r.loaded;
+            tp::after_publish(r.loaded);
         }
         r.failed = r.requested - r.loaded - r.over_budget;
         if (out) *out = r;
         return r.loaded == r.requested ? 1 : 0;
-    } catch (...) { return -1; }
+    } catch (...) {
+        r.failed = r.requested - r.loaded - r.over_budget;
+        if (out) *out = r;  /* Account the pinned prefix even on publication failure. */
+        return -1;
+    }
 #endif
 }
 

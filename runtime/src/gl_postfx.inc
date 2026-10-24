@@ -1,3 +1,8 @@
+#include "gte_postfx_projection.h"
+#include "postfx_debug_json.h"
+#ifndef PFX_NOW_TICKS
+#define PFX_NOW_TICKS() SDL_GetPerformanceCounter()
+#endif
 /* ---- Post-effect pipeline (docs/POST_EFFECTS.md) ---------------------------
  * One executor for every post effect on the composed game image: chains of
  * full-screen fragment passes (postfx_chain.h). Three stages, in order, each
@@ -41,6 +46,7 @@ typedef struct {
 typedef struct {
     PfxChain chain;
     int      loaded, failed;
+    uint64_t started_at;
     GLuint   prog[PFX_MAX_PASSES];
     PfxLocs  loc[PFX_MAX_PASSES];
     GLuint   tex[PFX_MAX_PASSES], fbo[PFX_MAX_PASSES];
@@ -90,22 +96,22 @@ static GLuint s_depth_tex = 0, s_depth_fbo = 0, s_depth_map_prog = 0;
 static GLint  s_dmap_uUv = -1, s_dmap_uS = -1, s_dmap_uSrc = -1, s_dmap_uDst = -1;
 static int    s_depth_w = 0, s_depth_h = 0, s_depth_ok = 0;
 static int    s_pfx_depth_on = 0;          /* a loaded chain reads `depth` */
-static uint64_t s_pfx_t0 = 0;              /* u_time origin */
 /* Live values for preset `uniform` lines, set by the title from game state
  * (psx_host_set_post_uniform, host_overlay.h): a live value replaces the
  * preset default of the same name in every pass that declares it. */
 enum { PFX_LIVE_MAX = 16 };
-typedef struct { char name[PFX_NAME]; float v[4]; } PfxLive;
+typedef PfxDebugLive PfxLive;
 static PfxLive s_pfx_live[PFX_LIVE_MAX];
 static int s_pfx_nlive = 0;
 static SDL_SpinLock s_pfx_live_lock = 0;
 void psx_host_set_post_uniform(const char *name, float x, float y, float z, float w) {
-    if (!name || !name[0] || strlen(name) >= PFX_NAME) return;
+    if (!name || !name[0] || strlen(name) >= sizeof s_pfx_live[0].name ||
+        !isfinite(x) || !isfinite(y) || !isfinite(z) || !isfinite(w)) return;
     SDL_LockSpinlock(&s_pfx_live_lock);
     int i = 0;
     while (i < s_pfx_nlive && strcmp(s_pfx_live[i].name, name)) i++;
     if (i == s_pfx_nlive && s_pfx_nlive < PFX_LIVE_MAX) {
-        snprintf(s_pfx_live[i].name, PFX_NAME, "%s", name);
+        snprintf(s_pfx_live[i].name, sizeof s_pfx_live[i].name, "%s", name);
         s_pfx_nlive++;
     }
     if (i < s_pfx_nlive) {
@@ -123,7 +129,7 @@ static int pfx_live_get(const char *name, float out[4]) {
     SDL_UnlockSpinlock(&s_pfx_live_lock);
     return found;
 }
-extern volatile int32_t g_gte_last_h, g_gte_last_ofx, g_gte_last_ofy;   /* gte.cpp */
+
 static int    s_mask_w = 0, s_mask_h = 0;
 
 static int pfx_stage_on(int i) {
@@ -157,10 +163,12 @@ static void pfx_stage_unload(PfxStage *st) {
     }
     pfx_chain_free(&st->chain);
     st->loaded = st->failed = 0;
+    st->started_at = 0;
 }
 
 /* Which stages read the mask decides whether draws keep it. */
 static void pfx_mask_wanted_update(void) {
+    gte_postfx_projection_enable(postfx_active());
     int want = 0;
     for (int i = 0; i < PFX_NSTAGES; i++) {
         if (!pfx_stage_on(i)) continue;
@@ -491,6 +499,7 @@ static int pfx_depth_build(int fresh, int lw, int lh) {
 static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, int lh) {
     PfxChain *c = &st->chain;
     int copied = 0;
+    if (!st->started_at) st->started_at = PFX_NOW_TICKS();
     for (int i = 0; i < c->npasses; i++) {
         const PfxPass *ps = &c->pass[i];
         const int last = i == c->npasses - 1;
@@ -549,6 +558,17 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
                 p_glBlitFramebuffer(lx, ly, lx + lw, ly + lh, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
             }
         }
+        /* Allocate/reset before sampling, including the final window pass.
+         * A resize starts an empty history rather than sampling the old size. */
+        if (st->hist[i] && (st->hw[i] != w || st->hh[i] != h)) {
+            pfx_tex_alloc(&st->htex[i], w, h, ps->format, ps->nearest);
+            pfx_fbo_attach(&st->hfbo[i], st->htex[i]);
+            st->hw[i] = w; st->hh[i] = h;
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, st->hfbo[i]);
+            GLfloat clear[4]; glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+            glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+            glClearColor(clear[0],clear[1],clear[2],clear[3]);
+        }
         if (last) { p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0); glViewport(lx, ly, lw, lh); }
         else { p_glBindFramebuffer(PSXGL_FRAMEBUFFER, st->fbo[i]); glViewport(0, 0, w, h); }
         const GLuint prog = st->prog[i];
@@ -569,18 +589,19 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         p_glUniform2f(L->fixed[PFX_LOC_RCP], 1.0f / (float)w, 1.0f / (float)h);
         p_glUniform2f(L->fixed[PFX_LOC_SIZE], (float)w, (float)h);
         p_glUniform2i(L->fixed[PFX_LOC_ORG], last ? lx : 0, last ? ly : 0);
-        if (!s_pfx_t0) s_pfx_t0 = SDL_GetPerformanceCounter();
         if (L->proj >= 0) {
             /* u_proj: x/z = (uv.x - y) * w * x, y/z = (uv.y - z) * x for a view-space
              * point at depth sz (240-line reference, same scale on both axes). */
             const float aspect = (float)lw / (float)(lh > 0 ? lh : 1);
-            const float H = g_gte_last_h > 0 ? (float)g_gte_last_h : 256.0f;
-            const float ofx = (float)g_gte_last_ofx / 65536.0f, ofy = (float)g_gte_last_ofy / 65536.0f;
+            GtePostfxProjection projection = {256, 160 * 65536, 120 * 65536};
+            (void)gte_postfx_projection_read(&projection);
+            const float H = projection.h > 0 ? (float)projection.h : 256.0f;
+            const float ofx = (float)projection.ofx / 65536.0f, ofy = (float)projection.ofy / 65536.0f;
             p_glUniform4f(L->proj, 240.0f / H, 0.5f + (ofx - 160.0f) / (240.0f * aspect),
                           1.0f - (ofy > 0.0f ? ofy : 120.0f) / 240.0f, aspect);
         }
         if (L->time >= 0)
-            p_glUniform1f(L->time, (float)((double)(SDL_GetPerformanceCounter() - s_pfx_t0) /
+            p_glUniform1f(L->time, (float)((double)(PFX_NOW_TICKS() - st->started_at) /
                                            (double)SDL_GetPerformanceFrequency()));
         for (int k = 0; k < ps->nuniforms; k++) {
             const PfxUniform *u = &ps->u[k];
@@ -602,16 +623,12 @@ static int pfx_stage_run(PfxStage *st, int generated, int lx, int ly, int lw, in
         }
         post_fullscreen(prog, L->fixed[PFX_LOC_UV]);
         if (ps->blend != PFX_BLEND_REPLACE) glDisable(GL_BLEND);
-        if (!last && !generated && st->hist[i]) {
-            /* This pass's target becomes its `history` for the next real frame. */
-            if (st->hw[i] != w || st->hh[i] != h) {
-                pfx_tex_alloc(&st->htex[i], w, h, ps->format, ps->nearest);
-                pfx_fbo_attach(&st->hfbo[i], st->htex[i]);
-                st->hw[i] = w; st->hh[i] = h;
-            }
-            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, st->fbo[i]);
+        if (!generated && st->hist[i]) {
+            /* Capture the final window target as well as intermediate FBOs. */
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, last ? 0 : st->fbo[i]);
             p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, st->hfbo[i]);
-            p_glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            const int x = last ? lx : 0, y = last ? ly : 0;
+            p_glBlitFramebuffer(x, y, x+w, y+h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
         }
     }
     for (int k = PFX_MAX_INPUTS - 1; k >= 0; k--) {
@@ -738,6 +755,7 @@ static void postfx_capture_temporal_source(int lx, int ly, int lw, int lh) {
 
 /* Objects died with the context. */
 static void postfx_release(void) {
+    gte_postfx_projection_enable(0);
     for (int i = 0; i < PFX_NSTAGES; i++) {
         for (int k = 0; k < PFX_MAX_PASSES; k++) {
             s_pfx[i].prog[k] = s_pfx[i].tex[k] = s_pfx[i].fbo[k] = 0;
@@ -779,19 +797,12 @@ void gl_renderer_set_post_shader(const char *path) {
 }
 /* Debug: the user chain's last load outcome and the live uniforms, as JSON members. */
 int gl_renderer_post_shader_debug(char *out, int cap) {
-    char chemin[sizeof s_pfx_user_path];
-    snprintf(chemin, sizeof chemin, "%s", s_pfx_user_path);
-    for (char *q = chemin; *q; q++) if (*q == 92 || *q == 34) *q = '/';   /* JSON-safe */
-    int k = snprintf(out, (size_t)cap, "\"path\":\"%s\",\"status\":\"%s\",\"uniforms\":{",
-                     chemin, s_pfx_user_status);
+    GL_RT_SYNC("post_shader_debug");
+    PfxLive live[PFX_LIVE_MAX]; int count;
     SDL_LockSpinlock(&s_pfx_live_lock);
-    for (int i = 0; i < s_pfx_nlive && k < cap - 96; i++)
-        k += snprintf(out + k, (size_t)(cap - k), "%s\"%s\":[%.4f,%.4f,%.4f,%.4f]", i ? "," : "",
-                      s_pfx_live[i].name, s_pfx_live[i].v[0], s_pfx_live[i].v[1], s_pfx_live[i].v[2],
-                      s_pfx_live[i].v[3]);
+    count = s_pfx_nlive; memcpy(live,s_pfx_live,sizeof live);
     SDL_UnlockSpinlock(&s_pfx_live_lock);
-    if (k < cap - 2) k += snprintf(out + k, (size_t)(cap - k), "}");
-    return k;
+    return pfx_debug_json(out,cap,s_pfx_user_path,s_pfx_user_status,live,count);
 }
 
 int gl_renderer_post_shader_loaded(void) {

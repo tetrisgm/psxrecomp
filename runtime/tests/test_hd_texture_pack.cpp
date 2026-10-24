@@ -212,6 +212,24 @@ HdTextureDrawQuery query4(const std::vector<uint16_t>& vram,
     return query;
 }
 
+void test_indexed_palette_fallback() {
+    Fixture f;
+    std::ostringstream stem; stem<<std::hex<<f.upload_hash;
+    touch(f.replacements/(stem.str()+"-index.png"));
+    auto* pack=open_pack(f.root); if(!pack)return;
+    hd_texture_pack_track_upload(pack,10,20,8,4,f.upload_words.data(),f.upload_words.size(),nullptr);
+    auto q=query4(f.vram,0,31); HdTextureMatch match{};
+    check(hd_texture_pack_match(pack,&q,&match)==HD_TEXTURE_LOOKUP_FOUND &&
+          match.entry.palette_hash==f.palette4_hash,"exact palette wins over indexed fallback");
+    f.vram[7*1024+1020]^=1;
+    hd_texture_pack_invalidate(pack,1020,7,1,1);
+    check(hd_texture_pack_match(pack,&q,&match)==HD_TEXTURE_LOOKUP_FOUND &&
+          match.entry.palette_hash==HD_TEXTURE_PALETTE_INDEXED,"changed CLUT uses palette-independent index key");
+    q.depth=HD_TEXTURE_DEPTH_16BPP; q.u_last=7;
+    check(hd_texture_pack_match(pack,&q,&match)==HD_TEXTURE_LOOKUP_NONE,"16bpp never uses indexed palette fallback");
+    hd_texture_pack_destroy(pack);
+}
+
 void test_crc_exact_little_endian() {
     const uint16_t ascii_words[] = {0x3231, 0x3433, 0x3635, 0x3837};
     check(hd_texture_crc32_words_le(ascii_words, 4) == 0x9AE0DAAFu,
@@ -532,6 +550,14 @@ void test_bounded_preload(Fixture& fixture) {
                   (r.requested == 1 ? status == 1 : (status == 0 && r.failed >= 1)),
               "malformed replacements are reported, not counted as preloaded");
         hd_texture_pack_set_decode_budget(pack, 1);
+        HdTexturePreloadResult repeat{};
+        check(hd_texture_pack_preload(pack,64u*8u*4u,1,&repeat) >= 0 &&
+              repeat.loaded == 1 && repeat.bytes == 64u*8u*4u &&
+              repeat.failed == repeat.requested - 1,
+              "repeat counts pinned images without decoding them under a reduced budget");
+        check(hd_texture_pack_preload(pack,64u*8u*4u-1,1,&repeat) == -1 &&
+              repeat.bytes == 64u*8u*4u,
+              "a smaller lifetime cap rejects and reports retained residency");
         check(hd_texture_pack_track_upload(pack, 10, 20, 8, 4,
                                            fixture.upload_words.data(),
                                            fixture.upload_words.size(), nullptr) == 1,
@@ -564,12 +590,27 @@ void test_bounded_preload(Fixture& fixture) {
               "an injected worker failure is caught and reported as partial");
         hd_texture_pack_destroy(pack);
     }
+    {
+        HdTexturePack* pack = open_pack(fixture.root);
+        if (!pack) return;
+        tp::fault_mode() = 3;
+        HdTexturePreloadResult r{};
+        const int status = hd_texture_pack_preload(pack, size_t{64} << 20, 4, &r);
+        tp::fault_mode() = 0;
+        check(status == -1 && r.loaded == 1 && r.bytes == 64u * 8u * 4u,
+              "publication failure still accounts the retained pinned image");
+        check(hd_texture_pack_preload(pack,64u*8u*4u,1,&r) >= 0 &&
+              r.loaded == 1 && r.bytes == 64u*8u*4u && r.failed == r.requested-1,
+              "publication retry accounts existing pinned residency");
+        hd_texture_pack_destroy(pack);
+    }
 }
 
 } // namespace
 
 int main() {
     test_crc_exact_little_endian();
+    test_indexed_palette_fallback();
     Fixture fixture;
     test_scan_mapping(fixture);
     test_palette_match_and_invalidation(fixture);
