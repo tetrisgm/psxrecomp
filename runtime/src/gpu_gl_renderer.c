@@ -9682,7 +9682,7 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
 }
 #define ASYNC_COUNTERS(X) X(unavailable) X(stale) X(late) X(duplicate) X(ring_full) \
-    X(render_stale) X(render_late) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue) \
+    X(render_stale) X(render_late) X(render_expired) X(resource) X(unsupported) X(capture) X(submitted) X(presented_to_queue) \
     X(resource_scale) X(resource_epoch) X(resource_wide) X(resource_alloc) \
     X(resource_acquire) X(resource_hd) X(epoch_acquire) X(epoch_hd) \
     X(reserve_ns) X(enter_ns) X(replay_ns) X(finish_ns) X(replay_count) X(flush_ns) X(capture_ns) X(rollback_ns) X(compose_ns) \
@@ -15862,6 +15862,28 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
 }
 
 static void gl_rth_exec_impl(void *user,const RtCmd *c,const void *payload);
+static int async_expire_fast_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_GL_ASYNC_EXPIRE_FAST");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+static unsigned s_async_expiry_poll;
+/* An expired output can never reach the timed presenter. Stop consuming its
+ * remaining draw commands, then roll its transaction back at PASS_END. */
+static void async_expire_check(void) {
+    if (!s_async_exec || s_pass_dead || !async_expire_fast_on()) return;
+    if (s_async_executing.output.epoch != gl_renderer_present_epoch()) {
+        ASYNC_COUNT(render_stale);
+        s_pass_dead = 1;
+    } else if (s_async_executing.output.expires &&
+               pt_clock_ns() >= s_async_executing.output.expires) {
+        ASYNC_COUNT(render_expired);
+        s_pass_dead = 1;
+    }
+}
 static void gl_rth_exec(void *user,const RtCmd *c,const void *payload) {
     if (s_op_profile<0) {
         const char *e=getenv("PSX_RENDER_OP_PROFILE"); s_op_profile=e && *e && *e!='0';
@@ -15874,6 +15896,9 @@ static void gl_rth_exec(void *user,const RtCmd *c,const void *payload) {
     if(async) s_op_async_ns[c->op]+=ns;
 }
 static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
+    if (s_async_exec && (c->op == RTH_GROUP || c->op == RTH_PASS_END ||
+                         (++s_async_expiry_poll & 15u) == 0u))
+        async_expire_check();
     if(c->op==RTH_GROUP) {
         const int32_t *words=payload;
         unsigned count=c->payload/4u, at=0;
@@ -16043,6 +16068,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             ASYNC_COUNT(render_late); s_pass_dead=1; break;
         }
         s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0; s_async_hd_copy=0;
+        s_async_expiry_poll=0;
         if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
             s_pass_leaks_at_begin=s_pass_leaks;
             if(!async_vram_enter(gi)) {
@@ -16093,6 +16119,15 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             s_async_invalid = 1;
         if (s_async_exec) { ASYNC_COUNT(replay_count); atomic_fetch_add(&s_async_count_replay_ns,stage_start-s_async_replay_started); }
         if (s_pass_dead) {
+            if (s_async_exec) {
+                /* The pass was admitted and has a live backup. Undo every
+                 * partial draw before skipping the rest of this output. */
+                pass_end_now(0, 0);
+                gpu_hd_textures_suppress_dumps(0);
+                s_async_exec=0; s_async_invalid=0; s_async_hd_copy=0;
+                s_pgen_write=s_async_previous_write;
+                atomic_fetch_add(&s_async_count_finish_ns,pt_clock_ns()-stage_start);
+            }
             async_seam_prepared_unref(s_async_seam_active);
             s_async_seam_active = NULL;
             s_async_seam_failed = s_async_seam_reset_pending = 0;

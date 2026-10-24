@@ -92,7 +92,7 @@ int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep);
 /* Lifetime counters, sampled without GL acquisition or queue waits. */
 typedef struct GLRenderAsyncStats {
     uint64_t unavailable, stale, late, duplicate, ring_full;
-    uint64_t render_stale, render_late, resource, unsupported, capture;
+    uint64_t render_stale, render_late, render_expired, resource, unsupported, capture;
     uint64_t submitted, presented_to_queue;
     uint64_t present_calls, present_invalid, present_expired, present_mismatch, present_unready, present_refused;
     uint64_t resource_scale, resource_epoch, resource_wide, resource_alloc;
