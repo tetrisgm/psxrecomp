@@ -236,13 +236,43 @@ static GLuint pfx_surface_rb(GLuint fbo) {
     return wi >= 0 ? s_wide_rb[wi] : 0;
 }
 /* A displayed rect of a surface in that surface's px (y0 = top row). */
-static void pfx_rect_px(GLuint tex, float tex_w, float tex_h, int x, int y, int w, int h, int out[4],
+static void pfx_rect_px(GLuint fbo, GLuint tex, float tex_w, float tex_h, int x, int y, int w, int h, int out[4],
                         int *out_tw, int *out_th) {
     GLint tw = 0, th = 0;
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    /* These are renderer-owned surfaces with known allocation extents. The
+     * texture-level queries otherwise synchronize the GL driver for every
+     * present, including generated frames. Keep the query for an unfamiliar
+     * surface and as an A/B switch. */
+    static int known_dims = -1;
+    if (known_dims < 0) {
+        const char *e = getenv("PSX_GL_POSTFX_KNOWN_DIMS");
+        known_dims = !e || *e != '0';
+    }
+    if (known_dims) {
+        if (fbo == s_hr_fbo && tex == s_hr_tex && s_hr_alloc > 0) {
+            tw = VRAM_W * s_hr_alloc; th = VRAM_H * s_hr_alloc;
+        } else {
+            for (int i = 0; i < s_hiw_n; i++) {
+                if (fbo == s_hiw_t[i].fbo && tex == s_hiw_t[i].tex) {
+                    tw = (s_hiw_t[i].x1 - s_hiw_t[i].x0) * s_out_scale;
+                    th = VRAM_H * s_out_scale;
+                    break;
+                }
+            }
+            if (!tw) {
+                const int i = wide_index(fbo);
+                if (i >= 0 && tex == s_wide_tex[i] && s_wide_as[i] > 0) {
+                    tw = g_wide_w * s_wide_as[i]; th = VRAM_H * s_wide_as[i];
+                }
+            }
+        }
+    }
+    if (!tw || !th) {
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
     const float sx = (float)tw / tex_w, sy = (float)th / tex_h;
     *out_tw = tw; *out_th = th;
     out[0] = (int)lrintf((float)x * sx);
@@ -258,7 +288,7 @@ static void postfx_note_center(GLuint fbo, GLuint tex, float tex_w, float tex_h,
     if ((!s_bcls_on && !s_pfx_depth_on) || !fbo || !tex || wide_w <= 0) return;
     s_mask_ctr_rb = pfx_surface_rb(fbo);
     if (!s_mask_ctr_rb) return;
-    pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_mask_ctr, &s_mask_ctr_tw, &s_mask_ctr_th);
+    pfx_rect_px(fbo, tex, tex_w, tex_h, x, y, w, h, s_mask_ctr, &s_mask_ctr_tw, &s_mask_ctr_th);
     s_mask_ctr_fbo = fbo;
     s_mask_ctr_x0 = (float)off / (float)wide_w;
     s_mask_ctr_x1 = (float)(off + w) / (float)wide_w;
@@ -274,7 +304,7 @@ static void postfx_note_source(GLuint fbo, GLuint tex, float tex_w, float tex_h,
     if ((!s_bcls_on && !s_pfx_depth_on) || !fbo || !tex || tex_w <= 0.0f || tex_h <= 0.0f) return;
     s_mask_src_rb = pfx_surface_rb(fbo);
     if (!s_mask_src_rb) return;
-    pfx_rect_px(tex, tex_w, tex_h, x, y, w, h, s_mask_src, &s_mask_src_tw, &s_mask_src_th);
+    pfx_rect_px(fbo, tex, tex_w, tex_h, x, y, w, h, s_mask_src, &s_mask_src_tw, &s_mask_src_th);
     s_mask_src_fbo = fbo;
     s_mask_src_valid = 1;
 }
