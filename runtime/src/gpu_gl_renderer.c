@@ -8625,6 +8625,10 @@ static float s_pb_depth_avg;
 static PgxpSnap *s_pb_snap;
 static int s_pb_snap_present;
 static int s_pb_area[4];
+/* Only the render owner sets this around an async reserve. Publish the seam
+ * baseline as soon as its transaction snapshot is complete, before the GPU
+ * backup and VRAM copies that do not change the snapshot. */
+static uint64_t s_async_seam_reserve_epoch, s_async_seam_reserve_generation;
 /* Copy only live prefixes; the fixed index is several MiB but most frames
  * use a fraction of it. Counters remain cumulative across discarded draws. */
 static void pass_snap_copy(PgxpSnap *dst, const PgxpSnap *src) {
@@ -8653,6 +8657,15 @@ static void async_seam_baseline_publish(int gi, uint64_t epoch, uint64_t generat
         memcpy(slot->area, area, sizeof slot->area);
     }
     slot->present = src != NULL;
+    async_seam_unlock();
+}
+static void async_seam_baseline_invalidate(uint64_t epoch, uint64_t generation) {
+    async_seam_lock();
+    for (int gi = 0; gi < PASS_GENERATIONS; ++gi) {
+        AsyncSeamBaseline *slot = &s_async_seam_baseline[gi];
+        if (slot->epoch == epoch && slot->generation == generation)
+            slot->epoch = slot->generation = 0;
+    }
     async_seam_unlock();
 }
 /* The caller owns dst. A zero result means reserve is not published yet,
@@ -9552,6 +9565,10 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         return pass_begin_refuse("backup_seam_index");
     s_pb_area[0]=s_area_x1; s_pb_area[1]=s_area_y1;
     s_pb_area[2]=s_area_x2; s_pb_area[3]=s_area_y2;
+    if (s_async_seam_reserve_epoch)
+        async_seam_baseline_publish(s_pgen_write, s_async_seam_reserve_epoch,
+            s_async_seam_reserve_generation,
+            s_pb_snap_present ? s_pb_snap : NULL, s_pb_area);
     /* Back up the rect: hr color + stencil, raw mirror, wide band, CPU rows. */
     s_pass_begin_diag.resource = "backup_hr";
     if (!pass_make_color_fbo(&s_pb_hr_tex, &s_pb_hr_rb, &s_pb_hr_fbo,
@@ -16082,17 +16099,20 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         uint64_t stage_start=pt_clock_ns();
         GLRenderAsyncToken token; memcpy(&token,payload,sizeof token);
         if (token.output.epoch!=gl_renderer_present_epoch() || pt_clock_ns()>token.output.expires) break;
-        if (transaction_begin(token.x,token.y,token.w,token.h,1,token.period_vblanks,0,0)) {
+        s_async_seam_reserve_epoch=token.output.epoch;
+        s_async_seam_reserve_generation=token.output.generation;
+        int reserve_started=transaction_begin(token.x,token.y,token.w,token.h,
+                                               1,token.period_vblanks,0,0);
+        s_async_seam_reserve_epoch=s_async_seam_reserve_generation=0;
+        if (reserve_started) {
             if(!async_vram_capture(s_pgen_write,1)) {
+                async_seam_baseline_invalidate(token.output.epoch,
+                                               token.output.generation);
                 ASYNC_COUNT(capture);
                 s_pgen[s_pgen_write].valid=0; pass_end_now(0,0); break;
             }
             s_pgen[s_pgen_write].async_id=token.output.generation;
             s_pgen[s_pgen_write].async_epoch=token.output.epoch;
-            async_seam_baseline_publish(s_pgen_write, token.output.epoch,
-                token.output.generation, s_async_vram[s_pgen_write].snap_present ?
-                s_async_vram[s_pgen_write].snap : NULL,
-                s_async_vram[s_pgen_write].area);
             pass_end_now(0,0);
             async_vram_take_backup(s_pgen_write);
             s_async_display_epoch=token.output.epoch;
@@ -16100,7 +16120,8 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             uint64_t period=(uint64_t)(1e9/s_interp_target_hz);
             if(first.deadline+period<first.expires) first.expires=first.deadline+period;
             if (!token.output.alpha_q16) async_present_slot(s_pgen_write,0,&first);
-        }
+        } else async_seam_baseline_invalidate(token.output.epoch,
+                                              token.output.generation);
         atomic_fetch_add(&s_async_count_reserve_ns,pt_clock_ns()-stage_start);
         break;
     }
