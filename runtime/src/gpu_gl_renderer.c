@@ -5735,6 +5735,8 @@ static void native_draw_end(int previous) { sw_set_faithful_authority(previous);
 static inline void precise_consumed(void) { s_pc_valid = 0; s_pq_valid = 0; s_projected_uv_valid = 0; s_pz_valid = 0; }
 
 int gl_renderer_projective_supported(void) {
+    /* Eye replay owns a separate FBO even when native-wide presentation is off. */
+    if (s_pass_active) return s_raster_ok;
     if (s_rth_on && !rt_on_render_thread() && !rt_held())
         return s_raster_ok && s_rthm_cur && !cpu_vram_authoritative();
     return s_raster_ok && g_wide_cur && !cpu_vram_authoritative();
@@ -6977,6 +6979,7 @@ static void present_image_ring_gl_forget(void);
 void gl_renderer_shutdown(void) {
     gl_renderer_render_thread_stop();   /* drains; the context comes back to this thread */
     rth_op_report();
+    psx_host_set_hud_draw_cb(NULL, NULL);
     /* After the worker has stopped (it presents, and captures, on its own
      * thread) and before the context dies: forget the ring's GL names. */
     present_image_ring_gl_forget();
@@ -12414,12 +12417,9 @@ int gl_renderer_request_internal_scale(int scale) {
     return 1;
 }
 
-/* Settings -> Internal resolution / Supersampling changed in game: move to
- * the new scale at the next frame boundary, without a relaunch. The step
- * machinery dynamic resolution uses does the work; this only moves its
- * ceiling (clamped like the boot scale to the full-VRAM limit) and queues the
- * step. Returns the scale that will apply, 0 when not possible (windowed
- * high-resolution mode, CPU-authoritative dual rendering, no context). */
+/* Settings -> Internal resolution / Supersampling changed in game. Drain the
+ * render queue and apply under the owned context before acknowledging it.
+ * A queued dynamic-resolution step is not proof its allocation succeeded. */
 /* Whether gl_renderer_set_internal_scale_live can move the scale on this
  * session at all: not in windowed high-resolution mode, not with
  * CPU-authoritative dual rendering, and only with a live raster context. */
@@ -12429,7 +12429,7 @@ int gl_renderer_internal_scale_live_capable(void) {
 
 int gl_renderer_set_internal_scale_live(int scale) {
     if (s_ctx) GL_RT_SYNC("set_internal_scale_live");
-    if (!s_ctx || !s_raster_ok || s_hiw || s_cpu_auth_dual) return 0;
+    if (!s_ctx || !s_raster_ok || s_hiw || s_cpu_auth_dual || s_pass_active) return 0;
     int reason = 0;
     if (scale < 1) scale = 1;
     scale = psx_gl_clamp_full_vram_scale(scale, GL_MAX_INTERNAL_SCALE, s_gl_max_dim,
@@ -12438,11 +12438,16 @@ int gl_renderer_set_internal_scale_live(int scale) {
         if (!dyn_resources()) return 0;
         s_alloc_scale = s_hr_scale;
     }
-    s_alloc_scale = scale;   /* dyn_apply allocates beyond the old surface */
+    const int previous_ceiling = s_alloc_scale;
+    s_alloc_scale = scale;   /* dyn_apply may allocate beyond the old surface */
+    if (!dyn_apply(scale) || s_hr_scale != scale) {
+        s_alloc_scale = previous_ceiling;
+        return 0;
+    }
+    s_dyn_pending = 0;
+    s_rthm_scale = scale;
     s_req_scale = scale;
-    /* Recorded in stream order with the render thread, else queued for the
-     * next present. */
-    return gl_renderer_request_internal_scale(scale) ? scale : 0;
+    return scale;
 }
 
 int gl_renderer_step_internal_scale_now(int scale) {

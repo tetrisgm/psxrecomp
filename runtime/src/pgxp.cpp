@@ -59,6 +59,30 @@ extern "C" int gte_geometry_correction_lookup_probe(uint32_t packed,
 #include "pgxp_engine.inc"
 #undef PGXP_S
 #undef PGXP_API
+
+extern "C" int pgxp_projective_scope_begin(PGXPProjectiveScope *scope) {
+    if (!scope || scope->active) return 0;
+    scope->saved_enabled = s_enabled;
+    scope->saved_cpu_mode = s_cpu_mode;
+    if (!scope->saved_enabled) {
+        pgxp_set_enabled(1);
+        if (!s_enabled) {
+            s_cpu_mode = scope->saved_cpu_mode;
+            return 0;
+        }
+    }
+    s_cpu_mode = 1;
+    scope->active = 1;
+    return 1;
+}
+
+extern "C" void pgxp_projective_scope_end(PGXPProjectiveScope *scope) {
+    if (!scope || !scope->active) return;
+    s_cpu_mode = scope->saved_cpu_mode;
+    if (!scope->saved_enabled) pgxp_set_enabled(0);
+    scope->active = 0;
+}
+
 /* Draw-context snapshot (pgxp_ctx.cpp, docs/THREADED_CONTEXTS.md): the main
  * engine's configuration and live RAM/register/scratchpad shadows. Main thread only,
  * at a snapshot point; reads only. */

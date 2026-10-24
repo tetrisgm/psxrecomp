@@ -240,6 +240,10 @@ body (memory/registers and PGXP hook stream); main BIOS/timing code is
 unchanged. Four-context equality is not a replacement for the draw-isolation
 gate or stock frame identity. Guest logic remains sequential at 30 Hz;
 draw/output workers must not change its cadence.
+- **2026-10-23 — VR upstream split.** Precise projective replay reconstructed on
+  current master; six focused runtime regressions and the GPU-history guard pass.
+  Prior fork/headset acceptance remains historical. Other VR features are
+  separate single-commit branches. Central Beads F: is unavailable.
 
 - **2026-10-07 — DuckStation texture authoring fidelity (beads-qi66).**
   The early Tomba capture report exposed per-draw crops and automatic page

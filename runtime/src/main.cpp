@@ -34,6 +34,9 @@
 #include "starvation_ring.h"
 #include "load_accel.h"
 #include "savestate.h"
+#include "psx_openxr.h"
+#include "atomic_file_write.h"
+#include "openxr_ready_state.h"
 #include "psx_rewind.h"
 #include "psx_savestate_menu.h"
 #include "host_osd.h"
@@ -3999,7 +4002,7 @@ static int host_driver_vsync_unreliable(void) {
      * changes take effect. PSX_TRUST_DRIVER_VSYNC=1 keeps driver vsync. */
     if (const char *e = std::getenv("PSX_TRUST_DRIVER_VSYNC"); e && e[0] && e[0] != '0')
         return 0;
-    return (g_video_renderer == 1 && g_gl_active && g_fullscreen != 2 &&
+    return (g_video_renderer == 1 && g_gl_active && s_window_fullscreen.mode != 2 &&
             gl_renderer_render_thread_active() &&
             gl_renderer_vendor_is_nvidia()) ? 1 : 0;
 #else
@@ -4839,6 +4842,145 @@ static uint64_t g_frame_report_wait_ticks = 0;   /* offline pacer waits */
 /* Host ticks the emulation thread has spent in the offline pacer: its idle
  * time (render_pass.c budgets queued passes from it). */
 extern "C" uint64_t psx_frame_pacer_wait_ticks(void) { return g_frame_report_wait_ticks; }
+static uint64_t g_openxr_ready_execution_generation = 0;
+static PSXOpenXRReadyLoadRequest g_openxr_ready_load_request{};
+
+static void openxr_ready_record_load_request(int slot, const char *error) {
+    PSXSavestateStatus status{};
+    savestate_get_status(&status);
+    g_openxr_ready_load_request.sequence++;
+    if (g_openxr_ready_load_request.sequence == 0)
+        g_openxr_ready_load_request.sequence = 1;
+    g_openxr_ready_load_request.execution_generation =
+        g_openxr_ready_execution_generation;
+    g_openxr_ready_load_request.status_generation_before = status.generation;
+    g_openxr_ready_load_request.slot = slot;
+    g_openxr_ready_load_request.error = error;
+}
+
+/* One opt-in startup receipt per XR session, including production builds without
+ * debug TCP. The destination must not exist at process start. */
+static void openxr_ready_report_tick(uint64_t frames) {
+    static bool initialized = false;
+    static bool requested = false;
+    static PSXOpenXRReadyLoadState load_state{};
+    static uint64_t observed_execution = 0;
+    static uint64_t observed_session = 0, submission_floor = 0;
+    static bool published_for_session = false;
+    static uint64_t retry_at_ms = 0;
+    static std::filesystem::path path;
+
+    if (!initialized) {
+        initialized = true;
+        const char *env_path = std::getenv("PSX_OPENXR_READY_FILE");
+        if (!env_path || !*env_path) return;
+        path = env_path;
+        std::error_code ec;
+        const bool present = std::filesystem::exists(path, ec);
+        if (ec || present) {
+            std::fprintf(stderr,
+                "psxrecomp: refusing %s OpenXR readiness path '%s'\n",
+                ec ? "unreadable" : "existing", path.string().c_str());
+            return;
+        }
+        requested = true;
+        const char *load = std::getenv("PSX_LOAD_SLOT");
+        const bool load_expected = load && *load;
+        int load_slot = -1;
+        if (load_expected) {
+            char *end = nullptr;
+            const long parsed = std::strtol(load, &end, 10);
+            if (end && *end == '\0' && parsed >= 0 && parsed < SAVESTATE_SLOTS)
+                load_slot = static_cast<int>(parsed);
+        }
+        psx_openxr_ready_load_begin_execution(
+            &load_state, g_openxr_ready_execution_generation,
+            load_expected, load_slot);
+        if (load_expected && load_slot < 0)
+            openxr_ready_record_load_request(
+                -1, "state_load_request_invalid");
+        observed_execution = g_openxr_ready_execution_generation;
+    }
+    if (!requested) return;
+
+    bool execution_changed =
+        observed_execution != g_openxr_ready_execution_generation;
+    if (execution_changed) {
+        psx_openxr_ready_load_begin_execution(
+            &load_state, g_openxr_ready_execution_generation,
+            load_state.expected, load_state.slot);
+        observed_execution = g_openxr_ready_execution_generation;
+    }
+    psx_openxr_ready_load_observe_request(
+        &load_state, &g_openxr_ready_load_request);
+
+    PSXOpenXRStats xr{};
+    psx_openxr_stats(&xr);
+    if (execution_changed) {
+        submission_floor = xr.submitted;
+        published_for_session = false;
+    }
+    if (xr.session_generation && xr.session_generation != observed_session) {
+        if (observed_session != 0) {
+            psx_openxr_ready_load_begin_execution(
+                &load_state, g_openxr_ready_execution_generation,
+                load_state.expected, load_state.slot);
+            psx_openxr_ready_load_observe_request(
+                &load_state, &g_openxr_ready_load_request);
+        }
+        observed_session = xr.session_generation;
+        submission_floor = xr.submitted;
+        published_for_session = false;
+    }
+
+    PSXSavestateStatus current_state{};
+    savestate_get_status(&current_state);
+    PSXOpenXRReadyLoadStatus load_status = {
+        current_state.generation, current_state.pending, current_state.last_ok,
+        current_state.last_load, current_state.last_slot};
+    if (psx_openxr_ready_load_observe_status(&load_state, &load_status))
+        submission_floor = xr.submitted;
+
+    const uint64_t now = SDL_GetTicks();
+    if (now < retry_at_ms || published_for_session) return;
+
+    const bool load_ok = psx_openxr_ready_load_ok(&load_state);
+    const bool fresh_submission =
+        xr.session_generation != 0 &&
+        xr.submitted_session_generation == xr.session_generation &&
+        xr.submitted > submission_floor;
+    const bool load_failed = psx_openxr_ready_load_failed(&load_state);
+    if (!load_failed && (!load_ok || !xr.enabled || !xr.running || !fresh_submission))
+        return;
+
+    char state[512];
+    savestate_status_json(state, sizeof state);
+    char receipt[2048];
+    std::snprintf(receipt, sizeof receipt,
+        "{\"schema\":2,\"ready\":%d,\"error\":\"%s\",\"frame\":%llu,"
+        "\"openxr\":{\"session_generation\":%llu,\"submitted_session_generation\":%llu,"
+        "\"running\":%u,\"tracking\":%u,\"submitted\":%llu,"
+        "\"empty\":%llu,\"failures\":%llu},\"savestate\":{%s}}\n",
+        load_failed ? 0 : 1,
+        load_failed
+            ? (load_state.error ? load_state.error : "state_load_failed")
+            : "",
+        (unsigned long long)frames,
+        (unsigned long long)xr.session_generation,
+        (unsigned long long)xr.submitted_session_generation,
+        xr.running, xr.tracking, (unsigned long long)xr.submitted,
+        (unsigned long long)xr.empty, (unsigned long long)xr.failures, state);
+    std::string error;
+    if (psx::atomic_write_file(path, receipt, &error)) {
+        published_for_session = true;
+    } else {
+        retry_at_ms = now + 1000;
+        std::fprintf(stderr,
+            "psxrecomp: cannot publish OpenXR startup receipt '%s': %s\n",
+            path.string().c_str(), error.c_str());
+    }
+}
+
 static void frame_report_tick(uint64_t frames) {
     static int interval_ms = -1;
     static uint64_t first_ticks = 0, last_ticks = 0, last_frames = 0;
@@ -4994,6 +5136,22 @@ static void runtime_perf_diag_tick() {
         current.capture_triggers - last.capture_triggers,
         current.capture_overlays - last.capture_overlays,
         (unsigned long long)current.capture_last_dispatch_delta);
+    PSXOpenXRStats xr{};
+    psx_openxr_stats(&xr);
+    if (xr.enabled) {
+        RenderStereoStats stereo{};
+        RenderPassStats passes{};
+        render_stereo_get_stats(&stereo);
+        render_pass_get_stats(&passes);
+        std::fprintf(stdout,
+            "psxrecomp: VR pairs=%llu shed=%llu empty=%llu failures=%llu "
+            "avg_pair_ms=%.3f last_pair_ms=%.3f verify=%llu mismatch=%llu\n",
+            (unsigned long long)stereo.pairs, (unsigned long long)stereo.shed,
+            (unsigned long long)xr.empty, (unsigned long long)xr.failures,
+            stereo.avg_pair_ms, stereo.last_pair_ms,
+            (unsigned long long)passes.verify_checks,
+            (unsigned long long)passes.verify_mismatch);
+    }
     std::fflush(stdout);
     last = current;
     last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
@@ -9003,9 +9161,11 @@ static bool drain_host_events() {
                                              (int)mod)) {
                 const int target = s_window_fullscreen.mode ? 0 :
                                    (g_fullscreen ? g_fullscreen : 1);
-                if (psx_window_fullscreen_set(sdl_window, &s_window_fullscreen, target) == 0)
+                if (psx_window_fullscreen_set(sdl_window, &s_window_fullscreen, target) == 0) {
+                    apply_present_cadence();
+                    log_present_cadence();
                     host_osd_push(target ? "Fullscreen" : "Windowed", 1500);
-                else
+                } else
                     host_osd_push("Fullscreen change failed", 1500);
             }
         }
@@ -9084,6 +9244,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     {
         /* Outside every debug guard on purpose: production must be measurable. */
         extern uint64_t s_frame_count;
+        openxr_ready_report_tick(s_frame_count);
         frame_report_tick(s_frame_count);
     }
     runtime_perf_frame_begin();
@@ -10191,6 +10352,10 @@ static void render_thread_vblank(void) {
         gl_renderer_set_present_thread(g_present_thread, g_present_thread_slots);
         if (g_gl_active && gr_backend() == GR_BACKEND_OPENGL &&
             gl_renderer_render_thread_start(g_render_thread_frames)) {
+            /* The NVIDIA policy only becomes eligible once the worker owns
+             * GL. Update the actual driver interval at that transition. */
+            apply_present_cadence();
+            log_present_cadence();
             std::fprintf(stdout, "psxrecomp: render thread on (OpenGL, %d frame(s) in flight)\n",
                          g_render_thread_frames);
             if (g_frame_generation) {
@@ -10302,27 +10467,43 @@ static bool g_video_boot_valid = false;
  * for the menu thread. */
 static int g_video_res_applied_ir = PSX_IR_UNSET;
 static int g_video_res_applied_ss = 1000;
+static std::mutex g_video_res_applied_mutex;
 static std::atomic<bool> g_video_res_live_failed{false};
 static std::atomic<bool> g_video_res_live_capable{false};
+
+static void video_res_set_applied(int ir, int ss) {
+    std::lock_guard<std::mutex> lock(g_video_res_applied_mutex);
+    g_video_res_applied_ir = ir;
+    g_video_res_applied_ss = ss;
+}
 
 static void video_res_refresh_capable(void) {
     g_video_res_live_capable.store(g_gl_active && g_video_scale_applies &&
                                    gl_renderer_internal_scale_live_capable() != 0);
 }
 
-/* psx_host_video_restart_bits plus the resolution group whenever the
- * requested resolution differs from boot and cannot be (or was not) applied
- * live on this backend. */
+/* Other restart-only settings still compare against boot. Resolution compares
+ * against its last confirmed application, including after a live A -> B. */
 static unsigned video_restart_bits(const PsxHostVideoSettings *boot,
                                    const PsxHostVideoSettings *next) {
+    if (!boot || !next) return 0;
+    PsxHostVideoSettings applied = *boot;
+    {
+        std::lock_guard<std::mutex> lock(g_video_res_applied_mutex);
+        applied.internal_resolution = g_video_res_applied_ir;
+        applied.supersample_milli = g_video_res_applied_ss;
+    }
     return psx_host_video_restart_bits_backend(
-        boot, next, g_video_res_live_capable.load() && !g_video_res_live_failed.load());
+        &applied, next, 0);
 }
 
 extern "C" void psx_video_resolution_applied(int *ir, int *ss_milli, int *live_capable,
                                              int *restart_pending) {
-    if (ir) *ir = g_video_res_applied_ir;
-    if (ss_milli) *ss_milli = g_video_res_applied_ss;
+    {
+        std::lock_guard<std::mutex> lock(g_video_res_applied_mutex);
+        if (ir) *ir = g_video_res_applied_ir;
+        if (ss_milli) *ss_milli = g_video_res_applied_ss;
+    }
     if (live_capable) *live_capable = g_video_res_live_capable.load() ? 1 : 0;
     if (restart_pending) *restart_pending = g_video_res_live_failed.load() ? 1 : 0;
 }
@@ -10349,8 +10530,7 @@ extern "C" void psx_video_current(PsxHostVideoSettings *v) {
     video_res_refresh_capable();
     if (!g_video_boot_valid) {
         g_video_boot = *v; g_video_boot_valid = true;
-        g_video_res_applied_ir = v->internal_resolution;
-        g_video_res_applied_ss = v->supersample_milli;
+        video_res_set_applied(v->internal_resolution, v->supersample_milli);
     }
 }
 
@@ -10374,8 +10554,11 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
         if (m & ~present_only) deferred = PSX_VIDEO_RESTART_NETPLAY;
         m &= present_only;
     }
-    if (m & PSX_VIDEO_LIVE_FULLSCREEN)
-        (void)psx_window_fullscreen_set(sdl_window, &s_window_fullscreen, next->fullscreen);
+    if ((m & PSX_VIDEO_LIVE_FULLSCREEN) &&
+        psx_window_fullscreen_set(sdl_window, &s_window_fullscreen, next->fullscreen) == 0) {
+        apply_present_cadence();
+        log_present_cadence();
+    }
     if (m & PSX_VIDEO_LIVE_TEXTURE_FILTER) {
         g_video_texfilter = psx_texture_filter_from_ui(next->texture_filter);
         if (g_mod_texfilter < 0) gr_set_texture_filter(g_video_texfilter);
@@ -10393,8 +10576,7 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
         else { dynres_setup(); if (!g_dynres.active && gl_renderer_dynamic_resolution_ceiling() >= 2) g_dynres.active = true; }
     }
     if (m & PSX_VIDEO_LIVE_RESOLUTION) {
-        /* Internal resolution / Supersampling: the scale moves at the next
-         * frame (gl_renderer_set_internal_scale_live), no relaunch. */
+        /* The GL owner confirms allocation/application before this returns. */
         if (next->internal_resolution != PSX_IR_UNSET)
             g_video_internal_res = next->internal_resolution;
         if (next->supersample_milli >= PSX_SS_MILLI_MIN &&
@@ -10412,8 +10594,8 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
         }
         if (applied) {
             std::fprintf(stdout, "psxrecomp: internal scale %dx (live)\n", applied);
-            g_video_res_applied_ir = g_video_internal_res;
-            g_video_res_applied_ss = g_video_ss_milli;
+            g_video_scale = applied;
+            video_res_set_applied(g_video_internal_res, g_video_ss_milli);
             g_video_res_live_failed.store(false);
             dynres_setup();   /* the new scale is the controller's ceiling */
         } else {
@@ -20366,6 +20548,15 @@ int main(int argc, char** argv) {
     DiscMenuSession disc_menu_session{};
 
 session_reboot:
+    /* A new backend/session must not inherit the prior applied settings or
+     * a refused live request. Capture its boot baseline again on first read. */
+    g_video_boot_valid = false;
+    video_res_set_applied(PSX_IR_UNSET, 1000);
+    g_video_res_live_failed.store(false);
+    g_video_res_live_capable.store(false);
+    g_openxr_ready_execution_generation++;
+    if (g_openxr_ready_execution_generation == 0)
+        g_openxr_ready_execution_generation = 1;
     mod_runtime_set_mounted_disc_resolver(nullptr, nullptr);
     psx_disc_tray_reset_session();
     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
@@ -21650,17 +21841,33 @@ session_reboot:
         psx_rewind_set_depth((uint32_t)g_rewind_depth);
         psx_rewind_set_interval((uint32_t)g_rewind_interval);
         psx_rewind_configure(memory_get_bios_checksum(), game_entry_pc);
-        /* Headless / agent load: PSX_LOAD_SLOT=N stages slot load (0..11)
+        /* Headless load: PSX_LOAD_SLOT=N stages slot load (0..11)
          * at the next safe block boundary after boot. */
-        if (const char *ls = std::getenv("PSX_LOAD_SLOT")) {
-            int slot = atoi(ls);
-            if (slot >= 0 && slot < 12) {
+        if (const char *ls = std::getenv("PSX_LOAD_SLOT"); ls && *ls) {
+            char *end = nullptr;
+            const long parsed = std::strtol(ls, &end, 10);
+            if (!end || *end != '\0' || parsed < 0 || parsed >= SAVESTATE_SLOTS) {
+                openxr_ready_record_load_request(
+                    -1, "state_load_request_invalid");
+                std::fprintf(stderr,
+                             "psxrecomp: PSX_LOAD_SLOT=%s ignored (expected 0..%d)\n",
+                             ls, SAVESTATE_SLOTS - 1);
+            } else {
+                const int slot = static_cast<int>(parsed);
                 if (psx_netplay_active()) {
+                    openxr_ready_record_load_request(
+                        slot, "state_load_unavailable_netplay");
                     std::fprintf(stdout,
                         "psxrecomp: PSX_LOAD_SLOT=%d ignored (use the save-state menu after netplay starts)\n",
                         slot);
                 } else if (savestate_request_load(slot)) {
+                    openxr_ready_record_load_request(slot, nullptr);
                     std::fprintf(stdout, "psxrecomp: PSX_LOAD_SLOT=%d staged\n", slot);
+                } else {
+                    openxr_ready_record_load_request(
+                        slot, "state_load_request_refused");
+                    std::fprintf(stderr,
+                        "psxrecomp: PSX_LOAD_SLOT=%d could not be staged\n", slot);
                 }
             }
         }
