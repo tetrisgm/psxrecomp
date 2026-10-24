@@ -44,3 +44,4 @@ default = "false"
 [[plugin]]
 feature = "hd-textures"
 id = "psx.hd-textures"
+netplay = "local_view"

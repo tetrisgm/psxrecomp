@@ -213,6 +213,13 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-24 — HD packs in vanilla netplay.** The built-in HD texture
+  package is a local presentation feature: its activation selects a host
+  artwork directory and GPU renderer state, while the guest-visible CPU VRAM
+  remains authoritative. It now opts into the existing local-view mod policy;
+  the mod runtime fixture checks that a vanilla match retains that player's
+  pack and options. A consuming-title digest run with one peer disabled is
+  still needed.
 - **2026-10-23 — VR upstream split.** Precise projective replay reconstructed on
   current master; six focused runtime regressions and the GPU-history guard pass.
   Prior fork/headset acceptance remains historical. Other VR features are

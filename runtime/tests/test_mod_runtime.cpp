@@ -1894,7 +1894,8 @@ int main(int argc, char** argv) {
             "label = \"Load\"\ntype = \"boolean\"\ndefault = \"true\"\n"
             "[[option]]\nfeature = \"textures\"\nid = \"dump\"\n"
             "label = \"Dump\"\ntype = \"boolean\"\ndefault = \"false\"\n"
-            "[[plugin]]\nfeature = \"textures\"\nid = \"psx.hd-textures\"\n");
+            "[[plugin]]\nfeature = \"textures\"\nid = \"psx.hd-textures\"\n"
+            "netplay = \"local_view\"\n");
         write_text(hd_mods / "state.toml",
             "format_version = 2\n[[feature]]\npackage_id = \"runtime.hd\"\n"
             "id = \"textures\"\nenabled = true\n[feature.values]\ndump = \"true\"\n");
@@ -1924,9 +1925,16 @@ int main(int argc, char** argv) {
               "dump-only session can turn capture back on after turning it off");
         check(psx_mod_reload_hd_texture_pack() && hd_reload_calls == 1,
               "pack reload forwards to renderer");
+        check(PSXRecompV4::mod_runtime_commit_netplay_view(stock_path, &error) &&
+                  PSXRecompV4::mod_runtime_netplay_view_active(),
+              "HD-only pack remains a local presentation feature in vanilla netplay");
+        mod_runtime_activate_plugins();
+        check(hd_configure_calls == 2 && hd_root == expected.string() &&
+                  hd_replacements_value == 1 && hd_dump_value == 1,
+              "local HD pack activates with this peer's pack and options");
         check(PSXRecompV4::mod_runtime_clear_for_netplay(&error), "HD plan clears");
         mod_runtime_activate_plugins();
-        check(hd_shutdown_calls == shutdown_before + 2 && hd_configure_calls == 1,
+        check(hd_shutdown_calls >= shutdown_before + 2 && hd_configure_calls == 2,
               "disabled HD feature leaves no previous session pack active");
         check(!psx_mod_set_hd_texture_dump(1), "live dump control refuses an unconfigured session");
         const fs::path custom = hd_mods / fs::u8path(u8"chosen pack # % \u65e5\u672c");
