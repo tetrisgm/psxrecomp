@@ -59,6 +59,7 @@ uint32_t psx_mod_read_word(uint32_t a){(void)a;return 0;}
 int g_psx_vram_dirty_tracking=0;
 /* gte.cpp: last GTE projection (H, OFX, OFY) read by the postfx depth inputs. */
 volatile int32_t g_gte_last_h, g_gte_last_ofx, g_gte_last_ofy;
+void host_sampler_retarget_current(const char *name){(void)name;}
 /* Host menu overlay and video telemetry (psx_host_menu.c, video_telemetry.cpp):
  * none here. */
 int psx_host_menu_overlay_image(const uint32_t **pixels, int *w, int *h){(void)pixels;(void)w;(void)h;return 0;}

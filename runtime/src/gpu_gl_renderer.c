@@ -370,6 +370,10 @@ static PFN_glDeleteSync p_glDeleteSync;
 static PFN_glBindFramebuffer p_glBindFramebuffer_raw;
 static int    s_pt_on = 0;               /* redirect active (present thread running) */
 static int    s_pt_want = 0;
+/* Composition-context FBO state. The present thread uses raw binds in its
+ * separate context and never updates this shadow. */
+static GLuint s_pt_bound_draw, s_pt_bound_read;
+static int s_pt_draw_known, s_pt_read_known;
 static _Atomic uint64_t s_pt_epoch = 1;
 static PtTiming s_pt_next_timing;        /* GL owning thread, one swap only */
 
@@ -387,6 +391,12 @@ static GLuint pt_target_fbo(void);
 static void APIENTRY gl_bind_fb_redirect(GLenum target, GLuint fb) {
     if (fb == 0 && s_pt_on) fb = pt_target_fbo();
     p_glBindFramebuffer_raw(target, fb);
+    if (target == PSXGL_FRAMEBUFFER || target == PSXGL_DRAW_FRAMEBUFFER) {
+        s_pt_bound_draw = fb; s_pt_draw_known = 1;
+    }
+    if (target == PSXGL_FRAMEBUFFER || target == PSXGL_READ_FRAMEBUFFER) {
+        s_pt_bound_read = fb; s_pt_read_known = 1;
+    }
 }
 
 static int load_modern_gl(void) {
@@ -445,6 +455,7 @@ static int load_modern_gl(void) {
     if (p_glBindFramebuffer && p_glBindFramebuffer != gl_bind_fb_redirect) {
         p_glBindFramebuffer_raw = p_glBindFramebuffer;
         p_glBindFramebuffer = gl_bind_fb_redirect;
+        s_pt_draw_known = s_pt_read_known = 0;
     }
 #undef LOAD
     return ok;
@@ -10923,6 +10934,8 @@ static GLuint pt_target_fbo(void) {
     p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, ww, wh);
     p_glGenFramebuffers(1, &s_pts_fbo[i]);
     p_glBindFramebuffer_raw(PSXGL_FRAMEBUFFER, s_pts_fbo[i]);
+    s_pt_bound_draw = s_pt_bound_read = s_pts_fbo[i];
+    s_pt_draw_known = s_pt_read_known = 1;
     p_glFramebufferTexture2D(PSXGL_FRAMEBUFFER, PSXGL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_pts_tex[i], 0);
     p_glFramebufferRenderbuffer(PSXGL_FRAMEBUFFER, PSXGL_DEPTH_STENCIL_ATTACHMENT,
                                 PSXGL_RENDERBUFFER, s_pts_rb[i]);
@@ -11087,6 +11100,8 @@ static int pt_begin(void) {
         typedef void (APIENTRY *PFN_gfap)(GLenum, GLenum, GLenum, GLint *);
         PFN_gfap gfap = (PFN_gfap)SDL_GL_GetProcAddress("glGetFramebufferAttachmentParameteriv");
         p_glBindFramebuffer_raw(PSXGL_FRAMEBUFFER, 0);
+        s_pt_bound_draw = s_pt_bound_read = 0;
+        s_pt_draw_known = s_pt_read_known = 1;
         while (glGetError() != GL_NO_ERROR) {}
         if (gfap) gfap(PSXGL_FRAMEBUFFER, GL_BACK_LEFT, 0x8215 /* ALPHA_SIZE */, &a);
         if (glGetError() != GL_NO_ERROR) a = 8;
@@ -11181,8 +11196,19 @@ static void gl_present_swap(void) {
     }
     /* Whatever is bound as the window now means the new slot. */
     GLint d = 0, r = 0;
-    glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &d);
-    glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &r);
+    static int tracked = -1;
+    if (tracked < 0) {
+        const char *e = getenv("PSX_GL_PRESENTER_FBO_CACHE");
+        tracked = !e || *e != '0';
+    }
+    if (tracked && s_pt_draw_known && s_pt_read_known) {
+        d = (GLint)s_pt_bound_draw; r = (GLint)s_pt_bound_read;
+    } else {
+        glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &d);
+        glGetIntegerv(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &r);
+        s_pt_bound_draw = (GLuint)d; s_pt_bound_read = (GLuint)r;
+        s_pt_draw_known = s_pt_read_known = 1;
+    }
     for (int i = 0; i < PT_MAX_SLOTS; i++) {
         if (s_pts_fbo[i] && (GLuint)d == s_pts_fbo[i]) p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
         if (s_pts_fbo[i] && (GLuint)r == s_pts_fbo[i]) p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
