@@ -606,6 +606,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `exc_ring` |  | ✓ |  |
 | `first_failure` | ✓ | ✓ | ✓ |
 | `fmv_chroma` | ✓ |  | ✓ |
+| `fmv_hd` | ✓ |  |  |
 | `fmv_state` | ✓ |  |  |
 | `fn_clear` | ✓ |  |  |
 | `fn_disable` | ✓ |  |  |
