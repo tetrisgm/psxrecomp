@@ -12,6 +12,11 @@ int iso_read_raw_sector(void* h, uint32_t lba, uint8_t* out, int size) {
     memset(out+24, (unsigned char)lba, 2048); return 1;
 }
 int iso_read_sector(void* h,uint32_t lba,uint8_t* out,int size) {(void)h;memset(out,(unsigned char)lba,size);return 1;}
+void iso_prefetch_stats(void* h, uint64_t* hits, uint64_t* misses) {
+    (void)h;
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
+}
 
 static void setup(void) {
     test_dma_active = 0;
