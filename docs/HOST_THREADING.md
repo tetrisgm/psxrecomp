@@ -44,9 +44,24 @@ segment misses.
   `ws_explicit_hud_anchor`, `ws_view_current`, mod predicates, ~30%), and
   GPUSTAT-visible draw state. Deferring it to a worker would read later
   values; capturing them per primitive is most of the cost. Only the
-  record overhead was cut (above). Remaining candidates: one record per
-  triangle instead of ~6 (dead `set_*(0)` records before each draw), memoize
-  `gpu_get_display_info` (pure function of GP1 state, ~6% of GP0).
+  record overhead was cut (above). Both follow-ups have landed:
+  `6ea95b0f` publishes a triangle and its short `set_*` setup sequence as
+  one ordered ring record (`RTH_GROUP`; the consumer expands the logical
+  records in order; kill switch `PSX_RENDER_THREAD_GROUPS=0`), and
+  `3c151afd` caches the derived display layout per thread, invalidated by an
+  epoch bumped on GP1 writes and register restore (kill switch
+  `PSX_GPU_DISPLAY_CACHE=0`). Measured on a Release R4 race, headless
+  OpenGL with turbo (pin `ab9d181d`, 2400-frame windows, 3 runs per mode).
+  The sampler puts `gpu_display_info_compute`,
+  `rth_rec_ints`, `rt_cmd_begin` and `rth_record_mode` at ~0.1% of
+  game-thread samples each with both switches off (the 6% figure above
+  was a Debug build), so the ceiling for these two is under 1% and the
+  measured wall time is within noise (mean 5.73 ms/frame with both on,
+  5.74 with both off; run-to-run spread about 10% on a shared machine).
+  Identity: `fp_identity.py` A/A and A/B (both switches off vs default),
+  12000 frames `--headless-opengl`, IDENTICAL, 0 dispatch misses;
+  `render_thread_test` and `gl_render_thread_test` pass with the switches on
+  and off.
 - **PGXP seam strips.** Not on the game thread: `seam_snap_measure` runs in
   the GL backend, i.e. on the render thread whenever it runs (R4 default).
   ~1.3 ms per guest tick there. Each triangle's measure depends on every
