@@ -236,7 +236,8 @@ if(BUILD_TESTING)
         foreach(test_target host_snapshot_guard_test fntrace_restore_handoff_test)
             target_include_directories(${test_target} PRIVATE include src)
             target_compile_options(${test_target} PRIVATE -O2 -flto -ffunction-sections -fdata-sections)
-            target_link_options(${test_target} PRIVATE -flto -Wl,--gc-sections)
+            target_link_options(${test_target} PRIVATE -flto
+                $<IF:$<PLATFORM_ID:Darwin>,-Wl$<COMMA>-dead_strip,-Wl$<COMMA>--gc-sections>)
             add_test(NAME ${test_target} COMMAND ${test_target})
         endforeach()
         add_executable(ws_world_scene_test tests/test_ws_world_scene.c
