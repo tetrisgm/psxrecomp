@@ -9898,11 +9898,78 @@ ASYNC_COUNTERS(ASYNC_DECLARE)
 #undef ASYNC_DECLARE
 #define ASYNC_COUNT(n) atomic_fetch_add(&s_async_count_##n,1)
 static uint64_t s_async_replay_started;
+/* PSX_GL_ASYNC_GPU_TIMER=1: GPU time (GL_TIME_ELAPSED) of each timed output's
+ * stages (enter, replay, finish, compose) and of each reserve, apart from the
+ * render thread's wall time. A stage span counts GPU idle inside it (the GPU
+ * waiting for the render thread), as the dynamic-resolution frame timer does;
+ * PSX_GL_ASYNC_GPU_OPS=1 measures each replayed record instead, which excludes
+ * those gaps. The dynamic-resolution timer stands aside while this measures
+ * (queries of one target cannot nest; frame_perf's brackets are closed too).
+ * Reported on stderr with the async stats (render_pass_stats). */
+#define AGPU_Q 32
+static int s_agpu_on=-1;
+static GLuint s_agpu_q[AGPU_Q]; static int s_agpu_kind[AGPU_Q];
+static unsigned s_agpu_head,s_agpu_tail; static int s_agpu_open;
+static _Atomic uint64_t s_agpu_ns[5],s_agpu_n[5],s_agpu_lost;
+static _Atomic uint64_t s_agpu_op_ns[RTH_GROUP+1],s_agpu_op_n[RTH_GROUP+1]; static int s_agpu_ops=-1;
+static int agpu_on(void) {
+    if (s_agpu_on<0) { const char *e=getenv("PSX_GL_ASYNC_GPU_TIMER"); s_agpu_on=e && *e && *e!='0' &&
+        p_glGenQueries && p_glBeginQuery && p_glEndQuery && p_glGetQueryObjectui64v; if(s_agpu_on) p_glGenQueries(AGPU_Q,s_agpu_q); }
+    return s_agpu_on;
+}
+static void agpu_poll(int all) {
+    while (s_agpu_tail!=s_agpu_head) {
+        unsigned i=s_agpu_tail%AGPU_Q; uint64_t ns=0;
+        if(!all) { p_glGetQueryObjectui64v(s_agpu_q[i],GL_QUERY_RESULT_AVAILABLE,&ns); if(!ns) return; }
+        p_glGetQueryObjectui64v(s_agpu_q[i],GL_QUERY_RESULT,&ns);
+        atomic_fetch_add(&s_agpu_ns[s_agpu_kind[i]],ns); atomic_fetch_add(&s_agpu_n[s_agpu_kind[i]],1); s_agpu_tail++;
+    }
+}
+static void agpu_begin(int kind) {
+    if(!agpu_on()||s_agpu_open) return;
+    agpu_poll(0);
+    if(s_agpu_head-s_agpu_tail>=AGPU_Q) { atomic_fetch_add(&s_agpu_lost,1); return; }
+    gl_perf_yield();
+    s_agpu_kind[s_agpu_head%AGPU_Q]=kind; p_glBeginQuery(GL_TIME_ELAPSED,s_agpu_q[s_agpu_head%AGPU_Q]); s_agpu_open=1;
+}
+static void agpu_end(void) {
+    if(!s_agpu_open) return;
+    p_glEndQuery(GL_TIME_ELAPSED); s_agpu_open=0; s_agpu_head++;
+}
+static void agpu_report(void) {
+    if(s_agpu_on!=1) return;
+    static const char *names[5]={"replay","compose","enter","finish","reserve"};
+    fprintf(stderr,"async_gpu");
+    for(int k=0;k<5;++k) fprintf(stderr," %s_n=%llu %s_ms=%.3f",names[k],
+        (unsigned long long)atomic_load(&s_agpu_n[k]),names[k],atomic_load(&s_agpu_ns[k])*1e-6);
+    fprintf(stderr," lost=%llu\n",(unsigned long long)atomic_load(&s_agpu_lost));
+    for(unsigned op=1;op<=RTH_GROUP;++op) if(atomic_load(&s_agpu_op_n[op]))
+        fprintf(stderr,"async_gpu_op op=%u n=%llu ms=%.3f\n",op,
+            (unsigned long long)atomic_load(&s_agpu_op_n[op]),atomic_load(&s_agpu_op_ns[op])*1e-6);
+}
+/* PSX_GL_ASYNC_GPU_OPS=1: one query per replayed record instead of one per
+ * replay; the per-query cost distorts totals, the ranking is the point. */
+static int agpu_ops(void) {
+    if(s_agpu_ops<0) { const char *e=getenv("PSX_GL_ASYNC_GPU_OPS"); s_agpu_ops=e && *e && *e!='0'; }
+    return s_agpu_ops;
+}
+static GLuint s_agpu_opq[2]; static int s_agpu_opq_i=-1, s_agpu_opq_kind[2];
+static void agpu_op_begin(unsigned op) {
+    if(!agpu_on()||!agpu_ops()||op>RTH_GROUP) return;
+    if(!s_agpu_opq[0]) p_glGenQueries(2,s_agpu_opq);
+    if(s_agpu_open) agpu_end();
+    int i=(s_agpu_opq_i+1)&1; uint64_t ns=0;
+    if(s_agpu_opq_i>=0) { p_glGetQueryObjectui64v(s_agpu_opq[i],GL_QUERY_RESULT,&ns);
+        atomic_fetch_add(&s_agpu_op_ns[s_agpu_opq_kind[i]],ns); }
+    s_agpu_opq_kind[i]=(int)op; s_agpu_opq_i=i; atomic_fetch_add(&s_agpu_op_n[op],1);
+    p_glBeginQuery(GL_TIME_ELAPSED,s_agpu_opq[i]);
+}
+static void agpu_op_end(void) { if(agpu_on()&&agpu_ops()&&s_agpu_opq_i>=0) p_glEndQuery(GL_TIME_ELAPSED); }
 void gl_renderer_pass_async_stats(GLRenderAsyncStats *out) {
     if (!out) return;
     /* Counters are independently atomic: diagnostic reads neither drain the
      * render queue nor invalidate in-flight presentation generations. */
-    rth_op_report();
+    rth_op_report(); agpu_report();
     if (getenv("PSX_SEAM_PREP_STATS"))
         fprintf(stderr, "seam_prep collect=%llu tris=%llu invalid=%llu first_op=%d candidates=%llu prepared=%llu used=%llu mismatch=%llu fallback=%llu verify_tris=%llu verify_mismatch=%llu\n",
             (unsigned long long)atomic_load(&s_async_seam_collect_count),
@@ -13101,7 +13168,8 @@ static void rthf_begin(void) {
     if (s_rthf_qok < 0) {
         s_rthf_qok = (p_glGenQueries && p_glBeginQuery && p_glEndQuery &&
                       p_glGetQueryObjectui64v &&
-                      !(getenv("PSX_DYNRES_GPU_TIMER") && getenv("PSX_DYNRES_GPU_TIMER")[0] == '0')) ? 1 : 0;
+                      !(getenv("PSX_DYNRES_GPU_TIMER") && getenv("PSX_DYNRES_GPU_TIMER")[0] == '0') &&
+                      !(getenv("PSX_GL_ASYNC_GPU_TIMER") && getenv("PSX_GL_ASYNC_GPU_TIMER")[0] != '0')) ? 1 : 0;
         if (s_rthf_qok) p_glGenQueries(RTHF_Q * RTHF_SEG, &s_rthf_q[0][0]);
     }
     s_rthf_open = 1;
@@ -16087,6 +16155,7 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
         ASYNC_COUNT(present_mismatch); return;
     }
     uint64_t compose_start=pt_clock_ns();
+    agpu_begin(1);
     PtTiming timing={output->epoch,output->deadline,output->expires,
                      output->generation,output->index,output->alpha_q16};
     if (gl_renderer_set_present_timing(&timing)) {
@@ -16097,6 +16166,7 @@ static void async_present_slot(int gi,uint32_t slot,const RenderPassOutput *outp
         else if(!drew) ASYNC_COUNT(present_unready);
         else ASYNC_COUNT(present_refused);
     } else ASYNC_COUNT(present_refused);
+    agpu_end();
     memset(&s_pt_next_timing,0,sizeof s_pt_next_timing);
     atomic_fetch_add(&s_async_count_compose_ns,pt_clock_ns()-compose_start);
 }
@@ -16175,6 +16245,8 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         (v[0]!=s_pass_x || v[2]<s_pass_y || v[2]+v[6]>s_pass_y+s_pass_h)) {
         ASYNC_COUNT(unsupported); s_async_invalid=1; return;
     }
+    int agpu_op_open = s_async_exec && c->op!=RTH_PASS_END && c->op!=RTH_ASYNC_BEGIN;
+    if (agpu_op_open) agpu_op_begin(c->op);
     switch (c->op) {
     case RTH_SEMI:      glb_set_semi_transparency(v[0], v[1]); break;
     case RTH_DITHER:    glb_set_dither(v[0]); break;
@@ -16270,6 +16342,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         if (token.output.epoch!=gl_renderer_present_epoch() || pt_clock_ns()>token.output.expires) break;
         s_async_seam_reserve_epoch=token.output.epoch;
         s_async_seam_reserve_generation=token.output.generation;
+        agpu_begin(4);
         int reserve_started=transaction_begin(token.x,token.y,token.w,token.h,
                                                1,token.period_vblanks,0,0);
         s_async_seam_reserve_epoch=s_async_seam_reserve_generation=0;
@@ -16291,6 +16364,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             if (!token.output.alpha_q16) async_present_slot(s_pgen_write,0,&first);
         } else async_seam_baseline_invalidate(token.output.epoch,
                                               token.output.generation);
+        agpu_end();
         atomic_fetch_add(&s_async_count_reserve_ns,pt_clock_ns()-stage_start);
         break;
     }
@@ -16313,6 +16387,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         }
         s_async_previous_write=s_pgen_write; s_pgen_write=gi; s_async_exec=1; s_async_executing=token; s_async_invalid=0; s_async_hd_copy=0;
         s_async_expiry_poll=0;
+        agpu_begin(2);
         if (transaction_begin(token.x,token.y,token.w,token.h,0,token.period_vblanks,0,0)) {
             s_pass_leaks_at_begin=s_pass_leaks;
             if(!async_vram_enter(gi)) {
@@ -16321,6 +16396,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
                 atomic_fetch_add(&s_pass_q_refused,1);
             } else {
                 gpu_hd_textures_suppress_dumps(1);
+                agpu_end(); agpu_begin(0);
                 int ready = prepared &&
                     atomic_load_explicit(&prepared->state, memory_order_acquire) == 1;
                 const PgxpSnap *live = s_snap ? s_snap :
@@ -16336,6 +16412,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
                 } else if (prepared) atomic_fetch_add(&s_async_seam_fallback_count, 1);
             }
         } else { ASYNC_COUNT(capture); s_pass_dead=1; s_async_exec=0; s_pgen_write=s_async_previous_write; }
+        if(!s_async_exec) agpu_end();
         async_seam_prepared_unref(prepared);
         s_async_replay_started=pt_clock_ns();
         atomic_fetch_add(&s_async_count_enter_ns,s_async_replay_started-stage_start);
@@ -16361,12 +16438,13 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             (s_async_seam_failed ||
              s_async_seam_active->batch.consumed != s_async_seam_active->batch.count))
             s_async_invalid = 1;
-        if (s_async_exec) { ASYNC_COUNT(replay_count); atomic_fetch_add(&s_async_count_replay_ns,stage_start-s_async_replay_started); }
+        if (s_async_exec) { agpu_end(); agpu_begin(3); ASYNC_COUNT(replay_count); atomic_fetch_add(&s_async_count_replay_ns,stage_start-s_async_replay_started); }
         if (s_pass_dead) {
             if (s_async_exec) {
                 /* The pass was admitted and has a live backup. Undo every
                  * partial draw before skipping the rest of this output. */
                 pass_end_now(0, 0);
+                agpu_end();
                 gpu_hd_textures_suppress_dumps(0);
                 s_async_exec=0; s_async_invalid=0; s_async_hd_copy=0;
                 s_pgen_write=s_async_previous_write;
@@ -16386,6 +16464,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
             pass_end_now((uint32_t)v[0], v[1]);
         }
         if (s_async_exec) {
+            agpu_end();
             if (v[1] && !s_async_invalid && s_pass_leaks==s_pass_leaks_at_begin) {
                 PassGen *g=&s_pgen[s_pgen_write];
                 for(uint32_t k=1;k<g->n;++k)
@@ -16409,6 +16488,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
     }
     default: break;
     }
+    if (agpu_op_open) agpu_op_end();
     s_rthx_prim = 0;
 }
 
