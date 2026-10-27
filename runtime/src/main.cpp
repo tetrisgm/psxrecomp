@@ -9618,7 +9618,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         /* Keyboard ([KeyMap] Turbo, default Tab) or the controller host
          * shortcut ([hotkeys] fast_forward_pad, default select+L1). Both are
-         * follow the persisted Hold/Toggle mode; the pad chord goes through the same combo matcher as
+         * hold-to-run; the pad chord goes through the same combo matcher as
          * Rewind / Save states so the launcher's binding editor covers it.
          * g_manual_turbo_latched is the press-to-lock twin (TurboToggle /
          * fast_forward_toggle_pad) and drives the same path. */
@@ -9626,9 +9626,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         psx_keybinds_host_keys(keys, host_keys);
         const bool kb_turbo = host_hotkey_input_focused() &&
             host_keymap_down(HOST_KEYMAP_TURBO, host_keys, (int)SDL_GetModState());
-        manual_turbo_requested = g_manual_turbo_latched || (!g_fast_forward_toggle_mode &&
-            (kb_turbo || hotkey_shortcut_down(PSX_ASSIST_BIND_FAST_FORWARD,
-                                             g_hotkey_pad_fast_forward)));
+        manual_turbo_requested = g_manual_turbo_latched || kb_turbo ||
+            hotkey_shortcut_down(PSX_ASSIST_BIND_FAST_FORWARD,
+                                 g_hotkey_pad_fast_forward);
     }
 
 #ifndef PSX_SDL_NO_AUDIO
