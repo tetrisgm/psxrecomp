@@ -13131,8 +13131,20 @@ static uint64_t host_now_ns_rthf(void) {
                       (double)SDL_GetPerformanceFrequency());
 }
 
+/* PSX_DYNRES_GPU_COST=1 restores cost = max(CPU, GPU). The GPU span of a
+ * frame is GL_TIME_ELAPSED between its first and last command: it includes
+ * every gap the GPU spent idle waiting for the render thread to submit, so
+ * on a CPU-bound render thread it reads the whole interval (16 ms at 60 Hz
+ * with 0.2 ms of real GPU work) and dynamic resolution never leaves the
+ * floor. A GPU that really is the bound shows in the CPU time instead: the
+ * render thread waits on its fences (finish) and slots, inside the span. */
+static int rthf_gpu_cost(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PSX_DYNRES_GPU_COST"); on = e && *e && *e != '0'; }
+    return on;
+}
 static void rthf_publish(uint64_t cpu, uint64_t gpu, int has_gpu) {
-    uint64_t cost = has_gpu && gpu > cpu ? gpu : cpu;
+    uint64_t cost = has_gpu && rthf_gpu_cost() && gpu > cpu ? gpu : cpu;
     atomic_fetch_add(&s_rthf_cpu_ns, cpu);
     if (has_gpu) {
         atomic_fetch_add(&s_rthf_gpu_ns, gpu);
@@ -13269,6 +13281,20 @@ static void rthf_end(void) {
 }
 
 void gl_renderer_render_thread_measure(int on) { atomic_store(&s_rthf_want, on ? 1 : 0); }
+
+/* Queued render-pass outputs (a mod's extra frames) run on the render thread
+ * between the guest frames the cost above measures: their render-thread time
+ * (entering the pass, replaying it, waiting for its GPU work, composing it)
+ * as a running total, with the outputs replayed. Dynamic resolution adds it
+ * to the guest frames' cost. */
+/* The interpolation/output target rate (0 = off), for the emulation thread
+ * that sets it: no context acquisition, unlike interpolation_diag. */
+double gl_renderer_interp_target_hz(void) { return s_interp_target_hz; }
+void gl_renderer_async_output_costs(uint64_t *ns, uint64_t *outputs) {
+    if (ns) *ns = atomic_load(&s_async_count_enter_ns) + atomic_load(&s_async_count_replay_ns) +
+                  atomic_load(&s_async_count_finish_ns) + atomic_load(&s_async_count_compose_ns);
+    if (outputs) *outputs = atomic_load(&s_async_count_replay_count);
+}
 static int rthf_owns_timer(void) {
     return s_rth_on && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on) &&
            s_rthf_qok > 0;

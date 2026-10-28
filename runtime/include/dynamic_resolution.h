@@ -215,6 +215,8 @@ typedef struct DynrtParams {
     double min_coverage;
     double descent_s;                /* fast descent lasts this long once judging */
     double descent_load;             /* fast descent target (predicted load) */
+    double output_short;             /* outputs a window may fall short of its
+                                        target rate before it counts as over */
 } DynrtParams;
 
 void dynrt_default_params(DynrtParams *p);
@@ -229,6 +231,7 @@ typedef struct DynrtSample {
     double generated_cost_s; /* part of cost_s spent on generated frames; 0 without FG */
     double output_frames; /* completed presenter outputs, not submissions */
     int output_valid;     /* optional cadence receipt; zero keeps cost-only verification */
+    double output_target_hz; /* the presenter's output rate; 0 = unknown (no cadence judgement) */
 } DynrtSample;
 
 typedef struct DynrtController {
@@ -240,11 +243,12 @@ typedef struct DynrtController {
     int    win_n, win_frames;
     double win_outputs;
     int win_output_samples;
+    double win_output_target_hz;
     /* the last closed window */
     double last_load, last_bp_share, last_hz, last_real_load;
     int    last_valid, last_guest_bound, last_over;
     double last_output_hz;
-    int last_output_valid;
+    int last_output_valid, last_output_short;
     int    over_streak;
     double hold_until;
     double up_streak_s;

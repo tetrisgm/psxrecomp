@@ -283,12 +283,19 @@ the only lever.
 (wall time minus its idle waits for records and its time in the swap, the
 display's vsync) and the GPU time of the same span (a `GL_TIME_ELAPSED`
 query, read back when available, never waited on; `GL_TIMESTAMP` counters
-read 0 on macOS). cost = max(CPU, GPU), published as running totals
-(`gl_renderer_render_thread_costs`). A frame during which the context went
+read 0 on macOS). cost = the CPU time, published with the GPU time as
+running totals (`gl_renderer_render_thread_costs`). The GPU span is a
+statistic, not the cost: `GL_TIME_ELAPSED` between a frame's first and last
+command counts every gap the GPU spent idle waiting for the render thread,
+so on a CPU-bound render thread it reads the whole interval (16 ms at 60 Hz
+against 0.2 ms of GPU work) and the controller would never leave the floor.
+A GPU that is the bound shows in the CPU time instead: the render thread
+waits on its fences and presenter slots inside the span. `PSX_DYNRES_GPU_COST=1`
+restores cost = max(CPU, GPU). A frame during which the context went
 to the emulation thread is dropped (its span holds the emulation thread's
 drawing). While this measures, `frame_perf`'s own TIME_ELAPSED brackets
 stand aside (queries of one target cannot nest). `PSX_DYNRES_GPU_TIMER=0`
-leaves CPU time only.
+turns the GPU query off.
 
 **Decisions** (0.25 s windows of guest time; `dynamic_resolution.h` has the
 full rules and `dynrt_default_params` the numbers):

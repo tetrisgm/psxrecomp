@@ -331,6 +331,7 @@ void dynrt_default_params(DynrtParams *p) {
     p->min_coverage = 0.5;
     p->descent_s = 6.0;
     p->descent_load = 0.78;
+    p->output_short = 1.5;
 }
 
 static int rt_clamp(const DynrtController *c, int l) {
@@ -396,6 +397,7 @@ static void rt_window_reset(DynrtController *c) {
     c->win_generated_cost = 0.0;
     c->win_n = c->win_frames = 0;
     c->win_outputs = 0.0; c->win_output_samples = 0;
+    c->win_output_target_hz = 0.0;
 }
 
 static void rt_discard(DynrtController *c) {
@@ -478,6 +480,11 @@ static int rt_close_window(DynrtController *c, double now) {
     const double real_cost = cost - c->win_generated_cost;
     c->last_output_valid = c->win_output_samples == n && wall > 0.0;
     c->last_output_hz = c->last_output_valid ? c->win_outputs / wall : 0.0;
+    /* The display did not get its outputs: whatever the cost meter read (a
+     * GPU-bound presenter shows little on the render thread's clock), the
+     * level is too high. Judged with slack for one quantized output. */
+    c->last_output_short = c->last_output_valid && c->win_output_target_hz > 0.0 &&
+        c->win_outputs < c->win_output_target_hz * wall - c->p.output_short;
     rt_window_reset(c);
     c->windows++;
     if (frames < 1 || (double)frames < c->p.min_coverage * (double)n) {
@@ -580,7 +587,7 @@ static int rt_close_window(DynrtController *c, double now) {
     }
     if (c->post_active) return c->level;
 
-    const int over = !guest_bound && (load >= budget || strong_bp);
+    const int over = !guest_bound && (load >= budget || strong_bp || c->last_output_short);
     c->last_over = over;
     if (over) {
         c->up_streak_s = 0.0;
@@ -591,7 +598,8 @@ static int rt_close_window(DynrtController *c, double now) {
             int to = c->level - 1;
             const char *why = strong_bp ? "queue full (render thread behind)"
                               : strong ? "render cost over the interval"
-                                       : "render cost over budget";
+                              : load >= budget ? "render cost over budget"
+                                               : "outputs short of the display rate";
             /* Armed, and over by the meter (a full interval, or budget for
              * down_windows): jump to the predicted level. Backpressure alone
              * (a meter that under-reads) predicts no jump: single steps. */
@@ -649,6 +657,7 @@ int dynrt_sample(DynrtController *c, double now_s, const DynrtSample *s) {
     c->win_n++;
     if (s->output_valid && s->output_frames >= 0.0) {
         c->win_outputs += s->output_frames; c->win_output_samples++;
+        if (s->output_target_hz > 0.0) c->win_output_target_hz = s->output_target_hz;
     }
     if (s->frames > 0 && s->cost_s >= 0.0) {
         c->win_frames += s->frames;

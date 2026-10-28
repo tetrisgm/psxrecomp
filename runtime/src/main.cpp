@@ -1437,6 +1437,9 @@ struct DynresHost {
     /* Smooth motion's generated frames (dynres_tick_rt). */
     uint64_t last_gen = 0, last_gen_meas = 0, last_gen_cost_ns = 0;
     double gen_mean_s = 0.0, gen_pending_s = 0.0;
+    /* Queued render-pass outputs' render-thread time (dynres_tick_rt). */
+    uint64_t last_async_ns = 0;
+    double async_pending_s = 0.0;
     unsigned long long rt_last_windows = 0;
     bool rt_trace_header = false;
     double rt_win_cpu_ms = 0.0, rt_win_gpu_ms = 0.0;   /* last window's means */
@@ -10918,6 +10921,26 @@ static void dynres_tick_rt(double now_s, double wall, double period, int held,
     double gen_s = 0.0;
     if (frames > 0 && !held) { gen_s = g_dynres.gen_pending_s; g_dynres.gen_pending_s = 0.0; }
     if (held) g_dynres.gen_pending_s = 0.0;
+    /* A mod's extra frames (queued render passes) run on the render thread
+     * between the measured guest frames, so the frame cost above never sees
+     * them, nor the fence waits a GPU-bound level puts in them. Their time
+     * is render work like the real frames' (PSX_DYNRES_ASYNC_COST=0 leaves
+     * it out). */
+    static const bool async_cost = [] {
+        const char *e = std::getenv("PSX_DYNRES_ASYNC_COST");
+        return !e || e[0] != '0';
+    }();
+    double async_s = 0.0;
+    {
+        uint64_t ans = 0;
+        gl_renderer_async_output_costs(&ans, nullptr);
+        if (ans >= g_dynres.last_async_ns)
+            g_dynres.async_pending_s += (double)(ans - g_dynres.last_async_ns) * 1e-9;
+        g_dynres.last_async_ns = ans;
+        if (frames > 0 && !held) { async_s = g_dynres.async_pending_s; g_dynres.async_pending_s = 0.0; }
+        if (held || !async_cost) { g_dynres.async_pending_s = 0.0; async_s = 0.0; }
+    }
+    const double output_target_hz = gl_renderer_interp_target_hz();
     PtStats output_stats{};
     pt_get_stats(&output_stats);
     const bool output_running = pt_running() != 0;
@@ -10930,7 +10953,8 @@ static void dynres_tick_rt(double now_s, double wall, double period, int held,
     const double outputs = output_valid ? (double)(output_stats.presents - g_dynres.last_output_presents) : 0.0;
     g_dynres.last_output_presents = output_stats.presents;
     g_dynres.last_output_valid = output_running;
-    DynrtSample smp{ period, wall, frames, cost + gen_s, bp, held, gen_s, outputs, output_valid };
+    DynrtSample smp{ period, wall, frames, cost + gen_s + async_s, bp, held, gen_s, outputs,
+                     output_valid, output_target_hz };
     const int prev_level = c.level;
     const int level = dynrt_sample(&c, now_s, &smp);
     /* Frame generation only spends surplus: not while the real frames are

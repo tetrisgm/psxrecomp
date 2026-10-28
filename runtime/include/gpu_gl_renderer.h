@@ -538,6 +538,8 @@ typedef struct GlRthCosts {
 } GlRthCosts;
 void gl_renderer_render_thread_measure(int on);
 void gl_renderer_render_thread_costs(GlRthCosts *out);
+void gl_renderer_async_output_costs(uint64_t *ns, uint64_t *outputs);
+double gl_renderer_interp_target_hz(void);
 
 /* Narrow a native-wide display aspect num:den to the widest whose surface
  * this context can allocate at its internal scale (psx_gl_fit_wide_aspect;
