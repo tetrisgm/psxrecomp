@@ -17431,6 +17431,11 @@ void mh_launcher_settings_get(RecompLauncherCSettings* out) {
     PsxHostVideoSettings v;
     mh_video_get(&v);
     RecompLauncherCSettings& ls = *out;
+    /* Audio as the pre-game launcher seeds it: the menu showed Volume 0% and
+     * Sound off while the game played at the host volume (100%). */
+    ls.enable_audio = 1;
+    ls.audio_freq = g_audio_freq;
+    ls.volume = host_volume_get();
     ls.fullscreen = v.fullscreen;
     ls.texture_filter = v.texture_filter;
     ls.fmv_filter = cfg_fmv_filter_to_launcher(v.fmv_filter);
@@ -17693,6 +17698,9 @@ static void host_pause_service(void) {
     if (have_video) (void)psx_video_apply_live(&video);
 #if defined(RECOMP_LAUNCHER)
     if (have_ls) {
+        /* Settings > Volume applies at once, like the numpad +/- keys. */
+        if (post.volume >= 0 && post.volume <= 100 && post.volume != host_volume_get())
+            host_volume_set(post.volume);
 #if defined(RECOMP_LAUNCHER_HAS_QUALITY_PRESETS)
         /* The menu's Graphics preset row: classified like the launcher's
          * (a pick, or a governed edit); the save below settles it. Rows the
