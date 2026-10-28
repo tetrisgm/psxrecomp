@@ -1475,11 +1475,26 @@ static int effective_internal_resolution(void) {
 /* Resolve the Internal resolution preset into g_video_scale. display_px_h is
  * the monitor's pixel height for Match display (0 = not known yet: 1x until
  * the window exists). No-op while unset. */
-static void apply_internal_resolution(int display_px_h) {
+static int resolved_internal_scale(int display_px_h) {
     const int preset = effective_internal_resolution();
-    if (preset == PSX_IR_UNSET) return;
-    g_video_scale = psx_resolve_internal_scale_ss_cap(preset, g_video_ref_lines,
+    if (preset == PSX_IR_UNSET) return 0;
+    return psx_resolve_internal_scale_ss_cap(preset, g_video_ref_lines,
         display_px_h, video_scale_ceiling(), display_supersample(nullptr), g_video_match_max_lines);
+}
+static void apply_internal_resolution(int display_px_h) {
+    const int s = resolved_internal_scale(display_px_h);
+    if (s) g_video_scale = s;
+}
+/* Mod API (mod_plugins.h): the scale the session resolves to, computed on
+ * demand so activation (which runs before the window and before
+ * apply_internal_resolution) sees the same answer. Match display needs the
+ * display mode: bring SDL video up for the probe when nothing has yet. */
+extern "C" uint32_t psx_mod_internal_scale(void) {
+    const bool was_init = SDL_WasInit(SDL_INIT_VIDEO) != 0;
+    const bool probe = was_init || SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+    const int s = resolved_internal_scale(probe ? match_display_px_h(nullptr) : 0);
+    if (probe && !was_init) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    return s < 0 ? 0u : (uint32_t)s;
 }
 
 /* The value the launcher row starts on: the preset, or the legacy factor shown

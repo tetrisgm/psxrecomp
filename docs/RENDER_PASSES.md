@@ -159,13 +159,18 @@ per axis and moves up to 2^16 per frame.
 ```c
 int psx_mod_activate_render_pass_rate(const char *pkg, const char *feature,
                                       const char *option, uint32_t flip_mode);
+int psx_mod_activate_render_pass_fps(uint32_t fps, uint32_t flip_mode);
 uint32_t psx_mod_render_pass_frame(struct CPUState *cpu,
                                    const PSXModRenderPassFrame *frame,
                                    PSXModRenderPassFn fn, void *user);
 ```
 
 The first reads a choice option (`display` or a rate) and selects the FLIP
-source, HOLD blend, the flip mode and the rate. The second plans one game
+source, HOLD blend, the flip mode and the rate; `_fps` does the same with a
+rate the plugin chose itself (0 = display refresh), for a choice such as
+"auto" that depends on `psx_mod_internal_scale()`, the integer raster scale
+the session's Internal resolution resolves to (valid at activation, before
+the window exists). The last plans one game
 frame, runs `fn` at each phase into the frame's rect, and switches the
 presenter to a crossfade while passes are unavailable for a lasting reason
 (back to HOLD when they return).

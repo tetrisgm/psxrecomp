@@ -232,6 +232,10 @@ static void test_frame_driver(void) {
     strcpy(s_option, "display");
     psx_mod_activate_render_pass_rate("p", "f", "rate", PSX_MOD_RENDER_PASS_FLIP_SHOWN);
     CHECK(s_fps == 0 && s_flip == PSX_MOD_RENDER_PASS_FLIP_SHOWN, "display refresh is rate 0");
+    s_blend = 99;
+    CHECK(psx_mod_activate_render_pass_fps(30, PSX_MOD_RENDER_PASS_FLIP_PENDING) &&
+          s_fps == 30 && s_blend == PSX_MOD_FRAME_INTERPOLATION_HOLD &&
+          s_flip == PSX_MOD_RENDER_PASS_FLIP_PENDING, "caller-chosen rate activates the same way");
 
     memset(&f, 0, sizeof f);
     f.struct_size = sizeof f;

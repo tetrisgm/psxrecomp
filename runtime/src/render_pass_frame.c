@@ -9,6 +9,15 @@
 
 static int s_crossfade;   /* passes lastingly unavailable: presenter crossfades */
 
+int psx_mod_activate_render_pass_fps(uint32_t fps, uint32_t flip_mode) {
+    s_crossfade = 0;
+    if (!psx_mod_set_frame_interpolation_source(PSX_MOD_FRAME_SOURCE_FLIP) ||
+        !psx_mod_set_render_pass_flip(flip_mode) ||
+        !psx_mod_set_frame_interpolation_blend(PSX_MOD_FRAME_INTERPOLATION_HOLD))
+        return 0;
+    return psx_mod_set_frame_interpolation(fps);
+}
+
 int psx_mod_activate_render_pass_rate(const char* package, const char* feature,
                                       const char* option, uint32_t flip_mode) {
     char value[16];
@@ -20,12 +29,7 @@ int psx_mod_activate_render_pass_rate(const char* package, const char* feature,
         const unsigned long parsed = strtoul(value, &end, 10);
         if (end != value && *end == '\0') fps = parsed;
     }
-    s_crossfade = 0;
-    if (!psx_mod_set_frame_interpolation_source(PSX_MOD_FRAME_SOURCE_FLIP) ||
-        !psx_mod_set_render_pass_flip(flip_mode) ||
-        !psx_mod_set_frame_interpolation_blend(PSX_MOD_FRAME_INTERPOLATION_HOLD))
-        return 0;
-    return psx_mod_set_frame_interpolation((uint32_t)fps);
+    return psx_mod_activate_render_pass_fps((uint32_t)fps, flip_mode);
 }
 
 uint32_t psx_mod_render_pass_frame(struct CPUState* cpu,
