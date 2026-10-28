@@ -2,7 +2,6 @@
 #define main render_thread_fixture_main
 #include "test_gl_render_thread.c"
 #undef main
-void host_sampler_retarget_current(const char *thread) { (void)thread; }
 static void test_depth_clear(GLuint fbo, double value) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER,fbo);
     glDisable(GL_SCISSOR_TEST); glDepthMask(GL_TRUE); glClearDepth(value);

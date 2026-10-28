@@ -58,6 +58,9 @@ def main():
     ap.add_argument("--frames", default="80")
     ap.add_argument("--single", action="store_true",
                     help="run the fixture once with no arguments; its exit code is the result")
+    ap.add_argument("--compare-env",
+                    help="with --single: run the fixture a second time with this variable set "
+                         "to 0; both runs must pass and print the same name=hex digests")
     args = ap.parse_args()
     sdl_includes = [str(pathlib.Path(d).resolve()) for d in args.sdl_include.split(";") if d]
     args.sdl_library = str(pathlib.Path(args.sdl_library).resolve())
@@ -69,11 +72,11 @@ def main():
     print("Evidence directory:", dest)
     receipt = []
 
-    def run(command):
+    def run(command, env=None):
         command = [str(c) for c in command]
         r = subprocess.run(command, cwd=dest, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
-        receipt.append({"cmd": command, "exit": r.returncode,
+                           encoding="utf-8", errors="replace", env=env)
+        receipt.append({"cmd": command, "exit": r.returncode, "env": sorted(env or {}) if env else None,
                         "stdout": r.stdout, "stderr": r.stderr[-4000:]})
         (dest / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
         return r
@@ -126,7 +129,21 @@ def main():
         print(r.stdout[-6000:], r.stderr[-3000:])
         if r.returncode == SKIP_EXIT:
             print("SKIP:", r.stderr.strip()[-600:])
-        return r.returncode
+        if r.returncode or not args.compare_env:
+            return r.returncode
+        # The opt-out path (NAME=0) must pass too and leave the same image:
+        # every name=<16 hex> digest the fixture prints is compared.
+        env = dict(os.environ, **{args.compare_env: "0"})
+        r2 = run([probe], env=env)
+        print(f"{args.compare_env}=0:", r2.stdout[-6000:], r2.stderr[-3000:])
+        if r2.returncode:
+            return r2.returncode
+        digests = lambda text: dict(re.findall(r"(\w+)=([0-9a-f]{16})\b", text))
+        a, b = digests(r.stdout), digests(r2.stdout)
+        if not a or a != b:
+            print(f"FAIL: digests differ with {args.compare_env}=0 ({a} vs {b})")
+            return 1
+        return 0
 
     ok = True
     first = True

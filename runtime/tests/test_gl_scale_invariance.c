@@ -97,7 +97,7 @@ int g_psx_vram_dirty_tracking=0;
 volatile int32_t g_gte_last_h, g_gte_last_ofx, g_gte_last_ofy;
 /* Host menu overlay and video telemetry (psx_host_menu.c, video_telemetry.cpp):
  * none here. */
-int psx_host_menu_overlay_image(const uint32_t **pixels, int *w, int *h){(void)pixels;(void)w;(void)h;return 0;}
+int psx_host_menu_overlay_image(const uint32_t **pixels, int *w, int *h){*pixels=NULL;*w=*h=0;return 0;}
 void psx_video_telemetry_present(int result){(void)result;}
 void psx_video_telemetry_compose(int renderer, int scale, int source_w, int source_h,
                                int drawable_w, int drawable_h, int viewport_w, int viewport_h){
@@ -113,16 +113,11 @@ int psx_netplay_active(void){return 0;}
 #ifndef PSX_TEST_HD_TEXTURE_PACK
 GrBackend gr_backend(void){return GR_BACKEND_OPENGL;}
 void gr_refresh_backend(void){}
+/* No HD texture pack (gpu_hd_textures.cpp) in these fixtures. */
+int gpu_hd_textures_active(void){return 0;}
 #endif
-/* These renderer-only fixtures have no frontend telemetry/menu consumer. */
-void psx_video_telemetry_compose(int r,int s,int sw,int sh,int dw,int dh,int vw,int vh) {
-    (void)r;(void)s;(void)sw;(void)sh;(void)dw;(void)dh;(void)vw;(void)vh;
-}
-void psx_video_telemetry_present(int result) {(void)result;}
-int psx_host_menu_overlay_image(const uint32_t **p,int *w,int *h) {
-    *p=NULL;*w=*h=0;return 0;
-}
-
+/* Host sampler (host_sampler.c): the render thread retargets it; none here. */
+void host_sampler_retarget_current(const char *name){(void)name;}
 int gpu_display_is_depth24(void){return 0;}
 void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));out->width=320;out->height=240;}
 int psx_ws_prim_in_backdrop(void){return 0;}

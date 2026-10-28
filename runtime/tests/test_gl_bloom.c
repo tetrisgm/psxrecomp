@@ -23,8 +23,6 @@ static uint64_t pfx_fixture_clock(void) {
     return s_pfx_test_clock ? s_pfx_test_clock : SDL_GetPerformanceCounter();
 }
 void gpu_hd_textures_begin_upload(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
-int gpu_hd_textures_active(void){return 0;}
-void host_sampler_retarget_current(const char *name){(void)name;}
 void gpu_hd_textures_track_upload(int x,int y,int w,int h,const uint16_t* p){(void)x;(void)y;(void)w;(void)h;(void)p;}
 void gpu_hd_textures_invalidate(int x,int y,int w,int h){(void)x;(void)y;(void)w;(void)h;}
 void gpu_hd_textures_begin_copy(int sx,int sy,int x,int y,int w,int h){(void)sx;(void)sy;(void)x;(void)y;(void)w;(void)h;}
