@@ -1515,6 +1515,7 @@ static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're de
 /* Local rewind is opt-in: the snap ring is whole-machine state on a frame
  * cadence, too much to charge every host for a feature many never open. */
 static int           g_rewind_enabled = 0;
+static int           g_rewind_title_default = 0; /* game.toml [video] rewind */
 static int           g_rewind_depth  = 50;  /* local rewind snap count (50/100/150/200) */
 static int           g_rewind_interval = 15; /* frames between snaps (1/4/8/12/15) */
 static int           g_hotkey_pad_rewind = 1272;       /* select + r3 */
@@ -18408,6 +18409,8 @@ int main(int argc, char** argv) {
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
             gl_renderer_set_texture_window_batching(
                 gc.runtime.video_texture_window_batching ? 1 : 0);
+            g_rewind_title_default = gc.runtime.video_rewind ? 1 : 0;
+            g_rewind_enabled = g_rewind_title_default;
             g_render_thread = gc.runtime.video_render_thread ? 1 : 0;
             g_frame_generation = gc.runtime.video_frame_generation ? 1 : 0;
             g_frame_generation_method = gc.runtime.video_frame_generation_method;
@@ -20463,7 +20466,8 @@ int main(int argc, char** argv) {
                 g_video_aspect_den = seed.aspect_den;
                 g_audio_freq      = seed.audio_freq;
                 g_audio_spu_hq    = seed.spu_hq;
-                g_rewind_enabled = seed.has_rewind ? (seed.rewind ? 1 : 0) : 0;
+                g_rewind_enabled = seed.has_rewind ? (seed.rewind ? 1 : 0)
+                                                   : g_rewind_title_default;
                 g_rewind_depth   = seed.has_rewind_depth && seed.rewind_depth > 0
                     ? seed.rewind_depth : 50;
                 g_rewind_interval = seed.has_rewind_interval && seed.rewind_interval > 0

@@ -1116,6 +1116,8 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("low_latency_input")) {
             rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
         }
+        if (video.contains("rewind"))
+            rt.video_rewind = toml::find<bool>(video, "rewind");
         if (video.contains("texture_window_batching")) {
             rt.video_texture_window_batching =
                 toml::find<bool>(video, "texture_window_batching");

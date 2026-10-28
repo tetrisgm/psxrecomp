@@ -673,6 +673,9 @@ struct RuntimeConfig {
     // image is identical; games that tile textures with per-primitive windows
     // draw in far fewer batches. Off by default; a game opts in.
     bool                  video_texture_window_batching = false;
+    // rewind: the title's default for the local rewind ring when the player's
+    // settings.toml has no [video] rewind (off unless a title opts in).
+    bool                  video_rewind = false;
 
     // render_thread: OpenGL only. Run the GL backend on its own thread: the
     // emulation thread records each frame's draw work and the render thread

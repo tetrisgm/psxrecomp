@@ -1065,8 +1065,10 @@ Vulkan renderers ignore the key.
 
 ### Local rewind (`settings.toml`)
 
-Rewind is a player setting, not a game one: it lives in the user's
-`settings.toml` beside the runtime executable, under `[video]`.
+Rewind is a player setting: it lives in the user's `settings.toml` beside
+the runtime executable, under `[video]`. A title may set its default with the
+same key in `game.toml` `[video]` (`rewind = true`); the player's saved value
+always wins.
 
 ```toml
 [video]
