@@ -280,14 +280,29 @@ int pt_try_submit_at(void *ready, const PtTiming *timing, void **next_done) {
     if (next_done) *next_done = NULL;
     if (!P.running) return -1;
     mtx_lock(&P.mtx);
-    if (!P.stop && timing && timing->epoch && timing->epoch == P.epoch &&
-        timing->expires_ns > timing->not_before_ns &&
-        now_ns() < timing->expires_ns) {
-        for (int k = 1; k < P.cfg.slots; ++k) {
-            const int slot = (P.current + k) % P.cfg.slots;
-            if (P.state[slot] == S_FREE) { next = slot; break; }
+    uint64_t waited_from = 0;
+    if (timing && timing->epoch && timing->expires_ns > timing->not_before_ns) {
+        for (;;) {
+            const uint64_t now = now_ns();
+            if (P.stop || timing->epoch != P.epoch || now >= timing->expires_ns) break;
+            for (int k = 1; k < P.cfg.slots; ++k) {
+                const int slot = (P.current + k) % P.cfg.slots;
+                if (P.state[slot] == S_FREE) { next = slot; break; }
+            }
+            if (next >= 0 || !P.cfg.admit_wait_ns) break;
+            /* Every slot holds an output ahead of this one: the queue is
+             * full because the producer is early, so waiting for the next
+             * present to free a slot loses nothing, where refusing would
+             * drop a finished output. Bounded by the wait cap and the
+             * output's own expiry. */
+            if (!waited_from) { waited_from = now; P.st.timed_waited++; }
+            const uint64_t until = waited_from + P.cfg.admit_wait_ns < timing->expires_ns ?
+                                   waited_from + P.cfg.admit_wait_ns : timing->expires_ns;
+            if (now >= until) break;
+            cnd_wait_ns(&P.cv, &P.mtx, until - now);
         }
     }
+    if (waited_from) P.st.timed_wait_ns += now_ns() - waited_from;
     if (next < 0) {
         P.st.timed_refused++;
         mtx_unlock(&P.mtx);

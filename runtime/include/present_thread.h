@@ -51,6 +51,10 @@ typedef struct PtConfig {
     PtPresentFn present;
     PtDisposeFn dispose;   /* optional */
     void       *user;
+    /* pt_try_submit_at: with every slot taken, wait up to this long (and
+     * never past the output's expiry) for one to free before refusing. 0
+     * refuses at once. */
+    uint64_t    admit_wait_ns;
 } PtConfig;
 
 /* Start the thread; returns once its ctx(1) has run. 1 on success (the
@@ -80,8 +84,9 @@ typedef struct PtTiming {
 } PtTiming;
 uint64_t pt_clock_ns(void);
 void pt_set_epoch(uint64_t epoch);
-/* Producer: submit only if another slot is already free, the epoch matches,
- * and the output has not expired. Never waits for a slot or deadline.
+/* Producer: submit only if another slot is free (or frees within
+ * cfg.admit_wait_ns, while the output has not expired), the epoch matches,
+ * and the output has not expired. Never waits for a deadline.
  * Returns new slot, -1 when stopped, -2 on refusal. On refusal the producer
  * keeps its current slot AND ready token; next_done is NULL. Accepted timed
  * outputs wait on the present thread, and drop if expired/reset before use.
@@ -98,6 +103,8 @@ typedef struct PtStats {
     uint64_t present_gap_max_ns, present_gaps_over_25ms;
     uint64_t timed_dropped, timed_refused;
     int      slots, queued_high;
+    /* Timed submissions that waited for a slot (admit_wait_ns), and how long. */
+    uint64_t timed_waited, timed_wait_ns;
 } PtStats;
 void pt_get_stats(PtStats *out);
 

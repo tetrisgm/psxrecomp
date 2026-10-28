@@ -201,6 +201,41 @@ static void run_timed(void) {
     check(pt_try_submit_at((void *)23, &t, &done) == -2,
           "already expired output refused at admission");
     pt_stop();
+
+    /* Admission wait: a full queue holds the producer until the next present
+     * frees a slot (bounded by the cap and the output's expiry). */
+    reset();
+    c.slots = 2;
+    c.admit_wait_ns = 2000000000ull;
+    check(pt_start(&c), "admission-wait presenter starts");
+    pt_set_epoch(5);
+    begin = pt_clock_ns();
+    t = (PtTiming){5, begin + 100000000ull, begin + 2000000000ull};
+    check(pt_try_submit_at((void *)31, &t, &done) == 1, "first timed output queued");
+    t.not_before_ns = begin + 110000000ull;
+    uint64_t w0 = pt_clock_ns();
+    int got = pt_try_submit_at((void *)32, &t, &done);
+    uint64_t w = pt_clock_ns() - w0;
+    check(got == 0 && done == (void *)31,
+          "full queue waits for the present and takes the freed slot");
+    check(w >= 50000000ull && w < 1500000000ull, "waited for the present, not the cap");
+    pt_drain();
+    check(atomic_load(&n_presented) == 2 && presented[0] == 31 && presented[1] == 32,
+          "both outputs presented in order after the wait");
+    pt_get_stats(&st);
+    check(st.timed_waited == 1 && st.timed_refused == 0 && st.timed_wait_ns >= 50000000ull,
+          "admission wait counted, no refusal");
+    /* An output that expires before a slot frees is still refused. */
+    t = (PtTiming){5, pt_clock_ns() + 300000000ull, pt_clock_ns() + 2000000000ull};
+    check(pt_try_submit_at((void *)33, &t, &done) >= 0, "late output queued");
+    t.not_before_ns = pt_clock_ns() + 10000000ull; t.expires_ns = pt_clock_ns() + 40000000ull;
+    w0 = pt_clock_ns();
+    check(pt_try_submit_at((void *)34, &t, &done) == -2, "output expiring before a slot frees is refused");
+    check(pt_clock_ns() - w0 < 250000000ull, "refusal at expiry, not at the cap");
+    pt_get_stats(&st);
+    check(st.timed_waited == 2 && st.timed_refused == 1, "expired wait counted as a refusal");
+    pt_set_epoch(6);
+    pt_stop();
 }
 
 int main(void) {

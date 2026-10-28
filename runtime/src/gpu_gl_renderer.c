@@ -11323,7 +11323,18 @@ static int pt_begin(void) {
     SDL_GL_MakeCurrent(s_win, s_ctx);
     memset(s_pts_fbo, 0, sizeof s_pts_fbo);
     memset(s_ptp_fbo, 0, sizeof s_ptp_fbo);
-    PtConfig c = { slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL };
+    PtConfig c = { slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL, 0 };
+    /* A timed output that finds every slot taken waits for the next present
+     * to free one (within its expiry) instead of being dropped. The wait is
+     * capped at PSX_PRESENT_ADMIT_WAIT_MS (default 25, 0 = refuse at once as
+     * before). */
+    {
+        const char *e = getenv("PSX_PRESENT_ADMIT_WAIT_MS");
+        double ms = e && *e ? atof(e) : 25.0;
+        if (ms < 0.0) ms = 0.0;
+        if (ms > 1000.0) ms = 1000.0;
+        c.admit_wait_ns = (uint64_t)(ms * 1e6);
+    }
     if (!pt_start(&c)) {
         fprintf(stdout, "psxrecomp: present thread: start failed; swaps stay on the render thread\n");
         SDL_GL_DeleteContext(s_pt_ctx);
@@ -11414,12 +11425,14 @@ int gl_renderer_present_thread_json(char *out, size_t cap) {
         "\"present_thread\":{\"active\":%d,\"slots\":%d,\"submits\":%llu,\"presents\":%llu,"
         "\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
         "\"queued_high\":%d,\"timed_dropped\":%llu,\"timed_refused\":%llu,"
+        "\"timed_waited\":%llu,\"timed_wait_ms\":%.3f,"
         "\"gap_ms_max\":%.3f,\"gaps_over_25ms\":%llu}",
         s_pt_on, st.slots, (unsigned long long)st.submits, (unsigned long long)st.presents,
         (unsigned long long)st.waits, st.wait_ns / 1e6,
         st.presents ? (double)st.present_ns / (double)st.presents / 1e6 : 0.0,
         st.present_max_ns / 1e6, st.queued_high,
         (unsigned long long)st.timed_dropped, (unsigned long long)st.timed_refused,
+        (unsigned long long)st.timed_waited, st.timed_wait_ns / 1e6,
         st.present_gap_max_ns / 1e6, (unsigned long long)st.present_gaps_over_25ms);
 }
 static void gl_swap_now(int generated);
