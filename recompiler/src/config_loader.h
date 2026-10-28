@@ -478,6 +478,10 @@ struct RuntimeConfig {
     // (runtime/include/dynamic_resolution.h). Off by default; a title opts
     // in. dynamic_resolution_min: the lowest level, a preset value as for
     // internal_resolution (720 = "720p"; 1 = native).
+    // fullscreen: the window mode until settings.toml has one (0 windowed,
+    // 1 borderless desktop fullscreen, 2 exclusive). In game.toml also
+    // "windowed" / "borderless" / "exclusive". Windowed unless a title opts in.
+    int                   video_fullscreen = 0;
     bool                  video_dynamic_resolution = false;
     int                   video_dynamic_resolution_min = 720;
     bool                  video_dynamic_resolution_start_min = false;

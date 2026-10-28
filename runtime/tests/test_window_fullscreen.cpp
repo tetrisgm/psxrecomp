@@ -29,8 +29,10 @@ int main() {
     for (int i = 0; i < 3; ++i) {
         check(psx_window_fullscreen_set(window, &state, 1) == 0, "enter borderless");
 #if defined(_WIN32) && defined(PSX_SDL3)
-        check(!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN), "borderless never arms native fullscreen");
-        check((SDL_GetWindowFlags(window) & SDL_WINDOW_BORDERLESS) != 0, "borderless has no decorations");
+        // Desktop fullscreen: SDL's own fullscreen with no display mode, not a
+        // window sized to the display (drivers promote that to an exclusive
+        // flip surface, which blanked on Alt-Tab).
+        check((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0, "borderless is desktop fullscreen");
         check(SDL_GetWindowFullscreenMode(window) == nullptr, "borderless has no exclusive display mode");
         SDL_Rect bounds{};
         SDL_GetDisplayBounds(SDL_GetDisplayForWindow(window), &bounds);

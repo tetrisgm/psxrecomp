@@ -17690,6 +17690,21 @@ static void host_pause_service(void) {
         std::fprintf(stdout, "psxrecomp: in-game menu disc %d -> %d\n", disc, rc);
     }
     psx_host_set_ui_capture(ovl_open());
+    {
+        /* Fullscreen hides the cursor; the menu takes mouse input, so show
+         * it while the menu is open and hide it again when it closes. */
+        static int cursor_for_menu = -1;
+        const int fs = s_window_fullscreen.mode != 0;
+        const int want_cursor = fs && ovl_open() ? 1 : 0;
+        if (fs && want_cursor != cursor_for_menu) {
+#if defined(PSX_SDL3)
+            if (want_cursor) SDL_ShowCursor(); else SDL_HideCursor();
+#else
+            SDL_ShowCursor(want_cursor ? SDL_ENABLE : SDL_DISABLE);
+#endif
+        }
+        cursor_for_menu = fs ? want_cursor : -1;
+    }
     const bool want = g_ovl_pause_wanted != 0 && ovl_open();
     if (want && !g_ovl_pause_held) g_ovl_pause_held = psx_host_pause_push("overlay") != 0;
     else if (!want && g_ovl_pause_held) { psx_host_pause_pop(); g_ovl_pause_held = false; }
@@ -18341,6 +18356,7 @@ int main(int argc, char** argv) {
             g_video_internal_res = gc.runtime.video_internal_resolution;
             g_video_ref_lines    = gc.runtime.video_resolution_reference_lines;
             g_video_match_max_lines = gc.runtime.video_match_display_max_lines;
+            g_fullscreen = gc.runtime.video_fullscreen;  /* settings.toml overrides */
             g_video_ss_disable_at_lines = gc.runtime.video_supersample_disable_at_lines;
             g_video_dynres       = gc.runtime.video_dynamic_resolution ? 1 : 0;
             g_video_dynres_min   = gc.runtime.video_dynamic_resolution_min;

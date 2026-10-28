@@ -871,6 +871,20 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("dynamic_resolution")) {
             rt.video_dynamic_resolution = toml::find<bool>(video, "dynamic_resolution");
         }
+        if (video.contains("fullscreen")) {
+            const toml::value& fs = toml::find(video, "fullscreen");
+            int mode = -1;
+            if (fs.is_integer()) mode = static_cast<int>(fs.as_integer());
+            else if (fs.is_boolean()) mode = fs.as_boolean() ? 1 : 0;
+            else if (fs.is_string()) {
+                const std::string s = fs.as_string();
+                mode = s == "windowed" ? 0 : s == "borderless" ? 1 : s == "exclusive" ? 2 : -1;
+            }
+            if (mode < 0 || mode > 2)
+                throw std::runtime_error(
+                    "[video] fullscreen must be windowed, borderless, exclusive or 0..2");
+            rt.video_fullscreen = mode;
+        }
         if (video.contains("dynamic_resolution_start_min")) {
             rt.video_dynamic_resolution_start_min =
                 toml::find<bool>(video, "dynamic_resolution_start_min");

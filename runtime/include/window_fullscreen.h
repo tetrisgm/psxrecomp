@@ -2,8 +2,11 @@
 
 #include "psx_sdl.h"
 
-/* On Windows/SDL3, borderless stays a normal desktop-sized window. Other
- * window managers retain native desktop fullscreen (Wayland owns placement). */
+/* Mode 1 is the platform desktop ("borderless") fullscreen: the desktop
+ * display mode, no mode change, Alt-Tab friendly. On Windows it used to be a
+ * plain window sized to the display, which drivers promote to an exclusive
+ * flip surface, so it blanked black on Alt-Tab like mode 2. Mode 2 changes
+ * the display mode. */
 struct PsxWindowFullscreen {
     int mode = 0;
     int x = 0, y = 0, width = 0, height = 0;
@@ -61,14 +64,10 @@ static inline int psx_window_fullscreen_set(SDL_Window* window,
     SDL_SyncWindow(window);
 #endif
     if (mode == 1) {
-#if defined(_WIN32) && defined(PSX_SDL3)
-        SDL_SetWindowBordered(window, SDL_FALSE);
-        SDL_SetWindowResizable(window, SDL_FALSE);
-        SDL_SetWindowPosition(window, desktop.x, desktop.y);
-        SDL_SetWindowSize(window, desktop.w, desktop.h);
-        SDL_SyncWindow(window);
-#elif defined(PSX_SDL3)
+        (void)desktop;
+#if defined(PSX_SDL3)
         if (!SDL_SetWindowFullscreen(window, true)) return -1;
+        SDL_SyncWindow(window);
 #else
         if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) return -1;
 #endif
