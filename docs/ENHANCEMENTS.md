@@ -1375,6 +1375,26 @@ dispatch / segment misses and 4 mixed triangles in a boot-to-race smoke.
 `tests/test_pgxp_seam_snap.c` pins the measurements (crest gap, shared
 mesh, overlap, decal, depth and size limits, T-junction, reset).
 
+**Strip extent and depth (2026-10-27).** The first version drew each strip
+along the whole edge at the largest gap measured anywhere on it, and pushed
+it behind the triangle's plane by only the colour pass's tolerance. Two
+surfaces that touch for a few pixels (R4: a road row's edge running on past
+a kerb's, the integer lines collinear, the precise lines 0.4 px apart over
+the 4 px they share) then got a 13 px strip in the road's texture (black
+past its edge) over the kerb face beside the road, and a lane mark whose
+edge lay on a road row's grew its own texture over the road: dark and
+light bars along kerbs and lane marks at 18x (owner, 0.2.1 candidate:
+"pgxp was buggy"). Now `pgxp_snap_triangle_ex` returns, per edge, the part
+of the edge that lies on the neighbour and the gap at each end of it
+(`PgxpSnapStrip`: the gap varies along the edge within the 3-degree
+parallel tolerance), a T-junction's strips taper to nothing 3 px from the
+vertex, and a strip's depth sits behind the triangle's plane by the pairing's
+own depth agreement (12%) plus the colour pass's tolerance, so it never wins
+against either surface or anything near their plane and only shows where
+the gap opens onto what is behind. Measured on the R4 attract demo at 18x
+(40 tick-exact frames, snapping on vs off): the kerb and lane-mark bars are
+gone; the remaining differences are the strips in the cracks they close.
+
 ## IR1 — Internal resolution presets (Native … 8K) and the GL scale ceiling (2026-09-26)
 
 **What the player gets.** Settings → Display → **Internal resolution**: Native,
