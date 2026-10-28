@@ -1084,11 +1084,27 @@ int hd_texture_pack_invalidation_changes(const HdTexturePack* p, uint16_t x,uint
         for (const Rect& cut : cuts) touches = touches || intersects(p->upload_bounds, cut);
         if (!touches) return 0;
     }
-    for (const Rect& cut : cuts)
-        for (const Upload& upload : p->uploads)
-            if (intersects(upload.bounds,cut))
-                for (const Fragment& fragment : upload.fragments)
-                    if (intersects(fragment.rect,cut)) return 1;
+    /* Then only the uploads indexed under the tiles the cut covers: an
+     * upload's bounds lie within its tiles, so one outside them cannot
+     * intersect the cut. */
+    for (const Rect& cut : cuts) {
+        const unsigned first_x = cut.x / kUploadIndexTileSize;
+        const unsigned first_y = cut.y / kUploadIndexTileSize;
+        const unsigned last_x = std::min(kUploadIndexCols - 1,
+                                         (cut.x + cut.width - 1) / kUploadIndexTileSize);
+        const unsigned last_y = std::min(kUploadIndexRows - 1,
+                                         (cut.y + cut.height - 1) / kUploadIndexTileSize);
+        for (unsigned ty = first_y; ty <= last_y; ++ty)
+            for (unsigned tx = first_x; tx <= last_x; ++tx)
+                for (const uint64_t serial : p->upload_index[upload_index_cell(tx, ty)]) {
+                    const auto indexed = p->upload_by_serial.find(serial);
+                    if (indexed == p->upload_by_serial.end() || !indexed->second) continue;
+                    const Upload& upload = *indexed->second;
+                    if (!intersects(upload.bounds, cut)) continue;
+                    for (const Fragment& fragment : upload.fragments)
+                        if (intersects(fragment.rect, cut)) return 1;
+                }
+    }
     return 0;
 }
 
@@ -1376,6 +1392,16 @@ int hd_texture_pack_match(HdTexturePack* pack,
     const uint64_t* candidate_serials = serials.overflow ? overflow_serials.data() : serials.items.data();
     const size_t candidate_count = serials.overflow ? overflow_serials.size() : serials.count;
     if (candidate_count == 0) return HD_TEXTURE_LOOKUP_NONE;
+    /* No candidate upload has a replacement under any palette: the entry
+     * lookups below would all fail, so the CLUT need not be hashed. */
+    bool any_replaceable = false;
+    for (size_t ci = 0; ci < candidate_count && !any_replaceable; ++ci) {
+        const auto indexed = pack->upload_by_serial.find(candidate_serials[ci]);
+        if (indexed != pack->upload_by_serial.end() && indexed->second &&
+            pack->texture_hashes.count(indexed->second->hash))
+            any_replaceable = true;
+    }
+    if (!any_replaceable) return HD_TEXTURE_LOOKUP_NONE;
     const uint32_t palette_hash = hd_texture_hash_clut(
         query->vram, query->vram_word_count, query->clut_x, query->clut_y,
         query->depth);
