@@ -17245,6 +17245,7 @@ std::atomic<int> g_ovl_pause_wanted{0};
 bool g_ovl_pause_held = false;
 std::atomic<int> g_ovl_reload_binds{0};
 std::atomic<int> g_ovl_exit{0};            /* PSX_MENU_EXIT_* + 1; 0 = none */
+std::atomic<int> g_ovl_state_req{0};       /* menu save/load: slot + 1, | 0x100 = save; 0 = none */
 bool g_ovl_video_pending = false;
 PsxHostVideoSettings g_ovl_video_post{};
 PsxHostVideoSettings g_ovl_video_current{}, g_ovl_video_boot{};
@@ -17397,6 +17398,30 @@ int disc_cycle_now(int n) { const PsxMenuDiscOps* d = psx_menu_disc_ops(); retur
  * queued, -1 when there is no disc to change to, or the policy's netplay
  * refusal up front. */
 std::atomic<int> g_ovl_disc_req{0};
+/* Save states from the menu: the hotkey menu's slots and rules
+ * (savestate_submit_slot), applied on the main thread. */
+int mh_state_slot_count(void) { return SAVESTATE_SLOTS; }
+int mh_state_available(void) {
+    return !mh_netplay_active() && !savestate_title_blocked() && psx_mod_netplay_savestates_supported() ? 1 : 0;
+}
+int mh_state_info(int slot, long long* mtime) {
+    if (slot < 0 || slot >= SAVESTATE_SLOTS || !savestate_slot_exists(slot)) return 0;
+    int64_t t = 0;
+    if (mtime) *mtime = savestate_slot_mtime(slot, &t) ? (long long)t : 0;
+    return 1;
+}
+int mh_state_thumb(int slot, unsigned* argb, int w, int h) {
+    if (slot < 0 || slot >= SAVESTATE_SLOTS || !argb || w <= 0 || h <= 0) return 0;
+    return savestate_read_thumb(slot, reinterpret_cast<uint32_t*>(argb), w, h);
+}
+int mh_state_request(int slot, int save) {
+    if (slot < 0 || slot >= SAVESTATE_SLOTS || !mh_state_available()) return 0;
+    if (!save && !savestate_slot_exists(slot)) return 0;
+    g_ovl_state_req = (slot + 1) | (save ? 0x100 : 0);
+    return 1;
+}
+int mh_state_save(int slot) { return mh_state_request(slot, 1); }
+int mh_state_load(int slot) { return mh_state_request(slot, 0); }
 int mh_disc_insert(int n) {
     if (n < 1 || n > mh_disc_count()) return -1;
     if (psx_netplay_active()) return 3;  /* PSX_DISC_TRAY_ERR_NETPLAY */
@@ -17561,6 +17586,7 @@ PsxMenuHost g_menu_host = {
 #endif
     nullptr,
     0,
+    mh_state_slot_count, mh_state_available, mh_state_info, mh_state_thumb, mh_state_save, mh_state_load,
 };
 
 int ovl_sink(const void* ev, void*) {
@@ -17779,6 +17805,10 @@ static void host_pause_service(void) {
             }
         }
         (void)psx_mod_save_selection();
+    }
+    if (const int req = g_ovl_state_req.exchange(0)) {
+        const int slot = (req & 0xff) - 1;
+        (void)savestate_submit_slot(slot, (req & 0x100) ? 1 : 0);
     }
     if (g_ovl_reload_binds.exchange(0)) {
         psx_keybinds_init(g_ovl_argv0.c_str());
