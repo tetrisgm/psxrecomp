@@ -17500,6 +17500,10 @@ void mh_launcher_game_info(RecompLauncherCGameInfo* out) {
     gi.has_vsync = 0;
     gi.has_rewind_depth = 0;
     gi.mods = PSXRecompV4::mod_runtime_launcher_provider();
+    /* Disc setup in the menu: the same verifier the pre-game launcher uses.
+     * Without it every disc read as "Could not read this disc", even the one
+     * the game was running from. */
+    gi.disc_verify = ae_disc_verify;
 #if defined(RECOMP_LAUNCHER_HAS_QUALITY_PRESETS)
     /* The Graphics preset contract, for providers that implement it. Only
      * thread-safe callbacks: quality_apply is a pure preset -> rows mapping,
