@@ -558,6 +558,7 @@ static PgxpRthSeamEvent async_seam_event(uint16_t op) {
     case RTH_TEX_TRI: return PGXP_RTH_TEX_TRI;
     case RTH_SHADED_TEX_TRI: return PGXP_RTH_SHADED_TEX_TRI;
     case RTH_AREA: return PGXP_RTH_AREA;
+    case RTH_FILL: return PGXP_RTH_FILL;
     case RTH_FRAME: case RTH_PROJ_TRI:
         return PGXP_RTH_UNSUPPORTED;
     default: return PGXP_RTH_IGNORE;
@@ -899,6 +900,8 @@ static float   s_pz[3];
  * edge (k -> k+1) of the triangle being drawn and an earlier neighbour,
  * filled by snap strips (snap_strip_tris). */
 static float   s_snap_e[3];
+static PgxpSnapStrip s_snap_st[3];      /* their extent along the edge */
+static PgxpSnap *s_snap;                 /* the frame's edge index (below) */
 typedef struct AsyncSeamPrepared {
     PgxpSnapBatch batch;
     PgxpRthSeamStream stream;
@@ -4691,6 +4694,13 @@ static void depth_clear_now(void) {
     flush_flat_batch();
     s_depth_clears++;
     s_depth_clear_reason[s_depth_need_reason]++;
+    /* Seam snapping: the surfaces drawn so far have no depth any more, so a
+     * strip paired with their edges would win against them. Forget them
+     * (this runs before the triangle's measurement, so for this triangle
+     * on). The prepared batch predicts the same clears
+     * (pgxp_rth_seam_stream_mark_resets). */
+    if (s_snap) pgxp_snap_reset(s_snap);
+    if (s_async_seam_active) s_async_seam_reset_pending = 1;
     { FILE *f = pgxp_tri_log(); if (f) fprintf(f, "C\n"); }
 }
 /* Before a depth-tested triangle: clear when the drawing area changed since
@@ -4802,8 +4812,14 @@ static void seam_q(const float B[3][3], float q[3]) {
  * draw as a batch of their own when it flushes, after its depth is laid
  * down. */
 #define SNAP_STRIP_MAX_TRIS 9
+/* ax/ay: where each strip vertex takes its attributes from -- its foot on
+ * the triangle's edge. A strip carries the edge's own texels and colour
+ * outward (a smear of the edge, at most a native px wide); extrapolating
+ * the texture past the edge sampled whatever lies beyond the polygon's
+ * texels in the page (black bars along R4's kerbs). */
 static int snap_strip_tris(const float x[3], const float y[3],
-                           float sx[SNAP_STRIP_MAX_TRIS][3], float sy[SNAP_STRIP_MAX_TRIS][3]) {
+                           float sx[SNAP_STRIP_MAX_TRIS][3], float sy[SNAP_STRIP_MAX_TRIS][3],
+                           float ax[SNAP_STRIP_MAX_TRIS][3], float ay[SNAP_STRIP_MAX_TRIS][3]) {
     if (s_snap_e[0] <= 0.0f && s_snap_e[1] <= 0.0f && s_snap_e[2] <= 0.0f) return 0;
     const float area = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
     if (fabsf(area) < 1e-4f) return 0;
@@ -4817,22 +4833,38 @@ static int snap_strip_tris(const float x[3], const float y[3],
     }
     int n = 0;
     for (int k = 0; k < 3; k++) {
-        const float e = s_snap_e[k];
-        if (e <= 0.0f) continue;
+        /* Only the part of the edge that lies on its neighbour, the gap at
+         * each end (pgxp_seam_snap.h PgxpSnapStrip): a trapezoid, or a
+         * triangle where it tapers to nothing. */
+        const PgxpSnapStrip *st = &s_snap_st[k];
+        if (s_snap_e[k] <= 0.0f || (st->w0 <= 0.0f && st->w1 <= 0.0f) || st->t1 <= st->t0) continue;
         const int b = (k + 1) % 3;
-        const float ax2 = x[k] + e * nx[k], ay2 = y[k] + e * ny[k];
-        const float bx2 = x[b] + e * nx[k], by2 = y[b] + e * ny[k];
-        sx[n][0] = x[k]; sy[n][0] = y[k]; sx[n][1] = x[b]; sy[n][1] = y[b];
-        sx[n][2] = bx2;  sy[n][2] = by2;  n++;
-        sx[n][0] = x[k]; sy[n][0] = y[k]; sx[n][1] = bx2;  sy[n][1] = by2;
-        sx[n][2] = ax2;  sy[n][2] = ay2;  n++;
+        const float p0x = x[k] + (x[b] - x[k]) * st->t0, p0y = y[k] + (y[b] - y[k]) * st->t0;
+        const float p1x = x[k] + (x[b] - x[k]) * st->t1, p1y = y[k] + (y[b] - y[k]) * st->t1;
+        const float q0x = p0x + st->w0 * nx[k], q0y = p0y + st->w0 * ny[k];
+        const float q1x = p1x + st->w1 * nx[k], q1y = p1y + st->w1 * ny[k];
+        if (st->w1 > 0.0f) {
+            sx[n][0] = p0x; sy[n][0] = p0y; sx[n][1] = p1x; sy[n][1] = p1y;
+            sx[n][2] = q1x; sy[n][2] = q1y;
+            ax[n][0] = p0x; ay[n][0] = p0y; ax[n][1] = p1x; ay[n][1] = p1y;
+            ax[n][2] = p1x; ay[n][2] = p1y; n++;
+        }
+        if (st->w0 > 0.0f) {
+            sx[n][0] = p0x; sy[n][0] = p0y; sx[n][1] = q1x; sy[n][1] = q1y;
+            sx[n][2] = q0x; sy[n][2] = q0y;
+            ax[n][0] = p0x; ay[n][0] = p0y; ax[n][1] = p1x; ay[n][1] = p1y;
+            ax[n][2] = p0x; ay[n][2] = p0y; n++;
+        }
     }
-    for (int v = 0; v < 3; v++) {               /* caps between two strips */
+    for (int v = 0; v < 3; v++) {               /* caps where two strips meet at a vertex */
         const int kp = (v + 2) % 3;
+        const PgxpSnapStrip *a = &s_snap_st[kp], *c = &s_snap_st[v];
         if (s_snap_e[kp] <= 0.0f || s_snap_e[v] <= 0.0f) continue;
+        if (a->t1 < 1.0f - 1e-4f || a->w1 <= 0.0f || c->t0 > 1e-4f || c->w0 <= 0.0f) continue;
         sx[n][0] = x[v]; sy[n][0] = y[v];
-        sx[n][1] = x[v] + s_snap_e[kp] * nx[kp]; sy[n][1] = y[v] + s_snap_e[kp] * ny[kp];
-        sx[n][2] = x[v] + s_snap_e[v] * nx[v];   sy[n][2] = y[v] + s_snap_e[v] * ny[v];
+        sx[n][1] = x[v] + a->w1 * nx[kp]; sy[n][1] = y[v] + a->w1 * ny[kp];
+        sx[n][2] = x[v] + c->w0 * nx[v];  sy[n][2] = y[v] + c->w0 * ny[v];
+        for (int i = 0; i < 3; i++) { ax[n][i] = x[v]; ay[n][i] = y[v]; }
         n++;
     }
     return n;
@@ -4847,11 +4879,14 @@ static void snap_bary(const float x[3], const float y[3], const float cx[3], con
             B[k][i] = ((x[i2] - x[i1]) * (cy[k] - y[i1]) - (y[i2] - y[i1]) * (cx[k] - x[i1])) * inv;
         }
 }
-/* A strip's depth: behind its own plane by more than the colour pass's
+/* A strip's depth: behind its own plane by more than the depth agreement
+ * that paired the two surfaces (PGXP_SNAP_DEPTH_TOL) and the colour pass's
  * near tolerance (u_zbias, plus its 48-unit term), so it never wins against
- * a surface at that plane. */
+ * either surface or anything near their plane -- a kerb face beside a road
+ * row, the road under a lane mark -- and only shows where the gap really
+ * opens onto what is behind. */
 static float snap_strip_depth(float z) {
-    return z * (1.0f + 1.5f * pgxp_depth_tol()) + 64.0f;
+    return z * (1.0f + PGXP_SNAP_DEPTH_TOL + 1.5f * pgxp_depth_tol()) + 64.0f;
 }
 static uint64_t s_snap_strip_tris = 0;
 /* The frame's edge index (allocated on first use, reset at every present).
@@ -4910,8 +4945,8 @@ static int seam_snap_measure(const int *xs, const int *ys) {
         memcpy(input.word, word, sizeof word);
         input.reset_before = (uint32_t)s_async_seam_reset_pending;
         s_async_seam_reset_pending = 0;
-        if (!pgxp_snap_batch_next(&s_async_seam_active->batch,
-                s_async_seam_active->batch.consumed, &input, s_snap_e, &n)) {
+        if (!pgxp_snap_batch_next_ex(&s_async_seam_active->batch,
+                s_async_seam_active->batch.consumed, &input, s_snap_e, s_snap_st, &n)) {
             s_async_seam_failed = 1;
             atomic_fetch_add(&s_async_seam_mismatch_count, 1);
             return 0;
@@ -4950,14 +4985,16 @@ static int seam_snap_measure(const int *xs, const int *ys) {
             s_snap->n_links > PGXP_SNAP_MAX_LINKS - 4096)
             pgxp_snap_reset(s_snap);
         const uint64_t t0 = SDL_GetPerformanceCounter();
-        n = pgxp_snap_triangle(s_snap, ix, iy, fx, fy, s_pz, word, s_snap_e);
+        n = pgxp_snap_triangle_ex(s_snap, ix, iy, fx, fy, s_pz, word, s_snap_e, s_snap_st);
         s_snap_ticks += SDL_GetPerformanceCounter() - t0;
     }
     /* A gap no wider than seam expansion's own reach is already closed by
      * it: no strip. */
     const float w = pgxp_seam_width();
     for (int k = 0; k < 3 && n; k++)
-        if (s_snap_e[k] > 0.0f && s_snap_e[k] <= w) { s_snap_e[k] = 0.0f; n--; }
+        if (s_snap_e[k] > 0.0f && s_snap_e[k] <= w) {
+            s_snap_e[k] = 0.0f; s_snap_st[k].w0 = s_snap_st[k].w1 = 0.0f; n--;
+        }
     return n;
 }
 
@@ -5194,12 +5231,13 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     if (n == 3) pgxp_tri_log_tri('G', dmode, semi, v0, 6);
     if (snap_on) {
         float x[3], y[3], sx[SNAP_STRIP_MAX_TRIS][3], sy[SNAP_STRIP_MAX_TRIS][3];
+        float ax[SNAP_STRIP_MAX_TRIS][3], ay[SNAP_STRIP_MAX_TRIS][3];
         for (int i = 0; i < 3; i++) { x[i] = snap_src[i * 6]; y[i] = snap_src[i * 6 + 1]; }
-        const int ns = snap_strip_tris(x, y, sx, sy);
+        const int ns = snap_strip_tris(x, y, sx, sy, ax, ay);
         const float qc[3] = { 1.0f / s_pz[0], 1.0f / s_pz[1], 1.0f / s_pz[2] };
         for (int t = 0; t < ns; t++) {
             float B[3][3], z[3] = { s_pz[0], s_pz[1], s_pz[2] };
-            snap_bary(x, y, sx[t], sy[t], B);
+            snap_bary(x, y, ax[t], ay[t], B);
             float *d = &s_fbs[s_fbs_n * 6];
             memcpy(d, snap_src, sizeof snap_src);
             seam_attr(B, d + 2, 6, 3, s_pgxp_cpersp ? qc : NULL);
@@ -5411,13 +5449,14 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         s_tb_n += 3;
         if (snap_on) {
             float x[3], y[3], sx[SNAP_STRIP_MAX_TRIS][3], sy[SNAP_STRIP_MAX_TRIS][3];
+            float ax[SNAP_STRIP_MAX_TRIS][3], ay[SNAP_STRIP_MAX_TRIS][3];
             for (int i = 0; i < 3; i++) { x[i] = snap_src[i * TEXV]; y[i] = snap_src[i * TEXV + 1]; }
-            const int ns = snap_strip_tris(x, y, sx, sy);
+            const int ns = snap_strip_tris(x, y, sx, sy, ax, ay);
             const float qc[3] = { 1.0f / s_pz[0], 1.0f / s_pz[1], 1.0f / s_pz[2] };
             for (int t = 0; t < ns; t++) {
                 float B[3][3], z[3] = { s_pz[0], s_pz[1], s_pz[2] };
                 float q[3] = { snap_src[19], snap_src[TEXV + 19], snap_src[2 * TEXV + 19] };
-                snap_bary(x, y, sx[t], sy[t], B);
+                snap_bary(x, y, ax[t], ay[t], B);
                 float *d = &s_tbs[s_tbs_n * TEXV];
                 memcpy(d, snap_src, sizeof snap_src);
                 seam_attr(B, d + 2, TEXV, 2, s_pq_valid ? q : NULL);          /* uv  */
@@ -8691,6 +8730,7 @@ typedef struct AsyncSeamBaseline {
     uint64_t epoch, generation;
     int present;
     int32_t area[4];
+    PgxpRthSeamDepth depth;       /* depth-clear state at the snapshot */
 } AsyncSeamBaseline;
 static AsyncSeamBaseline s_async_seam_baseline[PASS_GENERATIONS];
 static atomic_flag s_async_seam_lock = ATOMIC_FLAG_INIT;
@@ -8795,7 +8835,8 @@ static void pass_snap_copy(PgxpSnap *dst, const PgxpSnap *src) {
  * worker never observes a partially replaced baseline. It immediately takes
  * its own copy and releases the lock before running seam preparation. */
 static void async_seam_baseline_publish(int gi, uint64_t epoch, uint64_t generation,
-                                         const PgxpSnap *src, const int area[4]) {
+                                         const PgxpSnap *src, const int area[4],
+                                         const PgxpRthSeamDepth *depth) {
     if (gi < 0 || gi >= PASS_GENERATIONS) return;
     async_seam_lock();
     AsyncSeamBaseline *slot = &s_async_seam_baseline[gi];
@@ -8807,6 +8848,7 @@ static void async_seam_baseline_publish(int gi, uint64_t epoch, uint64_t generat
         slot->epoch = epoch;
         slot->generation = generation;
         memcpy(slot->area, area, sizeof slot->area);
+        slot->depth = *depth;
     }
     slot->present = src != NULL;
     async_seam_unlock();
@@ -8823,7 +8865,8 @@ static void async_seam_baseline_invalidate(uint64_t epoch, uint64_t generation) 
 /* The caller owns dst. A zero result means reserve is not published yet,
  * expired, or allocation failed; it must not use any partial copy. */
 static int async_seam_baseline_copy(uint64_t epoch, uint64_t generation,
-                                    PgxpSnap *dst, int *present, int32_t area[4]) {
+                                    PgxpSnap *dst, int *present, int32_t area[4],
+                                    PgxpRthSeamDepth *depth) {
     if (!dst || !epoch || !generation) return 0;
     int found = 0;
     async_seam_lock();
@@ -8833,6 +8876,7 @@ static int async_seam_baseline_copy(uint64_t epoch, uint64_t generation,
             pass_snap_copy(dst, slot->snap);
             if (present) *present = slot->present;
             if (area) memcpy(area, slot->area, sizeof slot->area);
+            if (depth) *depth = slot->depth;
             found = 1;
             break;
         }
@@ -8857,9 +8901,10 @@ static void async_seam_prepare_one(AsyncSeamPrepared *p) {
     while (pt_clock_ns() < p->deadline &&
            atomic_load_explicit(&p->refs, memory_order_acquire) > 1) {
         int32_t area[4];
+        PgxpRthSeamDepth depth;
         if (async_seam_baseline_copy(p->epoch, p->generation,
-                                     p->baseline, &p->baseline_present, area)) {
-            p->ready = pgxp_rth_seam_stream_mark_resets(&p->stream, area) &&
+                                     p->baseline, &p->baseline_present, area, &depth)) {
+            p->ready = pgxp_rth_seam_stream_mark_resets(&p->stream, area, &depth) &&
                        pgxp_snap_batch_prepare(&p->batch, p->baseline,
                                                 p->generation, p->stream.input,
                                                 p->stream.count);
@@ -9717,10 +9762,13 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         return pass_begin_refuse("backup_seam_index");
     s_pb_area[0]=s_area_x1; s_pb_area[1]=s_area_y1;
     s_pb_area[2]=s_area_x2; s_pb_area[3]=s_area_y2;
-    if (s_async_seam_reserve_epoch)
+    if (s_async_seam_reserve_epoch) {
+        const PgxpRthSeamDepth depth = { s_depth_need_clear, s_depth_used,
+                                         s_depth_last_avg, s_pgxp_depth_threshold };
         async_seam_baseline_publish(s_pgen_write, s_async_seam_reserve_epoch,
             s_async_seam_reserve_generation,
-            s_pb_snap_present ? s_pb_snap : NULL, s_pb_area);
+            s_pb_snap_present ? s_pb_snap : NULL, s_pb_area, &depth);
+    }
     /* Back up the rect: hr color + stencil, raw mirror, wide band, CPU rows. */
     s_pass_begin_diag.resource = "backup_hr";
     if (!pass_make_color_fbo(&s_pb_hr_tex, &s_pb_hr_rb, &s_pb_hr_fbo,

@@ -74,6 +74,18 @@ typedef struct {
     uint64_t tris, snapped_tris, snapped_edges;
 } PgxpSnap;
 
+/* The strip an edge needs (pgxp_snap_triangle_ex): along edge k from vertex
+ * k (t = 0) to vertex k+1 (t = 1), the part [t0, t1] that lies on a
+ * neighbour, with the gap to close (native px, outward) at each end. A gap
+ * varies along the edge (the two lines are only parallel within
+ * PGXP_SNAP_PARALLEL) and a neighbour rarely spans the whole edge, so a
+ * strip over the full edge at the largest gap bloats the surface past its
+ * neighbour (a kerb or a lane mark grew a dark bar along a road row that
+ * only touched it for a few pixels). Both widths 0: no strip. */
+typedef struct {
+    float t0, t1, w0, w1;
+} PgxpSnapStrip;
+
 /* Start a new frame: forget every edge (counters keep accumulating). Call
  * once before the first triangle. */
 static inline void pgxp_snap_reset(PgxpSnap *s) {
@@ -186,10 +198,15 @@ static inline float pgxp_snap_gap(const PgxpSnapEdge *f, float x, float y) {
  * the number of edges with a gap. word may be 0 (positions alone identify
  * a shared vertex then). */
 #define PGXP_SNAP_CANDS 48
-static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int32_t iy[3],
-                                     const int32_t fx[3], const int32_t fy[3], const float z[3],
-                                     const uint32_t word[3], float e[3]) {
+/* Vertex-rule strips reach this far from the vertex along each edge: the
+ * hole at a T-junction is local (the neighbours across the edges cover the
+ * rest); the width tapers to 0 there. */
+#define PGXP_SNAP_T_TAPER_PX  3.0f
+static inline int pgxp_snap_triangle_ex(PgxpSnap *s, const int32_t ix[3], const int32_t iy[3],
+                                        const int32_t fx[3], const int32_t fy[3], const float z[3],
+                                        const uint32_t word[3], float e[3], PgxpSnapStrip st[3]) {
     s->tris++;
+    for (int k = 0; k < 3; k++) { st[k].t0 = st[k].t1 = st[k].w0 = st[k].w1 = 0.0f; }
     float px[3], py[3], iz[3], on[3][2] = {{0, 0}, {0, 0}, {0, 0}};
 #ifndef PSX_PGXP_SNAP_EAGER_NORMALS
     unsigned char normal_done[3] = {0, 0, 0};
@@ -310,17 +327,34 @@ static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int
             const float sf = pgxp_snap_cross(fex, fey, f->cx - f->ax, f->cy - f->ay);
             const float sn = pgxp_snap_cross(ex, ey, px[o] - px[a], py[o] - py[a]);
             const float par = fex * ex + fey * ey;            /* same direction: + */
-            const float d = fmaxf(pgxp_snap_gap(f, px[a], py[a]), pgxp_snap_gap(f, px[b], py[b]));
+            /* The part of this edge that lies along the neighbour ([lo, hi]
+             * of the neighbour's line as this edge's own t) and the gap at
+             * each end of it: the gap varies along the edge. */
+            if (fabsf(tb - ta) < 1e-6f) continue;
+            float n0 = (lo - ta) / (tb - ta), n1 = (hi - ta) / (tb - ta);
+            if (n0 > n1) { const float t = n0; n0 = n1; n1 = t; }
+            n0 = fminf(fmaxf(n0, 0.0f), 1.0f); n1 = fminf(fmaxf(n1, 0.0f), 1.0f);
+            const float ga = pgxp_snap_gap(f, px[a], py[a]), gb = pgxp_snap_gap(f, px[b], py[b]);
+            const float g0 = ga + (gb - ga) * n0, g1 = ga + (gb - ga) * n1;
+            const float d = fmaxf(g0, g1);
             if (!(sf * sn * par < 0.0f)) {                    /* same side */
                 if (d <= PGXP_SNAP_OVERLAY_PX && (hi - lo) * fl >= 0.75f * el) { overlay = 1; break; }
                 continue;
             }
             if (d > PGXP_SNAP_MAX_PX) continue;
-            if (d > best) best = d;
+            if (d > best) {
+                best = d;
+                st[k].t0 = n0; st[k].t1 = n1;
+                st[k].w0 = fminf(fmaxf(g0, 0.0f), PGXP_SNAP_MAX_PX);
+                st[k].w1 = fminf(fmaxf(g1, 0.0f), PGXP_SNAP_MAX_PX);
+            }
         }
         if (best > e[k]) e[k] = best;
     }
-    if (overlay) e[0] = e[1] = e[2] = 0.0f;
+    if (overlay) {
+        e[0] = e[1] = e[2] = 0.0f;
+        for (int k = 0; k < 3; k++) st[k].t0 = st[k].t1 = st[k].w0 = st[k].w1 = 0.0f;
+    }
 
     /* Vertex rule: a vertex on (or just past the end of) an earlier edge in
      * integer space with a gap in precise space (a T-junction). The two
@@ -368,10 +402,26 @@ static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int
             normal_done[k] = 1;
         }
 #endif
-        const float ep = best * (on[kp][0] * bnx + on[kp][1] * bny);
-        const float en = best * (on[v][0] * bnx + on[v][1] * bny);
-        if (ep > e[kp]) e[kp] = fminf(ep, PGXP_SNAP_MAX_PX);
-        if (en > e[v]) e[v] = fminf(en, PGXP_SNAP_MAX_PX);
+        const float ep = fminf(best * (on[kp][0] * bnx + on[kp][1] * bny), PGXP_SNAP_MAX_PX);
+        const float en = fminf(best * (on[v][0] * bnx + on[v][1] * bny), PGXP_SNAP_MAX_PX);
+        /* Edge kp ends at v and edge v starts there: each strip is ep / en
+         * wide at the vertex and tapers to nothing PGXP_SNAP_T_TAPER_PX
+         * along the edge. */
+        if (ep > e[kp]) {
+            const float lx = px[v] - px[kp], ly = py[v] - py[kp];
+            const float l = sqrtf(lx * lx + ly * ly);
+            const float r = l > PGXP_SNAP_T_TAPER_PX ? PGXP_SNAP_T_TAPER_PX / l : 1.0f;
+            e[kp] = ep;
+            st[kp].t0 = 1.0f - r; st[kp].t1 = 1.0f; st[kp].w0 = 0.0f; st[kp].w1 = ep;
+        }
+        if (en > e[v]) {
+            const int w = (v + 1) % 3;
+            const float lx = px[w] - px[v], ly = py[w] - py[v];
+            const float l = sqrtf(lx * lx + ly * ly);
+            const float r = l > PGXP_SNAP_T_TAPER_PX ? PGXP_SNAP_T_TAPER_PX / l : 1.0f;
+            e[v] = en;
+            st[v].t0 = 0.0f; st[v].t1 = r; st[v].w0 = en; st[v].w1 = 0.0f;
+        }
     }
 
     /* Index this triangle's own (PGXP) edges for the triangles after it. */
@@ -392,6 +442,14 @@ static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int
     const int n = (e[0] > 0.0f) + (e[1] > 0.0f) + (e[2] > 0.0f);
     if (n) { s->snapped_tris++; s->snapped_edges += (uint64_t)n; }
     return n;
+}
+
+/* The widths alone (e[k]: the largest gap of edge k). */
+static inline int pgxp_snap_triangle(PgxpSnap *s, const int32_t ix[3], const int32_t iy[3],
+                                     const int32_t fx[3], const int32_t fy[3], const float z[3],
+                                     const uint32_t word[3], float e[3]) {
+    PgxpSnapStrip st[3];
+    return pgxp_snap_triangle_ex(s, ix, iy, fx, fy, z, word, e, st);
 }
 
 #endif /* PGXP_SEAM_SNAP_H */

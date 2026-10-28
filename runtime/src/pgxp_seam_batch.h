@@ -22,6 +22,7 @@ typedef struct {
     uint64_t checksum;
     size_t ordinal;
     float gap[3];
+    PgxpSnapStrip strip[3];
     int count;
 } PgxpSnapBatchEntry;
 
@@ -117,9 +118,9 @@ static inline int pgxp_snap_batch_prepare(PgxpSnapBatch *b, const PgxpSnap *base
         if (input[i].reset_before || b->index->n_edges > PGXP_SNAP_MAX_EDGES - 3 ||
             b->index->n_links > PGXP_SNAP_MAX_LINKS - 4096)
             pgxp_snap_reset(b->index);
-        e->count = pgxp_snap_triangle(b->index, input[i].ix, input[i].iy,
-                                      input[i].fx, input[i].fy, input[i].z,
-                                      input[i].word, e->gap);
+        e->count = pgxp_snap_triangle_ex(b->index, input[i].ix, input[i].iy,
+                                         input[i].fx, input[i].fy, input[i].z,
+                                         input[i].word, e->gap, e->strip);
     }
     b->epoch = epoch; b->count = count; b->ready = 1;
     return 1;
@@ -147,9 +148,9 @@ static inline int pgxp_snap_batch_preflight(PgxpSnapBatch *b, const PgxpSnap *ba
 /* Sequential consumption enforces the same draw order. On any failure the
  * caller discards the optional transaction; never mix a prepared prefix with
  * a serial suffix against an index that the prepared prefix did not advance. */
-static inline int pgxp_snap_batch_next(PgxpSnapBatch *b, size_t ordinal,
-                                       const PgxpSnapBatchInput *input,
-                                       float gap[3], int *count) {
+static inline int pgxp_snap_batch_next_ex(PgxpSnapBatch *b, size_t ordinal,
+                                          const PgxpSnapBatchInput *input,
+                                          float gap[3], PgxpSnapStrip strip[3], int *count) {
     if (!b || !b->verified) return 0;
     if (ordinal != b->consumed || ordinal >= b->count || !input || !gap || !count) {
         b->verified = 0;
@@ -161,8 +162,14 @@ static inline int pgxp_snap_batch_next(PgxpSnapBatch *b, size_t ordinal,
         b->verified = 0; return 0;
     }
     memcpy(gap, e->gap, sizeof e->gap);
+    if (strip) memcpy(strip, e->strip, sizeof e->strip);
     *count = e->count; b->consumed++;
     return 1;
+}
+static inline int pgxp_snap_batch_next(PgxpSnapBatch *b, size_t ordinal,
+                                       const PgxpSnapBatchInput *input,
+                                       float gap[3], int *count) {
+    return pgxp_snap_batch_next_ex(b, ordinal, input, gap, NULL, count);
 }
 
 #endif /* PGXP_SEAM_BATCH_H */

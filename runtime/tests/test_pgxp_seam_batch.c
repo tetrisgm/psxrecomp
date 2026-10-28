@@ -118,9 +118,36 @@ int main(void) {
     assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_PRECISE, precise, 7));
     assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_DEPTH, depth, 4));
     assert(pgxp_rth_seam_stream_feed(&stream, PGXP_RTH_FLAT_TRI, tri, 7));
-    assert(pgxp_rth_seam_stream_mark_resets(&stream, initial_area));
+    assert(pgxp_rth_seam_stream_mark_resets(&stream, initial_area, NULL));
     assert(stream.count == 2 && !stream.input[0].reset_before &&
            stream.input[1].reset_before);
+    /* Depth clears forget the index for the triangle after them: one
+     * requested at the start, one from the average SZ jumping back by the
+     * threshold, one from a fill; none for a steady run. */
+    {
+        PgxpRthSeamStream ds;
+        pgxp_rth_seam_stream_init(&ds, 1, 1, 100.0f, 0);
+        const float zs[6] = {1000.0f, 1000.0f, 1000.0f, 9000.0f, 9000.0f, 1000.0f};
+        for (int i = 0; i < 6; i++) {
+            int32_t dz[4] = {1};
+            float z3[3] = {zs[i], zs[i], zs[i]};
+            memcpy(dz + 1, z3, sizeof z3);
+            if (i == 5) assert(pgxp_rth_seam_stream_feed(&ds, PGXP_RTH_FILL, NULL, 0));
+            assert(pgxp_rth_seam_stream_feed(&ds, PGXP_RTH_PRECISE, precise, 7));
+            assert(pgxp_rth_seam_stream_feed(&ds, PGXP_RTH_DEPTH, dz, 4));
+            assert(pgxp_rth_seam_stream_feed(&ds, PGXP_RTH_FLAT_TRI, tri, 7));
+        }
+        const PgxpRthSeamDepth d0 = { 1, 1, 1000.0f, 4096.0f };
+        assert(pgxp_rth_seam_stream_mark_resets(&ds, initial_area, &d0));
+        assert(ds.count == 6);
+        assert(ds.input[0].reset_before);    /* the initial clear runs before tri 0's measurement */
+        assert(!ds.input[1].reset_before);
+        assert(!ds.input[2].reset_before);
+        assert(ds.input[3].reset_before);    /* 1000 -> 9000: tri 3's own jump clears before it */
+        assert(!ds.input[4].reset_before);   /* 9000 -> 9000: steady */
+        assert(ds.input[5].reset_before);    /* the fill before tri 5 */
+        pgxp_rth_seam_stream_release(&ds);
+    }
     PgxpSnapBatch reset_batch = {0};
     assert(pgxp_snap_batch_prepare(&reset_batch, &baseline, 43,
                                    stream.input, stream.count));
@@ -141,13 +168,15 @@ int main(void) {
     pgxp_snap_batch_release(&reset_batch);
     pgxp_rth_seam_stream_release(&stream);
     float expected[4][3];
+    PgxpSnapStrip expected_strip[4][3];
     int expected_count[4];
     pgxp_snap_reset(&baseline);
     pgxp_snap_batch_copy_index(&serial, &baseline);
     for (int i = 0; i < 4; i++)
-        expected_count[i] = pgxp_snap_triangle(&serial, input[i].ix, input[i].iy,
-                                               input[i].fx, input[i].fy, input[i].z,
-                                               input[i].word, expected[i]);
+        expected_count[i] = pgxp_snap_triangle_ex(&serial, input[i].ix, input[i].iy,
+                                                  input[i].fx, input[i].fy, input[i].z,
+                                                  input[i].word, expected[i],
+                                                  expected_strip[i]);
     assert(expected_count[2] == 1 && expected_count[3] == 2);
     for (int worker = 0; worker < 4; worker++) {
         float got[3]; int count;
@@ -157,9 +186,11 @@ int main(void) {
         assert(!batch[worker].verified);
         assert(pgxp_snap_batch_preflight(&batch[worker], &baseline, 41, input, 4));
         for (int i = 0; i < 4; i++) {
-            assert(pgxp_snap_batch_next(&batch[worker], (size_t)i, &input[i], got, &count));
+            PgxpSnapStrip strip[3];
+            assert(pgxp_snap_batch_next_ex(&batch[worker], (size_t)i, &input[i], got, strip, &count));
             assert(count == expected_count[i]);
             assert(memcmp(got, expected[i], sizeof got) == 0);
+            assert(memcmp(strip, expected_strip[i], sizeof strip) == 0);   /* the strips too */
         }
         assert(!pgxp_snap_batch_next(&batch[worker], 4, &input[3], got, &count));
         assert(batch[worker].index->n_edges == serial.n_edges);

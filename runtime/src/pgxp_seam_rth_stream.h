@@ -17,8 +17,22 @@ typedef enum {
     PGXP_RTH_GOURAUD_TRI,
     PGXP_RTH_TEX_TRI,
     PGXP_RTH_SHADED_TEX_TRI,
+    PGXP_RTH_FILL,
     PGXP_RTH_UNSUPPORTED
 } PgxpRthSeamEvent;
+
+/* The renderer's PGXP depth-clear state when the stream starts (its live
+ * values at the transaction snapshot) and its clear threshold. A depth
+ * clear forgets the seam index too (gpu_gl_renderer.c depth_clear_now: a
+ * strip over a surface whose depth is gone would win against it), so the
+ * batch must predict every clear the live replay will run: before the
+ * triangle after one requested (the initial state, a fill, a drawing-area
+ * change once depth was used) and after the average SZ jumps back by the
+ * threshold (depth_before_tri). */
+typedef struct {
+    int need_clear, used;
+    float last_avg, threshold;
+} PgxpRthSeamDepth;
 
 typedef struct {
     size_t ordinal;
@@ -30,6 +44,8 @@ typedef struct {
     size_t count, capacity;
     PgxpRthSeamArea *areas;
     size_t area_count, area_capacity;
+    size_t *fills;                /* ordinals of the fills (depth clears) */
+    size_t fill_count, fill_capacity;
     float z[3];
     int32_t precise[6];
     float depth_near;
@@ -51,6 +67,7 @@ static inline void pgxp_rth_seam_stream_init(PgxpRthSeamStream *s,
 static inline void pgxp_rth_seam_stream_release(PgxpRthSeamStream *s) {
     free(s->input);
     free(s->areas);
+    free(s->fills);
     memset(s, 0, sizeof *s);
 }
 
@@ -60,6 +77,17 @@ static inline int pgxp_rth_seam_stream_feed(PgxpRthSeamStream *s,
     if (!s || !s->valid) return 0;
     if (event == PGXP_RTH_UNSUPPORTED) return s->valid = 0;
     if (event == PGXP_RTH_IGNORE) return 1;
+    if (event == PGXP_RTH_FILL) {
+        if (s->fill_count == s->fill_capacity) {
+            if (s->fill_capacity > SIZE_MAX / 2 / sizeof *s->fills) return s->valid = 0;
+            size_t capacity = s->fill_capacity ? s->fill_capacity * 2 : 8;
+            size_t *next = (size_t *)realloc(s->fills, capacity * sizeof *next);
+            if (!next) return s->valid = 0;
+            s->fills = next; s->fill_capacity = capacity;
+        }
+        s->fills[s->fill_count++] = s->count;
+        return 1;
+    }
     if (!v) return s->valid = 0;
     if (event == PGXP_RTH_PRECISE) {
         if (n != 7) return s->valid = 0;
@@ -132,22 +160,42 @@ static inline int pgxp_rth_seam_stream_feed(PgxpRthSeamStream *s,
     return 1;
 }
 
-/* The reserve publishes the true initial drawing area later than command
- * recording. Resolve every reset against it before running the batch. */
+/* The reserve publishes the true initial drawing area (and depth-clear
+ * state) later than command recording. Resolve every reset against them
+ * before running the batch. A depth clear runs in depth_before_tri, before
+ * the triangle's seam measurement, so it resets the index for that
+ * triangle, as a drawing-area change does. With depth NULL, clears are not
+ * predicted (tests of the area rule alone). */
 static inline int pgxp_rth_seam_stream_mark_resets(PgxpRthSeamStream *s,
-                                                    const int32_t initial_area[4]) {
+                                                    const int32_t initial_area[4],
+                                                    const PgxpRthSeamDepth *depth) {
     if (!s || !s->valid || !initial_area) return 0;
     int32_t current[4];
     memcpy(current, initial_area, sizeof current);
-    size_t area_at = 0;
+    size_t area_at = 0, fill_at = 0;
     int pending = 0;
+    int need = depth ? depth->need_clear : 0, used = depth ? depth->used : 0;
+    float last = depth ? depth->last_avg : 0.0f;
+    const float thr = depth ? depth->threshold : 0.0f;
     for (size_t i = 0; i < s->count; i++) {
         while (area_at < s->area_count && s->areas[area_at].ordinal <= i) {
             if (memcmp(current, s->areas[area_at].area, sizeof current) != 0) {
                 pending = 1;
                 memcpy(current, s->areas[area_at].area, sizeof current);
+                if (depth && used) need = 1;              /* DCLR_AREA */
             }
             area_at++;
+        }
+        while (fill_at < s->fill_count && s->fills[fill_at] <= i) {
+            if (depth && used) need = 1;                  /* DCLR_FILL */
+            fill_at++;
+        }
+        if (depth) {                                      /* depth_before_tri */
+            const float avg = (s->input[i].z[0] + s->input[i].z[1] + s->input[i].z[2]) * (1.0f / 3.0f);
+            if (used && thr > 0.0f && avg - last >= thr) need = 1;   /* DCLR_THRESHOLD */
+            last = avg;
+            if (need) { need = 0; pending = 1; }
+            used = 1;
         }
         s->input[i].reset_before = (uint32_t)pending;
         pending = 0;
