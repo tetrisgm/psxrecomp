@@ -1506,6 +1506,7 @@ extern "C" uint32_t psx_mod_internal_scale(void) {
 static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
+static bool          g_boot_skip_launcher = false; /* this run skipped the launcher */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
 static int           g_video_win_w    = 0;    /* 0 = fit the display; see clamp_window_aspect */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
@@ -17436,6 +17437,10 @@ void mh_launcher_settings_get(RecompLauncherCSettings* out) {
     ls.enable_audio = 1;
     ls.audio_freq = g_audio_freq;
     ls.volume = host_volume_get();
+    /* The player or the command line skipped the launcher (--no-launcher,
+     * [launcher] skip_launcher, PSX_NO_LAUNCHER, Game Mode): a provider that
+     * opens its menu at boot leaves it closed. */
+    ls.skip_launcher = g_boot_skip_launcher ? 1 : 0;
     ls.fullscreen = v.fullscreen;
     ls.texture_filter = v.texture_filter;
     ls.fmv_filter = cfg_fmv_filter_to_launcher(v.fmv_filter);
@@ -17557,7 +17562,15 @@ PsxMenuHost g_menu_host = {
     0,
 };
 
-int ovl_sink(const void* ev, void*) { return g_ovl && g_ovl->event ? g_ovl->event(g_ovl->ctx, ev) : 0; }
+int ovl_sink(const void* ev, void*) {
+    const int used = g_ovl && g_ovl->event ? g_ovl->event(g_ovl->ctx, ev) : 0;
+    /* Input capture follows the provider at once, not at the next service:
+     * the pad is sampled right after the events are drained, so a button
+     * that opens the menu (or that the provider holds back) never reaches
+     * the guest for a frame. */
+    psx_host_set_ui_capture(ovl_open());
+    return used;
+}
 void ovl_draw(int w, int h, void*) { if (g_ovl && g_ovl->draw) g_ovl->draw(g_ovl->ctx, w, h); }
 }  // namespace
 
@@ -19478,6 +19491,7 @@ int main(int argc, char** argv) {
     const bool want_launcher =
         force_launcher ||
         (!std::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting);
+    g_boot_skip_launcher = !want_launcher;
     if (want_launcher) {
         launcher_boot_timing_mark("host:before_sdl_init");
     /* Per-monitor DPI awareness, BEFORE any SDL_Init.
