@@ -5880,7 +5880,7 @@ static int device_claimed_by_other(int self_slot, SDL_JoystickID inst) {
 static void open_player(PlayerInput& p, int self_slot) {
     if (p.kind != 2 || p.handle) return;
 
-    int chosen = -1, fallback = -1;
+    int chosen = -1, fallback = -1, valve_fallback = -1;
     const int joysticks = SDL_NumJoysticks();
     for (int i = 0; i < joysticks; i++) {
         if (!SDL_IsGameController(i)) continue;
@@ -5910,8 +5910,20 @@ static void open_player(PlayerInput& p, int self_slot) {
             break;
         }
         if (chosen < 0 && p.guid[0] && std::strcmp(buf, p.guid) == 0) chosen = i;
-        if (fallback < 0) fallback = i;
+        /* A physical Valve pad (Steam Controller, Deck) read through HIDAPI
+         * while the Steam client owns it delivers no input; Steam Input's
+         * virtual pad (or any other pad) carries the player's input then.
+         * Take the physical one only when nothing else is connected. */
+        /* SDL GUIDs carry the USB vendor/product little-endian at 4 and 8. */
+        const unsigned vid = (unsigned)g.data[4] | ((unsigned)g.data[5] << 8);
+        const unsigned pid = (unsigned)g.data[8] | ((unsigned)g.data[9] << 8);
+        if (psx_controller_is_physical_valve_pad(vid, pid)) {
+            if (valve_fallback < 0) valve_fallback = i;
+        } else if (fallback < 0) {
+            fallback = i;
+        }
     }
+    if (fallback < 0) fallback = valve_fallback;
     if (chosen < 0) chosen = fallback;
     if (chosen < 0) return;
 
