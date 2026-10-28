@@ -838,6 +838,10 @@ the existing integer-scale resolver and backend allocation limits; zero clears
 the request. `PSX_INTERNAL_RESOLUTION` takes precedence. The player's saved
 resolution stays unchanged, and every new session clears the request before
 its mod plan activates, including rematches and sessions without that mod.
+`psx_mod_internal_scale()` returns the integer raster scale the session
+resolves to (override, request or player preset, Match display against the
+primary display, supersample and caps), already at activation, so a plugin
+can pick a frame rate that fits the resolution.
 
 The shared PGXP plugin uses `psx_mod_set_pgxp_precision(enabled, cpu_mode)`.
 This stores a session selection as well as setting live correction flags, so

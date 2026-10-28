@@ -574,6 +574,14 @@ int psx_mod_set_widescreen_hud_size(int proportional);
    * win, and each session clears this request before activating its committed
    * mod plan. */
 int psx_mod_set_internal_resolution(uint32_t target_lines);
+/* The integer raster scale this session's Internal resolution resolves to
+ * (environment override, mod request or player preset; Match display uses
+ * the primary display's pixel height; supersample and caps applied), i.e.
+ * what the backend is asked for at context init. Valid from activation on,
+ * before the window exists. 0 while the title's video config is unresolved.
+ * A plugin that trades frame rate for resolution (a rate "auto" choice)
+ * reads it at activation. */
+uint32_t psx_mod_internal_scale(void);
 /*
  * Set the wall-clock cadence of simulated guest VBlanks. A value of zero
  * removes frontend pacing; 60 and higher request that many native guest
@@ -942,6 +950,10 @@ int psx_mod_set_render_pass_netplay(int enabled);
  */
 int psx_mod_activate_render_pass_rate(const char* package, const char* feature,
                                       const char* option, uint32_t flip_mode);
+/* The same activation with the rate chosen by the caller (a plugin that
+ * resolves its own choice, e.g. from psx_mod_internal_scale()): 0 follows
+ * the measured display refresh, otherwise frames per second. */
+int psx_mod_activate_render_pass_fps(uint32_t fps, uint32_t flip_mode);
 typedef struct PSXModRenderPassFrame {
     uint32_t struct_size;          /* sizeof(PSXModRenderPassFrame) */
     uint32_t period_vblanks;       /* VBlanks this game frame stays on screen */
