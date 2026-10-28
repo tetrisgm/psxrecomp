@@ -17504,6 +17504,16 @@ void mh_launcher_game_info(RecompLauncherCGameInfo* out) {
      * Without it every disc read as "Could not read this disc", even the one
      * the game was running from. */
     gi.disc_verify = ae_disc_verify;
+#if defined(RECOMP_LAUNCHER_HAS_INTERNAL_RESOLUTION)
+    /* The Internal resolution list, as the pre-game launcher offers it (the
+     * row applies live; see ovl_video_from). Built here, on the main thread,
+     * before the provider can read it. */
+    build_internal_resolution_vocab(internal_resolution_for_launcher());
+    gi.internal_resolution_labels = g_ir_labels;
+    gi.internal_resolution_values = g_ir_values;
+    gi.num_internal_resolutions = g_ir_count;
+    gi.internal_resolution_note = kIrNote;
+#endif
 #if defined(RECOMP_LAUNCHER_HAS_QUALITY_PRESETS)
     /* The Graphics preset contract, for providers that implement it. Only
      * thread-safe callbacks: quality_apply is a pure preset -> rows mapping,
