@@ -10,6 +10,12 @@ static void check(bool ok, const char* message) {
 }
 
 int main() {
+    {
+        const SDL_Rect d{10, 20, 7680, 4320};
+        const SDL_Rect a = psx_borderless_rect(d, 1), b = psx_borderless_rect(d, 0);
+        check(a.x == 10 && a.y == 20 && a.w == 7680 && a.h == 4321, "windows popup is one row taller");
+        check(b.w == 7680 && b.h == 4320, "desktop fullscreen rect is the display");
+    }
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return 1;
     SDL_Window* window = SDL_CreateWindow("Fullscreen regression", 100, 100,
@@ -29,15 +35,17 @@ int main() {
     for (int i = 0; i < 3; ++i) {
         check(psx_window_fullscreen_set(window, &state, 1) == 0, "enter borderless");
 #if defined(_WIN32) && defined(PSX_SDL3)
-        // Desktop fullscreen: SDL's own fullscreen with no display mode, not a
-        // window sized to the display (drivers promote that to an exclusive
-        // flip surface, which blanked on Alt-Tab).
-        check((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0, "borderless is desktop fullscreen");
-        check(SDL_GetWindowFullscreenMode(window) == nullptr, "borderless has no exclusive display mode");
+        // A borderless popup, not SDL fullscreen, and not exactly the display:
+        // an exact cover is promoted to an exclusive flip (black Alt-Tab).
+        check((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) == 0, "borderless is not SDL fullscreen");
+        check((SDL_GetWindowFlags(window) & SDL_WINDOW_BORDERLESS) != 0, "borderless has no frame");
         SDL_Rect bounds{};
         SDL_GetDisplayBounds(SDL_GetDisplayForWindow(window), &bounds);
-        int full_w, full_h; SDL_GetWindowSize(window, &full_w, &full_h);
-        check(full_w == bounds.w && full_h == bounds.h, "borderless covers the current display");
+        int full_x, full_y, full_w, full_h;
+        SDL_GetWindowPosition(window, &full_x, &full_y);
+        SDL_GetWindowSize(window, &full_w, &full_h);
+        check(full_x == bounds.x && full_y == bounds.y && full_w == bounds.w &&
+              full_h == bounds.h + 1, "borderless covers the display plus one row");
         check(!SDL_CursorVisible(), "fullscreen cursor hidden");
         SDL_DisplayMode current{};
         check(SDL_GetCurrentDisplayMode(original_display, &current) == 0 &&

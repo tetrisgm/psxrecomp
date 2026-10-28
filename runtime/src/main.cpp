@@ -10667,8 +10667,11 @@ static unsigned video_restart_bits(const PsxHostVideoSettings *boot,
         applied.internal_resolution = g_video_res_applied_ir;
         applied.supersample_milli = g_video_res_applied_ss;
     }
-    return psx_host_video_restart_bits_backend(
-        &applied, next, 0);
+    /* A backend that moves the scale live (and has not refused a change)
+     * needs no relaunch for it, so the menu's prediction must not ask for one. */
+    const int res_live_ok = g_video_res_live_capable.load() &&
+                            !g_video_res_live_failed.load();
+    return psx_host_video_restart_bits_backend(&applied, next, res_live_ok);
 }
 
 extern "C" void psx_video_resolution_applied(int *ir, int *ss_milli, int *live_capable,
@@ -16875,13 +16878,42 @@ namespace {
     static int         g_ir_values[PSX_IR_PRESET_COUNT + 1];
     static int         g_ir_count = 0;
     static char        g_ir_custom_label[48];
+    static char        g_ir_label_buf[PSX_IR_PRESET_COUNT][96];
+    /* "4K · 2880×2160 (9×)": the frame the preset really renders on this
+     * display (Match display resolved, the title's cap and supersample
+     * applied), as wide as the current display aspect (native-wide). */
+    static void internal_resolution_label(char *out, size_t cap, const char *name, int value) {
+        const int disp_h = match_display_px_h(sdl_window);
+        int s = psx_resolve_internal_scale_ss_cap(value, g_video_ref_lines,
+            disp_h, video_scale_ceiling(), display_supersample(sdl_window),
+            g_video_match_max_lines);
+        if (s < 1) s = 1;
+        int an = 4, ad = 3;
+        if (g_gl_active) gl_renderer_get_display_aspect(&an, &ad);
+        if (an <= 0 || ad <= 0) { an = 4; ad = 3; }
+        const int h = g_video_ref_lines * s;
+        const int w = (h * an + ad / 2) / ad;
+        if (value == PSX_IR_DISPLAY) {
+            const char *res = "";
+            for (int i = 0; i < PSX_IR_PRESET_COUNT; i++)
+                if (k_psx_ir_presets[i].value == h) res = k_psx_ir_presets[i].label;
+            std::snprintf(out, cap, "%s \xC2\xB7 %s%s%d\xC3\x97%d (%d\xC3\x97)", name, res,
+                          *res ? " " : "", w, h, s);
+        } else if (value == PSX_IR_NATIVE) {
+            std::snprintf(out, cap, "%s \xC2\xB7 %d\xC3\x97%d", name, w, h);
+        } else {
+            std::snprintf(out, cap, "%s \xC2\xB7 %d\xC3\x97%d (%d\xC3\x97)", name, w, h, s);
+        }
+    }
     static const char  kIrNote[] =
         "Above 4x: OpenGL only. Past 16x on Apple GPUs only the displayed "
         "frame is kept at full resolution.";
     static void build_internal_resolution_vocab(int current) {
         g_ir_count = 0;
         for (int i = 0; i < PSX_IR_PRESET_COUNT; i++) {
-            g_ir_labels[g_ir_count] = k_psx_ir_presets[i].label;
+            internal_resolution_label(g_ir_label_buf[i], sizeof g_ir_label_buf[i],
+                                      k_psx_ir_presets[i].label, k_psx_ir_presets[i].value);
+            g_ir_labels[g_ir_count] = g_ir_label_buf[i];
             g_ir_values[g_ir_count] = k_psx_ir_presets[i].value;
             g_ir_count++;
         }

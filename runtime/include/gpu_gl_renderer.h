@@ -349,6 +349,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
  * for the widescreen field-of-view hack. */
 void gl_renderer_set_display_aspect(int num, int den);
+/* The aspect last set above (4:3 until a widescreen mode sets one). */
+void gl_renderer_get_display_aspect(int *num, int *den);
 
 /* Scanline post-process (host display setting). on toggles the effect; strength
  * (0..1) is the depth of the dark gap between PS1 scanlines. Applied at the

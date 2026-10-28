@@ -6384,6 +6384,11 @@ void gl_renderer_set_display_aspect(int num, int den) {
     s_aspect_num = num; s_aspect_den = den;
 }
 
+void gl_renderer_get_display_aspect(int *num, int *den) {
+    if (num) *num = s_aspect_num;
+    if (den) *den = s_aspect_den;
+}
+
 /* Scanline post-process toggle (host display setting). strength is the depth of
  * the dark gap between lines, 0..1 (0 = off-looking, 1 = fully black gap). The
  * actual darkening is applied per-draw in the present/interpolation shaders and
