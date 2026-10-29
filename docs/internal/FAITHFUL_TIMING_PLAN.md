@@ -213,6 +213,13 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-10-29: Phase-4 topic adds pre-cull PGXP transform capture, immutable
+packet transform-history attachments, a source-table sampler and signed-depth
+clipping fixtures. Guest timing is unchanged. Moving audit still fails on
+unverified new-source vertices; presenter cutover is not accepted. See
+`docs/PACKET_INTERPOLATION.md`.
+
+
 - 2026-10-29: Phase-3b continuation adds diagnostic-only GTE projection
   provenance and per-frame accuracy classes. Matched R4 scene: 324 IR saturation
   recoveries, 518 exact fractional projections, zero unexplained. Guest timing,
