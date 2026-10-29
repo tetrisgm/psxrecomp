@@ -714,6 +714,8 @@ int  gl_renderer_render_thread_json(char *out, size_t cap);
 void gl_renderer_set_present_thread(int on, int slots);
 int  gl_renderer_present_thread_active(void);
 int  gl_renderer_present_thread_json(char *out, size_t cap);
+/* Render-owner-only opt-in PGXP diagnostics; depth_probe -1 leaves it unchanged. */
+void gl_renderer_pgxp_raster_json(char *out, size_t cap, int depth_probe);
 void gl_renderer_ring_capture(uint32_t frame, int wide, int base_x, int disp_y, int disp_h,
                               int cx, int cy, int cw, int ch);
 

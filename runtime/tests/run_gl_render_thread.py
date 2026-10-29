@@ -21,6 +21,7 @@ import os
 import pathlib
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,13 @@ def main():
                     help="with --single: run the fixture a second time with this variable set "
                          "to 0; both runs must pass and print the same name=hex digests")
     args = ap.parse_args()
+    if WINDOWS:
+        # An explicitly selected MinGW compiler needs its own DLL/helper tools,
+        # even when CTest was started from a different compiler's environment.
+        compiler = shutil.which(args.cc)
+        if compiler:
+            compiler_bin = str(pathlib.Path(compiler).resolve().parent)
+            os.environ["PATH"] = compiler_bin + os.pathsep + os.environ.get("PATH", "")
     sdl_includes = [str(pathlib.Path(d).resolve()) for d in args.sdl_include.split(";") if d]
     args.sdl_library = str(pathlib.Path(args.sdl_library).resolve())
     framework = pathlib.Path(__file__).resolve().parents[2]

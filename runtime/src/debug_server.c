@@ -192,6 +192,56 @@ int debug_server_fmv_quiet(void)
  * ring-buffer entries with the current frame for cross-correlation. */
 uint64_t s_frame_count = 0;
 
+/* Complete guest-frame PGXP deltas. These come from the emulation-side
+ * precision engine, so a render thread running behind cannot shift them to
+ * a different frame. The renderer's depth/seam totals remain in `pgxp`. */
+#define PGXP_FRAME_RING_CAP 256u
+typedef struct PGXPFrameAudit {
+    uint64_t frame;
+    uint64_t lookups, native, value_mismatch, trunc_reject;
+    uint64_t tolerance_reject, depth_only, over_one_pixel;
+    uint64_t over_one_unclamped, over_one_derived, over_one_projected, invalidations;
+    uint64_t over_one_ir_sz, over_one_ir, over_one_sz, over_one_fraction, over_one_divide, over_one_sxy, over_one_unexplained;
+    uint64_t word_lookups, word_hit, word_untracked, word_mismatch;
+    uint64_t word_partial, word_no_z;
+} PGXPFrameAudit;
+static PGXPFrameAudit s_pgxp_frame_ring[PGXP_FRAME_RING_CAP];
+static PGXPStats s_pgxp_frame_previous;
+static void pgxp_frame_audit_capture(uint64_t frame) {
+    PGXPStats now;
+    pgxp_get_stats(&now);
+    PGXPFrameAudit *r = &s_pgxp_frame_ring[frame % PGXP_FRAME_RING_CAP];
+    r->frame = frame;
+#define PGXP_FRAME_DELTA(field) r->field = now.field - s_pgxp_frame_previous.field
+    PGXP_FRAME_DELTA(lookups);
+    PGXP_FRAME_DELTA(native);
+    PGXP_FRAME_DELTA(value_mismatch);
+    PGXP_FRAME_DELTA(trunc_reject);
+    PGXP_FRAME_DELTA(tolerance_reject);
+    PGXP_FRAME_DELTA(depth_only);
+    PGXP_FRAME_DELTA(over_one_pixel);
+    PGXP_FRAME_DELTA(over_one_unclamped);
+    PGXP_FRAME_DELTA(over_one_derived);
+    PGXP_FRAME_DELTA(over_one_projected);
+    PGXP_FRAME_DELTA(over_one_ir_sz);
+    PGXP_FRAME_DELTA(over_one_ir);
+    PGXP_FRAME_DELTA(over_one_sz);
+    PGXP_FRAME_DELTA(over_one_fraction);
+    PGXP_FRAME_DELTA(over_one_divide);
+    PGXP_FRAME_DELTA(over_one_sxy);
+    PGXP_FRAME_DELTA(over_one_unexplained);
+
+    PGXP_FRAME_DELTA(invalidations);
+    PGXP_FRAME_DELTA(word_lookups);
+    PGXP_FRAME_DELTA(word_hit);
+    PGXP_FRAME_DELTA(word_untracked);
+    PGXP_FRAME_DELTA(word_mismatch);
+    PGXP_FRAME_DELTA(word_partial);
+    PGXP_FRAME_DELTA(word_no_z);
+#undef PGXP_FRAME_DELTA
+    s_pgxp_frame_previous = now;
+}
+
 /* ---- Layer-1 first-divergence per-frame fingerprint ----------------------
  * Cumulative hashes over guest writes, snapshotted once per guest frame.
  * Native and dirty-interp are the SAME deterministic program run two ways;
@@ -5413,6 +5463,7 @@ static void handle_geom_correction(int id, const char *json)
              "\"lookups\":%llu,\"dataflow_hit\":%llu,\"fallback_hit\":%llu,"
              "\"native\":%llu,\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
              "\"tolerance_reject\":%llu,\"depth_only\":%llu,\"w_valid\":%llu,"
+             "\"over_one_pixel\":%llu,"
              "\"produced\":%llu,\"swc2_stores\":%llu,\"ppp_produced\":%llu,"
              "\"ppp_window_fallback\":%llu,"
              "\"tri_precise\":%llu,\"tri_mixed\":%llu,\"tri_native\":%llu,"
@@ -5442,6 +5493,7 @@ static void handle_geom_correction(int id, const char *json)
              (unsigned long long)ps.tolerance_reject,
              (unsigned long long)ps.depth_only,
              (unsigned long long)ps.w_valid,
+             (unsigned long long)ps.over_one_pixel,
              (unsigned long long)ps.produced,
              (unsigned long long)ps.swc2_stores,
              (unsigned long long)ps.ppp_produced,
@@ -5837,6 +5889,10 @@ static void handle_pgxp_store_ring(int id, const char *json)
  * "position_fallback":0|1,"preserve_projection":0|1,"culling":0|1}. Fields
  * are optional; the reply echoes the resulting state (same shape as
  * geom_correction's "pgxp" object, flattened). */
+static void handle_pgxp_raster(int id,const char *json) {
+    char result[1024];gl_renderer_pgxp_raster_json(result,sizeof result,json_get_int(json,"depth_probe",-1));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}",id,result);
+}
 static void handle_pgxp(int id, const char *json)
 {
     /* Live toggles for the one-toggle-at-a-time A/B protocol (docs/ENHANCEMENTS.md
@@ -5866,6 +5922,10 @@ static void handle_pgxp(int id, const char *json)
     /* Seam snapping: 1 on, 0 off, -1 follow [video] pgxp_seam. */
     if (strstr(json, "\"snap\""))
         gl_renderer_set_seam_snap(json_get_int(json, "snap", -1));
+    if (strstr(json, "\"depth_buffer\""))
+        gl_renderer_set_pgxp_depth(json_get_int(json, "depth_buffer", 1));
+    if (strstr(json, "\"color_correction\""))
+        gl_renderer_set_pgxp_color_perspective(json_get_int(json, "color_correction", 1));
     /* tolerance is fractional (sub-pixel), so scan it directly — json_get_int
      * would truncate 0.5 to 0. */
     const char *p = strstr(json, "\"tolerance\"");
@@ -5905,6 +5965,54 @@ static void handle_pgxp(int id, const char *json)
              (unsigned long long)sn_edges,
              (unsigned long long)sn_strips,
              (unsigned long long)gl_renderer_seam_snap_us());
+}
+
+/* pgxp_frame: emulation-side precision outcomes for a completed guest frame.
+ * {"cmd":"pgxp_frame","frame":N}; omitting frame selects the newest. */
+static void handle_pgxp_frame(int id, const char *json)
+{
+    if (!s_history_count) { send_err(id, "no completed frame"); return; }
+    const uint64_t latest = s_history_count - 1;
+    const int requested = json_get_int(json, "frame", -1);
+    const uint64_t frame = requested < 0 ? latest : (uint64_t)requested;
+    if (frame > latest || latest - frame >= PGXP_FRAME_RING_CAP) {
+        send_err(id, "PGXP frame outside ring"); return;
+    }
+    const PGXPFrameAudit *r = &s_pgxp_frame_ring[frame % PGXP_FRAME_RING_CAP];
+    if (r->frame != frame) { send_err(id, "PGXP frame unavailable"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%llu,"
+             "\"lookups\":%llu,\"integer_fallback\":%llu,"
+             "\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
+             "\"tolerance_reject\":%llu,\"depth_only\":%llu,"
+             "\"over_one_pixel\":%llu,\"over_one_unclamped\":%llu,\"over_one_derived\":%llu,"
+             "\"over_one_ir_sz\":%llu,\"over_one_ir\":%llu,\"over_one_sz\":%llu,\"over_one_fraction\":%llu,\"over_one_divide\":%llu,\"over_one_sxy\":%llu,\"over_one_unexplained\":%llu,"
+             "\"over_one_projected\":%llu,\"invalidations\":%llu,\"w\":{\"lookups\":%llu,"
+             "\"valid\":%llu,\"untracked\":%llu,\"mismatch\":%llu,"
+             "\"partial\":%llu,\"no_z\":%llu}}",
+             id, (unsigned long long)frame,
+             (unsigned long long)r->lookups, (unsigned long long)r->native,
+             (unsigned long long)r->value_mismatch,
+             (unsigned long long)r->trunc_reject,
+             (unsigned long long)r->tolerance_reject,
+             (unsigned long long)r->depth_only,
+             (unsigned long long)r->over_one_pixel,
+             (unsigned long long)r->over_one_unclamped,
+             (unsigned long long)r->over_one_derived,
+             (unsigned long long)r->over_one_ir_sz,
+             (unsigned long long)r->over_one_ir,
+             (unsigned long long)r->over_one_sz,
+             (unsigned long long)r->over_one_fraction,
+             (unsigned long long)r->over_one_divide,
+             (unsigned long long)r->over_one_sxy,
+             (unsigned long long)r->over_one_unexplained,
+             (unsigned long long)r->over_one_projected,
+             (unsigned long long)r->invalidations,
+             (unsigned long long)r->word_lookups,
+             (unsigned long long)r->word_hit,
+             (unsigned long long)r->word_untracked,
+             (unsigned long long)r->word_mismatch,
+             (unsigned long long)r->word_partial,
+             (unsigned long long)r->word_no_z);
 }
 
 static void handle_gpu_state(int id, const char *json)
@@ -16479,6 +16587,8 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "geom_correction",   handle_geom_correction },
     { "pgxp",              handle_pgxp },
+    { "pgxp_raster",       handle_pgxp_raster },
+    { "pgxp_frame",        handle_pgxp_frame },
     { "pgxp_tri_ring",     handle_pgxp_tri_ring },
     { "pgxp_store_ring",   handle_pgxp_store_ring },
     { "pgxp_shadow",       handle_pgxp_shadow },
@@ -17129,6 +17239,8 @@ void debug_server_init(int port)
         s_frame_history = (PSXFrameRecord *)calloc(FRAME_HISTORY_CAP, sizeof(PSXFrameRecord));
     }
     s_history_count = 0;
+    memset(s_pgxp_frame_ring, 0, sizeof(s_pgxp_frame_ring));
+    pgxp_get_stats(&s_pgxp_frame_previous);
 
     /* Tier 1: heap-allocate write trace ring buffer (32 MB). */
     if (!s_wtrace) {
@@ -17562,7 +17674,8 @@ static int queue_render_debug_request(const char *json) {
     /* These handlers access only renderer-owned state, never guest memory or
      * the guest lockstep recorder. Other handlers still run at the CPU safe
      * point until their mixed inputs have an explicit immutable snapshot. */
-    if(!strcmp(name,"gl_coh_ring")) request.handler=handle_gl_coh_ring;
+    if(!strcmp(name,"pgxp_raster")) request.handler=handle_pgxp_raster;
+    else if(!strcmp(name,"gl_coh_ring")) request.handler=handle_gl_coh_ring;
     else if(!strcmp(name,"gl_present_ring")) request.handler=handle_gl_present_ring;
     else if(!strcmp(name,"post_aa")) request.handler=handle_post_aa;
     else if(!strcmp(name,"post_shader")) request.handler=handle_post_shader;
@@ -17623,6 +17736,7 @@ void debug_server_poll(void)
 void debug_server_record_frame(void)
 {
     if (s_fmv_quiet) {
+        pgxp_frame_audit_capture(s_frame_count);
         s_history_count = s_frame_count + 1;
         s_frame_count++;
         return;
@@ -17693,6 +17807,8 @@ void debug_server_record_frame(void)
     /* Always-on display ring: raw display-area pixels for THIS frame number
      * (pre-increment, matching what the `frame` command reports right now). */
     disp_ring_capture();
+
+    pgxp_frame_audit_capture(s_frame_count);
 
     s_history_count = s_frame_count + 1;
     s_frame_count++;

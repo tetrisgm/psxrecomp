@@ -48,6 +48,7 @@ PGXP_S void ck_wrapped(void);
 
 PGXP_API void pgxp_invalidate_all(void) {
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
+    s_stats.invalidations++;
     if (++s_gen == 0) {
         ck_wrapped();
         /* generation wrapped: physically clear so stale slots can't revive */
@@ -458,7 +459,7 @@ PGXP_S inline int pv_live(const PGXPValue *pv) {
 PGXP_S inline void pv_validate(PGXPValue *pv, uint32_t actual) {
     if (pv->gen != s_gen) return;
     uint32_t diff = pv->value ^ actual;
-    if (diff) pv->flags &= (uint16_t)~(PGXP_F_PROJECTION | PGXP_F_UNCLAMPED);
+    if (diff) pv->flags &= (uint16_t)~(PGXP_F_PROJECTION | PGXP_F_UNCLAMPED | PGXP_AUDIT_MASK);
     if ((pv->flags & PGXP_F_VX) && (diff & 0x0000FFFFu))
         pv->flags &= (uint16_t)~(PGXP_F_VX | PGXP_F_DX | PGXP_F_VZ);
     if ((pv->flags & PGXP_F_VY) && (diff & 0xFFFF0000u))
@@ -675,7 +676,7 @@ PGXP_API void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
         if (hi_half) dst->value = (dst->value & 0x0000FFFFu) | (half << 16);
         else         dst->value = (dst->value & 0xFFFF0000u) | half;
         dst->flags &= (uint16_t)~((hi_half ? (PGXP_F_VY | PGXP_F_DY) : (PGXP_F_VX | PGXP_F_DX)) |
-                                  PGXP_F_VZ | PGXP_F_PROJECTION | PGXP_F_UNCLAMPED);
+                                  PGXP_F_VZ | PGXP_F_PROJECTION | PGXP_F_UNCLAMPED | PGXP_AUDIT_MASK);
         dst->z = 0;
         int ok = 0, derived = 0;
         int32_t v16 = 0;
@@ -705,7 +706,7 @@ PGXP_API void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
         dst->value = (dst->value & ~(0xFFu << shift)) |
                      ((value & 0xFFu) << shift);
         dst->flags &= (uint16_t)~(((addr & 2u) ? (PGXP_F_VY | PGXP_F_DY) : (PGXP_F_VX | PGXP_F_DX)) |
-                                  PGXP_F_VZ | PGXP_F_PROJECTION | PGXP_F_UNCLAMPED);
+                                  PGXP_F_VZ | PGXP_F_PROJECTION | PGXP_F_UNCLAMPED | PGXP_AUDIT_MASK);
         dst->z = 0;
         return;
     }
@@ -1482,9 +1483,18 @@ PGXP_API void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
     pv->y16 = y16;
     pv->z = sz3;
     pv->flags = (uint16_t)(PGXP_F_VXY | (sz3 != 0 ? PGXP_F_VZ : 0));
+    if ((int16_t)packed == -1024 || (int16_t)packed == 1023 ||
+        (int16_t)(packed >> 16) == -1024 || (int16_t)(packed >> 16) == 1023)
+        pv->flags |= PGXP_AUDIT_SXY;
     pv->value = packed;
     pv->gen = s_gen;
     s_gte[15] = *pv;                           /* SXYP mirrors SXY2           */
+}
+
+PGXP_API void pgxp_gte_mark_audit(uint32_t reasons) {
+    if (!g_pgxp_active) return;
+    s_gte[14].flags |= (uint16_t)(reasons & PGXP_AUDIT_MASK);
+    s_gte[15] = s_gte[14];
 }
 
 PGXP_API void pgxp_gte_mark_unclamped(uint32_t depth) {
@@ -1748,6 +1758,27 @@ PGXP_S int pgxp_get_precise_vertex_impl(uint32_t addr, uint32_t packet_word,
         if (have == PGXP_SRC_DATAFLOW) s_stats.dataflow_hit++;
         else                           s_stats.fallback_hit++;
         if (pz != 0) s_stats.w_valid++;
+        if ((int64_t)px - (int64_t)int_x * 65536 < -65536 ||
+            (int64_t)px - (int64_t)int_x * 65536 > 65536 ||
+            (int64_t)py - (int64_t)int_y * 65536 < -65536 ||
+            (int64_t)py - (int64_t)int_y * 65536 > 65536)
+        {
+            s_stats.over_one_pixel++;
+            if(pflags & PGXP_F_UNCLAMPED) s_stats.over_one_unclamped++;
+            else if(pflags & (PGXP_F_DX|PGXP_F_DY)) s_stats.over_one_derived++;
+            else s_stats.over_one_projected++;
+            /* Only producer-proven exact projections qualify for exclusions.
+             * Unknown/derived provenance stays a failure, never a blanket pass. */
+            if (pflags & PGXP_AUDIT_EXACT) {
+                if ((pflags & (PGXP_AUDIT_IR | PGXP_AUDIT_SZ)) ==
+                    (PGXP_AUDIT_IR | PGXP_AUDIT_SZ)) s_stats.over_one_ir_sz++;
+                else if (pflags & PGXP_AUDIT_IR) s_stats.over_one_ir++;
+                else if (pflags & PGXP_AUDIT_SZ) s_stats.over_one_sz++;
+                else s_stats.over_one_fraction++;
+            } else if (pflags & PGXP_AUDIT_DIVIDE) s_stats.over_one_divide++;
+            else if (pflags & PGXP_AUDIT_SXY) s_stats.over_one_sxy++;
+            else s_stats.over_one_unexplained++;
+        }
     }
     *x16 = px;
     *y16 = py;

@@ -209,6 +209,9 @@ extern "C" void pgxp_ctx_gte_push_sxy(PgxpCtxEngine *e, int32_t x16, int32_t y16
                                       uint16_t sz3, uint32_t packed) {
     e->pgxp_gte_push_sxy(x16, y16, sz3, packed);
 }
+extern "C" void pgxp_ctx_gte_mark_audit(PgxpCtxEngine *e, uint32_t reasons) {
+    e->pgxp_gte_mark_audit(reasons);
+}
 extern "C" void pgxp_ctx_gte_mark_unclamped(PgxpCtxEngine *e, uint32_t depth) {
     e->pgxp_gte_mark_unclamped(depth);
 }

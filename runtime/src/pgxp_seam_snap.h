@@ -63,6 +63,8 @@ typedef struct {
 
 typedef struct {
     int n_edges, n_links;
+    int32_t origin_x, origin_y;
+    int origin_valid;
     int32_t head[PGXP_SNAP_BUCKETS];
     /* Each link carries its edge's integer line (origin, unit direction), so
      * a query rejects non-collinear candidates from the link alone. */
@@ -89,6 +91,7 @@ typedef struct {
 /* Start a new frame: forget every edge (counters keep accumulating). Call
  * once before the first triangle. */
 static inline void pgxp_snap_reset(PgxpSnap *s) {
+    s->origin_valid = 0;
     s->n_edges = 0;
     s->n_links = 0;
     for (unsigned i = 0; i < PGXP_SNAP_BUCKETS; i++) s->head[i] = -1;
@@ -202,9 +205,16 @@ static inline float pgxp_snap_gap(const PgxpSnapEdge *f, float x, float y) {
  * hole at a T-junction is local (the neighbours across the edges cover the
  * rest); the width tapers to 0 there. */
 #define PGXP_SNAP_T_TAPER_PX  3.0f
-static inline int pgxp_snap_triangle_ex(PgxpSnap *s, const int32_t ix[3], const int32_t iy[3],
-                                        const int32_t fx[3], const int32_t fy[3], const float z[3],
+static inline int pgxp_snap_triangle_ex(PgxpSnap *s, const int32_t in_ix[3], const int32_t in_iy[3],
+                                        const int32_t in_fx[3], const int32_t in_fy[3], const float z[3],
                                         const uint32_t word[3], float e[3], PgxpSnapStrip st[3]) {
+    if(!s->origin_valid) {s->origin_x=in_ix[0];s->origin_y=in_iy[0];s->origin_valid=1;}
+    int32_t ix[3],iy[3],fx[3],fy[3];
+    for(int i=0;i<3;i++) {
+        ix[i]=in_ix[i]-s->origin_x; iy[i]=in_iy[i]-s->origin_y;
+        fx[i]=(int32_t)((int64_t)in_fx[i]-(int64_t)s->origin_x*65536);
+        fy[i]=(int32_t)((int64_t)in_fy[i]-(int64_t)s->origin_y*65536);
+    }
     s->tris++;
     for (int k = 0; k < 3; k++) { st[k].t0 = st[k].t1 = st[k].w0 = st[k].w1 = 0.0f; }
     float px[3], py[3], iz[3], on[3][2] = {{0, 0}, {0, 0}, {0, 0}};

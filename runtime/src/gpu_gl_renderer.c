@@ -822,6 +822,7 @@ static int s_native_surface_rect[4]; /* Fresh native backbuffer content, GL coor
 static double s_native_surface_distance, s_native_surface_width, s_native_surface_units;
 static void openxr_present_native(void);
 static GLint         s_present_uTex = -1, s_present_uUvRect = -1;
+static GLint s_present_uLocal = -1, s_present_uSource = -1;
 static GLint         s_present_uTexSize = -1, s_present_uSharpScale = -1;
 static GLint         s_present_uSharp = -1;
 static GLint         s_present_uGamma = -1;
@@ -985,7 +986,7 @@ static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 static int     s_pc_valid = 0;                  /* sub-pixel positions present */
 static int s_projected_uv_valid;
 static float s_projected_u[3], s_projected_v[3];
-static float   s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  */
+static double  s_pc_x[3], s_pc_y[3];            /* native VRAM px, fractional  */
 static int     s_pq_valid = 0;                  /* perspective weights present */
 static float   s_pq[3];
 /* PGXP depth for the next triangle (gr_set_depth_triangle): GTE SZ per
@@ -1047,6 +1048,9 @@ static GLint s_uLimits = -1;
  * bit-identical to the pre-native-wide projection. */
 static GLint s_geo_uXoff = -1, s_geo_uXhalf = -1;
 static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
+static GLint s_geo_uOrigin = -1, s_tex_uOrigin = -1;
+static GLint s_geo_uRasterGrid = -1, s_tex_uRasterGrid = -1;
+static GLint s_geo_uDepthProbe = -1, s_tex_uDepthProbe = -1;
 /* Native-wide 2D-backdrop x-stretch uniforms. The far 2D backdrop layer is a
  * ~4:3-width set of static prims scrolled by the draw offset; native-wide widens
  * 3D via the GTE but never these, so they leave a void in the 16:9 margins. The
@@ -1288,14 +1292,26 @@ static void wst_clear(int i) { s_wst_x0[i] = s_wst_y0[i] = s_wst_x1[i] = s_wst_y
  * by (scale, centre) exactly as GEO_VS/TEX_VS do; check: the mask check it
  * was drawn under (checked draws keep the stencil equal to alpha). The bbox
  * is widened by 2 px each way for sub-pixel positions and line quads. */
+static int pgxp_vertex_local(const float *v, int stride) {
+    if(stride==27) return v[7]<0.0f || v[7]>1.5f;
+    if(stride==6) {
+        float a=v[5];
+        if(a<0.0f) return a < -1.5f;
+        float code=floorf(a*.5f);
+        if(code>=131072.0f) code-=131072.0f;
+        if(code>=65536.0f) code-=65536.0f;
+        return code>.5f;
+    }
+    return 0;
+}
 static void wst_note_draw(GLuint fbo, const float *v, int n, int stride,
                           int dx, float scale, float centre, int check) {
     if (check || n <= 0) return;
     int i = wide_index(fbo);
     if (i < 0) return;
-    float lo = v[0], hi = v[0], ylo = v[1], yhi = v[1];
+    float lo = v[0]+(pgxp_vertex_local(v,stride)?s_area_x1:0), hi = lo, ylo = v[1] + (pgxp_vertex_local(v,stride)?s_area_y1:0), yhi = ylo;
     for (int k = 1; k < n; k++) {
-        float x = v[(size_t)k * stride], y = v[(size_t)k * stride + 1];
+        float x = v[(size_t)k * stride]+(pgxp_vertex_local(v+(size_t)k*stride,stride)?s_area_x1:0), y = v[(size_t)k * stride + 1] + (pgxp_vertex_local(v+(size_t)k*stride,stride)?s_area_y1:0);
         if (x < lo) lo = x; if (x > hi) hi = x;
         if (y < ylo) ylo = y; if (y > yhi) yhi = y;
     }
@@ -1707,7 +1723,9 @@ static const char *PRESENT_VS =
     "#version 330\n"
     "out vec2 v_uv;\n"
     "uniform vec4 u_uv_rect;\n"
+    "out vec2 v_local;\n"
     "void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2);\n"
+    "  v_local = vec2(p.x,1.0-p.y);\n"
     "  v_uv = vec2(mix(u_uv_rect.x,u_uv_rect.z,p.x),\n"
     "              mix(u_uv_rect.y,u_uv_rect.w,1.0-p.y));\n"
     "  gl_Position = vec4(p*2.0-1.0,0.0,1.0); }\n";
@@ -1871,6 +1889,21 @@ static const char *PRESENT_FS =
     "uniform vec2 u_tex_size;\n"
     "uniform vec2 u_sharp_scale;\n"
     "uniform int  u_sharp;\n"
+    "in vec2 v_local; uniform int u_local_sample; uniform vec4 u_source;\n"
+    "vec4 source_sample(vec2 p){\n"
+    "  p=clamp(p,vec2(0.0),u_source.zw); ivec2 i=ivec2(floor(p)); vec2 f=fract(p);\n"
+    "  ivec2 j=min(i+ivec2(1),ivec2(u_source.zw)); ivec2 o=ivec2(u_source.xy);\n"
+    "  if(u_local_sample==1) return texelFetch(u_tex,o+ivec2(floor(p+0.5)),0);\n"
+    "  return mix(mix(texelFetch(u_tex,o+i,0),texelFetch(u_tex,o+ivec2(j.x,i.y),0),f.x),\n"
+    "             mix(texelFetch(u_tex,o+ivec2(i.x,j.y),0),texelFetch(u_tex,o+j,0),f.x),f.y);\n"
+    "}\n"
+    "vec4 source_resolve(vec2 uv){\n"
+    "  vec2 p=uv*u_source.zw; if(u_sharp!=3) return source_sample(p);\n"
+    "  vec2 fp=1.0/max(u_sharp_scale,vec2(1.e-6)); vec2 nf=clamp(ceil(fp*.5),vec2(1.0),vec2(8.0));\n"
+    "  vec2 st=fp/nf; vec2 base=p-.5*fp+.5*st; vec4 acc=vec4(0.0);\n"
+    "  for(int j=0;j<int(nf.y);j++) for(int i=0;i<int(nf.x);i++) acc+=source_sample(base+vec2(i,j)*st);\n"
+    "  return acc/(nf.x*nf.y);\n"
+    "}\n"
     "uniform float u_gamma;\n"
     "uniform int  u_chroma;   /* [video] fmv_chroma_smoothing (24-bit frames) */\n"
     PSX_SCANLINE_UNIFORMS
@@ -1928,7 +1961,8 @@ static const char *PRESENT_FS =
     "void main(){\n"
     "  vec2 uv = v_uv;\n"
     "  vec4 c;\n"
-    "  if (u_sharp == 2) { c = bicubic(uv); }\n"
+    "  if (u_local_sample != 0) { c = source_resolve(v_local); }\n"
+    "  else if (u_sharp == 2) { c = bicubic(uv); }\n"
     "  else if (u_sharp == 3) { c = area_resolve(uv); }\n"
     "  else {\n"
     "    if (u_sharp == 1) {\n"
@@ -2034,9 +2068,12 @@ static const char *GEO_VS =
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
+    "uniform float u_depth_probe;\n"
+    "uniform float u_raster_grid;\n"
+    "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
     "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
     "noperspective out vec4 v_col;\n"
-    "smooth out vec3 v_col_p;   /* perspective-correct colour (PGXP, G1.14) */\n"
+    "noperspective out float v_iw; noperspective out vec3 v_col_p;   /* perspective-correct colour (PGXP, G1.14) */\n"
     "flat out int v_cp;\n"
     "noperspective out float v_b3d;   /* bloom source: 1 on a PGXP 3D vertex */\n"
     "noperspective out vec2 v_npos;  /* native VRAM position (dithering) */\n"
@@ -2056,18 +2093,22 @@ static const char *GEO_VS =
     "  v_dith = int(dth);\n"
     "  if (a < 0.0 && !far_code) { m = 0.0; zn = 1.0; sz = 0.0; cp = 0.0; }\n"
     "  else if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz * (1.0 - u_zbias) - (u_zbias > 0.0 ? 48.0 : 0.0), 1.0) + 256.0); if (cp > 0.5) w = sz / 1024.0; }\n"
-    "  v_col = vec4(a_col.rgb, m); v_col_p = a_col.rgb; v_cp = int(cp);\n"
+    "  v_col = vec4(a_col.rgb, m); v_col_p = a_col.rgb / w; v_iw = 1.0/w; v_cp = int(cp);\n"
     "  v_b3d = ((a >= 0.0 || far_code) && sz > 0.5) ? 1.0 : 0.0;\n"
-    "  float xb = a_pos.x;\n"
+    "  v_npos += sz > 0.5 ? u_origin : vec2(0.0);\n"
+    "  float xb = a_pos.x - (sz > 0.5 ? 0.0 : u_origin.x), xc=u_xcenter-u_origin.x;\n"
     "  if (u_xscale < 0.0) {\n"
     "    float s = -u_xscale; float h = u_xhalf / s;\n"
-    "    float l = u_xcenter - h, r = u_xcenter + h;\n"
+    "    float l = xc - h, r = xc + h;\n"
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
-    "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
-    "  gl_Position = vec4(((xb+u_shift+u_xoff)/u_xhalf - 1.0) * w, ((a_pos.y+u_shift)/256.0 - 1.0) * w, zn * w, w); }\n";
+    "  } else if(u_xscale != 1.0) xb = (xb - xc)*u_xscale + xc;\n"
+    "  zn -= 2.0*u_depth_probe;\n"
+    "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
+    "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
+    "  gl_Position = vec4(rp/vec2(u_xhalf,256.0)-1.0, zn, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
-    "noperspective in vec4 v_col; smooth in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
+    "noperspective in vec4 v_col; noperspective in float v_iw; noperspective in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
     "noperspective in float v_b3d;\n"
     "uniform int u_bcls;   /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
     "uniform int u_badd;   /* this batch blends additively */\n"
@@ -2075,7 +2116,7 @@ static const char *GEO_FS =
     PSX_DITHER_GLSL
     "void main(){\n"
     "  if (u_bcls != 0) { if (u_bcls == 1 && !(v_b3d > 0.999 || u_badd != 0)) discard; frag = vec4(0.0); return; }\n"
-    "  frag = v_cp != 0 ? vec4(v_col_p, v_col.a) : v_col;\n"
+    "  frag = v_cp != 0 ? vec4(v_col_p/v_iw, v_col.a) : v_col;\n"
     "  frag.rgb = psx_dither(frag.rgb, v_npos, v_dith); }\n";
 
 /* Textured prims: sample raw 1555 VRAM (integer), CLUT decode per depth,
@@ -2093,6 +2134,7 @@ static const char *GEO_FS =
  * batch keys + per-pass state. */
 static const char *TEX_VS =
     "#version 330\n"
+    "out vec2 g_raster;\n"
     "layout(location=0) in vec2 a_pos;\n"
     "layout(location=1) in vec2 a_uv;\n"
     "layout(location=2) in vec4 a_col;\n"
@@ -2112,42 +2154,44 @@ static const char *TEX_VS =
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
+    "uniform float u_depth_probe;\n"
+    "uniform float u_raster_grid;\n"
+    "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
     "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
-    "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
-    "smooth out vec2 v_uv_p;  /* perspective-correct UV (used when v_persp!=0) */\n"
-    "flat out int v_persp;\n"
-    "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
-    "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
-    "flat out int v_dith;\n"
-    "flat out int v_twin;\n"
-    "flat out vec4 v_hd_source; flat out int v_hd_mode;\n"
-    "flat out int v_filter;\n"
-    "smooth out vec3 v_col_p; flat out int v_cp;\n"
-    "noperspective out float v_b3d;   /* bloom source: 1 on a PGXP 3D vertex */\n"
-    "noperspective out vec2 v_npos;  /* native VRAM position (dithering) */\n"
-    "void main(){ v_uv = a_uv; v_uv_p = a_uv; v_col = a_col; v_col_p = a_col.rgb;\n"
-    "  v_npos = a_pos;\n"
-    "  v_persp = (a_q > 0.0) ? 1 : 0;\n"
-    "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
-    "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
-    "  v_semi = int(a_semi + 0.5);\n"
-    "  v_dith = v_semi >> 3; v_semi &= 7;   /* +8: dither-eligible primitive */\n"
-    "  v_twin = int(a_twin + 0.5);\n"
-    "  v_filter = int(a_filter + 0.5);\n"
-    "  v_hd_source=a_hd_source; v_hd_mode=int(a_hd_mode+0.5);\n"
-    "  v_limits = ivec4(floor(a_limits + 0.5));\n"
+    "noperspective out vec2 g_uv; noperspective out vec4 g_col;\n"
+    "noperspective out vec2 g_uv_p;  /* perspective-correct UV (used when g_persp!=0) */\n"
+    "flat out int g_persp;\n"
+    "flat out ivec2 g_tpage; flat out ivec2 g_clut; flat out int g_depth;\n"
+    "flat out int g_raw; flat out ivec4 g_limits; flat out int g_semi;\n"
+    "flat out int g_dith;\n"
+    "flat out int g_twin;\n"
+    "flat out vec4 g_hd_source; flat out int g_hd_mode;\n"
+    "flat out int g_filter;\n"
+    "noperspective out float g_iw; noperspective out vec3 g_col_p; flat out int g_cp;\n"
+    "noperspective out float g_b3d;   /* bloom source: 1 on a PGXP 3D vertex */\n"
+    "noperspective out vec2 g_npos;  /* native VRAM position (dithering) */\n"
+    "void main(){ g_uv = a_uv; g_uv_p = a_uv; g_col = a_col; g_col_p = a_col.rgb;\n"
+    "  g_npos = a_pos;\n"
+    "  g_persp = (a_q > 0.0) ? 1 : 0;\n"
+    "  g_tpage = ivec2(a_tpage + 0.5); g_clut = ivec2(a_clut + 0.5);\n"
+    "  g_depth = int(a_depth + 0.5); g_raw = int(a_raw + 0.5);\n"
+    "  g_semi = int(a_semi + 0.5);\n"
+    "  g_dith = g_semi >> 3; g_semi &= 7;   /* +8: dither-eligible primitive */\n"
+    "  g_twin = int(a_twin + 0.5);\n"
+    "  g_filter = int(a_filter + 0.5);\n"
+    "  g_hd_source=a_hd_source; g_hd_mode=int(a_hd_mode+0.5);\n"
+    "  g_limits = ivec4(floor(a_limits + 0.5));\n"
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
-    "  float xb = a_pos.x;\n"
+    "  float xb = a_pos.x - ((a_col.a<0.0 || a_col.a>1.5) ? 0.0 : u_origin.x), xc=u_xcenter-u_origin.x;\n"
     "  if (u_xscale < 0.0) {\n"
     "    float s = -u_xscale; float h = u_xhalf / s;\n"
-    "    float l = u_xcenter - h, r = u_xcenter + h;\n"
+    "    float l = xc - h, r = xc + h;\n"
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
-    "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
-    "  /* Perspective-correct UV rides the standard w divide: emit clip coords\n"
-    "   * pre-multiplied by w = 1/q so the post-divide NDC is unchanged while\n"
-    "   * the rasterizer interpolates the smooth varying hyperbolically. With\n"
-    "   * a_q == 0 (feature off) w is exactly 1.0 and this is the old expression. */\n"
+    "  } else if(u_xscale != 1.0) xb = (xb - xc)*u_xscale + xc;\n"
+    "  /* Carry reciprocal weights explicitly. Triangle-local interpolation\n"
+    "   * divides weighted attributes by the interpolated reciprocal weight,\n"
+    "   * preserving perspective without window-origin rounding history. */\n"
     "  float w = (a_q > 0.0) ? (1.0 / a_q) : 1.0;\n"
     "  /* PGXP (G1.14): a_col.a is 1.0 (unused) unless a PGXP 3D vertex\n"
     "   * stores -(sz + 65536*cp) there (cp: perspective-correct colour), so\n"
@@ -2156,14 +2200,22 @@ static const char *TEX_VS =
     "  float cp = pz >= 65536.0 ? 1.0 : 0.0, sz = pz - 65536.0 * cp, zn = 0.0;\n"
     "  if (a_col.a > 1.5) { uint bits = floatBitsToUint(a_col.a); cp = float((bits >> 1u) & 1u); sz = uintBitsToFloat(bits & 0xfffffff8u) - 2.0; }\n"
     "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz * (1.0 - u_zbias) - (u_zbias > 0.0 ? 48.0 : 0.0), 1.0) + 256.0); if (a_q <= 0.0 && cp > 0.5) w = sz / 1024.0; }\n"
-    "  v_cp = int(cp); v_b3d = sz > 0.5 ? 1.0 : 0.0;\n"
-    "  vec2 ndc = vec2((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0);\n"
-    "  gl_Position = vec4(ndc * w, zn * w, w); }\n";
+    "  g_uv_p = a_uv/w; g_col_p = a_col.rgb/w; g_iw = 1.0/w; g_cp = int(cp); g_b3d = sz > 0.5 ? 1.0 : 0.0; g_npos += sz > 0.5 ? u_origin : vec2(0.0);\n"
+    "  zn -= 2.0*u_depth_probe;\n"
+    "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
+    "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
+    "  g_raster=rp*(u_raster_grid/256.0); vec2 ndc = rp/vec2(u_xhalf,256.0)-1.0;\n"
+    "  gl_Position = vec4(ndc, zn, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
+    "flat in vec2 t_pos[3]; flat in vec3 t_uvq[3]; flat in vec4 t_colq[3];\n"
+    "uniform vec2 u_origin; uniform float u_raster_grid;\n"
+    "vec3 local_weights(){ vec2 p=gl_FragCoord.xy-(u_origin*u_raster_grid/256.0)-t_pos[0];\n"
+    " vec2 a=t_pos[1]-t_pos[0],b=t_pos[2]-t_pos[0];float d=a.x*b.y-a.y*b.x;\n"
+    " float y=(p.x*b.y-p.y*b.x)/d,z=(a.x*p.y-a.y*p.x)/d;return vec3(1.0-y-z,y,z); }\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
-    "smooth in vec2 v_uv_p; flat in int v_persp;\n"
-    "smooth in vec3 v_col_p; flat in int v_cp;\n"
+    "noperspective in vec2 v_uv_p; flat in int v_persp;\n"
+    "noperspective in float v_iw; noperspective in vec3 v_col_p; flat in int v_cp;\n"
     "noperspective in vec2 v_npos;\n"
     PSX_DITHER_GLSL
     "out vec4 frag; out vec4 blend_factor;\n"
@@ -2346,7 +2398,8 @@ static const char *TEX_FS =
     "  /* v_persp is 0 for every prim unless [video] perspective_texturing is on\n"
     "   * AND this prim's packet carried full GTE projection provenance, so the\n"
     "   * default is the PS1's affine (noperspective) mapping. */\n"
-    "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+    "  vec3 lw=local_weights(); vec3 uq=t_uvq[0]*lw.x+t_uvq[1]*lw.y+t_uvq[2]*lw.z;\n"
+    "  vec2 uv = v_b3d>0.999 ? uq.xy/uq.z : ((v_persp != 0) ? v_uv_p/v_iw : v_uv);\n"
     "  vec2 dx=dFdx(uv), dy=dFdy(uv);\n"
     "  vec2 uv0=uv, dx0=dx, dy0=dy;   /* the PS1 sample point (texture_lod) */\n"
     "  if (v_hd_mode == 5) {\n"
@@ -2443,7 +2496,8 @@ static const char *TEX_FS =
     "  if (u_semipass == 1 && stp == 1) discard;\n"
     "  if (u_semipass == 2 && stp == 0) discard;\n"
     "  if (v_raw == 0) {   /* modulation: (texel8 * colour8) >> 7, as the PS1 */\n"
-    "    vec3 m = v_cp != 0 ? v_col_p : v_col.rgb;\n"
+    "    vec4 cq=t_colq[0]*lw.x+t_colq[1]*lw.y+t_colq[2]*lw.z;\n"
+    "    vec3 m = v_b3d>0.999 ? cq.rgb/cq.a : (v_cp != 0 ? v_col_p/v_iw : v_col.rgb);\n"
     "    rgb = u_accurate != 0\n"
     "        ? clamp(floor(floor(rgb * 255.0 + 0.5) * floor(m * 255.0 + 0.5) * (1.0 / 128.0)) * (1.0 / 255.0), 0.0, 1.0)\n"
     "        : clamp(rgb * m * 2.0, 0.0, 1.0);\n"
@@ -2528,6 +2582,8 @@ static const char *STENCIL_FS =
     "void main(){ vec4 c=texelFetch(u_src,ivec2(gl_FragCoord.xy)-u_off,0);\n"
     "  if(c.a<0.5) discard; frag=vec4(0.0); }\n";
 
+#include "pgxp_shader_interpolation.inc"
+
 static GLuint compile_shader(GLenum type, const char *src) {
     GLuint s = p_glCreateShader(type);
     p_glShaderSource(s, 1, &src, NULL);
@@ -2538,24 +2594,26 @@ static GLuint compile_shader(GLenum type, const char *src) {
         p_glDeleteShader(s); return 0; }
     return s;
 }
-static GLuint build_program_ex(const char *vs, const char *fs, int dual_source) {
+static GLuint build_program_ex(const char *vs, const char *fs, int dual_source, const char *gs) {
     GLuint v = compile_shader(PSXGL_VERTEX_SHADER, vs), f = compile_shader(PSXGL_FRAGMENT_SHADER, fs);
     if (!v || !f) return 0;
     GLuint p = p_glCreateProgram();
     p_glAttachShader(p, v); p_glAttachShader(p, f);
+    GLuint g=0;
+    if(gs) {g=compile_shader(0x8DD9 /* GL_GEOMETRY_SHADER */,gs); if(!g){p_glDeleteShader(v);p_glDeleteShader(f);p_glDeleteProgram(p);return 0;} p_glAttachShader(p,g);}
     if (dual_source) {
         p_glBindFragDataLocationIndexed(p, 0, 0, "frag");
         p_glBindFragDataLocationIndexed(p, 0, 1, "blend_factor");
     }
     p_glLinkProgram(p);
-    p_glDeleteShader(v); p_glDeleteShader(f);
+    p_glDeleteShader(v); p_glDeleteShader(f); if(g)p_glDeleteShader(g);
     GLint ok = 0; p_glGetProgramiv(p, PSXGL_LINK_STATUS, &ok);
     if (!ok) { char log[1024]; log[0]=0; p_glGetProgramInfoLog(p, sizeof log, NULL, log);
         fprintf(stdout, "psxrecomp: GL program link failed: %s\n", log); return 0; }
     return p;
 }
 static GLuint build_program(const char *vs, const char *fs) {
-    return build_program_ex(vs, fs, 0);
+    return build_program_ex(vs, fs, 0, NULL);
 }
 
 /* ---- pixel conversion (PS1 1555: bit15=mask, B[14:10] G[9:5] R[4:0]) ---- */
@@ -2625,10 +2683,26 @@ static void apply_psx_blend(int mode) {
     }
 }
 
+#include "pgxp_raster_audit.inc"
+
+/* Keep precise vertices and seam arithmetic draw-area-local until rasterization.
+ * A page translation must not discard 16.16 bits before reaching the GPU.
+ * The explicit raster grid is 1/256 of an OUTPUT pixel (not a native-pixel
+ * precision reduction); the textured shader evaluates interpolation locally.
+ * Blits/uploads use origin zero and retain their existing VRAM coordinates. */
 /* ---- hr FBO render-state bracket ---------------------------------------- */
+static void pgxp_raster_origin(int x, int y, int width, int scale) {
+    glViewport(x * scale, y * scale, width * scale, VRAM_H * scale);
+    p_glUseProgram(s_geo_prog);
+    p_glUniform2f(s_geo_uOrigin, (float)x, (float)y);
+    p_glUniform1f(s_geo_uRasterGrid, (float)(scale*256));
+    p_glUseProgram(s_tex_prog);
+    p_glUniform2f(s_tex_uOrigin, (float)x, (float)y);
+    p_glUniform1f(s_tex_uRasterGrid, (float)(scale*256));
+}
 static void hr_begin(int clip_to_draw_area) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
-    glViewport(0, 0, VRAM_W * s_hr_scale, VRAM_H * s_hr_scale);
+    pgxp_raster_origin(clip_to_draw_area ? s_area_x1 : 0, clip_to_draw_area ? s_area_y1 : 0, VRAM_W, s_hr_scale);
     glEnable(GL_SCISSOR_TEST);
     if (clip_to_draw_area) {
         int ax1 = s_area_x1, ay1 = s_area_y1, ax2 = s_area_x2, ay2 = s_area_y2;
@@ -2645,6 +2719,7 @@ static void hr_begin(int clip_to_draw_area) {
     }
 }
 static void hr_end(void) {
+    pgxp_raster_origin(0, 0, VRAM_W, s_hr_scale);
     glDisable(GL_BLEND);
     /* apply_psx_blend mode 2 leaves REVERSE_SUBTRACT armed; reset so later
      * host draws (OSD) that re-enable blend do not inherit B-F math. */
@@ -2702,6 +2777,23 @@ static void depth_apply_ex(int mode, int tex) {
 static void depth_restore_ex(int mode, int tex, int n) {
     if (mode == 0) return;
     if (mode == 1) {
+        if(s_ra_depth_probe && p_glGenQueries && p_glGetQueryObjectui64v) {
+            if(!s_ra_queries[0])p_glGenQueries(2,s_ra_queries);
+            GLint write_mask;glGetIntegerv(GL_STENCIL_WRITEMASK,&write_mask);
+            glStencilMask(0);glColorMask(GL_FALSE,GL_FALSE,GL_FALSE,GL_FALSE);
+            glDepthMask(GL_FALSE);glDepthFunc(GL_GREATER);
+            GLuint64 samples[2]={0,0};
+            if(tex)p_glUniform1i(s_uSemipass,0);
+            for(int i=0;i<2;i++) {
+                p_glUniform1f(tex?s_tex_uDepthProbe:s_geo_uDepthProbe,i?1.0f/1048576.0f:0.0f);
+                p_glBeginQuery(0x8914 /* GL_SAMPLES_PASSED */,s_ra_queries[i]);
+                glDrawArrays(GL_TRIANGLES,0,n);p_glEndQuery(0x8914);
+                p_glGetQueryObjectui64v(s_ra_queries[i],GL_QUERY_RESULT,&samples[i]);
+            }
+            s_ra_failed+=samples[0];if(samples[0]>=samples[1])s_ra_near+=samples[0]-samples[1];
+            p_glUniform1f(tex?s_tex_uDepthProbe:s_geo_uDepthProbe,0.0f);
+            glStencilMask((GLuint)write_mask);glDepthFunc(GL_LEQUAL);
+        }
         p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, 0.0f);
         GLboolean st = glIsEnabled(GL_STENCIL_TEST), bl = glIsEnabled(GL_BLEND);
         glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
@@ -3576,7 +3668,9 @@ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
      * the canonical pass ran at 1x, so they take the S sample-grid shift. */
     if (s_hiw)
         p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hi);
-    glViewport(0, 0, g_wide_w * s_out_scale, VRAM_H * s_out_scale);
+    glViewport(s_area_x1 * s_out_scale, s_area_y1 * s_out_scale, g_wide_w*s_out_scale, VRAM_H*s_out_scale);
+    p_glUniform2f(uXoff == s_tex_uXoff ? s_tex_uOrigin : s_geo_uOrigin, (float)s_area_x1, (float)s_area_y1);
+    p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uRasterGrid : s_geo_uRasterGrid,(float)(s_out_scale*256));
     wide_band_scissor_x(view_pad_left, g_wide_w - view_pad_left - view_pad_right);
     p_glUniform1f(uXoff, (float)dx);
     p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);
@@ -4140,9 +4234,9 @@ static int    s_cw_batches = 0, s_cw_wide_sets = 0, s_cw_wide_cfgs = 0,
  * (attr 0, stride TEXV). Defined here so s_tb / TEXV are in scope. */
 static int mirror_batch_center_only(int nverts) {
     if (!wide_center_is_canonical() || nverts <= 0) return 0;
-    float flo = s_tb[0], fhi = s_tb[0];
+    float flo = s_tb[0]+(pgxp_vertex_local(s_tb,TEXV)?s_area_x1:0), fhi = flo;
     for (int i = 1; i < nverts; i++) {
-        float x = s_tb[i * TEXV];
+        float x = s_tb[i * TEXV]+(pgxp_vertex_local(s_tb+i*TEXV,TEXV)?s_area_x1:0);
         if (x < flo) flo = x; if (x > fhi) fhi = x;
     }
     /* floor/ceil, not a truncating cast: with geometry_correction these are
@@ -4327,6 +4421,8 @@ static void hiw_replay_wide(void) {
             bound = c->wfbo;
             cur = 0;
         }
+        pgxp_raster_origin(c->ax0, c->ay0, g_wide_w, S);
+        cur = 0;
         glScissor(c->wsx * S, c->wsy * S, c->wsw * S, c->wsh * S);
         if (c->kind == HQ_TEX) {
             if (cur != HQ_TEX) {
@@ -4414,6 +4510,8 @@ static void hiw_flush_queue(void) {
                 p_glActiveTexture(PSXGL_TEXTURE0);
                 bound = 1;
             }
+            pgxp_raster_origin(c->ax0, c->ay0, ww, S);
+            cur = 0;
             glScissor((cx0 - T->x0) * S, cy0 * S, (cx1 - cx0) * S, (cy1 - cy0) * S);
             if (c->kind == HQ_TEX) {
                 if (cur != HQ_TEX) {
@@ -4478,6 +4576,7 @@ static void flush_tex_batch_impl(void) {
     double cw_t0 = cw_ms();
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
+    pgxp_raster_record(s_tb,nverts,TEXV);
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
     bind_textured_resources(s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex,
@@ -4625,6 +4724,7 @@ static void flush_flat_batch_impl(void) {
     s_fb_n = 0;
     s_fbl_n = 0;
 
+    pgxp_raster_record(s_fb,nverts,6);
     hr_begin(1);
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(mask);
@@ -4856,7 +4956,7 @@ static int seam_expand(float x[3], float y[3], float e, float B[3][3]) {
         if (l < 1e-5f) return 0;
         nx[k] = sgn * ey / l; ny[k] = -sgn * ex / l;
     }
-    float ox[3], oy[3];
+    float ox[3], oy[3], dx[3], dy[3];
     for (int k = 0; k < 3; k++) {
         const int kp = (k + 2) % 3;   /* edges kp and k meet at corner k */
         float mx = nx[kp] + nx[k], my = ny[kp] + ny[k];
@@ -4865,13 +4965,14 @@ static int seam_expand(float x[3], float y[3], float e, float B[3][3]) {
             const float l = sqrtf(mx * mx + my * my);
             if (l > 1e-6f) { mx *= 2.0f / l; my *= 2.0f / l; }
         } else { mx /= d; my /= d; }
-        ox[k] = x[k] + e * mx; oy[k] = y[k] + e * my;
+        dx[k] = e * mx; dy[k] = e * my;
+        ox[k] = x[k] + dx[k]; oy[k] = y[k] + dy[k];
     }
     const float inv = 1.0f / area;
     for (int k = 0; k < 3; k++) {
         for (int i = 0; i < 3; i++) {
             const int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
-            B[k][i] = ((x[i2] - x[i1]) * (oy[k] - y[i1]) - (y[i2] - y[i1]) * (ox[k] - x[i1])) * inv;
+            B[k][i] = ((x[i2] - x[i1]) * ((y[k] - y[i1]) + dy[k]) - (y[i2] - y[i1]) * ((x[k] - x[i1]) + dx[k])) * inv;
         }
     }
     for (int k = 0; k < 3; k++) { x[k] = ox[k]; y[k] = oy[k]; }
@@ -5047,8 +5148,8 @@ static int seam_snap_measure(const int *xs, const int *ys) {
     const uint32_t word[3] = { 0, 0, 0 };
     for (int i = 0; i < 3; i++) {
         ix[i] = xs[i]; iy[i] = ys[i];
-        fx[i] = (int32_t)lrintf(s_pc_x[i] * 65536.0f);
-        fy[i] = (int32_t)lrintf(s_pc_y[i] * 65536.0f);
+        fx[i] = (int32_t)llrint(s_pc_x[i] * 65536.0);
+        fy[i] = (int32_t)llrint(s_pc_y[i] * 65536.0);
     }
     int n;
     if (s_async_seam_active) {
@@ -5110,6 +5211,7 @@ static int seam_snap_measure(const int *xs, const int *ys) {
         if (s_snap_e[k] > 0.0f && s_snap_e[k] <= w) {
             s_snap_e[k] = 0.0f; s_snap_st[k].w0 = s_snap_st[k].w1 = 0.0f; n--;
         }
+    pgxp_raster_seam(xs,ys);
     return n;
 }
 
@@ -5313,8 +5415,8 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     float *v0 = &s_fb[s_fb_n * 6];
     for (int i = 0; i < n; i++) {
         float *v = &s_fb[s_fb_n * 6];
-        v[0] = precise ? s_pc_x[i] : (float)xs[i];
-        v[1] = precise ? s_pc_y[i] : (float)ys[i];
+        v[0] = precise ? (float)(s_pc_x[i] - (pgxp_tri_is_3d() ? s_area_x1 : 0)) : (float)xs[i];
+        v[1] = precise ? (float)(s_pc_y[i] - (pgxp_tri_is_3d() ? s_area_y1 : 0)) : (float)ys[i];
         v[2] = ((cs[i] & 0x1F) << 3) / 255.0f;
         v[3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
         v[4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
@@ -5514,8 +5616,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         float twin = (float)(twx | (twy << 5) | (tox << 10) | (toy << 15));
         float *vp = &s_tb[s_tb_n * TEXV];
         for (int i = 0; i < 3; i++, vp += TEXV) {
-            vp[0] = s_pc_valid ? s_pc_x[i] : (float)xs[i];
-            vp[1] = s_pc_valid ? s_pc_y[i] : (float)ys[i];
+            vp[0] = s_pc_valid ? (float)(s_pc_x[i] - (pgxp_tri_is_3d() ? s_area_x1 : 0)) : (float)xs[i];
+            vp[1] = s_pc_valid ? (float)(s_pc_y[i] - (pgxp_tri_is_3d() ? s_area_y1 : 0)) : (float)ys[i];
             vp[2] = s_projected_uv_valid ? s_projected_u[i] : (float)us[i];
             vp[3] = s_projected_uv_valid ? s_projected_v[i] : (float)vs[i];
             vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
@@ -5940,22 +6042,25 @@ static void glb_set_precise_triangle(int enabled,
     if (s_pc_valid) {
         /* 16.16 native VRAM px -> float. The GL pipeline is float end-to-end,
          * so the fraction survives to the rasterizer at any internal scale. */
-        s_pc_x[0] = (float)x0 / 65536.0f;  s_pc_y[0] = (float)y0 / 65536.0f;
-        s_pc_x[1] = (float)x1 / 65536.0f;  s_pc_y[1] = (float)y1 / 65536.0f;
-        s_pc_x[2] = (float)x2 / 65536.0f;  s_pc_y[2] = (float)y2 / 65536.0f;
+        s_pc_x[0] = (double)x0 / 65536.0;  s_pc_y[0] = (double)y0 / 65536.0;
+        s_pc_x[1] = (double)x1 / 65536.0;  s_pc_y[1] = (double)y1 / 65536.0;
+        s_pc_x[2] = (double)x2 / 65536.0;  s_pc_y[2] = (double)y2 / 65536.0;
     }
     sw_set_precise_triangle(enabled, x0,y0, x1,y1, x2,y2);
 }
 static void glb_set_perspective_triangle(int enabled, float q0, float q1, float q2) {
-    s_pq_valid = (enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f) ? 1 : 0;
+    s_pq_valid = enabled && isfinite(q0) && isfinite(q1) && isfinite(q2) && q0>0 && q1>0 && q2>0;
+    if(enabled && !s_pq_valid)s_ra_invalid_w++;
     s_pq[0] = q0; s_pq[1] = q1; s_pq[2] = q2;
-    sw_set_perspective_triangle(enabled, q0, q1, q2);
+    sw_set_perspective_triangle(s_pq_valid, q0, q1, q2);
 }
 static void glb_set_depth_triangle(int enabled, float z0, float z1, float z2) {
-    s_pz_valid = (enabled && z0 > 0.0f && z1 > 0.0f && z2 > 0.0f) ? 1 : 0;
+    s_pz_valid = enabled && isfinite(z0) && isfinite(z1) && isfinite(z2) && z0>0 && z1>0 && z2>0;
+    if(enabled && !s_pz_valid)s_ra_invalid_z++;
     s_pz[0] = z0; s_pz[1] = z1; s_pz[2] = z2;
 }
 static void glb_set_draw_area(int x1,int y1,int x2,int y2) {
+    if(x1!=s_area_x1 || y1!=s_area_y1) {flush_flat_batch();flush_tex_batch();pgxp_raster_boundary();}
     /* Seam snapping: a new drawing area is a new frame (or surface). */
     if (s_async_seam_active &&
         (x1 != s_area_x1 || y1 != s_area_y1 || x2 != s_area_x2 || y2 != s_area_y2))
@@ -6046,8 +6151,8 @@ void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
         int xs[3],ys[3],us[3],vs[3]; float col[9];
         s_pc_valid=1; s_pq_valid=perspective; s_projected_uv_valid=1;
         for (int i=0;i<3;++i) {
-            s_pc_x[i]=(float)(v[i].x/v[i].z);
-            s_pc_y[i]=(float)(v[i].y/v[i].z);
+            s_pc_x[i]=v[i].x/v[i].z;
+            s_pc_y[i]=v[i].y/v[i].z;
             xs[i]=(int)floorf(s_pc_x[i]); ys[i]=(int)floorf(s_pc_y[i]);
             s_pq[i]=(float)(1.0/v[i].z);
             s_projected_u[i]=(float)v[i].u; s_projected_v[i]=(float)v[i].v;
@@ -6732,8 +6837,10 @@ static int init_gpu_raster(void) {
         s_scale_alloc_retries = 0;
     }
 
+    /* PS1 dithering is explicit in the shaders; host dithering must not depend on the VRAM page origin. */
+    glDisable(GL_DITHER);
     s_geo_prog  = build_program(GEO_VS, GEO_FS);
-    s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
+    s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1, TEX_GS);
     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
     s_blit_hi_prog = build_program(BLIT_VS_HI, BLIT_FS);
     s_pack_prog = build_program(PACK_VS, PACK_FS);
@@ -6829,6 +6936,12 @@ static int init_gpu_raster(void) {
     s_uBhShift   = p_glGetUniformLocation(s_blit_hi_prog, "u_shift");
     s_uBhXoff    = p_glGetUniformLocation(s_blit_hi_prog, "u_xoff");
     s_uBhXhalf   = p_glGetUniformLocation(s_blit_hi_prog, "u_xhalf");
+    s_geo_uDepthProbe=p_glGetUniformLocation(s_geo_prog,"u_depth_probe");
+    s_tex_uDepthProbe=p_glGetUniformLocation(s_tex_prog,"u_depth_probe");
+    s_geo_uRasterGrid=p_glGetUniformLocation(s_geo_prog,"u_raster_grid");
+    s_tex_uRasterGrid=p_glGetUniformLocation(s_tex_prog,"u_raster_grid");
+    s_geo_uOrigin = p_glGetUniformLocation(s_geo_prog, "u_origin");
+    s_tex_uOrigin = p_glGetUniformLocation(s_tex_prog, "u_origin");
     s_geo_uXoff  = p_glGetUniformLocation(s_geo_prog, "u_xoff");
     s_geo_uXhalf = p_glGetUniformLocation(s_geo_prog, "u_xhalf");
     s_tex_uXoff  = p_glGetUniformLocation(s_tex_prog, "u_xoff");
@@ -7180,6 +7293,8 @@ int gl_renderer_init_context(SDL_Window *win) {
             p_glGenVertexArrays(1, &s_present_vao);
             s_present_uTex = p_glGetUniformLocation(s_present_prog, "u_tex");
             s_present_uUvRect = p_glGetUniformLocation(s_present_prog, "u_uv_rect");
+            s_present_uLocal = p_glGetUniformLocation(s_present_prog,"u_local_sample");
+            s_present_uSource = p_glGetUniformLocation(s_present_prog,"u_source");
             s_present_uTexSize =
                 p_glGetUniformLocation(s_present_prog, "u_tex_size");
             s_present_uSharpScale =
@@ -7292,6 +7407,7 @@ void gl_renderer_shutdown(void) {
         if (s_raw_pbo) p_glDeleteBuffers(1, &s_raw_pbo);
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
     }
+    pgxp_raster_shutdown();
     s_raw_pbo = 0;
     free(s_conv); s_conv = NULL;
     s_hq_n = 0; s_hq_vn = 0;   /* queued window draws die with the context */
@@ -8292,6 +8408,7 @@ static void gl_perf_mirror_end(void) {
 
 /* Top of present (after flush_cpu_upload, before clear/blit). */
 static void gl_perf_present_enter(void) {
+    pgxp_raster_frame_end();
     /* Per-frame boundary for the 2D-backdrop stretch — runs from BOTH present
      * paths (4:3 present_vram AND native-wide present_wide_fbo), before the
      * perf-on gate so native-wide frames reset too. Snapshot this frame's
@@ -8983,6 +9100,7 @@ static uint64_t s_async_seam_reserve_epoch, s_async_seam_reserve_generation;
  * use a fraction of it. Counters remain cumulative across discarded draws. */
 static void pass_snap_copy(PgxpSnap *dst, const PgxpSnap *src) {
     dst->n_edges=src->n_edges; dst->n_links=src->n_links;
+    dst->origin_x=src->origin_x; dst->origin_y=src->origin_y; dst->origin_valid=src->origin_valid;
     dst->stamp_gen=src->stamp_gen;
     memcpy(dst->head,src->head,sizeof src->head);
     memcpy(dst->links,src->links,(size_t)src->n_links*sizeof src->links[0]);
@@ -12002,9 +12120,13 @@ static void present_target_quad(GLuint tex, float tex_w, float tex_h,
         v1 = t;
     }
     p_glUniform4f(s_present_uUvRect, u0, v0, u1, v1);
+    p_glUniform1i(s_present_uLocal, v_flip ? ((linear || area) ? 2 : 1) : 0);
+    p_glUniform4f(s_present_uSource,(float)(x*src_scale),(float)(y*src_scale),
+                  (float)(w*src_scale-1),(float)(h*src_scale-1));
     p_glBindVertexArray(s_present_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0);
+    p_glUniform1i(s_present_uLocal,0);
     p_glUseProgram(0);
 }
 

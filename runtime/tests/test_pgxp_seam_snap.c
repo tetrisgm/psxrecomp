@@ -5,6 +5,7 @@
 #undef NDEBUG /* the Release test target must execute its assertions */
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 static PgxpSnap s;
 
@@ -197,7 +198,32 @@ static void test_t_junction_extent(void) {
     assert(near(st[2].w1, e[2]) && st[2].w0 == 0.0f);
 }
 
+/* Match every decision bit across translated draw domains, including fractions
+ * below float's ULP at the second VRAM page. */
+static void test_translated_domains(void) {
+    float expected[3][3]; PgxpSnapStrip strips[3][3];
+    const int32_t x[3][3]={{0,40,40},{0,40,0},{10,60,60}};
+    const int32_t y[3][3]={{10,10,20},{10,20,20},{20,20,30}};
+    const int32_t frac[3][3]={{0,0,-26213},{0,-26213,-26213},{13109,13109,0}};
+    for(int page=0;page<3;page++) {
+        pgxp_snap_reset(&s); assert(!s.origin_valid);
+        for(int t=0;t<3;t++) {
+            int32_t ix[3],iy[3],fx[3],fy[3]; float e[3],z[3]={1000,1000,1000};
+            uint32_t word[3]={0,0,0}; PgxpSnapStrip out[3];
+            for(int i=0;i<3;i++) {
+                ix[i]=x[t][i]+page*320; iy[i]=y[t][i]+page*240;
+                fx[i]=ix[i]*65536+7; fy[i]=iy[i]*65536+frac[t][i];
+            }
+            pgxp_snap_triangle_ex(&s,ix,iy,fx,fy,z,word,e,out);
+            if(!page) {memcpy(expected[t],e,sizeof e);memcpy(strips[t],out,sizeof out);}
+            else {assert(!memcmp(expected[t],e,sizeof e));assert(!memcmp(strips[t],out,sizeof out));}
+        }
+    }
+    assert(expected[2][0]>0);
+}
+
 int main(void) {
+    test_translated_domains();
     test_crest();
     test_strip_extent();
     test_t_junction_extent();
