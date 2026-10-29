@@ -4,6 +4,87 @@
 #undef main
 static GLuint direct_scene_fbo,direct_scene_tex,direct_scene_rb;
 static int scene_backdrop;
+static void pool_regions(int scale) {
+    uint16_t *saved=(uint16_t *)malloc(1024*512*sizeof *saved);
+    memcpy(saved,s_vram,1024*512*sizeof *saved);
+    for(unsigned i=0;i<1024*512;++i)s_vram[i]=0x7c00;
+    GlSurfacePool pool;
+    check(surface_pool_init(&pool),"surface pool starts native-only");
+    unsigned left=surface_pool_acquire(&pool,0,0,64,64,0,0,64,64,scale,1);
+    unsigned right=surface_pool_acquire(&pool,64,0,64,64,64,0,64,64,scale,1);
+    check(left && right,"on-demand offscreen allocations");
+    for(unsigned i=0;i<2;++i) {
+        const GlRasterSurface *s=pool.surfaces[i?right:left];
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,s->fbo);
+        glDisable(GL_SCISSOR_TEST);glStencilMask(255);glDepthMask(GL_TRUE);
+        glClearColor(i?0:1,i?1:0,0,i?0:1);glClearDepth(i?.5:.25);glClearStencil(0);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    }
+    unsigned display=surface_pool_acquire(&pool,-53,0,426,240,0,0,320,240,scale,0);
+    check(display!=0,"direct-wide allocation takes canonical ownership");
+    const GlRasterSurface *output=pool.surfaces[display];
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,output->fbo);
+    uint8_t pixels[4],stencil;float depth;
+    glReadPixels(54*scale,scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    glReadPixels(54*scale,scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&depth);
+    glReadPixels(54*scale,scale,1,1,GL_STENCIL_INDEX,GL_UNSIGNED_BYTE,&stencil);
+    check(pixels[0]==255 && pixels[3]==255 && fabsf(depth-.25f)<.00001f && stencil==1,
+        "display promotion retains enhanced colour/depth and rebuilds stale mask stencil");
+    glReadPixels(118*scale,scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    glReadPixels(118*scale,scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&depth);
+    check(pixels[1]==255 && pixels[3]==0 && fabsf(depth-.5f)<.00001f,
+        "display promotion gathers independent offscreen allocations");
+    glReadPixels(253*scale,scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    check(pixels[0]==0 && pixels[1]==0 && pixels[2]==248,
+        "display promotion seeds uncovered pixels from native");
+    glReadPixels(scale,scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+    check(!pixels[0] && !pixels[1] && !pixels[2] && !pixels[3],
+        "native seeding does not fill wide reveal margins");
+    surface_pool_collect(&pool,&display,1);
+    check(!pool.surfaces[left] && !pool.surfaces[right],"superseded RT allocations are deleted");
+    unsigned edge=surface_pool_acquire(&pool,256,192,128,64,256,192,128,64,scale,1);
+    check(edge!=0,"offscreen tile can straddle a display");
+    check(edge==left,"surface registry reuses released handles");
+    unsigned display_owner=0,edge_owner=0;
+    for(size_t i=0;i<pool.coverage.count;++i) {
+        const GlCoverageRect *r=pool.coverage.rects+i;
+        if(300>=r->x && 300<r->x+r->w && 220>=r->y && 220<r->y+r->h)display_owner=r->owner;
+        if(300>=r->x && 300<r->x+r->w && 250>=r->y && 250<r->y+r->h)edge_owner=r->owner;
+    }
+    check(display_owner==display && edge_owner==edge,"tile claims only native-only pieces");
+    surface_pool_fill_segment(&pool,296,216,16,40,0x03e0);
+    for(unsigned i=0;i<2;++i) {
+        const GlRasterSurface *s=pool.surfaces[i?edge:display];
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s->fbo);
+        glReadPixels((300-s->x)*scale,((i?250:220)-s->y)*scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+        check(!pixels[0] && pixels[1]==248 && !pixels[2] && !pixels[3],
+            "fill crosses independently owned display/tile pieces");
+    }
+    for(int row=216;row<256;++row)for(int col=296;col<312;++col)s_vram[row*1024+col]=0x801f;
+    native_texture_upload_rect(296,216,16,40);
+    DirtyRect upload={0};rect_add(&upload,296,216,311,255);
+    surface_pool_upload(&pool,&upload,1);
+    for(unsigned i=0;i<2;++i) {
+        const GlRasterSurface *s=pool.surfaces[i?edge:display];
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s->fbo);
+        glReadPixels((300-s->x)*scale,((i?250:220)-s->y)*scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+        glReadPixels((300-s->x)*scale,((i?250:220)-s->y)*scale,1,1,GL_STENCIL_INDEX,GL_UNSIGNED_BYTE,&stencil);
+        check(pixels[0]==248 && !pixels[1] && !pixels[2] && pixels[3]==255 && stencil==1,
+            "native upload updates colour/mask across allocation ownership");
+    }
+    GlRasterSurface *back=surface_pool_display(&pool,0,240,320,240,426,53,0,scale);
+    check(back && back->fbo!=output->fbo && back->y==240 && back->h==240,
+        "vertical display pages allocate independent visible bands");
+    check(surface_pool_find(&pool,output->fbo)==output,
+        "front display survives back-buffer selection");
+    GlRasterSurface *shifted=surface_pool_display(&pool,0,0,320,240,426,53,80,scale);
+    check(shifted && shifted->x==-133 && shifted->w==426 && shifted->h==240,
+        "shifted display keeps only its physical output extent");
+    surface_pool_destroy(&pool);
+    memcpy(s_vram,saved,1024*512*sizeof *saved);free(saved);
+    native_texture_upload_rect(0,0,1024,512);
+    check(glGetError()==GL_NO_ERROR,"surface ownership GL transfers valid");
+}
 static void scene(int x,int y,int textured) {
     g_prim_id=scene_backdrop?0:1; /* Exercise both ordinary and authored backdrop geometry. */
     glb_wide_set_target(x);
@@ -53,6 +134,135 @@ static void scene(int x,int y,int textured) {
     flush_flat_batch();flush_tex_batch();hiw_flush_queue();
     gr_set_semi_transparency(0,0);
 }
+static void routed_triangle(int textured) {
+    gr_set_precise_triangle(1,48*65536,48*65536,112*65536,48*65536,48*65536,112*65536);
+    gr_set_depth_triangle(1,2048,2048,2048);
+    gr_set_perspective_triangle(1,.5f,.5f,.5f);
+    if(textured)gr_draw_shaded_textured_triangle(48,48,1,1,0x808080,
+        112,48,32,1,0x808080,48,112,1,32,0x808080,0,0,0x11a,0);
+    else gr_draw_gouraud_triangle(48,48,0x001f,112,48,0x001f,48,112,0x001f);
+    flush_flat_batch();flush_tex_batch();
+}
+static void routed_copies(int scale) {
+    uint16_t *saved=malloc(1024*512*2),*expected=malloc(1024*512*2);
+    memcpy(saved,s_vram,1024*512*2);
+    for(unsigned i=0;i<1024*512;++i)s_vram[i]=(uint16_t)(i*37u+31u);
+    memcpy(expected,s_vram,1024*512*2);
+    unsigned old_set=s_mask_set,old_check=s_mask_check;s_mask_set=s_mask_check=0;
+    check(surface_pool_init(&s_region_pool),"copy ownership pool");
+    check(surface_pool_acquire(&s_region_pool,960,448,64,64,960,448,64,64,scale,1)!=0,
+        "enhanced copy source allocation");
+    for(int row=0;row<3;++row)for(int col=0;col<140;col+=128) {
+        uint16_t chunk[128];int n=140-col<128?140-col:128;
+        for(int i=0;i<n;++i)chunk[i]=expected[((510+row)&511)*1024+((1016+col+i)&1023)];
+        for(int i=0;i<n;++i)expected[((511+row)&511)*1024+((1018+col+i)&1023)]=chunk[i];
+    }
+    surface_pool_copy(1016,510,1018,511,140,3);
+    check(!memcmp(expected,s_vram,1024*512*2),"copy CPU shadow follows block overlap and two-axis wrap");
+    uint8_t *pixels=malloc((size_t)64*64*scale*scale*4);
+    unsigned differences=0;
+    for(size_t i=1;i<s_region_pool.count;++i) {
+        const GlRasterSurface *s=s_region_pool.surfaces[i];
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s->fbo);
+        glReadPixels(0,0,64*scale,64*scale,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+        for(int y=0;y<64*scale;++y)for(int x=0;x<64*scale;++x) {
+            uint16_t c=expected[(s->y+y/scale)*1024+s->x+x/scale];
+            const uint8_t *p=pixels+((size_t)y*64*scale+x)*4;
+            int mismatch=p[0]!=((c&31)<<3) || p[1]!=(((c>>5)&31)<<3) ||
+                p[2]!=(((c>>10)&31)<<3) || p[3]!=((c&32768)?255:0);
+            if(mismatch && differences<4)printf("copy tile=%zu at=%d,%d got=%02x%02x%02x%02x expected=%04x\n",
+                i,s->x+x/scale,s->y+y/scale,p[0],p[1],p[2],p[3],c);
+            differences+=mismatch;
+        }
+    }
+    check(!differences,"enhanced copy retains exact wrapped block ordering");
+    free(pixels);surface_pool_destroy(&s_region_pool);
+    memcpy(s_vram,saved,1024*512*2);free(saved);free(expected);
+    native_texture_upload_rect(0,0,1024,512);s_mask_set=old_set;s_mask_check=old_check;
+}
+static void routed_wide(int scale) {
+    GlRasterSurface *previous=s_draw_surface;GLuint wide=g_wide_cur;
+    check(surface_pool_init(&s_region_pool),"direct-wide routing pool");
+    GLuint pages[2]={0,0};
+    for(int page=0;page<2;++page) {
+        int y=page*240;
+        gr_set_draw_area(0,y,319,y+239);glb_wide_set_target(0);
+        gr_set_precise_triangle(1,48*65536,(y+48)*65536,
+            112*65536,(y+48)*65536,48*65536,(y+112)*65536);
+        gr_set_depth_triangle(1,2048,2048,2048);
+        gr_draw_gouraud_triangle(48,y+48,0x001f,112,y+48,0x001f,48,y+112,0x001f);
+        flush_flat_batch();
+        check(direct_wide_target() && s_hr_width==426 && s_hr_height==240 && s_hr_origin_y==y,
+            "production draw selection uses one visible wide band");
+        pages[page]=g_wide_cur;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,pages[page]);
+        uint8_t pixel[4];glReadPixels(113*scale,60*scale,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
+        check(pixel[0]==248 && !pixel[1] && !pixel[2],"selected wide target receives canonical geometry");
+    }
+    check(pages[0]!=pages[1] && s_region_pool.count==3,"vertical buffering retains two display bands only");
+    check(present_wide_fbo_impl(0,0,240,0)==1 && present_wide_fbo_impl(0,240,240,0)==1,
+        "presentation finds each cropped display independently of current draw target");
+    check(glGetError()==GL_NO_ERROR,"cropped display presentation GL state");
+    s_draw_surface=previous;s_hr_scale=scale;g_wide_cur=wide;s_pool_wide_enabled=0;
+    surface_pool_destroy(&s_region_pool);
+    gr_set_precise_triangle(0,0,0,0,0,0,0);gr_set_depth_triangle(0,0,0,0);
+}
+static void routed_batches(int scale) {
+    GLuint wide=g_wide_cur;g_wide_cur=0;
+    gr_set_draw_area(0,0,127,127);gr_set_draw_offset(0,0);
+    size_t bytes=(size_t)128*128*scale*scale*4;
+    uint8_t *reference=malloc(bytes),*piece=malloc(bytes);
+    for(int textured=0;textured<2;++textured) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,s_hr_fbo);
+        glDisable(GL_SCISSOR_TEST);glDepthMask(GL_TRUE);glStencilMask(255);
+        glClearColor(0,0,0,0);glClearDepth(1);glClearStencil(0);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+        routed_triangle(textured);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_hr_fbo);
+        glReadPixels(0,0,128*scale,128*scale,GL_RGBA,GL_UNSIGNED_BYTE,reference);
+        check(surface_pool_init(&s_region_pool),"batch routing native-only pool");
+        routed_triangle(textured);
+        check(s_region_pool.count==5,"draw allocates only four intersecting RT tiles");
+        for(size_t i=1;i<s_region_pool.count;++i) {
+            const GlRasterSurface *s=s_region_pool.surfaces[i];
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s->fbo);
+            glReadPixels(0,0,64*scale,64*scale,GL_RGBA,GL_UNSIGNED_BYTE,piece);
+            unsigned differences=0;
+            for(int y=0;y<64*scale;++y) {
+                /* Compare only the triangle interior; native-only surrounding
+                 * pixels deliberately retain the CPU authority's contents. */
+                for(int x=0;x<64*scale;++x) {
+                    int gx=s->x*scale+x,gy=s->y*scale+y;
+                    if(gx<49*scale || gy<49*scale || gx+gy>=159*scale)continue;
+                    uint8_t *got=piece+((size_t)y*64*scale+x)*4;
+                    uint8_t *want=reference+((size_t)gy*128*scale+gx)*4;
+                    if(memcmp(got,want,4)) {
+                        if(!differences)printf("routed scale=%d textured=%d tile=%zu at=%d,%d got=%02x%02x%02x%02x want=%02x%02x%02x%02x\n",
+                            scale,textured,i,gx,gy,got[0],got[1],got[2],got[3],want[0],want[1],want[2],want[3]);
+                        ++differences;
+                    }
+                }
+            }
+            check(!differences,"routed triangle matches reference across tile boundaries");
+        }
+        size_t allocations=s_region_pool.count;
+        gr_set_draw_area(0,0,1023,511);
+        DEPTH_REQUEST_CLEAR(DCLR_AREA);depth_clear_now();
+        check(s_region_pool.count==allocations,"depth clear does not allocate untouched VRAM");
+        for(size_t i=1;i<s_region_pool.count;++i) {
+            float depth=0;
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_region_pool.surfaces[i]->fbo);
+            glReadPixels(32*scale,32*scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&depth);
+            check(depth==1,"depth domain clear visits every owned tile");
+        }
+        gr_set_draw_area(0,0,127,127);
+        surface_pool_destroy(&s_region_pool);
+    }
+    free(reference);free(piece);g_wide_cur=wide;
+    gr_set_precise_triangle(0,0,0,0,0,0,0);gr_set_depth_triangle(0,0,0,0);
+    gr_set_perspective_triangle(0,0,0,0);
+    check(glGetError()==GL_NO_ERROR,"batch routing GL state");
+}
 static int run_scale(int scale) {
     if(SDL_Init(SDL_INIT_VIDEO)!=0)return 77;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);
@@ -65,10 +275,14 @@ static int run_scale(int scale) {
     if(!gl_renderer_init_context(win))return 77;
     gl_renderer_set_pgxp_depth(1);gl_renderer_set_pgxp_color_perspective(1);
     gl_renderer_set_seam_snap(1);s_pgxp_seam=1;
+    pool_regions(scale);
     gr_set_color_modulation(128,128,128,1);
     glb_wide_configure(426,53);s_wide_fast=0;
     uint16_t texels[256*64];for(unsigned i=0;i<256*64;++i)texels[i]=0x8000|((i*37)&32767);
     gr_vram_transfer_in(640,256,256,64,texels);flush_cpu_upload();
+    routed_batches(scale);
+    routed_copies(scale);
+    routed_wide(scale);
     GLuint full_fbo=s_hr_fbo,full_tex=s_hr_tex,full_rb=s_hr_rb;
     GLuint tex,rb,fbo,direct_tex,direct_rb,direct_fbo;
     check(raster_surface_alloc(320,240,scale,&tex,&rb,&fbo),"cropped target allocation");
@@ -252,6 +466,17 @@ static int run_scale(int scale) {
         glReadPixels(200*scale,170*scale,16*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
         check(!memcmp(reference,cropped,(size_t)16*16*scale*scale*4),
             "gathered enhanced source survives separate destination application");
+        GlCoverage ownership={0};
+        check(gl_coverage_init(&ownership,1024,512),"native-only surface coverage");
+        check(gl_coverage_replace(&ownership,x,y,320,240,1),"assign canonical wide coverage");
+        const GlRasterSurface enhanced={direct_tex,direct_fbo,direct_rb,x-53,y,426,240,scale};
+        const GlRasterSurface *allocations[]={NULL,&enhanced};
+        gpu_copy_rect_coverage(&ownership,allocations,x+312,y+60,x+200,y+170,16,16);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+        glReadPixels(200*scale,170*scale,16*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+        check(!memcmp(reference,cropped,(size_t)16*16*scale*scale*4),
+            "coverage gather excludes reveal margins and seeds native-only neighbours");
+        gl_coverage_destroy(&ownership);
         for(int row=0;row<16;++row)for(int col=0;col<16;++col)
             s_vram[(size_t)(y+60+row)*1024+x+312+col]=native_before[row*16+col];
         native_texture_upload_rect(x+312,y+60,16,16);

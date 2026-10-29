@@ -1,83 +1,30 @@
-﻿/* gpu_gl_renderer.c — hardware OpenGL renderer backend.
+/* gpu_gl_renderer.c - enhanced presentation renderer.
  *
- * ARCHITECTURE (v2 — GPU-authoritative VRAM)
- * -------------------------------------------
- * The FBO color texture (`s_hr_tex`, RGBA8, 1024*S x 512*S where S is the
- * internal-resolution scale from [video] supersampling) is the single
- * authoritative copy of VRAM during normal 15-bit rendering. Every mutation
- * goes through the GPU; depth24 scanout additionally keeps the CPU mirror
- * authoritative because packed RGB888 framebuffer uploads are not staged as
- * 1555 FBO pixels. GP0 clears/draws/copies must also update that mirror:
+ * Runtime guest-visible VRAM belongs to NativeRaster. Immutable frame packets
+ * bring native texture inputs and pre-copy sources to the render owner; guest
+ * reads, snapshots and HD keys do not read this renderer's OpenGL surfaces.
+ * R16UI texture pages and CLUTs receive native input versions through a bounded
+ * upload stream. Enhanced colour/depth are disposable presentation state.
  *
- *   - polys / rects / lines  -> rasterized into the hr FBO
- *   - GP0(02h) fills         -> scissored glClear (color + stencil)
- *   - VRAM->VRAM copies      -> hr FBO -> scratch texture blit, then a
- *                               masked quad draw back into the hr FBO
- *   - CPU->VRAM transfers    -> written to the CPU mirror immediately and
- *                               accumulated into a pending-upload rect; the
- *                               rect is flushed (staging texture + quad into
- *                               the hr FBO, plus a direct R16UI subimage)
- *                               before the next GPU op, preserving op order
+ * The region allocator and canonical coverage map distinguish valid VRAM
+ * pixels from wide reveal margins. The production primary allocation is still
+ * full-VRAM pending the draw/present routing cutover. Copies gather retained
+ * enhanced regions plus native-only holes before applying masked writes.
  *
- * PS1 MASK BIT (bit15). The FBO alpha channel carries bit15 exactly
- * (1.0 = set), and a stencil buffer mirrors it (stencil bit0 == bit15):
- *   - "set mask"  -> fragment alpha + stencil write value
- *   - "check mask"-> stencil test (pass iff stored == 0). The stencil write
- *     value is coupled to the test reference in GL, so when checking we use
- *     GL_INVERT on pass to write a 1 (stored is known 0 when the test
- *     passes) and GL_KEEP to write a 0.
- *   - textured prims (and copies/uploads, whose pixels carry per-texel STP
- *     bits) are drawn in TWO passes split by the STP bit via discard, so
- *     each pass writes a single known stencil value. The same split already
- *     existed for semi-transparent texture blending.
- *   - blending uses glBlendFuncSeparate so the alpha (mask) channel is
- *     always REPLACED by the source fragment's mask bit, never blended.
- *
- * TEXTURE SAMPLING / RENDER-TO-TEXTURE. Textured prims sample a native-res
- * R16UI mirror (`s_raw_tex`) holding raw 1555 VRAM values (CLUT decode +
- * texture window + optional bilinear in the fragment shader). GPU draws
- * mark a native-coords dirty union; before any textured draw whose texture
- * page or CLUT intersects the union, a PACK pass re-encodes the dirty
- * region of the hr FBO into the raw mirror (point-sampled at native
- * coords). CPU->VRAM uploads update the raw mirror directly. So content
- * rendered by the GPU is immediately valid as a texture source.
- *
- * CPU READBACKS (VRAM->CPU transfers, GPUREAD, screenshots) in 15-bit mode
- * flush uploads + pack, then glReadPixels the raw mirror straight into CPU
- * VRAM (raw 1555, no conversion loop). Depth24 entry synchronizes once before
- * the first write; readback is then suppressed until 15-bit rendering resumes.
- *
- * PRESENT is deterministic: 15-bit frames always blit the display region
- * from the hr FBO into a 4:3 letterboxed rect (single path — no more
- * frame-to-frame alternation between FBO and CPU presents). 24-bit (FMV)
- * frames use the authoritative CPU mirror and quad-present, also letterboxed.
- * PSX_GL_FORCE_CPU_PRESENT=1 (read by main.cpp) forces the CPU path as a
- * diagnostic.
- *
- * Known divergences from the software rasterizer (accepted, documented):
- *   - GL triangle/line coverage rules differ from the PS1 DDA by ±1px on
- *     edges; lines use GL_LINES at 1x and, above 1x, a quad one native pixel
- *     thick that covers both endpoints (line_to_quad) instead of Bresenham.
- *   - No dithering (the software path doesn't dither either).
- *   - Gouraud interpolation happens at 8-bit precision instead of 5-bit
- *     (smoother gradients; readback re-quantizes to 5-bit).
- *   - VRAM-wrapping draws are clamped, except GP0(02h) fills which split
- *     into wrapped segments. Wrapping copies/draws are unused by real SDKs.
- *
- * INTERNAL SCALE LIMITS. S is clamped at init to the driver's texture,
- * renderbuffer and viewport limits and to a memory budget (gl_scale_limits.h),
- * and an FBO that still fails to allocate is retried one scale lower. A large
- * S therefore never costs the GL backend itself.
- *
- * Init is all-or-nothing: if any shader/FBO fails, gl_renderer_init_context
- * returns 0 and the runtime falls back to the pure software renderer — no
- * half-GL hybrid. */
+ * RGBA alpha carries PS1 bit15; stencil mirrors it for mask checks. Textured
+ * semi-transparency can require separate STP classes, but PGXP depth is written
+ * in the colour pass. Native uploads decode R16UI directly into the destination
+ * region. PGXP rasterization intentionally enhances native geometry; it is not
+ * the guest's pixel authority. Legacy diagnostic/direct-call pack and readback
+ * helpers remain separate from runtime frame-packet texture coherence.
+ */
 
 #include "host_overlay.h"
 #include "host_sampler.h"
 #include "gpu.h"
 #include "gpu_render.h"
 #include "gl_scale_limits.h"
+#include "gl_surface_coverage.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_fmv_hd.h"
 #include "gpu_gl_renderer.h"
@@ -954,6 +901,28 @@ typedef struct GlRasterSurface {
     GLuint tex,fbo,rb;
     int x,y,w,h,allocation_scale;
 } GlRasterSurface;
+typedef struct GlSurfacePool {
+    GlCoverage coverage;
+    GlRasterSurface **surfaces;
+    size_t count,capacity;
+} GlSurfacePool;
+static GlSurfacePool s_region_pool;
+typedef struct GlDrawRegion {
+    GlRasterSurface *surface;
+    int x,y,w,h,direct;
+} GlDrawRegion;
+static GlDrawRegion *s_draw_regions;
+static size_t s_draw_region_count,s_draw_region_capacity;
+static int s_draw_region_clip;
+static GlCoverageRect s_draw_region_bounds;
+static int surface_draw_regions(const float *vertices,int count,int stride);
+static void surface_draw_region_begin(size_t index);
+static void surface_draw_regions_end(GlRasterSurface *previous);
+static void surface_depth_clear(void);
+static void surface_stencil_rebuild(void);
+static void surface_pool_copy(int sx,int sy,int dx,int dy,int w,int h);
+static int s_pool_wide_enabled;
+static void surface_wide_select(void);
 static GlRasterSurface s_primary_surface={0,0,0,0,0,VRAM_W,VRAM_H,0};
 static GlRasterSurface *s_draw_surface=&s_primary_surface;
 #define s_hr_tex (s_draw_surface->tex)
@@ -1118,6 +1087,8 @@ static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
 
 /* Dirty-rect unions, native VRAM coords, inclusive bounds. */
 typedef struct { int x0, y0, x1, y1, set; } DirtyRect;
+static void surface_pool_upload(GlSurfacePool *pool,const DirtyRect *uploads,int count);
+static void surface_pool_fill_segment(GlSurfacePool *pool,int x,int y,int w,int h,uint16_t colour);
 static DirtyRect s_cpu_dirty; /* conservative GPU-written area not yet read into CPU VRAM */
 static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror */
 /* Native-coords union of primitive bboxes since the last stencil rebuild: the
@@ -2599,7 +2570,7 @@ static const char *NATIVE_UPLOAD_FS =
     "uniform usampler2D u_src; uniform ivec2 u_origin; uniform int u_scale,u_pass;\n"
     "out vec4 frag;\n"
     "void main(){\n"
-    " uint p=texelFetch(u_src,ivec2(gl_FragCoord.xy)/u_scale+u_origin,0).r;\n"
+    " uint p=texelFetch(u_src,(ivec2(gl_FragCoord.xy)/u_scale+u_origin)&ivec2(1023,511),0).r;\n"
     " bool mask=(p&32768u)!=0u;\n"
     " if((u_pass==0 && mask)||(u_pass==1 && !mask))discard;\n"
     " frag=vec4(vec3(p&31u,(p>>5)&31u,(p>>10)&31u)*(8.0/255.0),mask?1.0:0.0);\n"
@@ -2766,15 +2737,23 @@ static void pgxp_raster_origin(int x,int y,int width,int scale) {
 static void hr_begin(int clip_to_draw_area) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     const int direct=clip_to_draw_area && direct_wide_target();
+    /* A tile is storage, not the primitive's clip volume. Keep the entire
+     * draw area's projection visible and translate its viewport into the
+     * allocation; ownership scissors select the destination pixels. */
+    int raster_w=s_hr_width,raster_h=s_hr_height;
+    if(clip_to_draw_area && s_draw_region_clip && !direct) {
+        if(raster_w<s_area_x2-s_area_x1+1)raster_w=s_area_x2-s_area_x1+1;
+        if(raster_h<s_area_y2-s_area_y1+1)raster_h=s_area_y2-s_area_y1+1;
+    }
     pgxp_raster_target(clip_to_draw_area?s_area_x1:0,clip_to_draw_area?s_area_y1:0,
-        s_hr_width,s_hr_height,s_hr_scale,direct?s_area_x1:s_hr_origin_x,s_hr_origin_y);
+        raster_w,raster_h,s_hr_scale,direct?s_area_x1:s_hr_origin_x,s_hr_origin_y);
     if(s_hr_width!=VRAM_W || direct) {
         p_glUseProgram(s_geo_prog);
         p_glUniform1f(s_geo_uXoff,direct?s_area_x1-s_hr_origin_x:0);
-        p_glUniform1f(s_geo_uXhalf,s_hr_width*.5f);
+        p_glUniform1f(s_geo_uXhalf,raster_w*.5f);
         p_glUseProgram(s_tex_prog);
         p_glUniform1f(s_tex_uXoff,direct?s_area_x1-s_hr_origin_x:0);
-        p_glUniform1f(s_tex_uXhalf,s_hr_width*.5f);
+        p_glUniform1f(s_tex_uXhalf,raster_w*.5f);
     }
     if(!clip_to_draw_area) {
         glViewport(0,0,s_hr_width*s_hr_scale,s_hr_height*s_hr_scale);
@@ -2794,6 +2773,12 @@ static void hr_begin(int clip_to_draw_area) {
         if(direct_wide_target()) {
             ax1=s_hr_origin_x+view_pad_left;
             ax2=s_hr_origin_x+s_hr_width-view_pad_right-1;
+        }
+        if(s_draw_region_clip) {
+            if(ax1<s_draw_region_bounds.x)ax1=s_draw_region_bounds.x;
+            if(ay1<s_draw_region_bounds.y)ay1=s_draw_region_bounds.y;
+            if(ax2>=s_draw_region_bounds.x+s_draw_region_bounds.w)ax2=s_draw_region_bounds.x+s_draw_region_bounds.w-1;
+            if(ay2>=s_draw_region_bounds.y+s_draw_region_bounds.h)ay2=s_draw_region_bounds.y+s_draw_region_bounds.h-1;
         }
         int sw = ax2 - ax1 + 1, sh = ay2 - ay1 + 1;
         if (sw < 0) sw = 0; if (sh < 0) sh = 0;
@@ -2920,9 +2905,12 @@ static void flush_cpu_upload(void) {
     }
 
     uint64_t draw_t0 = diag ? SDL_GetPerformanceCounter() : 0;
+    if(s_region_pool.coverage.rects)surface_pool_upload(&s_region_pool,rects,nrects);
+    else {
     native_surface_upload(s_hr_fbo,s_hr_origin_x,s_hr_origin_y,s_hr_width,s_hr_height,
                           s_hr_scale,rects,nrects);
     hiw_mirror_uploads(rects, nrects);
+    }
     if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
 }
 
@@ -3069,6 +3057,11 @@ static void rebuild_target_stencil_tiled(GLuint target_fbo, int target_w, int ta
 static void rebuild_mask_stencils(void) {
     if (s_stencil_valid || !s_raster_ok) return;
     hiw_flush_queue();
+    if(s_region_pool.coverage.rects) {
+        surface_stencil_rebuild();
+        rect_clear(&s_stencil_stale);s_stencil_valid=1;
+        return;
+    }
     int hw = s_hr_width * s_hr_scale, hh = s_hr_height * s_hr_scale;
     if (s_out_scale <= 1) {
         /* Native: the historical whole-surface rebuild, unchanged. */
@@ -3768,6 +3761,7 @@ void gl_renderer_pgxp_render_stats(uint64_t *depth_tris, uint64_t *depth_clears,
     if (seam_tris) *seam_tris = s_seam_tris;
 }
 static int wide_fast_center_valid(void) {
+    if(s_region_pool.coverage.rects)return 0;
     /* An explicitly stretched sky differs inside the canonical viewport too.
      * Keep the full composite for those scenes, including later foreground
      * draws. Tags are installed before DMA, so no earlier center draws skip. */
@@ -4559,26 +4553,34 @@ static void flush_tex_batch_impl(void) {
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
     pgxp_raster_record(s_tb,nverts,TEXV);
+    GlRasterSurface *previous=s_draw_surface;
+    const int routed=surface_draw_regions(s_tb,nverts,TEXV);
+    p_glBindVertexArray(s_tex_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER,s_tex_vbo);
+    vertex_stream_upload(1,s_tb,(ptrdiff_t)(nverts*TEXV*sizeof(float)));
+    for(size_t target=0;target<(routed?s_draw_region_count:1);++target) {
+    if(routed)surface_draw_region_begin(target);
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
     bind_textured_resources(s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex,
         s_tb_bank_tex && !s_tb_bank_live_clut ? s_tb_bank_tex : s_raw_tex, s_tb_hd_tex);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glBindVertexArray(s_tex_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
-    vertex_stream_upload(1, s_tb, (ptrdiff_t)(nverts * TEXV * sizeof(float)));
 
     if(direct_wide_target()){s_bd_gate=s_tb_gate;wide_set_bd_scale(s_tex_uXscale,s_tex_uXcenter);}
     depth_apply_ex(dmode, 1);
     tex_batch_draw_passes(nverts, semi);
     depth_restore_ex(dmode, 1, nverts);
     if(direct_wide_target())wide_clear_bd_scale(s_tex_uXscale,s_tex_uXcenter);
+    if(routed)hr_end();
+    }
+    if(routed)surface_draw_regions_end(previous);
 
     /* Native-wide mirror — skipped for a batch fully inside the 4:3 frame (its
      * centre content comes from the present-time canonical blit; nothing to add
      * to the margins). A backdrop-stretched batch (s_tb_gate) widens past the
      * frame, so it is never treated as centre-only. */
-    int mirror = g_wide_cur && !direct_wide_target() && s_ws_ablate != 1 &&
+    int mirror = !routed && g_wide_cur && !direct_wide_target() && s_ws_ablate != 1 &&
                  !(s_tb_gate == 0 && mirror_batch_center_only(nverts));
     if (mirror) {   /* the stencil it may leave behind alpha */
         float sc, ce;
@@ -4589,7 +4591,7 @@ static void flush_tex_batch_impl(void) {
      * replayed in one render pass at the next sync point (see s_hq), with its
      * native-wide mirror. No-op unless that mode is engaged. */
     s_hq_depth_cur = dmode;
-    if ((hiw_on() || (mirror && wide_queue_live())) &&
+    if (!routed && (hiw_on() || (mirror && wide_queue_live())) &&
         hiw_enqueue_tex(nverts, semi, mirror, s_tb_gate)) mirror = 0;
     s_hq_depth_cur = 0;
 
@@ -4606,7 +4608,7 @@ static void flush_tex_batch_impl(void) {
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
         gl_perf_mirror_end();
     }
-    hr_end();
+    if(!routed)hr_end();
     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
     if (s_tbs_n > 0) {   /* the strips, as a batch of their own (same keys) */
         memcpy(s_tb, s_tbs, (size_t)s_tbs_n * TEXV * sizeof(float));
@@ -4709,22 +4711,30 @@ static void flush_flat_batch_impl(void) {
     s_fbl_n = 0;
 
     pgxp_raster_record(s_fb,nverts,6);
+    GlRasterSurface *previous=s_draw_surface;
+    const int routed=surface_draw_regions(s_fb,nverts,6);
+    p_glBindVertexArray(s_geo_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER,s_geo_vbo);
+    if(nl)memcpy(&s_fb[nverts*6],s_fbl,(size_t)nl*2*6*sizeof(float));
+    vertex_stream_upload(0,s_fb,(ptrdiff_t)((nverts+2*nl)*6*sizeof(float)));
+    for(size_t target=0;target<(routed?s_draw_region_count:1);++target) {
+    if(routed)surface_draw_region_begin(target);
     hr_begin(1);
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(mask);
     if (fmode == GL_LINES) glLineWidth((float)s_hr_scale);
     p_glUseProgram(s_geo_prog);
     p_glBindVertexArray(s_geo_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
-    if (nl) memcpy(&s_fb[nverts * 6], s_fbl, (size_t)nl * 2 * 6 * sizeof(float));
-    vertex_stream_upload(0, s_fb, (ptrdiff_t)((nverts + 2 * nl) * 6 * sizeof(float)));
     if(direct_wide_target()){s_bd_gate=s_fb_gate;wide_set_bd_scale(s_geo_uXscale,s_geo_uXcenter);}
     depth_apply_ex(dmode, 0);
     BCLS_DRAW(semi, dmode, mask, s_mask_check, b3d, if (nl) flat_batch_draw_hr_lines(nverts, nl);
                        else glDrawArrays(fmode, 0, nverts));
     depth_restore_ex(dmode, 0, nverts);
     if(direct_wide_target())wide_clear_bd_scale(s_geo_uXscale,s_geo_uXcenter);
-    int mirror = g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate != 1 &&
+    if(routed)hr_end();
+    }
+    if(routed)surface_draw_regions_end(previous);
+    int mirror = !routed && g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate != 1 &&
                  !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts));
     if (mirror) {
         float sc, ce;
@@ -4732,7 +4742,7 @@ static void flush_flat_batch_impl(void) {
         wst_note_draw(g_wide_cur, s_fb, nverts, 6, wide_dx(), sc, ce, s_mask_check);
     }
     s_hq_depth_cur = dmode;
-    if ((hiw_on() || (mirror && fmode == GL_TRIANGLES && wide_queue_live())) &&
+    if (!routed && (hiw_on() || (mirror && fmode == GL_TRIANGLES && wide_queue_live())) &&
         hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate)) mirror = 0;
     s_hq_depth_cur = 0;
 
@@ -4749,7 +4759,7 @@ static void flush_flat_batch_impl(void) {
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
         gl_perf_mirror_end();
     }
-    hr_end();
+    if(!routed)hr_end();
     if (s_fbs_n > 0) {   /* the strips, as a batch of their own (same keys) */
         memcpy(s_fb, s_fbs, (size_t)s_fbs_n * 6 * sizeof(float));
         s_fb_n = s_fbs_n;
@@ -4872,6 +4882,8 @@ static void depth_clear_now(void) {
     hiw_flush_queue();
     glDepthMask(GL_TRUE);
     glClearDepth(1.0);
+    if(s_region_pool.coverage.rects)surface_depth_clear();
+    else {
     hr_begin(1);
     glClear(GL_DEPTH_BUFFER_BIT);
     int y,h;
@@ -4896,6 +4908,7 @@ static void depth_clear_now(void) {
         glClear(GL_DEPTH_BUFFER_BIT);
     }
     hr_end();
+    }
     s_depth_clears++;
     s_depth_clear_reason[s_depth_need_reason]++;
     /* Seam snapping: the surfaces drawn so far have no depth any more, so a
@@ -5229,6 +5242,7 @@ static void seam_sz(const float B[3][3], float z[3]) {
 
 static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
                          const uint16_t *cs, int n, int semi) {
+    surface_wide_select();
     flush_tex_batch();   /* flat prim: drain textured draws first (order + program) */
     flush_cpu_upload();  /* also drains flat batch if an upload was pending */
     mark_prim_dirty(xs, ys, n, 0 /* flat */);
@@ -5342,6 +5356,13 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         int draw_n = n;
         if (is_line && s_hr_scale > 1) {
             draw_mode = GL_TRIANGLES; draw_verts = quad; draw_n = 6;
+        }
+        if(s_region_pool.coverage.rects) {
+            s_fb_mode=draw_mode;s_fb_semi=semi;s_fb_mask=(int)s_mask_set;
+            s_fb_depth=0;s_fb_b3d=0;s_fb_gate=bd_prim_gate(xs,n,0);
+            memcpy(s_fb,draw_verts,(size_t)draw_n*6*sizeof(float));s_fb_n=draw_n;
+            flush_flat_batch();
+            return;
         }
         wide_stencil_ready();   /* before any of this draw's GL state */
         if (draw_mode != GL_TRIANGLES && !hiw_on())
@@ -5509,6 +5530,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const float *col, uint16_t texpage,
                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
                                   int semi, const int *lim) {
+    surface_wide_select();
     /* PS1 dithering: texture-modulated polygons only (never raw texels or
      * rectangles), while E1 bit 9 is set. */
     const int dither_tex = s_dither_mode && s_dither_bit && !rawtex && !s_prim_rect;
@@ -5745,6 +5767,7 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
 }
 
 static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
+    surface_wide_select();
     if (w <= 0 || h <= 0) return;
     /* Full-screen 2D overlay (pause gray-filter / load fade): a flat rect
      * spanning the whole 4:3 framebuffer must cover the whole wide surface too,
@@ -5843,6 +5866,12 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
     if (x + w > VRAM_W) { w1 = VRAM_W - x; w2 = w - w1; }
     if (y + h > VRAM_H) { h1 = VRAM_H - y; h2 = h - h1; }
 
+    if(s_region_pool.coverage.rects) {
+        surface_pool_fill_segment(&s_region_pool,x,y,w1,h1,c);
+        if(w2)surface_pool_fill_segment(&s_region_pool,0,y,w2,h1,c);
+        if(h2)surface_pool_fill_segment(&s_region_pool,x,0,w1,h2,c);
+        if(w2 && h2)surface_pool_fill_segment(&s_region_pool,0,0,w2,h2,c);
+    } else {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glViewport(0, 0, VRAM_W * s_hr_scale, VRAM_H * s_hr_scale);
     glEnable(GL_SCISSOR_TEST);
@@ -5855,6 +5884,7 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
         if (w2)       hiw_clear_rect(0, y, w2, h1, r, g, b, 0.0f, 0);
         if (h2)       hiw_clear_rect(x, 0, w1, h2, r, g, b, 0.0f, 0);
         if (w2 && h2) hiw_clear_rect(0, 0, w2, h2, r, g, b, 0.0f, 0);
+    }
     }
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
@@ -5875,7 +5905,7 @@ typedef struct GlCopyRegion {
     int offset_x,offset_y;
 } GlCopyRegion;
 
-static void gpu_copy_rect_apply(GLuint source_tex,int sx,int sy,int dx,int dy,int w,int h) {
+static void gpu_copy_rect_apply_at(GLuint source_tex,int sx,int sy,int dx,int dy,int w,int h,int staged_dx,int staged_dy) {
     const int S=s_hr_scale;
     hr_begin(0);   /* copies ignore the draw area */
     glScissor((dx-s_hr_origin_x)*S,(dy-s_hr_origin_y)*S,w*S,h*S);
@@ -5887,7 +5917,7 @@ static void gpu_copy_rect_apply(GLuint source_tex,int sx,int sy,int dx,int dy,in
     p_glUniform1i(s_uBlitMaskset, s_mask_set);
     /* Scratch holds the source at its origin: texel = frag - dst*S. */
     p_glUniform1i(s_uBlitSrcDiv, 1);
-    p_glUniform2i(s_uBlitSrcOff,(s_hr_origin_x-dx)*S,(s_hr_origin_y-dy)*S);
+    p_glUniform2i(s_uBlitSrcOff,(s_hr_origin_x-staged_dx)*S,(s_hr_origin_y-staged_dy)*S);
     float fx0 = (float)dx, fy0 = (float)dy, fx1 = (float)(dx + w), fy1 = (float)(dy + h);
     float verts[6 * 2] = {
         fx0, fy0,  fx1, fy0,  fx0, fy1,
@@ -5900,7 +5930,7 @@ static void gpu_copy_rect_apply(GLuint source_tex,int sx,int sy,int dx,int dy,in
     mask_stencil(s_mask_set); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
     mask_stencil(1);          p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
     hr_end();
-    hiw_mirror_copy(sx, sy, dx, dy, w, h);   /* scratch still holds the 1x source */
+    if(!s_region_pool.coverage.rects)hiw_mirror_copy(sx, sy, dx, dy, w, h);   /* scratch still holds the 1x source */
 
     if(!s_rth_packet_replaying)rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
     if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, dx, dy, dx + w - 1, dy + h - 1);
@@ -5908,6 +5938,43 @@ static void gpu_copy_rect_apply(GLuint source_tex,int sx,int sy,int dx,int dy,in
         s_gpu_dirty = 1;
     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
     coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+}
+
+static void gpu_copy_rect_apply(GLuint source_tex,int sx,int sy,int dx,int dy,int w,int h) {
+    gpu_copy_rect_apply_at(source_tex,sx,sy,dx,dy,w,h,dx,dy);
+}
+
+static void gpu_copy_gather(const GlCopyRegion *sources,int source_count,int seed_native,
+                            int sx,int sy,int w,int h,int S) {
+    /* Stage the source at the scratch ORIGIN (not at its own hr coords), so
+     * the scratch only has to be as large as the biggest copy. The integer
+     * texelFetch in BLIT_FS makes the placement invisible in the result.
+     * w*S and h*S fit the GPU limit whenever the hr surface does; the
+     * high-resolution window stages its S-scaled source in a scratch of its
+     * own (hiw_mirror_copy), so this one never grows past the hr surface. */
+    if (!scratch_ensure(w * S, h * S)) return;
+    if(seed_native) {
+        native_texture_upload_rect(sx,sy,w,h);
+        DirtyRect source={0};rect_add(&source,sx,sy,sx+w-1,sy+h-1);
+        native_surface_upload(s_scratch_fbo,sx,sy,w,h,S,&source,1);
+    }
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    for(int i=0;i<source_count;++i) {
+        const GlCopyRegion *r=sources+i;
+        int x0=sx>r->x?sx:r->x,y0=sy>r->y?sy:r->y;
+        int x1=sx+w<r->x+r->w?sx+w:r->x+r->w;
+        int y1=sy+h<r->y+r->h?sy+h:r->y+r->h;
+        if(x1<=x0 || y1<=y0)continue;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,r->fbo);
+        p_glBlitFramebuffer((x0-r->x+r->offset_x)*r->scale,(y0-r->y+r->offset_y)*r->scale,
+                            (x1-r->x+r->offset_x)*r->scale,(y1-r->y+r->offset_y)*r->scale,
+                            (x0-sx)*S,(y0-sy)*S,(x1-sx)*S,(y1-sy)*S,
+                            GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+
 }
 
 /* Gather enhanced source regions before writing any destination. A copy may
@@ -5942,42 +6009,38 @@ static void gpu_copy_rect_regions_seeded(const GlCopyRegion *sources,int source_
     if(dy+h>s_hr_origin_y+s_hr_height)h=s_hr_origin_y+s_hr_height-dy;
     if(w<=0 || h<=0)return;
 
-    int S = s_hr_scale;
-    /* Stage the source at the scratch ORIGIN (not at its own hr coords), so
-     * the scratch only has to be as large as the biggest copy. The integer
-     * texelFetch in BLIT_FS makes the placement invisible in the result.
-     * w*S and h*S fit the GPU limit whenever the hr surface does; the
-     * high-resolution window stages its S-scaled source in a scratch of its
-     * own (hiw_mirror_copy), so this one never grows past the hr surface. */
-    if (!scratch_ensure(w * S, h * S)) return;
-    if(seed_native) {
-        native_texture_upload_rect(sx,sy,w,h);
-        DirtyRect source={0};rect_add(&source,sx,sy,sx+w-1,sy+h-1);
-        native_surface_upload(s_scratch_fbo,sx,sy,w,h,S,&source,1);
-    }
-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
-    glDisable(GL_SCISSOR_TEST);
-    for(int i=0;i<source_count;++i) {
-        const GlCopyRegion *r=sources+i;
-        int x0=sx>r->x?sx:r->x,y0=sy>r->y?sy:r->y;
-        int x1=sx+w<r->x+r->w?sx+w:r->x+r->w;
-        int y1=sy+h<r->y+r->h?sy+h:r->y+r->h;
-        if(x1<=x0 || y1<=y0)continue;
-        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,r->fbo);
-        p_glBlitFramebuffer((x0-r->x+r->offset_x)*r->scale,(y0-r->y+r->offset_y)*r->scale,
-                            (x1-r->x+r->offset_x)*r->scale,(y1-r->y+r->offset_y)*r->scale,
-                            (x0-sx)*S,(y0-sy)*S,(x1-sx)*S,(y1-sy)*S,
-                            GL_COLOR_BUFFER_BIT,GL_NEAREST);
-    }
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
-
+    gpu_copy_gather(sources,source_count,seed_native,sx,sy,w,h,s_hr_scale);
     gpu_copy_rect_apply(s_scratch_tex,sx,sy,dx,dy,w,h);
 }
 
 static void gpu_copy_rect_regions(const GlCopyRegion *sources,int source_count,
                                  int sx,int sy,int dx,int dy,int w,int h) {
     gpu_copy_rect_regions_seeded(sources,source_count,0,sx,sy,dx,dy,w,h);
+}
+
+static void gpu_copy_rect_coverage(const GlCoverage *coverage,
+                                   const GlRasterSurface *const *surfaces,
+                                   int sx,int sy,int dx,int dy,int w,int h) {
+    GlCopyRegion local[16];
+    GlCopyRegion *sources=coverage->count<=16?local:
+        (GlCopyRegion *)malloc(coverage->count*sizeof *sources);
+    if(!sources)abort();
+    int count=0;
+    int64_t covered=0;
+    for(size_t i=0;i<coverage->count;++i) {
+        const GlCoverageRect *r=coverage->rects+i;
+        if(!r->owner)continue;
+        int x0=sx>r->x?sx:r->x,y0=sy>r->y?sy:r->y;
+        int x1=sx+w<r->x+r->w?sx+w:r->x+r->w;
+        int y1=sy+h<r->y+r->h?sy+h:r->y+r->h;
+        if(x1<=x0 || y1<=y0)continue;
+        const GlRasterSurface *surface=surfaces[r->owner];
+        sources[count++]=(GlCopyRegion){surface->fbo,r->x,r->y,r->w,r->h,
+            surface->allocation_scale,r->x-surface->x,r->y-surface->y};
+        covered+=(int64_t)(x1-x0)*(y1-y0);
+    }
+    gpu_copy_rect_regions_seeded(sources,count,covered<(int64_t)w*h,sx,sy,dx,dy,w,h);
+    if(sources!=local)free(sources);
 }
 
 static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
@@ -5989,7 +6052,19 @@ static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
 }
 
 static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
-    gpu_copy_rect_from(s_hr_fbo,s_hr_origin_x,s_hr_origin_y,sx,sy,dx,dy,w,h);
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+        surface_pool_copy(sx,sy,dx,dy,w,h);
+        return;
+    }
+    GlCoverageRect rect={s_hr_origin_x,s_hr_origin_y,s_hr_width,s_hr_height,1};
+    if(direct_wide_target()) {
+        rect.x=g_wide_cur_base;
+        rect.w=g_wide_w-2*g_wide_off;
+    }
+    const GlCoverage coverage={&rect,1,VRAM_W,VRAM_H};
+    const GlRasterSurface *surfaces[]={NULL,s_draw_surface};
+    gpu_copy_rect_coverage(&coverage,surfaces,sx,sy,dx,dy,w,h);
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */
@@ -6262,6 +6337,12 @@ static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){
         int faithful = native_draw_begin();
         sw_fill_rect(x,y,w,h,c);
         native_draw_end(faithful);
+    } else if(s_region_pool.coverage.rects) {
+        /* Retain native-only regions for later on-demand allocation. This
+         * presentation shadow never feeds guest reads or snapshots. */
+        int rows=h<VRAM_H?h:VRAM_H,cols=w<VRAM_W?w:VRAM_W;
+        for(int row=0;row<rows;++row)for(int col=0;col<cols;++col)
+            s_vram[((y+row)&511)*VRAM_W+((x+col)&1023)]=c&0x7fff;
     }
     if (!s_raster_ok) return;
     gpu_fill(x,y,w,h,c);
@@ -6800,6 +6881,10 @@ static int raster_surface_alloc(int width,int height,int S,
     }
     return ok;
 }
+
+#include "gl_surface_pool.inc"
+#include "gl_surface_routing.inc"
+#include "gl_surface_copy.inc"
 
 /* Release the scale-dependent render targets (hr colour + depth-stencil +
  * copy scratch). Used when an allocation fails and init steps S down. */
@@ -8037,13 +8122,22 @@ static void glb_wide_set_target(int base_x) {
     double t0 = cw_ms(); s_cw_wide_sets++;
     flush_flat_batch();  /* drain into the OLD target before switching */
     flush_tex_batch();
+    if(s_region_pool.coverage.rects) {
+        s_pool_wide_enabled=1;g_wide_cur_base=base_x;
+        g_wide_cur=0;s_draw_surface=&s_primary_surface;
+        s_cw_wide_ms+=cw_ms()-t0;
+        return;
+    }
     g_wide_cur = wide_fbo_for(base_x);
     g_wide_cur_base = base_x;
     s_cw_wide_ms += cw_ms() - t0;
 }
 
 /* Stop mirroring (offscreen draws that don't target a framebuffer). */
-static void glb_wide_disable_target(void) { flush_flat_batch(); flush_tex_batch(); g_wide_cur = 0; }
+static void glb_wide_disable_target(void) {
+    flush_flat_batch();flush_tex_batch();g_wide_cur=0;s_pool_wide_enabled=0;
+    if(s_region_pool.coverage.rects)s_draw_surface=&s_primary_surface;
+}
 
 /* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
  * surface for base_x, so the revealed margins are clean. Mirrors sw_wide_clear:
@@ -8053,6 +8147,21 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     double t0 = cw_ms(); s_cw_wide_clears++;
     flush_tex_batch();
     hiw_flush_queue();   /* queued wide mirrors land before the clear */
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,base_x,y,
+            g_wide_w-2*g_wide_off,h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)abort();
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,surface->fbo);
+        glDisable(GL_SCISSOR_TEST);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        float r,g,b;c5_to_float(color,&r,&g,&b);
+        glClearColor(r,g,b,(color&32768)?1.f:0.f);
+        glStencilMask(255);glClearStencil((color>>15)&1);
+        glClear(GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+        s_cw_wide_ms+=cw_ms()-t0;
+        return;
+    }
     GLuint fbo = wide_fbo_for(base_x);
     if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
     gl_perf_mirror_begin();
@@ -8086,6 +8195,22 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     flush_flat_batch();
     flush_tex_batch();
     hiw_flush_queue();   /* queued wide mirrors land before the clear */
+    if(s_region_pool.coverage.rects) {
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,base_x,y,
+            g_wide_w-2*g_wide_off,h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)abort();
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,surface->fbo);
+        glEnable(GL_SCISSOR_TEST);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        float r,g,b;c5_to_float(color,&r,&g,&b);
+        glClearColor(r,g,b,(color&32768)?1.f:0.f);
+        glStencilMask(255);glClearStencil((color>>15)&1);
+        int S=surface->allocation_scale;
+        if(sides&1){glScissor(0,0,g_wide_off*S,h*S);glClear(GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);}
+        if(sides&2){glScissor((g_wide_w-g_wide_off)*S,0,g_wide_off*S,h*S);glClear(GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);}
+        glDisable(GL_SCISSOR_TEST);p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+        s_cw_wide_ms+=cw_ms()-t0;
+        return;
+    }
     GLuint fbo = wide_fbo_for(base_x);
     if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
     gl_perf_mirror_begin();
@@ -12582,6 +12707,7 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
  * x-translated by the reveal offset. No-op when s_wide_fast is off (then the
  * mirror drew the full surface, as before). Shared by both present paths. */
 static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h) {
+    if(s_region_pool.coverage.rects)return; /* direct target already contains the complete image */
     if (!wide_center_is_canonical() || g_wide_w <= 0) return;
     int native_w = g_wide_w - 2 * g_wide_off;
     if (native_w <= 0) return;
@@ -12664,7 +12790,16 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     }
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
     GLuint fbo = 0, tex = 0;
-    int wide_as = 0;
+    int wide_as = 0,source_y=disp_y,source_h=VRAM_H;
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,disp_x,disp_y,
+            g_wide_w-2*g_wide_off,disp_h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)return 0;
+        fbo=surface->fbo;tex=surface->tex;wide_as=surface->allocation_scale;
+        source_y=disp_y-surface->y;source_h=surface->h;
+    }
+    if(!s_region_pool.coverage.rects)
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == disp_x) {
             fbo = s_wide_fbo[i]; tex = s_wide_tex[i]; wide_as = s_wide_as[i];
@@ -12714,22 +12849,22 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     }
     uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
-        fbo, 0, disp_y, g_wide_w, disp_h, linear, 0, GL_PRES_WIDE,
+        fbo, 0, source_y, g_wide_w, disp_h, linear, 0, GL_PRES_WIDE,
         disp_x, disp_y,
         present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1));
     if (interp_pair) {
         if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
             const float wext = (wide_as > s_out_scale && s_out_scale >= 1)
                                    ? (float)wide_as / (float)s_out_scale : 1.0f;
-            postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
-                               0, disp_y, g_wide_w, disp_h);
+            postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)source_h * wext,
+                               0, source_y, g_wide_w, disp_h);
             if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
                 postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(s_hr_width, s_hr_scale),
                                    present_alloc_extent(s_hr_height, s_hr_scale), disp_x-s_hr_origin_x, disp_y-s_hr_origin_y,
                                    g_wide_w - 2 * g_wide_off, disp_h, g_wide_off, g_wide_w);
             postfx_capture_temporal_source(lx, ly, lw, lh);
         }
-        hold_capture_native_fbo(fbo, 0, disp_y, g_wide_w, disp_h, 0, linear);
+        hold_capture_native_fbo(fbo, 0, source_y, g_wide_w, disp_h, 0, linear);
         interp_present_source_interval();
         gl_perf_present_exit(1);
         present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
@@ -12742,10 +12877,10 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     /* The surface is allocated at its own scale (s_wide_as), the level. */
     const float wext = (wide_as > s_out_scale && s_out_scale >= 1)
                            ? (float)wide_as / (float)s_out_scale : 1.0f;
-    present_target_quad(tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
-                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
-    postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
-                      0, disp_y, g_wide_w, disp_h);
+    present_target_quad(tex, (float)g_wide_w * wext, (float)source_h * wext,
+                        0, source_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
+    postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)source_h * wext,
+                      0, source_y, g_wide_w, disp_h);
     if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
         postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(s_hr_width, s_hr_scale),
                            present_alloc_extent(s_hr_height, s_hr_scale), disp_x-s_hr_origin_x, disp_y-s_hr_origin_y,
