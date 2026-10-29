@@ -13426,7 +13426,7 @@ static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
         }
     }
     int setup=op==RTH_SEMI || op==RTH_MASK || op==RTH_TWIN || op==RTH_MOD ||
-        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC || op==RTH_NATIVE_SOURCE;
+        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC || op==RTH_NATIVE_SOURCE || op==RTH_PACKET_SOURCE;
     int triangle=op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI ||
         op==RTH_TEX_TRI || op==RTH_SHADED_TEX_TRI;
     if(!rth_group_on() || (!setup && !triangle) || n<0 || n>508) {
@@ -16315,10 +16315,11 @@ static void rth_packet_transform_record(const PGXPProjection *projection,const P
 }
 static void rth_packet_interpolation_record(const PacketInterpolationSource *source) {
     if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
-    if(!rth_group_flush()) return;
-    void *payload=rt_cmd_begin(RTH_PACKET_SOURCE,0,sizeof *source);
-    if(!payload) return;
-    memcpy(payload,source,sizeof *source);rt_cmd_commit();
+    /* Provenance is setup for the following triangle, not a batch boundary.
+     * Copy through aligned words; grouped records need not align a u64 field. */
+    int32_t words[sizeof *source/sizeof(int32_t)];
+    memcpy(words,source,sizeof *source);
+    rth_rec_ints(RTH_PACKET_SOURCE,0,sizeof words/sizeof words[0],words);
 }
 
 void gl_renderer_fg_source(const uint32_t id[3], const int32_t pc[9], const int32_t h[3],
@@ -17400,6 +17401,9 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
     }
     if(command->op==RTH_PACKET_SOURCE) {
         if(command->payload!=sizeof(PacketInterpolationSource)) return 0;
+        PacketInterpolationSource aligned_source;
+        memcpy(&aligned_source,payload,sizeof aligned_source);
+        payload=&aligned_source;
         if(s_packet_collect) {
             packet_interpolation_stream_append(payload);++s_packet_vertex_count;
             const PacketInterpolationSource *source=payload;

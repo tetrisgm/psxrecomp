@@ -54,3 +54,29 @@ interpolated and stock runs. The presenter cutover is NOT accepted for integrati
 A whole-model cut-threshold experiment worsened geometry and was reverted.
 Compact-layout rewind restored 49 snapshots without failures and resumed a clean
 45-pair census; the hidden complete-frame GL fixture passed 111 checks.
+
+
+### Exclusive profiling follow-up (2026-10-29)
+
+Transform attachment storage is now prepared and reclaimed by a CPU worker.
+The guest appends into its private fixed-capacity block, seals a nine-tick
+immutable history with reference increments, and returns attachments through
+a lock-free list. Neither append, sealing, release nor reset allocates on the
+guest. A 128-entry prepared queue absorbs worker scheduling delays; exhaustion
+rejects the optional packet and increments `storage_misses`, without blocking
+emulation or silently accepting a partial transform table. The pool retains
+its high-water storage for reuse; raw spare arrays are not zero-initialized.
+The worker also owns final block reclamation from rewind and presenter leases.
+
+Primitive provenance is grouped with the following draw setup instead of
+forcing an extra transport flush per triangle. Replay copies potentially
+unaligned grouped provenance into an aligned local value. Pair matching,
+departing topology, texture restoration and source tables remain render-owned.
+`audited_pairs`, `failed_pairs` and `peak_unmatched` are cumulative session
+counters, preserved across resets so polling cannot hide a transient miss.
+
+The focused stream fixture checks zero producer allocations with 64 retained
+attachments, immutable held history, reset, source matching and shared retiring
+edges. Sampler, presenter, HD context and hidden GL packet fixtures also pass.
+Performance acceptance awaits the exclusive 60-second A/B measurements recorded
+in R4's FRAME_INTERPOLATION_STATUS.md; this is not a phase-4 acceptance claim.

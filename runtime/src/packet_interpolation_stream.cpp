@@ -10,37 +10,111 @@
 #include <unordered_set>
 #include <array>
 #include <memory>
+#include <thread>
+#include <chrono>
 
 struct TransformRecord {PGXPProjection projection;PGXPAffineTransform affine;bool valid;};
-// Fixed producer storage: one bounded append per GTE point, no allocation or
-// history scan. Packet sealing shares immutable blocks; the render consumer
-// performs all history traversal. Sixteen blocks cover nine history ticks plus
-// the mailbox and retained presenter leases without waiting for the GPU.
+// The guest only appends and exchanges prepared storage. A CPU worker owns
+// allocation and reclamation, including attachments evicted by rewind. Empty
+// spare blocks are uninitialized: preparing capacity does not touch megabytes.
 struct TransformBlock {
     std::array<TransformRecord,32768> values;
     size_t count=0;
+    std::atomic<unsigned> references{1};
+    TransformBlock *next=nullptr;
 };
 struct PacketTransformTable {
-    std::array<std::shared_ptr<TransformBlock>,9> blocks;
+    std::array<TransformBlock*,9> blocks{};
+    TransformBlock *spare=nullptr;
+    PacketTransformTable *next=nullptr;
 };
 namespace {
-std::array<std::shared_ptr<TransformBlock>,16> transform_pool=[] {
-    std::array<std::shared_ptr<TransformBlock>,16> result;
-    for(auto& block:result) block=std::make_shared<TransformBlock>();
-    return result;
-}();
-std::array<std::shared_ptr<TransformBlock>,9> producer_history;
-std::shared_ptr<TransformBlock> producer_block=transform_pool[0];
-bool producer_failed=false;
-void acquire_transform_block() {
-    for(auto& block:transform_pool) if(block.use_count()==1) {
-        producer_block=block;producer_block->count=0;return;
-    }
-    // Rewind may retain blocks longer than the live mailbox. Allocate one
-    // uninitialized, fixed-capacity block at the packet boundary, never in
-    // the per-vertex append. Packet accounting bounds retained history.
-    try {producer_block.reset(new TransformBlock);} catch(...) {producer_failed=true;}
+template<class T> void return_node(std::atomic<T*>& stack,T* node) {
+    auto* head=stack.load(std::memory_order_relaxed);
+    do {node->next=head;} while(!stack.compare_exchange_weak(head,node,
+        std::memory_order_release,std::memory_order_relaxed));
 }
+struct TransformStorage {
+    static constexpr size_t capacity=128;
+    std::array<PacketTransformTable*,capacity> ready{};
+    std::atomic<size_t> written{0},read{0};
+    std::atomic<TransformBlock*> returned_blocks{nullptr};
+    std::atomic<PacketTransformTable*> returned_tables{nullptr};
+    std::atomic<bool> stopping{false};
+    std::atomic<uint64_t> misses{0};
+    std::vector<std::unique_ptr<TransformBlock>> blocks;
+    std::vector<std::unique_ptr<PacketTransformTable>> tables;
+    TransformBlock *free_blocks=nullptr;
+    PacketTransformTable *free_tables=nullptr;
+    std::thread worker;
+    void release(TransformBlock* block) {
+        if(block && block->references.fetch_sub(1,std::memory_order_acq_rel)==1)
+            return_node(returned_blocks,block);
+    }
+    void reclaim() {
+        auto* table=returned_tables.exchange(nullptr,std::memory_order_acquire);
+        while(table) {
+            auto* next=table->next;
+            for(auto*& block:table->blocks) {release(block);block=nullptr;}
+            release(table->spare);table->spare=nullptr;
+            table->next=free_tables;free_tables=table;table=next;
+        }
+        auto* block=returned_blocks.exchange(nullptr,std::memory_order_acquire);
+        while(block) {
+            auto* next=block->next;block->next=free_blocks;free_blocks=block;block=next;
+        }
+    }
+    void prepare() {
+        const size_t tail=written.load(std::memory_order_relaxed);
+        if(tail-read.load(std::memory_order_acquire)==capacity) return;
+        TransformBlock* block;
+        if(free_blocks) {block=free_blocks;free_blocks=block->next;}
+        else {blocks.emplace_back(new TransformBlock);block=blocks.back().get();}
+        block->count=0;block->references.store(1,std::memory_order_relaxed);
+        PacketTransformTable* table;
+        if(free_tables) {table=free_tables;free_tables=table->next;}
+        else {
+            try {tables.emplace_back(new PacketTransformTable);}
+            catch(...) {release(block);throw;}
+            table=tables.back().get();
+        }
+        table->spare=block;ready[tail%capacity]=table;
+        written.store(tail+1,std::memory_order_release);
+    }
+    TransformStorage() {
+        for(size_t i=0;i<capacity;++i) prepare(); // startup, before guest execution
+        worker=std::thread([this] {
+            while(!stopping.load(std::memory_order_acquire)) {
+                reclaim();
+                try {
+                    while(written.load(std::memory_order_relaxed)-read.load(std::memory_order_acquire)<capacity &&
+                          !stopping.load(std::memory_order_relaxed)) prepare();
+                } catch(...) {} // exhausted optional storage rejects a packet, never waits on the guest
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            reclaim();
+        });
+    }
+    ~TransformStorage() {stopping.store(true,std::memory_order_release);worker.join();}
+    PacketTransformTable* take() {
+        const size_t head=read.load(std::memory_order_relaxed);
+        if(head==written.load(std::memory_order_acquire)) {misses.fetch_add(1);return nullptr;}
+        auto* table=ready[head%capacity];read.store(head+1,std::memory_order_release);return table;
+    }
+} transform_storage;
+struct TransformProducer {
+    std::array<TransformBlock*,9> history{};
+    TransformBlock *block=nullptr;
+    bool failed=false;
+    TransformProducer() {
+        auto* table=transform_storage.take();block=table->spare;table->spare=nullptr;
+        return_node(transform_storage.returned_tables,table);
+    }
+    ~TransformProducer() {
+        for(auto* item:history) transform_storage.release(item);
+        transform_storage.release(block);
+    }
+} producer;
 
 struct Stream {
     PacketInterpolation *pair=packet_interpolation_create();
@@ -65,6 +139,7 @@ std::mutex stats_mutex;
 PacketInterpolationStats published{};
 uint64_t published_sequence=0,published_missing=0,published_count=0;
 bool published_failed=false,published_source_mode=false;
+uint64_t audited_pairs=0,failed_pairs=0,peak_unmatched=0;
 size_t retiring_unresolved=0,retiring_count=0;
 size_t published_retiring_unresolved=0,published_retiring_count=0;
 std::atomic<unsigned> output_rate{0},display_rate{60};
@@ -121,26 +196,32 @@ FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
 }
 }
 extern "C" void packet_interpolation_transform(const PGXPProjection *p,const PGXPAffineTransform *affine) {
-    if(!p) {producer_history={};producer_block.reset();producer_failed=false;acquire_transform_block();return;}
-    if(!p->interpolation_valid || producer_failed) return;
-    if(!producer_block) {producer_failed=true;return;}
-    if(!producer_block || producer_block->count==producer_block->values.size()) {producer_failed=true;return;}
-    producer_block->values[producer_block->count++]={*p,affine?*affine:PGXPAffineTransform{},affine!=nullptr};
+    if(!p) {
+        for(auto*& block:producer.history) {transform_storage.release(block);block=nullptr;}
+        producer.block->count=0;producer.failed=false;return;
+    }
+    if(!p->interpolation_valid || producer.failed) return;
+    if(producer.block->count==producer.block->values.size()) {producer.failed=true;return;}
+    producer.block->values[producer.block->count++]={*p,affine?*affine:PGXPAffineTransform{},affine!=nullptr};
 }
 extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
-    PacketTransformTable *result=nullptr;
-    for(size_t i=0;i+1<producer_history.size();++i) producer_history[i]=std::move(producer_history[i+1]);
-    producer_history.back()=std::move(producer_block);
-    try {if(!producer_failed) result=new PacketTransformTable{producer_history};}
-    catch(...) {}
-    producer_failed=false;acquire_transform_block();
+    auto* result=producer.failed?nullptr:transform_storage.take();
+    if(!result) {producer.failed=false;producer.block->count=0;return nullptr;}
+    transform_storage.release(producer.history.front());
+    for(size_t i=0;i+1<producer.history.size();++i) producer.history[i]=producer.history[i+1];
+    producer.history.back()=producer.block;
+    producer.block=result->spare;result->spare=nullptr;
+    result->blocks=producer.history;
+    for(auto* block:result->blocks) if(block) block->references.fetch_add(1,std::memory_order_relaxed);
     return result;
 }
-extern "C" void packet_interpolation_transform_free(PacketTransformTable *p) {delete p;}
+extern "C" void packet_interpolation_transform_free(PacketTransformTable *p) {
+    if(p) return_node(transform_storage.returned_tables,p);
+}
 extern "C" size_t packet_interpolation_transform_bytes(const PacketTransformTable *p) {
     if(!p) return 0;
     size_t bytes=sizeof(*p);
-    for(const auto& block:p->blocks) if(block) bytes+=block->count*sizeof(TransformRecord);
+    for(const auto* block:p->blocks) if(block) bytes+=block->count*sizeof(TransformRecord);
     return bytes;
 }
 extern "C" void packet_interpolation_stream_table(const PacketTransformTable *p) {
@@ -318,6 +399,9 @@ static void stream_end_impl(void) {
         published_sequence=stream.sequence;published_missing=stream.missing;
         published_count=stream.union_geometry.size();published_failed=stream.failed;
         published_retiring_count=retiring_count;published_retiring_unresolved=retiring_unresolved;
+        ++audited_pairs;peak_unmatched=std::max(peak_unmatched,published.unmatched);
+        if(stream.failed || published.unmatched || published.ambiguous || published.invalid ||
+           stream.missing || published.unexplained) ++failed_pairs;
         if(capture_requested.exchange(false)) {
             try {
                 captured[0]=stream.older;captured[1]=stream.current;
@@ -340,7 +424,7 @@ extern "C" void packet_interpolation_stream_end(void) {
     catch(...) {
         packet_interpolation_stream_reset();
         std::lock_guard<std::mutex> lock(stats_mutex);
-        published_failed=true;
+        published_failed=true;++failed_pairs;
     }
 }
 extern "C" void packet_interpolation_stream_reset(void) {
@@ -360,9 +444,11 @@ extern "C" void packet_interpolation_stream_reset(void) {
 extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
     std::lock_guard<std::mutex> lock(stats_mutex);
     return std::snprintf(out,capacity,
-        "{\"status\":\"ok\",\"mode\":\"%s\",\"retiring\":%llu,\"retiring_unresolved\":%llu,\"sequence\":%llu,\"primitives\":%llu,"
+        "{\"status\":\"ok\",\"storage_misses\":%llu,\"audited_pairs\":%llu,\"failed_pairs\":%llu,\"peak_unmatched\":%llu,\"mode\":\"%s\",\"retiring\":%llu,\"retiring_unresolved\":%llu,\"sequence\":%llu,\"primitives\":%llu,"
         "\"matched\":%llu,\"unmatched\":%llu,\"disappeared\":%llu,\"ambiguous\":%llu,"
         "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"source_moving\":%llu,\"verified_appearance\":%llu,\"unexplained\":%llu,\"model_reconstructed\":%llu,\"sampled_primitives\":%llu,\"held_primitives\":%llu,\"snapped\":%d,\"failed\":%s}",
+        (unsigned long long)transform_storage.misses.load(),
+        (unsigned long long)audited_pairs,(unsigned long long)failed_pairs,(unsigned long long)peak_unmatched,
         published_source_mode?"vertex_source_audit":"candidate_audit",
         (unsigned long long)published_retiring_count,(unsigned long long)published_retiring_unresolved,
         (unsigned long long)published_sequence,(unsigned long long)published_count,

@@ -3,11 +3,24 @@
 #include <cassert>
 #include <cstring>
 #include <vector>
+#include <cstdlib>
+#include <new>
+static thread_local bool watch_allocations=false;
+static thread_local size_t producer_allocations=0;
+void* operator new(size_t n) {
+    if(watch_allocations) ++producer_allocations;
+    if(auto* p=std::malloc(n?n:1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept {std::free(p);}
+void operator delete(void* p,size_t) noexcept {std::free(p);}
 
 int main() {
     // Rewind leases outlive the live mailbox. Holding more than the warm pool
     // must not exhaust capture or silently stop presentation.
     std::vector<PacketTransformTable*> retained;
+    retained.reserve(64);
+    watch_allocations=true;
     packet_interpolation_transform(nullptr,nullptr);
     PGXPProjection point{};point.interpolation_valid=1;
     for(unsigned i=0;i<64;++i) {
@@ -17,6 +30,9 @@ int main() {
     }
     for(auto* table:retained) packet_interpolation_transform_free(table);
     packet_interpolation_transform(nullptr,nullptr);
+
+    watch_allocations=false;
+    assert(producer_allocations==0); // append, seal, release and reset, including retained rewind history
 
     PacketInterpolationSource source{};
     source.valid_mask=7;
