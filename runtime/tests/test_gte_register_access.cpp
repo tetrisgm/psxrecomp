@@ -969,6 +969,14 @@ int test_precision_speculative_transaction() {
 
     int32_t got_x = 0, got_y = 0;
     uint16_t got_z = 0;
+    const uint32_t geom_generation = gte_test_get_geometry_generation();
+    gte_geometry_correction_set(1);
+    if (gte_test_get_geometry_generation() != geom_generation ||
+        !gte_geometry_correction_lookup(packed, &got_x, &got_y) ||
+        got_x != x16 || got_y != y16)
+        return fail_value("unchanged geometry setup preserves provenance",
+                          0, 0, packed, geom_generation,
+                          gte_test_get_geometry_generation());
     if (!gte_precision_load_word(address, packed, &got_x, &got_y, &got_z) ||
         got_x != x16 || got_y != y16 || got_z != z)
         return fail_value("precision seed lookup", 0, 14, packed, z, got_z);

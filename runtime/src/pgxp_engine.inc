@@ -1748,6 +1748,11 @@ PGXP_S int pgxp_get_precise_vertex_impl(uint32_t addr, uint32_t packet_word,
         if (have == PGXP_SRC_DATAFLOW) s_stats.dataflow_hit++;
         else                           s_stats.fallback_hit++;
         if (pz != 0) s_stats.w_valid++;
+        if ((int64_t)px - (int64_t)int_x * 65536 < -65536 ||
+            (int64_t)px - (int64_t)int_x * 65536 > 65536 ||
+            (int64_t)py - (int64_t)int_y * 65536 < -65536 ||
+            (int64_t)py - (int64_t)int_y * 65536 > 65536)
+            s_stats.over_one_pixel++;
     }
     *x16 = px;
     *y16 = py;

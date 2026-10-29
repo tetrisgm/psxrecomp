@@ -658,7 +658,11 @@ int main(void) {
         pgxp_gte_mark_unclamped(60000);
         pgxp_store_gte_reg(0x80005000, 14);
         int32_t px, py; uint16_t z;
+        PGXPStats audit_before{}, audit_after{};
+        pgxp_get_stats(&audit_before);
         CHECK(pgxp_get_precise_vertex(0x80005000, packed, 323, -44, &px, &py, &z));
+        pgxp_get_stats(&audit_after);
+        CHECK(audit_after.over_one_pixel == audit_before.over_one_pixel + 1);
         CHECK(px == x && py == y && z == 60000);
         CHECK(pgxp_get_unclamped_depth(0x80005000, packed) == 60000.0f);
         CHECK(!pgxp_get_precise_vertex(0x80005000, packed^1u, 322, -44, &px, &py, &z));

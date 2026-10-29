@@ -415,7 +415,12 @@ static inline int64_t geom_slot(uint32_t packed) {
 extern "C" void gpu_pgxp_rederive_enable(void);
 
 extern "C" void gte_geometry_correction_set(int enabled) {
-    s_geom_enabled = enabled ? 1 : 0;
+    enabled = enabled ? 1 : 0;
+    /* Reapplying an unchanged render configuration must not discard the
+     * projection cache. A debug query or session re-arm can otherwise turn
+     * the same static packet into a native/precise mixture for one frame. */
+    if (s_geom_enabled == enabled && (!enabled || s_geom_cache)) return;
+    s_geom_enabled = enabled;
     s_geom_hits = 0;
     s_geom_lookups = 0;
     s_geom_miss_unrec = 0;
