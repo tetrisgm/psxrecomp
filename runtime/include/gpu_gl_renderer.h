@@ -351,6 +351,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear);
 /* Graphics-owner diagnostic. Allocates exact current surface dimensions;
  * caller owns *pixels. This readback never runs on the guest thread. */
+/* Renderer-owner diagnostic: target used by the most recent packet present. */
+int gl_renderer_packet_display(int *x,int *y);
 int gl_renderer_capture_wide_display(int base_x,int y,int height,
                                     uint32_t **pixels,int *width,int *out_height);
 

@@ -18,6 +18,8 @@ extern "C" {
 void     gpu_init(void);
 struct NativeRaster;
 struct NativeRaster* gpu_native_owner(void);
+/* Scope ordered native submission around a DMA burst / completed chain. */
+void gpu_native_batch(int begin);
 uint32_t gpu_read_gpustat(void);   /* 0x1F801814 read */
 uint32_t gpu_peek_gpustat(void);   /* same value, no read side effects */
 uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */

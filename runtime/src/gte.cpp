@@ -1404,7 +1404,30 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
                 (float)(gte->OFX / 65536.0 * z + hx),
                 (float)(gte->OFY / 65536.0 * z + (double)gte->MAC2 * h_proj),
                 (float)z, (float)h_proj / 2.0f};
+            projection.view[0]=(float)((double)mac1/4096.0);
+            projection.view[1]=(float)((double)mac2/4096.0);
+            projection.view[2]=(float)((double)mac3/4096.0);
+            projection.h=(float)h_proj;
+            projection.ofx=(float)(gte->OFX/65536.0);
+            projection.ofy=(float)(gte->OFY/65536.0);
+            projection.x_scale=(float)((double)x_num/(double)x_den);
+            for(int i=0;i<3;++i) projection.model[i]=V[i];
+            projection.caller=gte->projection_caller;
+            projection.source_vertex=V==gte->V0?1:V==gte->V1?3:5;
+            uint64_t transform=14695981039346656037ULL;
+            for(int r=0;r<3;++r) {
+                for(int c=0;c<3;++c) transform=(transform^uint16_t(gte->RT[r][c]))*1099511628211ULL;
+                transform=(transform^uint32_t(gte->TR[r]))*1099511628211ULL;
+            }
+            projection.transform=transform;
+            PGXPAffineTransform affine{};
+            for(int r=0;r<3;++r) {
+                affine.translation[r]=gte->TR[r];
+                for(int c=0;c<3;++c) affine.rotation[3*r+c]=gte->RT[r][c];
+            }
+            projection.interpolation_valid=1;
             GTE_PGXP(gte, gte_set_projection, &projection);
+            if(!gte->ctx) pgxp_gte_record_transform(&affine);
         }
     }
     if (!gte->ctx) geom_note((uint32_t)gte->SXY[2], sx16, sy16);
@@ -2535,6 +2558,7 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
 
     GTEState gte;
     gte_import_cpu_state(&gte, cpu);
+    gte.projection_caller=cpu->gpr[31]&0x1fffffffu;
 
     uint8_t func = cmd & 0x3F;
     /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every

@@ -213,6 +213,50 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-10-29: phase-4 guest wait attribution
+
+On `feat/frame-arch-4-interp`, opt-in `main_cadence reset=1` now retains the
+worst 20 guest VBlank intervals with pacer sleep/overshoot, publication,
+packet reservation, native enqueue/completion and history retirement timings.
+Publication wakes the render owner without its request mutex; transform history
+returns use a fixed-step intrusive MPSC handoff. No guest timing/core semantics
+change. Locked A/B evidence and acceptance disposition are maintained in R4's
+`docs/FRAME_INTERPOLATION_STATUS.md`; baseline hitch work belongs to phase 3.
+
+
+2026-10-29 interpolation follow-up (d516f5fa): canonical source slots,
+connected fallback and retained departing geometry; immutable transform blocks
+and HD tracking cache. Final moving census 45/45 clean. Three sampled 8K midpoint
+captures have zero excess clear-colour pixels; repeated endpoints are identical.
+Acceptance still FAILS: final 60/120 requests yield 27.0/30.7 distinct images/s,
+51.5/49.4 guest VBlanks/s, 60339/78290 starved samples. Earlier zero-starvation
+runs were not reproducible. No scheduling/power-policy experiment is shipped.
+Details and limits: R4 docs/FRAME_INTERPOLATION_STATUS.md.
+
+
+- 2026-10-29 final phase-4 validation: 45-pair identity census passes, but
+  full-PGXP captures reveal interpolation-only geometry gaps. 8K requested
+  60/120 yields 25.6/26.1 distinct images/s with starvation. Presenter cutover
+  and legacy removal are not accepted for integration. Whole-model cut gate
+  experiment worsened captures and was reverted. See PACKET_INTERPOLATION.md.
+
+
+- 2026-10-29: Phase-4 topic adds render-owned retained packet sampling and opaque
+  interpolated metadata; no guest redraw is executed by the presenter. Source
+  classification separates whole-model appearances from missing points in an
+  existing invocation. Removed the unused private draw worker pool. GTE affine
+  observer data lives in packet attachments, avoiding per-shadow rewind growth.
+  R4 census has zero unexplained uses; visual/rate acceptance remains separately
+  gated (R4 FRAME_INTERPOLATION_STATUS.md), not claimed by counters alone.
+
+
+2026-10-29: Phase-4 topic adds pre-cull PGXP transform capture, immutable
+packet transform-history attachments, a source-table sampler and signed-depth
+clipping fixtures. Guest timing is unchanged. Moving audit still fails on
+unverified new-source vertices; presenter cutover is not accepted. See
+`docs/PACKET_INTERPOLATION.md`.
+
+
 - 2026-10-29: Phase-3b continuation adds diagnostic-only GTE projection
   provenance and per-frame accuracy classes. Matched R4 scene: 324 IR saturation
   recoveries, 518 exact fractional projections, zero unexplained. Guest timing,
@@ -2204,3 +2248,31 @@ ring backpressure remains. No phase-2 acceptance, merge or performance claim.
 2026-10-29 frame-architecture phase 2 WIP: production transport now publishes complete immutable native-seeded packets without guest ring/context waits. Native/MMCSS and durable controls/diagnostics integrated. Complete-packet GL (71), mailbox/owner, and full-PGXP bank endpoint parity fixtures pass. Present-slot admission is now nonblocking, with token ownership tests passing. Slowed-owner 18x gate still fails (57.653 VBlanks/s, 11869 starved); not accepted or promoted. Remaining legacy host GL ownership APIs and fixtures are being migrated; no faithful timing or generated-code changes.
 
 2026-10-29 frame phase 2 continuation: native command transport now SPSC with bounded-full/order tests; permanent GL owner starts before guest execution; asynchronous live allocation and diagnostic captures preserve native pixels. Current guest deadline admission prevents optional redraw spending while late. With 50 ms render-owner delay, hidden 18x race holds60.093VBlanks/s, zero starved samples and zero queue/context waits; Car Effects draw activity explicitly verified after R4 session callback lifecycle repair. Full framework build passed; non-hardware CTest300 listed,2disabled,3skipped,295passed; R4 32/32 passed. Hidden smoke/live-paused queries/live scales and asynchronous capture marks passed, zero misses. Remaining surface/interpolation ownership cleanup continues in subsequent phases; no generated or faithful timing changes.
+
+2026-10-29 phase 4 interpolation topic: added a renderer-only owned packet-pair sampler and absolute rational cadence, with exact-key matching, duplicate rejection, view-space projection, packet-N attributes and cut/epoch snapping. PGXP carries pre-projection coordinates, H/OFX/OFY and candidate model/caller provenance through validated shadows. Opt-in packet_interpolation TCP audit is integrated without changing production presentation. Unit sampler and PGXP transport checks pass; isolated R4 build and 32/32 tests pass; hidden boot-to-race smoke has zero dispatch/segment misses. Moving-race candidate audit has up to 332 unmatched and 32 ambiguous primitives, so phase 4 is NOT accepted. Identity instance provenance, presenter cutover, metadata, deletion and 8K distinct-image gates remain; no faithful timing changes.
+
+
+### 2026-10-29 renderer packet interpolation continuation
+
+RAM-origin transport through PGXP and deterministic duplicate correspondence
+are covered by focused tests. Added frozen-pair TCP provenance inspection.
+No guest timing changes. Production cutover remains behind identity and
+visual gates; see ../PACKET_INTERPOLATION.md.
+
+2026-10-29 interpolation profiling follow-up: transform attachment allocation
+and reclamation moved to a CPU worker with bounded prepared storage and a
+nonblocking guest append/seal path. Provenance records share draw groups.
+Focused allocation/retained-history, sampler, presenter, HD context and hidden
+GL tests pass. Cumulative pair failure/admission counters added for timed
+validation. No guest instruction timing or generated code changed; exclusive
+A/B acceptance results are tracked in R4 FRAME_INTERPOLATION_STATUS.md.
+
+### 2026-10-29 guest hot-path work
+
+SPSC native raster submission and upload arena implemented on fix/guest-hotpath.
+Native fixture suite and producer allocation check pass. Runtime acceptance is
+still pending; see [GUEST_HOTPATH.md](GUEST_HOTPATH.md) for measurements and gates.
+
+2026-10-29 guest execution G1 continuation: preallocated frame arenas, pooled metadata/input envelopes, batched DMA publication, opt-in display history and lock-safe caller sampling. Native/GL/allocation/CPU-hold tests and verified hidden smoke pass. First completed-phase grid gate failed 58.46/30184 with 35 packet allocations; corrected-phase gate pending. G2-G4 not started or merged. See GUEST_HOTPATH.md.
+
+2026-10-29 G1 accepted under Frame Architecture Part 2: supervisor fresh grid 60.04 VBlanks/s, 0 starved, 0 packet allocations; native/GL fixtures, CTest and verified 40-step hidden smoke pass. Mean guest CPU 11.903 ms, max interval 37.319 ms: final budget remains G4 gate. Integrating fix/guest-hotpath, then fix/static-block-timing (G2).

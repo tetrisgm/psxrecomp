@@ -35,6 +35,7 @@ enum GTEFlags : uint32_t {
 };
 
 struct GTEState {
+    uint32_t projection_caller = 0;     // host-only PGXP provenance
     // === Data Registers ===
     int16_t V0[3], V1[3], V2[3];       // Vertex vectors (s3.12)
     int32_t SXY[4];                      // Screen XY FIFO (packed: X low16, Y high16)

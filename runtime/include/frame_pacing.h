@@ -27,6 +27,10 @@ extern "C" {
 
 typedef struct FramePacer {
     uint64_t next_deadline;   /* perf-counter ticks; 0 = not started */
+#ifndef PSX_NO_DEBUG_TOOLS
+    int trace_waits; /* opt-in, owned by this pacer's thread */
+    uint64_t sleep_ticks, sleep_overshoot_ticks;
+#endif
 } FramePacer;
 
 /* Pure decision function (unit-testable, no SDL).
@@ -35,6 +39,9 @@ typedef struct FramePacer {
  * milliseconds to sleep right now, or 0 if the caller should stop
  * sleeping (deadline reached / close enough to spin).
  * Never returns a value larger than one period's worth of ms + 1. */
+/* High-resolution decision, retaining a bounded 500-us scheduling margin. */
+uint32_t frame_pacing_sleep_us(uint64_t now,uint64_t deadline,uint64_t freq,uint64_t period);
+
 uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
                                uint64_t freq, uint64_t period);
 

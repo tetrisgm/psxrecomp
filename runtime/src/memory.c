@@ -1163,6 +1163,7 @@ const ImaskTraceEntry *memory_get_imask_trace(int *idx_out, int *count_out) {
 }
 
 /* Tier 1 write-trace hooks (implemented in debug_server.c). */
+unsigned g_debug_write_hooks = 0;
 extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
@@ -1905,10 +1906,12 @@ static void isc_store(uint32_t addr, uint32_t val, uint32_t width) {
         PSX_BIU_DCACHE_ENABLE) {
         uint32_t off = addr & 0x3FFu;
 #ifndef PSX_NO_DEBUG_TOOLS
-        uint32_t old = 0;
-        for (uint32_t i = 0; i < width; i++)
-            old |= (uint32_t)scratchpad[(off + i) & 0x3FFu] << (8u * i);
-        debug_server_trace_write_check(0x1F800000u + off, old, val, (uint8_t)width);
+        if (g_debug_write_hooks) {
+            uint32_t old = 0;
+            for (uint32_t i = 0; i < width; i++)
+                old |= (uint32_t)scratchpad[(off + i) & 0x3FFu] << (8u * i);
+            debug_server_trace_write_check(0x1F800000u + off, old, val, (uint8_t)width);
+        }
 #endif
         for (uint32_t i = 0; i < width; i++)
             scratchpad[(off + i) & 0x3FFu] = (uint8_t)(val >> (8u * i));
@@ -2124,7 +2127,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         }
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
 #ifndef PSX_NO_DEBUG_TOOLS
-        debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
+        if (g_debug_write_hooks) debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
 #endif
         parity_trace_note_write(phys, 4, effective_store_pc());
         card_data_writes_check(phys, val, 4);
@@ -2160,7 +2163,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
 #ifndef PSX_NO_DEBUG_TOOLS
-        debug_server_trace_write_check(phys,
+        if (g_debug_write_hooks) debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off]
           | ((uint32_t)scratchpad[off + 1] << 8)
           | ((uint32_t)scratchpad[off + 2] << 16)
@@ -2260,7 +2263,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 
     if (phys < RAM_SIZE) {
 #ifndef PSX_NO_DEBUG_TOOLS
-        debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+        if (g_debug_write_hooks) debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
 #endif
         parity_trace_note_write(phys, 2, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 2);
@@ -2295,7 +2298,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
 #ifndef PSX_NO_DEBUG_TOOLS
-        debug_server_trace_write_check(phys,
+        if (g_debug_write_hooks) debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off] | ((uint32_t)scratchpad[off + 1] << 8),
             (uint32_t)val, 2);
 #endif
@@ -2630,7 +2633,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 
     if (phys < RAM_SIZE) {
 #ifndef PSX_NO_DEBUG_TOOLS
-        debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+        if (g_debug_write_hooks) debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
 #endif
         parity_trace_note_write(phys, 1, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 1);
@@ -2661,7 +2664,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
 #ifndef PSX_NO_DEBUG_TOOLS
-        debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
+        if (g_debug_write_hooks) debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
                                        (uint32_t)val, 1);
 #endif
         pgxp_untracked_store(phys);

@@ -16,10 +16,12 @@ int rt_history_available(uint64_t tick) {(void)tick;return 1;}
 void rt_history_reverse(int active) {(void)active;}
 void rt_history_mark(uint64_t tick) {(void)tick;}
 void rt_history_branch(uint64_t tick) {(void)tick;}
+int g_psx_capture_timing;
+static unsigned clock_reads;
 static uint64_t clock_ns;
 static int muted, presented, resumed, netplay, safe=1;
 static uint8_t ram_image[8193];
-uint64_t pt_clock_ns(void) { return clock_ns; }
+uint64_t pt_clock_ns(void) { ++clock_reads; return clock_ns; }
 void psx_host_sleep_ms(unsigned ms) { clock_ns+=(uint64_t)ms*1000000; }
 int psx_netplay_active(void) { return netplay; }
 int psx_is_dispatchable(uint32_t pc) { return pc==0x80010000; }
@@ -83,6 +85,7 @@ int main(void) {
         while(capturing)psx_rewind_poll(&cpu,cpu.pc);
     }
     assert(stats.captures==5);
+    assert(clock_reads==0); /* Disabled capture instrumentation reads no clock. */
     psx_rewind_set_held(1); safe=0; psx_rewind_poll(&cpu,cpu.pc);
     assert(!presented && !resumed);
     safe=1; psx_rewind_poll(&cpu,cpu.pc);

@@ -324,6 +324,8 @@ int gte_nclip_native_wide_sign(int32_t mac0, int *sign)
 { (void)mac0; (void)sign; abort(); }
 int gte_nclip_native_wide_previous_sign(int32_t mac0, int *sign)
 { (void)mac0; (void)sign; abort(); }
+int packet_interpolation_stream_enabled(void) {return 0;}
+void packet_interpolation_record(const void* p) {(void)p;abort();}
 int pgxp_projection_tracking(void) { return 0; }
 void pgxp_set_projection_tracking(int enabled)
 { if (!enabled) abort(); }

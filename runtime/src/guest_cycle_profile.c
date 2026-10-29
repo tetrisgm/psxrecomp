@@ -67,9 +67,11 @@ static void gcp_record(uint64_t cycle, uint32_t periods)
 
 void guest_cycle_profile_install(void)
 {
-    uint32_t period = 4096u;
+    uint32_t period = 0;
     const char *env = getenv("PSX_GCP_PERIOD");
     if (env && *env) period = (uint32_t)strtoul(env, NULL, 0);
+    extern int g_debug_cycle_hooks;
+    if(period)g_debug_cycle_hooks=1;
     psx_cycle_sample_hook = gcp_record;
     psx_cycle_sample_period = period;
 }

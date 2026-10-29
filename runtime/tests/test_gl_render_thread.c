@@ -38,6 +38,12 @@
 #include "gl_batch_policy_lle.c"
 #include "gl_batch_policy_hle.c"
 #include "gl_batch_policy_select.c"
+/* This renderer-only fixture supplies transforms directly; retain the
+ * observer registration just as the PGXP engine does in the runtime. */
+static PGXPTransformRecorder test_transform_recorder;
+void pgxp_set_transform_recorder(PGXPTransformRecorder observer) {
+    test_transform_recorder=observer;
+}
 /* gpu_render.c (the facade) observes draws for HD texture packs: no pack here. */
 static int test_hd_active, test_hd_overlap;
 static uint64_t test_hd_tracking;
@@ -74,6 +80,8 @@ volatile int32_t g_gte_last_h, g_gte_last_ofx, g_gte_last_ofy;
 int psx_host_menu_overlay_image(const uint32_t **pixels, int *w, int *h){(void)pixels;(void)w;(void)h;return 0;}
 void psx_video_telemetry_present(int result){(void)result;}
 void host_sampler_retarget_current(const char *name){(void)name;}
+/* Packet geometry is supplied directly; no guest PGXP engine in this fixture. */
+void gpu_pgxp_update_projection_tracking(void) {}
 void psx_video_telemetry_compose(int renderer, int scale, int source_w, int source_h,
                                int drawable_w, int drawable_h, int viewport_w, int viewport_h){
     (void)renderer;(void)scale;(void)source_w;(void)source_h;(void)drawable_w;(void)drawable_h;

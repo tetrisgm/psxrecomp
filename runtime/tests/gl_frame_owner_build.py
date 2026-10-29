@@ -15,7 +15,9 @@ def cxx_compiler(cc, explicit=None):
 def build_frame_owner(run, cxx, source, output, flags):
     objects = []
     flags = [flag for flag in flags if not str(flag).startswith("-std=")]
-    for name in ("frame_owner", "frame_packet", "native_raster"):
+    for name in ("frame_owner", "frame_packet", "native_raster",
+                 "packet_interpolation", "packet_interpolation_stream",
+                 "packet_presenter", "packet_metadata"):
         obj = output / (name + ".o")
         result = run([cxx, "-std=c++17", *flags, "-c", source / (name + ".cpp"), "-o", obj])
         if result is not None and result.returncode:

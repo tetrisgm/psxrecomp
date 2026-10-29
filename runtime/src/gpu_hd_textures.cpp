@@ -80,6 +80,9 @@ struct GpuHdTextureContext {
     uint64_t input_generation = 0;
     std::unique_ptr<GpuHdTextureTracking,decltype(&gpu_hd_textures_free_tracking)>
         input_tracking{nullptr,gpu_hd_textures_free_tracking};
+    std::unique_ptr<GpuHdTextureTracking,decltype(&gpu_hd_textures_free_tracking)>
+        applied_tracking{nullptr,gpu_hd_textures_free_tracking};
+    uint64_t applied_generation = 0;
 };
 
 struct GpuHdTextureTracking {
@@ -348,6 +351,13 @@ extern "C" int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracki
     if (!tracking->configured) return !context->session;
     if (!context->session) return 0;
     auto& destination = *context->session;
+    // Consecutive draws often share one immutable native tracking snapshot.
+    // Retain its identity (no pointer-reuse alias) and validate the destination
+    // generation: any intervening tracking mutation must restore it again.
+    if(context->applied_tracking.get()==tracking &&
+       context->applied_generation==gpu_hd_textures_tracking_generation() &&
+       destination.copy_pending==tracking->copy_pending &&
+       destination.learned==tracking->learned) return 1;
     if (destination.root != tracking->root || destination.replacements != tracking->replacements ||
         destination.dump != tracking->dump || bool(destination.beetle) != !tracking->beetle.empty()) return 0;
     if (destination.beetle &&
@@ -360,6 +370,9 @@ extern "C" int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracki
                 tracking->beetle.data(), tracking->beetle.size())) return 0;
         destination.learned.swap(learned);
         destination.copy_pending = tracking->copy_pending;
+        gpu_hd_textures_retain_tracking(const_cast<GpuHdTextureTracking*>(tracking));
+        context->applied_tracking.reset(const_cast<GpuHdTextureTracking*>(tracking));
+        context->applied_generation=gpu_hd_textures_tracking_generation();
         return 1;
     } catch (...) { return 0; }
 }

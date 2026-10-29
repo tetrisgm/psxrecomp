@@ -942,6 +942,10 @@ int main(void) {
      * byte-identical partial writes must still discard the 3D association. */
     {
         PGXPProjection p={12345.5f,-7311.0f,-62.0f,150.0f}, out;
+        p.view[0]=10.25f;p.view[1]=-3.5f;p.view[2]=62.75f;
+        p.h=300;p.ofx=160;p.ofy=120;p.x_scale=0.75f;
+        p.model[0]=17;p.model[1]=-93;p.model[2]=1024;
+        p.caller=0x123456;p.interpolation_valid=1;
         pgxp_set_projection_tracking(1);
         pgxp_gte_push_sxy(X16,Y16,0,PACKED);
         pgxp_gte_set_projection(&p);
@@ -950,6 +954,12 @@ int main(void) {
         psx_pgxp_cop2(nullptr,MFC2(9,14),PACKED,0);
         psx_pgxp_store(nullptr,SW(1,9),ADDR_B,PACKED);
         CHECK(pgxp_load_projection(ADDR_B,PACKED,&out) && out.x==p.x && out.z==p.z);
+        CHECK(std::memcmp(&out,&p,sizeof p)==0);
+        /* The other DMA buffer carries exactly the same provenance. Neither
+         * its address nor ordering-table placement enters the identity. */
+        psx_pgxp_store(nullptr,SW(1,9),ADDR_B+0x400,PACKED);
+        CHECK(pgxp_load_projection(ADDR_B+0x400,PACKED,&out));
+        CHECK(std::memcmp(&out,&p,sizeof p)==0);
         CHECK(!pgxp_load_projection(ADDR_B,PACKED^1,&out));
         pgxp_checkpoint_begin();
         psx_pgxp_store(nullptr,SB(1,9),ADDR_B,PACKED&255);
@@ -962,6 +972,34 @@ int main(void) {
         CHECK(pgxp_load_projection(ADDR_B,PACKED,&out));
         pgxp_invalidate_all();
         CHECK(!pgxp_load_projection(ADDR_B,PACKED,&out));
+        pgxp_set_projection_tracking(0);
+    }
+
+    // Model data copied through scratchpad keeps its RAM origin. Separate
+    // projected DMA buffers must transport identical instance evidence.
+    {
+        pgxp_invalidate_all();pgxp_set_cpu_mode(1);pgxp_set_projection_tracking(1);
+        const uint32_t model=0x80006000,matrix=0x80007000,scratch=0x1f800080;
+        psx_pgxp_load(nullptr,LW(1,9),model,123);
+        psx_pgxp_store(nullptr,SW(1,9),scratch,123);
+        psx_pgxp_cop2(nullptr,LWC2(0),123,scratch);
+        psx_pgxp_load(nullptr,LW(1,10),matrix,4096);
+        psx_pgxp_cop2(nullptr,enc_cop2(6,10,0),4096,0);
+        PGXPProjection p{},out{};p.source_vertex=1;p.interpolation_valid=1;
+        pgxp_gte_push_sxy(X16,Y16,100,PACKED);pgxp_gte_set_projection(&p);
+        pgxp_store_gte_reg(ADDR_B,14);pgxp_store_gte_reg(ADDR_B+0x400,14);
+        CHECK(pgxp_load_projection(ADDR_B,PACKED,&out));
+        CHECK(out.source_vertex==(model&0x1fffffff));
+        CHECK(out.source_matrix==(matrix&0x1fffffff));
+        p=out;
+        CHECK(pgxp_load_projection(ADDR_B+0x400,PACKED,&out));
+        CHECK(std::memcmp(&out,&p,sizeof p)==0);
+        psx_pgxp_store(nullptr,SH(1,9),scratch,123);
+        psx_pgxp_cop2(nullptr,LWC2(0),123,scratch);
+        p.source_vertex=1;
+        pgxp_gte_push_sxy(X16,Y16,100,PACKED);pgxp_gte_set_projection(&p);
+        CHECK(pgxp_get_gte_projection(2,PACKED,&out));
+        CHECK(out.source_vertex==scratch); // partial write killed the old origin
         pgxp_set_projection_tracking(0);
     }
 

@@ -47,6 +47,9 @@ PGXP_S void ck_wrapped(void);
 #endif
 
 PGXP_API void pgxp_invalidate_all(void) {
+#ifdef PGXP_TRANSFORM_RECORD
+    PGXP_TRANSFORM_RECORD(nullptr,nullptr);
+#endif
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
     s_stats.invalidations++;
     if (++s_gen == 0) {
@@ -459,6 +462,7 @@ PGXP_S inline int pv_live(const PGXPValue *pv) {
 PGXP_S inline void pv_validate(PGXPValue *pv, uint32_t actual) {
     if (pv->gen != s_gen) return;
     uint32_t diff = pv->value ^ actual;
+    if (diff) pv->source_address = 0;
     if (diff) pv->flags &= (uint16_t)~(PGXP_F_PROJECTION | PGXP_F_UNCLAMPED | PGXP_AUDIT_MASK);
     if ((pv->flags & PGXP_F_VX) && (diff & 0x0000FFFFu))
         pv->flags &= (uint16_t)~(PGXP_F_VX | PGXP_F_DX | PGXP_F_VZ);
@@ -472,6 +476,7 @@ PGXP_S inline void pv_validate(PGXPValue *pv, uint32_t actual) {
 PGXP_S inline void pv_reset(PGXPValue *pv, uint32_t value) {
     pv->x16 = 0; pv->y16 = 0; pv->z = 0;
     pv->flags = 0;
+    pv->source_address = 0;
     pv->value = value;
     pv->gen = s_gen;
 }
@@ -592,6 +597,7 @@ PGXP_API void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
         } else {
             pv_reset(dst, value);
         }
+        if(!dst->source_address) dst->source_address = addr & 0x1fffffffu;
         return;
     }
     case 0x21:                                 /* LH                          */
@@ -678,6 +684,7 @@ PGXP_API void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
         dst->flags &= (uint16_t)~((hi_half ? (PGXP_F_VY | PGXP_F_DY) : (PGXP_F_VX | PGXP_F_DX)) |
                                   PGXP_F_VZ | PGXP_F_PROJECTION | PGXP_F_UNCLAMPED | PGXP_AUDIT_MASK);
         dst->z = 0;
+        dst->source_address = 0;
         int ok = 0, derived = 0;
         int32_t v16 = 0;
         /* Hooks pass either the full register or just the stored half (the
@@ -708,6 +715,7 @@ PGXP_API void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
         dst->flags &= (uint16_t)~(((addr & 2u) ? (PGXP_F_VY | PGXP_F_DY) : (PGXP_F_VX | PGXP_F_DX)) |
                                   PGXP_F_VZ | PGXP_F_PROJECTION | PGXP_F_UNCLAMPED | PGXP_AUDIT_MASK);
         dst->z = 0;
+        dst->source_address = 0;
         return;
     }
     default:                                   /* SWL/SWR: forget the word    */
@@ -735,6 +743,7 @@ PGXP_API void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
         } else {
             pv_reset(dst, value);
         }
+        if(!dst->source_address) dst->source_address = addr & 0x1fffffffu;
         sc_kill(&s_gte_s[f_rt(instr)]);        /* memory carries no scalars   */
         gte_sxy2_mirror(f_rt(instr));
         return;
@@ -1479,6 +1488,7 @@ PGXP_API void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
     s_gte[12] = s_gte[13];
     s_gte[13] = s_gte[14];
     PGXPValue *pv = &s_gte[14];
+    pv->source_address = 0;
     pv->x16 = x16;
     pv->y16 = y16;
     pv->z = sz3;
@@ -1519,9 +1529,23 @@ PGXP_API int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16) {
 PGXP_API void pgxp_gte_set_projection(const PGXPProjection *projection) {
     if (!g_pgxp_active || !s_projection_tracking || !projection) return;
     s_gte[14].projection = *projection;
+    // GTE supplies its input register pair before the FIFO shift. RAM origins
+    // survive exact full-word copies; resets/partial arithmetic kill them.
+    const uint32_t slot=projection->source_vertex;
+    if(slot>=1 && slot<=6) {
+        const PGXPValue *input=&s_gte[slot-1];
+        s_gte[14].projection.source_vertex=input->gen==s_gen?input->source_address:0;
+        s_gte[14].projection.source_matrix=s_gtc[0].gen==s_gen?s_gtc[0].source_address:0;
+    }
     s_gte[14].flags |= PGXP_F_PROJECTION;
     s_gte[15] = s_gte[14];
 }
+#ifdef PGXP_TRANSFORM_RECORD
+PGXP_API void pgxp_gte_record_transform(const PGXPAffineTransform *affine) {
+    if(g_pgxp_active && s_projection_tracking && (s_gte[14].flags&PGXP_F_PROJECTION))
+        PGXP_TRANSFORM_RECORD(&s_gte[14].projection,affine);
+}
+#endif
 PGXP_S int projection_read(const PGXPValue *pv, uint32_t packed, PGXPProjection *out) {
     const uint16_t flags = PGXP_F_VXY | PGXP_F_PROJECTION;
     if (!s_enabled || !s_projection_tracking || !pv || pv->gen != s_gen || pv->value != packed ||

@@ -1,4 +1,6 @@
-﻿#include "audio_sync.h"
+﻿#include "guest_wait_trace.h"
+#include "frame_packet.h"
+#include "audio_sync.h"
 #include "audio_catchup.h"
 /* main.cpp — Phase 3 runtime entry point.
  *
@@ -4643,8 +4645,25 @@ static RuntimePerfState g_runtime_perf;
 /* Opt-in main-thread wall cadence. TCP commands execute on this thread.
  * Intervals include guest work, presentation and pacing, not just CPU work.
  * Reset after loading/unpausing: debugger pauses are deliberately not hidden. */
+static uint64_t main_cadence_cpu_100ns() {
+#ifdef _WIN32
+    FILETIME created,exited,kernel,user;
+    if(!GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user)) return 0;
+    return (uint64_t(kernel.dwHighDateTime)<<32)+kernel.dwLowDateTime+
+           (uint64_t(user.dwHighDateTime)<<32)+user.dwLowDateTime;
+#else
+    return 0;
+#endif
+}
 struct MainCadenceStats {
+    struct Interval {
+        uint64_t number=0, ticks=0, pacer=0, overshoot=0, sleep=0, sleep_overshoot=0, cpu=0;
+        std::array<uint64_t,guest_wait_trace::Count> waits{};
+    };
+    std::array<Interval,20> worst{};
+    uint64_t pacer=0, overshoot=0;
     bool enabled = false;
+    uint64_t previous_cpu=0, cpu=0, packet_allocations=0;
     uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
 };
@@ -4652,13 +4671,23 @@ static MainCadenceStats s_main_cadence;
 static void main_cadence_frame() {
     if (!s_main_cadence.enabled) return;
     const uint64_t now = SDL_GetPerformanceCounter();
+    const uint64_t cpu = main_cadence_cpu_100ns();
     if (s_main_cadence.previous && now >= s_main_cadence.previous) {
         const uint64_t elapsed = now - s_main_cadence.previous;
         ++s_main_cadence.intervals;
         s_main_cadence.ticks += elapsed;
+        s_main_cadence.cpu += cpu-s_main_cadence.previous_cpu;
         if (elapsed > s_main_cadence.max_ticks) s_main_cadence.max_ticks = elapsed;
+        MainCadenceStats::Interval row{s_main_cadence.intervals,elapsed,
+            s_main_cadence.pacer,s_main_cadence.overshoot,s_frame_pacer.sleep_ticks,
+            s_frame_pacer.sleep_overshoot_ticks,cpu-s_main_cadence.previous_cpu,guest_wait_trace::ns};
+        for(auto &entry:s_main_cadence.worst) if(row.ticks>entry.ticks) std::swap(row,entry);
     }
     s_main_cadence.previous = now;
+    s_main_cadence.previous_cpu = cpu;
+    s_main_cadence.pacer=s_main_cadence.overshoot=0;
+    guest_wait_trace::ns={};
+    s_frame_pacer.sleep_ticks=s_frame_pacer.sleep_overshoot_ticks=0;
 }
 static void main_cadence_pace(uint64_t now) {
     if (!s_main_cadence.enabled || !s_frame_pacer.next_deadline) return;
@@ -4674,6 +4703,8 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
     if (reset) {
         s_main_cadence = MainCadenceStats{};
         s_main_cadence.enabled = true;
+        s_main_cadence.packet_allocations=frame_packet_allocation_events();
+        guest_wait_trace::enabled=true;guest_wait_trace::ns={};
     }
     const auto &s = s_main_cadence;
     const double freq = (double)SDL_GetPerformanceFrequency();
@@ -4687,6 +4718,24 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         s.intervals ? s.ticks * ms / s.intervals : 0.0, s.max_ticks * ms,
         (unsigned long long)s.pace_checks, (unsigned long long)s.late,
         (unsigned long long)s.missed, s.max_late_ticks * ms);
+    size_t used=std::strlen(out);
+    auto append=[&](const char* format,auto... args) {
+        if(used>=cap) return;
+        int n=std::snprintf(out+used,cap-used,format,args...);
+        if(n>0) used+=size_t(n);
+    };
+    append(",\"packet_allocation_events\":%llu",(unsigned long long)(frame_packet_allocation_events()-s.packet_allocations));
+    append(",\"cpu_ms\":%.6f,\"worst\":[",s.cpu/1e4);
+    bool first=true;
+    for(const auto &r:s.worst) if(r.ticks) {
+        append("%s{\"interval\":%llu,\"ms\":%.6f,\"pacer_ms\":%.6f,\"overshoot_ms\":%.6f,"
+               "\"cpu_ms\":%.6f,\"sleep_ms\":%.6f,\"sleep_overshoot_ms\":%.6f,\"publish_ms\":%.6f,\"reserve_ms\":%.6f,\"native_lock_ms\":%.6f,"
+               "\"native_space_ms\":%.6f,\"history_ms\":%.6f,\"native_completion_ms\":%.6f}",
+               first?"":",",(unsigned long long)r.number,r.ticks*ms,r.pacer*ms,r.overshoot*ms,r.cpu/1e4,r.sleep*ms,r.sleep_overshoot*ms,
+               r.waits[0]/1e6,r.waits[1]/1e6,r.waits[2]/1e6,r.waits[3]/1e6,r.waits[4]/1e6,r.waits[5]/1e6);
+        first=false;
+    }
+    append("%s","]");
 }
 #endif
 
@@ -9901,10 +9950,19 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
 #ifndef PSX_NO_DEBUG_TOOLS
+            s_frame_pacer.trace_waits=s_main_cadence.enabled;
             main_cadence_pace(dyn_t0);
+            const uint64_t trace_deadline=s_frame_pacer.next_deadline;
 #endif
             frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
             const uint64_t waited = SDL_GetPerformanceCounter() - dyn_t0;
+#ifndef PSX_NO_DEBUG_TOOLS
+            if(s_main_cadence.enabled) {
+                s_main_cadence.pacer+=waited;
+                if(trace_deadline>dyn_t0 && dyn_t0+waited>trace_deadline)
+                    s_main_cadence.overshoot+=dyn_t0+waited-trace_deadline;
+            }
+#endif
             if (g_dynres.active) g_dynres.pacer_ticks += waited;
             g_frame_report_wait_ticks += waited;
         }

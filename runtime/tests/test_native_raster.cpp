@@ -11,8 +11,19 @@
 #include <vector>
 #include <memory>
 #include <new>
+#include <cstdlib>
 #include <cstring>
 #include "native_raster_oracle_fixtures.h"
+
+static thread_local bool count_allocations=false;
+static thread_local size_t allocations=0;
+void* operator new(size_t size) {
+    if(count_allocations) ++allocations;
+    if(void* p=std::malloc(size?size:1))return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p,size_t) noexcept { std::free(p); }
 
 /* Native contexts do not use title-specific wide presentation. */
 extern "C" {
@@ -188,6 +199,24 @@ static void provenance_observation() {
     assert(pixel(raster,0,0)==0 && owner.samples.size()==6);
     native_raster_destroy(raster);
 }
+static void allocation_free_submission() {
+    auto* r=native_raster_create(nullptr);assert(r);
+    std::array<uint16_t,1024> upload{};
+    NativeRasterCommand c{};c.op=NR_UPLOAD;c.args[2]=1024;c.args[3]=1;
+    NativeRasterState state{};state.right=1023;state.bottom=511;
+    const uint32_t packet[]={0x650000ff,100u|(100u<<16),0,0x00010001};
+    native_raster_inputs_enable(r,1);
+    allocations=0;count_allocations=true;
+    for(unsigned frame=0;frame<100;++frame) {
+        for(unsigned n=0;n<1000;++n)assert(native_raster_gp0(r,&state,packet,4));
+        upload.fill(uint16_t(frame));
+        assert(native_raster_submit(r,&c,upload.data(),upload.size()));
+        uint16_t result=0;native_raster_read(r,0,0,1,1,&result);assert(result==frame);
+        auto* inputs=native_raster_inputs_seal(r);assert(inputs);native_raster_inputs_destroy(inputs);
+    }
+    count_allocations=false;assert(allocations==0);
+    native_raster_destroy(r);
+}
 static void bounded_queue_wrap() {
     struct State {
         std::atomic<bool> entered{false},release{false};
@@ -206,21 +235,53 @@ static void bounded_queue_wrap() {
         }
     },&state);
     std::thread producer([&] {
-        for(unsigned n=1;n<=10000;++n) {
+        for(unsigned n=1;n<=50000;++n) {
             send(raster,NR_WRITE,{0,0,int(n)});
             state.submitted.store(n);
         }
     });
-    while(!state.entered.load() || state.submitted.load()<4097) std::this_thread::yield();
-    /* One leased command plus all 4096 queue slots: submission is bounded,
+    while(!state.entered.load() || state.submitted.load()<16384) std::this_thread::yield();
+    /* All 16384 queue slots, including the executing command: submission is bounded,
      * but release must wake the producer and preserve order across wraps. */
-    assert(state.submitted.load()==4097);
+    assert(state.submitted.load()==16384);
     state.release.store(true);
     producer.join();
-    assert(pixel(raster,0,0)==10000 && state.seen==10000);
+    assert(pixel(raster,0,0)== (50000 & 65535) && state.seen==50000);
     native_raster_destroy(raster);
 }
+static void test_batched_packets() {
+    auto* r=native_raster_create(nullptr);assert(r);
+    NativeRasterState state{};state.right=1023;state.bottom=511;
+    native_raster_batch(r,1);
+    native_raster_batch(r,1);
+    for(unsigned n=0;n<1000;++n) {
+        uint32_t packet[]={0x680000ffu,(n%1024)|((n/1024)<<16)};
+        assert(native_raster_gp0(r,&state,packet,2));
+        if(n==501)assert(pixel(r,501,0)==31); /* read publishes a partial batch */
+    }
+    native_raster_batch(r,0);native_raster_batch(r,0);
+    assert(pixel(r,999,0)==31);
+    native_raster_destroy(r);
+}
+static void test_attachment_retirement() {
+    auto* r=native_raster_create(nullptr);assert(r);native_raster_inputs_enable(r,1);
+    struct Cleanup {std::thread::id guest;std::atomic<bool> done{false};} state;
+    state.guest=std::this_thread::get_id();
+    auto* inputs=native_raster_inputs_seal(r);assert(inputs);
+    allocations=0;count_allocations=true;
+    native_raster_inputs_retire(inputs,[](void* p) {
+        auto* state=static_cast<Cleanup*>(p);
+        assert(std::this_thread::get_id()!=state->guest);
+        state->done.store(true,std::memory_order_release);
+    },&state);
+    count_allocations=false;assert(allocations==0);
+    while(!state.done.load(std::memory_order_acquire))std::this_thread::yield();
+    native_raster_destroy(r);
+}
 int main() {
+    test_batched_packets();
+    test_attachment_retirement();
+    allocation_free_submission();
     bounded_queue_wrap();
     immutable_texture_inputs();
     dropped_texture_input_packets();

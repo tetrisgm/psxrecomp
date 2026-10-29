@@ -13,6 +13,9 @@
 extern "C" {
 #endif
 
+/* Guest-owned opt-in capture timing; no QPC reads when disabled. */
+extern int g_psx_capture_timing;
+
 /*
  * Boot snapshot (a.k.a. fast_boot) — a COMPLETE post-BIOS save-state.
  *

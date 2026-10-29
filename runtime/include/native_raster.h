@@ -106,6 +106,9 @@ typedef struct NativeRasterTile {
 } NativeRasterTile;
 void native_raster_inputs_enable(NativeRaster *raster,int enabled);
 NativeRasterInputs *native_raster_inputs_seal(NativeRaster *raster);
+/* Retire an attachment with its inputs on the cleanup worker. A null input
+ * invokes cleanup synchronously (construction failure / teardown). */
+void native_raster_inputs_retire(NativeRasterInputs*,void (*cleanup)(void*),void* user);
 void native_raster_inputs_destroy(NativeRasterInputs *inputs);
 int native_raster_inputs_valid(const NativeRasterInputs *inputs);
 size_t native_raster_inputs_bytes(const NativeRasterInputs *inputs);
@@ -115,6 +118,8 @@ int native_raster_inputs_get(const NativeRasterInputs *inputs,uint64_t source,
                              NativeRasterTile *tiles,size_t capacity);
 const void *native_raster_inputs_metadata(const NativeRasterInputs *inputs,uint64_t source);
 
+/* Producer-only scoped batching; reads/checkpoints always publish pending draws. */
+void native_raster_batch(NativeRaster*,int begin);
 NativeRaster *native_raster_create(const uint16_t *initial_vram);
 void native_raster_destroy(NativeRaster *raster);
 /* Returns 0 for invalid opcode/upload dimensions or allocation failure. */

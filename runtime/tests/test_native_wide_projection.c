@@ -5,6 +5,13 @@
 #include "test_gpu_textured_dot_nw_shift_exec.c"
 #undef main
 
+static PacketInterpolationSource interpolation_sources[2];
+static unsigned interpolation_source_count;
+static void capture_interpolation_source(const PacketInterpolationSource *source) {
+    if(interpolation_source_count<2) interpolation_sources[interpolation_source_count]=*source;
+    ++interpolation_source_count;
+}
+
 static int64_t area(const int32_t *p) {
     int64_t x0=p[0]/65536, y0=p[1]/65536;
     int64_t x1=p[2]/65536, y1=p[3]/65536;
@@ -13,6 +20,12 @@ static int64_t area(const int32_t *p) {
 }
 
 int main(void) {
+#ifdef _WIN32
+    _putenv_s("PSX_PACKET_INTERPOLATION_AUDIT","1");
+#else
+    setenv("PSX_PACKET_INTERPOLATION_AUDIT","1",1);
+#endif
+    packet_interpolation_set_recorder(capture_interpolation_source);
     fixture_native_start();
     reset_gpu_state_for_test();
     configure_native_wide_16_9();
@@ -129,9 +142,9 @@ int main(void) {
     gp0_cmd_source_addr=UINT32_MAX;
     assert(gpu_triangle_rejected(wall_x,wall_y,0,1,2));
     psx_mod_set_native_wide_projection_correction(0);
-    assert(!fixture_pgxp_enabled && !fixture_projection_tracking);
+    assert(!fixture_pgxp_enabled && fixture_projection_tracking); /* packet audit retains tracking */
     psx_mod_set_native_wide_near_clip(1); /* legacy API cannot enable the mode */
-    assert(!fixture_projection_tracking);
+    assert(fixture_projection_tracking); /* packet audit retains tracking */
     prepare_precise_triangle(7,4,10,bx,by);
     assert(!fixture_triangle_recovered);
     assert(!fixture_precise_triangle.enabled);
@@ -147,11 +160,18 @@ int main(void) {
         fixture_homogeneous[i].addr=gp0_cmd_source_addr+4*k;
         fixture_homogeneous[i].word=gp0_cmd_buf[k];
         fixture_homogeneous[i].p=(PGXPProjection){40000,8000,i==1?-62:500,150};
+        fixture_homogeneous[i].p.interpolation_valid=1;
         fixture_homogeneous[i].valid=1;
     }
     psx_mod_set_native_wide_near_clip(0); /* legacy toggle cannot disable the fix */
     assert(fixture_projection_tracking);
+    interpolation_source_count=0;
     assert(native_wide_projective_draw() && fixture_projective_draws==2);
+    assert(interpolation_source_count==2);
+    assert(interpolation_sources[0].valid_mask==7 && interpolation_sources[1].valid_mask==7);
+    assert(interpolation_sources[0].projection[1].z==-62);
+    assert(interpolation_sources[1].projection[1].z==-62);
+    assert(interpolation_sources[0].primitive_type==0x3c);
     assert(fixture_projective_vertices[1].z==-62); /* behind-camera depth retained */
     gp0_cmd_buf[4]^=1;
     assert(!native_wide_projective_draw());

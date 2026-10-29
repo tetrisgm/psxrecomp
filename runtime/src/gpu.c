@@ -1,4 +1,5 @@
-﻿/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
+#include "packet_interpolation_stream.h"
+/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
  *
  * Implements:
  *   - GPUSTAT register with correct bit semantics
@@ -4889,9 +4890,14 @@ void gpu_render_projective_end(void) {
     pgxp_projective_scope_end(&s_render_pgxp_scope);
     s_render_scope = 0;
 }
+void gpu_pgxp_update_projection_tracking(void) {
+    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction ||
+                                 packet_interpolation_stream_enabled());
+}
 void psx_mod_set_render_projective(int enabled) {
     s_render_projective = !!enabled;
-    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction);
+    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction ||
+                                 packet_interpolation_stream_enabled());
 }
 static uint64_t s_native_wide_projection_vertices = 0;
 extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
@@ -4922,7 +4928,8 @@ void psx_mod_set_native_wide_projection_correction(int enabled) {
     s_native_wide_projection_vertices = 0;
     /* Signed camera-space provenance is required for correct native-wide
      * faces, including corners behind the camera. Arm it with the mode. */
-    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction);
+    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction ||
+                                 packet_interpolation_stream_enabled());
     gpu_pgxp_rederive_enable();
 }
 
@@ -5024,6 +5031,31 @@ uint32_t gpu_texture_correction_hits(void) {
  * is the G1.1 crack the tri_mixed counter measures. The integer delta folds
  * in draw offsets and any widescreen adjustment already applied by the
  * caller. */
+static void record_interpolation_triangle(int i0,int i1,int i2,
+                                           const int32_t vx[3],const int32_t vy[3]) {
+    if (gr_backend() == GR_BACKEND_OPENGL && packet_interpolation_stream_enabled()) {
+        PacketInterpolationSource source={0};
+        source.primitive_type=gp0_cmd_buf[0]>>24;
+        if(source.primitive_type&4) {
+            const int gouraud=(source.primitive_type&16)!=0;
+            source.clut=gp0_cmd_buf[2]>>16;
+            source.texpage=gp0_cmd_buf[gouraud?5:4]>>16;
+        }
+        const int indices[3]={i0,i1,i2};
+        for(unsigned i=0;i<3;++i) {
+            source.x[i]=vx[i];source.y[i]=vy[i];
+            int32_t px,py;uint16_t depth=0;
+            if(gte_precision_load_word(gp0_cmd_source_addr+4u*indices[i],
+                gp0_cmd_buf[indices[i]],&px,&py,&depth) && depth)
+                source.spatial_mask|=1u<<i;
+            if(pgxp_load_projection(gp0_cmd_source_addr+4u*indices[i],
+                gp0_cmd_buf[indices[i]],&source.projection[i]) &&
+                source.projection[i].interpolation_valid) source.valid_mask|=1u<<i;
+        }
+        packet_interpolation_record(&source);
+    }
+}
+
 static void prepare_precise_triangle(int i0, int i1, int i2,
                                      const int32_t vx[3], const int32_t vy[3]) {
     if (gr_backend() == GR_BACKEND_OPENGL) {
@@ -5035,6 +5067,7 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
             ws_native_wide_active() &&
             psx_gpu_triangle_oversize(raw_x,raw_y,0,1,2));
     }
+    record_interpolation_triangle(i0,i1,i2,vx,vy);
     if (gr_backend() == GR_BACKEND_OPENGL &&
         gl_renderer_frame_generation() != gte_fg_source_enabled())
         gte_fg_source_set(gl_renderer_frame_generation());   /* from the next projection */
@@ -5608,10 +5641,19 @@ static int native_wide_projective_draw(void) {
     const uint16_t tpage=gp0_cmd_buf[2+stride]>>16;
     set_tpage_from_poly(tpage);
     const int semi=(op&2u)?(int)semi_transparency:-1;
+    int32_t audit_x[4],audit_y[4];
+    for(unsigned i=0;i<n;++i) {
+        parse_vertex(gp0_cmd_buf[1+stride*i],&audit_x[i],&audit_y[i]);
+        audit_x[i]+=draw_offset_x;audit_y[i]+=draw_offset_y;
+    }
+    record_interpolation_triangle(1,1+stride,1+2*stride,audit_x,audit_y);
     gl_renderer_draw_projected_triangle(vertices,tpage&0x1ff,
         (clut&63)*16,(clut>>6)&511,op&1u,semi,render_projective || s_texture_correction_enabled);
     if (n==4) {
         const PSXProjectedVertex second[3]={vertices[2],vertices[1],vertices[3]};
+        const int32_t ax[3]={audit_x[2],audit_x[1],audit_x[3]};
+        const int32_t ay[3]={audit_y[2],audit_y[1],audit_y[3]};
+        record_interpolation_triangle(1+2*stride,1+stride,1+3*stride,ax,ay);
         gl_renderer_draw_projected_triangle(second,tpage&0x1ff,
             (clut&63)*16,(clut>>6)&511,op&1u,semi,render_projective || s_texture_correction_enabled);
     }
@@ -8759,3 +8801,5 @@ int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *pro
 #undef pgxp_load_projection
 #undef gte_precision_load_word
 #undef s_frame_count
+
+void gpu_native_batch(int begin) {native_raster_batch(s_native_raster,begin);}

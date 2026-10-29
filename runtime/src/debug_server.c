@@ -1,4 +1,7 @@
-﻿/*
+#define PSX_DEBUG_HOTPATH_IMPLEMENTATION
+#include "packet_interpolation_stream.h"
+#include "packet_presenter.h"
+/*
  * debug_server.c -- TCP debug server for PSX recomp v4
  *
  * Single-threaded, non-blocking TCP server polled once per vblank.
@@ -2750,7 +2753,8 @@ static inline void pc_probe_observe(uint32_t block_leader_phys)
  * block-leader PC — interior loop tops, prologue exits — not just function
  * entries, which is required for a clean, KNOWN-instruction-sequence ruler.
  * Disarmed cost = one volatile load + return (see cyc_watch_observe). */
-void debug_server_cyc_observe(uint32_t block_leader_phys) {
+int g_debug_cycle_hooks = 0;
+void debug_server_cyc_observe_enabled(uint32_t block_leader_phys) {
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)block_leader_phys;
     return;
@@ -5531,6 +5535,8 @@ static void handle_host_profile(int id, const char *json)
     enum { MAXB = 4096 };
     static uint64_t rvas[MAXB];
     static uint32_t counts[MAXB];
+    static uint16_t bins[MAXB*2];
+    memset(bins,0,sizeof bins);
     const uint64_t seq = host_sampler_seq();
     const uint64_t oldest = seq > HOST_SAMPLER_CAP ? seq - HOST_SAMPLER_CAP : 0;
     int since = json_get_int(json, "since", -1);
@@ -5561,10 +5567,17 @@ static void handle_host_profile(int id, const char *json)
         if (phase >= 0 && (int)smp.phase != phase) continue;
         total++;
         if (callers && smp.caller) { smp.rva = smp.caller; via_callers++; }
-        int b = 0;
-        while (b < nb && rvas[b] != smp.rva) b++;
+        /* Open addressing avoids a linear 4096-bin search per sample.
+         * This handler runs on the guest: a full-ring query must not create
+         * the hitch that the profiler is supposed to diagnose. */
+        uint64_t hash=smp.rva;
+        hash^=hash>>33;hash*=UINT64_C(0xff51afd7ed558ccd);hash^=hash>>33;
+        unsigned slot=(unsigned)hash & (MAXB*2-1);
+        while(bins[slot] && rvas[bins[slot]-1]!=smp.rva)slot=(slot+1)&(MAXB*2-1);
+        int b=bins[slot]?(int)bins[slot]-1:nb;
         if (b == nb) {
             if (nb == MAXB) { dropped++; continue; }
+            bins[slot]=(uint16_t)(nb+1);
             rvas[nb] = smp.rva; counts[nb] = 0; nb++;
         }
         counts[b]++;
@@ -5578,12 +5591,17 @@ static void handle_host_profile(int id, const char *json)
     {
         const HMODULE exe_mod = GetModuleHandleA(NULL);
         const uint64_t base = host_sampler_image_base();
+        const IMAGE_DOS_HEADER* dos=(const IMAGE_DOS_HEADER*)exe_mod;
+        const IMAGE_NT_HEADERS* pe=(const IMAGE_NT_HEADERS*)((const char*)exe_mod+dos->e_lfanew);
+        const uint64_t image_bytes=pe->OptionalHeader.SizeOfImage;
         for (int b = 0; b < nb; b++) {
             HMODULE h = NULL;
             const char *name = "(unknown)";
             char path[260];
             if (rvas[b] == 0) {
                 name = "(non-image pc)";
+            } else if(rvas[b]<image_bytes) {
+                name="(exe)";
             } else if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                           (LPCSTR)(uintptr_t)(base + rvas[b]), &h) && h) {
@@ -8473,6 +8491,7 @@ extern int sio_get_pad_mode_locked(int slot);
  * and the snapshots held, so scripted runs can check capture and opening. */
 static void handle_rewind_status(int id, const char *json)
 {
+    g_psx_capture_timing=json_get_int(json,"profile",g_psx_capture_timing)!=0;
     if(json_get_int(json,"reset_stats",0))psx_rewind_reset_stats();
     int hold=json_get_int(json,"hold",-1);
     if(hold>=0) psx_rewind_debug_hold(hold);
@@ -10536,18 +10555,12 @@ static uint64_t s_capture_mark_count = 0;
 static char     s_capture_wide_path[512];
 static _Atomic uint64_t s_capture_completion = 0;
 static _Atomic uint64_t s_capture_generation = 0;
+static int s_display_ring_enabled;
 static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 
 static void disp_ring_capture(void)
 {
-    /* Native snapshots never depend on the presentation queue. The opt-out
-     * remains useful when measuring the cost of debug instrumentation. */
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("PSX_DISPLAY_RING");
-        enabled = (!e || !*e || *e != '0') ? 1 : 0;
-    }
-    if (!enabled || s_capture_frozen) return;
+    if (s_capture_frozen) return;
     if (!s_disp_ring_px) {
         size_t vram = (size_t)1024 * 512;
         s_disp_ring_px = (uint16_t *)malloc(DISP_RING_CAP * vram * sizeof(uint16_t));
@@ -10594,7 +10607,7 @@ static void handle_display_ring_aux(int id, const char *json)
 
 static void handle_display_ring_stats(int id, const char *json)
 {
-    (void)json;
+    s_display_ring_enabled=json_get_int(json,"enabled",1)!=0;
     uint32_t oldest = 0, newest = 0;
     int n = 0;
     for (int i = 0; i < DISP_RING_CAP; i++) {
@@ -10604,9 +10617,9 @@ static void handle_display_ring_stats(int id, const char *json)
         if (n == 0 || f > newest) newest = f;
         n++;
     }
-    send_fmt("{\"id\":%d,\"ok\":true,\"capacity\":%d,\"valid\":%d,"
+    send_fmt("{\"id\":%d,\"ok\":true,\"capacity\":%d,\"enabled\":%d,\"valid\":%d,"
              "\"oldest_frame\":%u,\"newest_frame\":%u}",
-             id, DISP_RING_CAP, n, oldest, newest);
+             id, DISP_RING_CAP, s_display_ring_enabled, n, oldest, newest);
 }
 
 static void handle_display_ring_get(int id, const char *json)
@@ -11290,6 +11303,27 @@ static void handle_render_thread(int id, const char *json)
  *   {"cmd":"frame_gen"} -> enabled, active, generated / real presents, flips,
  *   the last plan (in-between frames per game frame, display slots), costs,
  *   match counts, breaker. Not a sync point (render-thread counters, racy). */
+static void packet_sample_request(const void *payload) {
+    if(packet_presenter_request_sample(*(const int *)payload)) rt_tick_at(rt_now_ns());
+}
+static void handle_packet_interpolation(int id, const char *json)
+{
+    char buf[16384];
+    int rate=json_get_int(json,"rate",-1);
+    if(rate>=0 && rate<=1000) packet_interpolation_set_rate((unsigned)rate);
+    int sample=json_get_int(json,"sample_milli",-1);
+    if(sample>=0 && (sample>1000 || !rt_request(packet_sample_request,&sample,sizeof sample))) {
+        send_err(id,"sample request rejected");return;
+    }
+    if(json_get_int(json,"capture",0)) packet_interpolation_capture_request();
+    if(json_get_int(json,"detail",0))
+        packet_interpolation_capture_json(buf,sizeof buf,json_get_int(json,"older",0),
+                                          (size_t)json_get_int(json,"start",0));
+    else packet_interpolation_stream_json(buf,sizeof buf);
+    char presenter[512];packet_presenter_json(presenter,sizeof presenter);
+    send_fmt("{\"id\":%d,\"ok\":true,\"interpolation\":%s,\"presenter\":%s}",id,buf,presenter);
+}
+
 static void handle_frame_gen(int id, const char *json)
 {
     (void)json;
@@ -16306,6 +16340,11 @@ static void handle_phase_profile(int id, const char *json)
  * shares of guest CPU time, including idle-skipped waits. */
 static void handle_gcp_ring(int id, const char *json)
 {
+    extern uint32_t psx_cycle_sample_period;
+    if(strstr(json,"\"period\"")) {
+        int period=json_get_int(json,"period",0);
+        psx_cycle_sample_period=period>0?(uint32_t)period:0;
+    }
     const uint64_t total = guest_cycle_profile_total();
     const uint64_t oldest = guest_cycle_profile_oldest();
     GcpSample first, last;
@@ -16560,7 +16599,7 @@ static void handle_warm_cd_route(int id, const char *json)
 /* reset=1 starts a new opt-in wall-time window. See main.cpp for semantics. */
 extern void psx_debug_main_cadence_json(int reset, char *out, size_t cap);
 static void handle_main_cadence(int id, const char *json) {
-    char buf[768];
+    char buf[8192];
     psx_debug_main_cadence_json(json_get_int(json, "reset", 0), buf, sizeof buf);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
 }
@@ -16629,6 +16668,7 @@ static const CmdEntry s_commands[] = {
     { "present_image_ring_stats", handle_present_image_ring_stats },
     { "render_thread",     handle_render_thread },
     { "frame_gen",         handle_frame_gen },
+    { "packet_interpolation", handle_packet_interpolation },
     { "present_image_ring_get",   handle_present_image_ring_get },
     { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },
@@ -16983,6 +17023,21 @@ static void process_command(const char *line)
     }
 
     int id = json_get_int(line, "id", 0);
+    /* Historical always-on rings are opt-in. Merely connecting or polling
+     * frame/audio/profile status must not turn hot-path instrumentation on. */
+    if (!strcmp(cmd,"debug_hotpath")) {
+        g_debug_write_hooks=(g_debug_write_hooks & 2u) |
+            (json_get_int(line,"writes",0)?1u:0u);
+        g_debug_cycle_hooks=json_get_int(line,"cycles",0)!=0;
+        send_fmt("{\"id\":%d,\"ok\":true,\"writes\":%u,\"cycles\":%d}",
+            id,g_debug_write_hooks,g_debug_cycle_hooks);
+        return;
+    }
+    if (!strncmp(cmd,"wtrace",6) || !strncmp(cmd,"card_trace",10) ||
+        !strncmp(cmd,"fp_",3) || !strncmp(cmd,"frame_fingerprint",17) || !strcmp(cmd,"record_frame")) g_debug_write_hooks|=1u;
+    if (!strncmp(cmd,"cyc_",4) || !strncmp(cmd,"pc_probe",8) ||
+        !strncmp(cmd,"lockstep",8) || !strncmp(cmd,"guest_cycle",11) || !strncmp(cmd,"ls_",3) || !strcmp(cmd,"gcp_ring")) g_debug_cycle_hooks=1;
+
 
     for (const CmdEntry *e = s_commands; e->name; e++) {
         if (strcmp(cmd, e->name) == 0) {
@@ -17024,6 +17079,11 @@ void debug_server_set_cpu(CPUState *cpu)
     debug_cpu_ptr = cpu;
     /* Always-on guest-cycle profile ring (gcp_ring), Release included. */
     guest_cycle_profile_install();
+    const char* diagnostic_env[]={"PSX_ND_WOOD_CLEAR80","PSX_ND_SIB_OT_LIFT",NULL};
+    for(int i=0;diagnostic_env[i];++i) {
+        const char* value=getenv(diagnostic_env[i]);
+        if(value && *value && *value!='0')g_debug_cycle_hooks=1;
+    }
 }
 
 /* Parse PSX_WTRACE_BOOT_RANGES (see debug_server_init). Returns the number of
@@ -17093,6 +17153,8 @@ malformed:
 void debug_server_init(int port)
 {
     if (port > 0) s_port = port;
+    {const char* enabled=getenv("PSX_DISPLAY_RING");s_display_ring_enabled=enabled && *enabled && *enabled!='0';}
+    if(getenv("PSX_WTRACE_BOOT_RANGES") || getenv("PSX_RECORD_FRAME"))g_debug_write_hooks|=1u;
 
     /* Deterministic cold-boot controller probe. Unlike a TCP set_input command,
      * which can only arrive after the guest has already started polling, this
@@ -17162,7 +17224,7 @@ void debug_server_init(int port)
                 }
                 if (pcs && *pcs) pc_probe_parse_list(pcs);
                 if (s_pc_probe_n > 0) {
-                    s_pc_probe_armed = 1;
+                    s_pc_probe_armed = 1;g_debug_cycle_hooks=1;
                     fprintf(stdout, "psxrecomp: pc_probe armed (%d pcs)\n", s_pc_probe_n);
                 }
             }
@@ -17680,7 +17742,12 @@ typedef struct RenderDebugRequest {
 static void execute_render_debug_request(const void *data) {
     const RenderDebugRequest *request=data;
     s_in_command=1;
-    s_debug_wide_snapshot=request->wide?&request->wide_snapshot:NULL;
+    DebugWideSnapshot snapshot=request->wide_snapshot;
+    if(request->wide && json_get_int(request->json,"packet",0)) {
+        int x,y;
+        if(gl_renderer_packet_display(&x,&y)) {snapshot.base_x=x;snapshot.display.display_y=y;}
+    }
+    s_debug_wide_snapshot=request->wide?&snapshot:NULL;
     request->handler(request->id,request->json);
     s_debug_wide_snapshot=NULL;
     s_in_command=0;
@@ -17825,7 +17892,7 @@ void debug_server_record_frame(void)
 
     /* Always-on display ring: raw display-area pixels for THIS frame number
      * (pre-increment, matching what the `frame` command reports right now). */
-    disp_ring_capture();
+    if(s_display_ring_enabled)disp_ring_capture();
 
     pgxp_frame_audit_capture(s_frame_count);
 
@@ -17966,4 +18033,10 @@ int debug_server_get_pad_connected_override(int slot)
 int debug_server_turbo_enabled(void)
 {
     return s_turbo_enabled != 0;
+}
+
+/* Keep the exported hook for previously compiled overlay modules. New code
+ * sees the inline guest-owned flag test in cpu_state.h. */
+void debug_server_cyc_observe(uint32_t pc) {
+    if(g_debug_cycle_hooks)debug_server_cyc_observe_enabled(pc);
 }
