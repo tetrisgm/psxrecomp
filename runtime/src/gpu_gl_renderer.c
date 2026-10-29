@@ -17270,6 +17270,7 @@ static size_t s_packet_vertex_count,s_packet_vertex_index;
 static const PacketInterpolationPrimitive *s_packet_vertex,*s_packet_endpoint;
 static int s_packet_retiring;
 static int s_packet_retiring_target,s_packet_retiring_y;
+static uint64_t s_packet_retiring_source,s_packet_retiring_applied_source;
 static const void *s_packet_present_payload;
 static uint16_t s_packet_present_op;
 static void rth_packet_draw(const FramePacketView *,double);
@@ -17359,6 +17360,7 @@ static void rth_packet_draw_retiring(void) {
         const FramePacketView *old=packet_presenter_previous();
         if(old && old->epoch==s_rth_packet_view->epoch) {
             s_packet_retiring=1;s_packet_vertex_index=0;s_packet_vertex=s_packet_endpoint=NULL;
+            s_packet_retiring_source=0;s_packet_retiring_applied_source=UINT64_MAX;
             const RthPacketSeed *old_seed=old->initial;
             RthFrameState state=old_seed->draw;
             s_packet_retiring_target=state.target_on?state.target:-1;
@@ -17450,13 +17452,23 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
         case RTH_WIDE_TARGET:
             s_packet_retiring_target=v[0];glb_wide_set_target(s_packet_display_target);return 1;
         case RTH_WIDE_DISABLE:s_packet_retiring_target=-1;return 1;
+        case RTH_NATIVE_SOURCE:
+            if(command->payload!=sizeof s_packet_retiring_source) return 0;
+            memcpy(&s_packet_retiring_source,payload,sizeof s_packet_retiring_source);
+            return 1;
         case RTH_FLAT_TRI:case RTH_GOURAUD_TRI:case RTH_TEX_TRI:
         case RTH_SHADED_TEX_TRI:case RTH_PROJ_TRI:
             if(s_packet_retiring_target!=s_packet_previous_target || s_packet_retiring_y!=s_packet_previous_y ||
                !s_packet_vertex || !s_packet_vertex->interpolated) {precise_consumed();return 1;}
+            // Most old primitives also exist in N. Do not copy their native
+            // tiles or restore their texture metadata during a visibility pass.
+            if(s_packet_retiring_source!=s_packet_retiring_applied_source) {
+                if(!rth_packet_native_input(inputs,s_packet_retiring_source)) return 0;
+                s_packet_retiring_applied_source=s_packet_retiring_source;
+            }
             break;
         case RTH_SEMI:case RTH_MASK:case RTH_TWIN:case RTH_MOD:case RTH_PRECISE:
-        case RTH_PERSP:case RTH_DEPTH:case RTH_DITHER:case RTH_BANK:case RTH_NATIVE_SOURCE:
+        case RTH_PERSP:case RTH_DEPTH:case RTH_DITHER:case RTH_BANK:
             break;
         default:return 1; // no clears, transfers, HUD, effects or presents from N-1
         }
