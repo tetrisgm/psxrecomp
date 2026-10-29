@@ -24,6 +24,14 @@ uint32_t frame_pacing_sleep_ms(uint64_t now, uint64_t deadline,
     return (uint32_t)(ms - 1);                 /* undershoot; spin covers rest */
 }
 
+uint32_t frame_pacing_sleep_us(uint64_t now,uint64_t deadline,uint64_t freq,uint64_t period) {
+    if(now>=deadline || !freq)return 0;
+    uint64_t remaining=deadline-now;
+    if(remaining>period)remaining=period;
+    uint64_t us=remaining*1000000u/freq;
+    return us>500 ? (uint32_t)(us-500) : 0;
+}
+
 #ifndef FRAME_PACING_PURE_ONLY
 
 /* Bounded catch-up window, in periods. A transient stall (heavy frame, CD
@@ -66,20 +74,20 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
     for (;;) {
         draw_service_poll();
         now = SDL_GetPerformanceCounter();     /* ONE read per iteration */
-        uint32_t ms = frame_pacing_sleep_ms(now, p->next_deadline, freq, period);
-        if (ms == 0) break;
+        uint32_t us = frame_pacing_sleep_us(now, p->next_deadline, freq, period);
+        if (us == 0) break;
         /* Waitable timer on Win32; usleep on Unix — not coarse Sleep/SDL_Delay. */
         /* Keep completed optional frames serviceable while main is paced.
          * Poll checks thread ownership, so render-thread waits remain inert. */
-        const uint32_t sleep_ms=draw_service_active() && ms > 1 ? 1 : ms;
+        const uint32_t sleep_us=draw_service_active() && us > 1000 ? 1000 : us;
 #ifndef PSX_NO_DEBUG_TOOLS
         const uint64_t sleep_start=p->trace_waits?SDL_GetPerformanceCounter():0;
 #endif
-        psx_host_sleep_ms(sleep_ms);
+        psx_host_sleep_micros(sleep_us);
 #ifndef PSX_NO_DEBUG_TOOLS
         if(p->trace_waits) {
             const uint64_t elapsed=SDL_GetPerformanceCounter()-sleep_start;
-            const uint64_t requested=(uint64_t)sleep_ms*freq/1000;
+            const uint64_t requested=(uint64_t)sleep_us*freq/1000000;
             p->sleep_ticks+=elapsed;
             if(elapsed>requested) p->sleep_overshoot_ticks+=elapsed-requested;
         }

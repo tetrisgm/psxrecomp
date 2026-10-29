@@ -1906,10 +1906,12 @@ static void isc_store(uint32_t addr, uint32_t val, uint32_t width) {
         PSX_BIU_DCACHE_ENABLE) {
         uint32_t off = addr & 0x3FFu;
 #ifndef PSX_NO_DEBUG_TOOLS
-        uint32_t old = 0;
-        for (uint32_t i = 0; i < width; i++)
-            old |= (uint32_t)scratchpad[(off + i) & 0x3FFu] << (8u * i);
-        if (g_debug_write_hooks) debug_server_trace_write_check(0x1F800000u + off, old, val, (uint8_t)width);
+        if (g_debug_write_hooks) {
+            uint32_t old = 0;
+            for (uint32_t i = 0; i < width; i++)
+                old |= (uint32_t)scratchpad[(off + i) & 0x3FFu] << (8u * i);
+            debug_server_trace_write_check(0x1F800000u + off, old, val, (uint8_t)width);
+        }
 #endif
         for (uint32_t i = 0; i < width; i++)
             scratchpad[(off + i) & 0x3FFu] = (uint8_t)(val >> (8u * i));
