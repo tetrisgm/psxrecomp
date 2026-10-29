@@ -16281,7 +16281,7 @@ int gl_renderer_frame_generation_method(void) {
     return s_fg_reproject ? GL_FG_METHOD_REPROJECTION : GL_FG_METHOD_REDRAW;
 }
 
-void packet_interpolation_record(const PacketInterpolationSource *source) {
+static void rth_packet_interpolation_record(const PacketInterpolationSource *source) {
     if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
     if(!rth_group_flush()) return;
     void *payload=rt_cmd_begin(RTH_PACKET_SOURCE,0,sizeof *source);
@@ -17312,6 +17312,7 @@ int gl_renderer_render_thread_start(int max_frames) {
     cfg.seal_frame=rth_packet_seal;
     cfg.execute_frame=rth_packet_execute;
     cfg.reset_frame=rth_packet_reset;
+    packet_interpolation_set_recorder(rth_packet_interpolation_record);
     native_raster_inputs_enable(gr_native_raster(),1);
     fg_invalidate();
     (void)pt_begin();   /* [video] present_thread; falls back to direct swaps */

@@ -5043,6 +5043,10 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
         const int indices[3]={i0,i1,i2};
         for(unsigned i=0;i<3;++i) {
             source.x[i]=vx[i];source.y[i]=vy[i];
+            int32_t px,py;uint16_t depth=0;
+            if(gte_precision_load_word(gp0_cmd_source_addr+4u*indices[i],
+                gp0_cmd_buf[indices[i]],&px,&py,&depth) && depth)
+                source.spatial_mask|=1u<<i;
             if(pgxp_load_projection(gp0_cmd_source_addr+4u*indices[i],
                 gp0_cmd_buf[indices[i]],&source.projection[i]) &&
                 source.projection[i].interpolation_valid) source.valid_mask|=1u<<i;

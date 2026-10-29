@@ -11,8 +11,13 @@ typedef struct PacketInterpolationSource {
     PGXPProjection projection[3];
     int32_t x[3],y[3];
     uint32_t valid_mask;
+    uint32_t spatial_mask; /* depth evidence, including missing provenance */
 } PacketInterpolationSource;
 int packet_interpolation_stream_enabled(void);
+typedef void (*PacketInterpolationRecorder)(const PacketInterpolationSource *source);
+/* Install during presenter startup; callbacks synchronously copy the source
+ * into an owned record. No presenter means this optional audit is inactive. */
+void packet_interpolation_set_recorder(PacketInterpolationRecorder recorder);
 void packet_interpolation_record(const PacketInterpolationSource *source);
 void packet_interpolation_stream_begin(uint64_t epoch,uint64_t sequence);
 void packet_interpolation_stream_append(const PacketInterpolationSource *source);

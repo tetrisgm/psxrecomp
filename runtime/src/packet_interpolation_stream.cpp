@@ -1,6 +1,7 @@
 #include "packet_interpolation_stream.h"
 #include "packet_interpolation.h"
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 #include <vector>
@@ -18,10 +19,18 @@ std::mutex stats_mutex;
 PacketInterpolationStats published{};
 uint64_t published_sequence=0,published_missing=0,published_count=0;
 bool published_failed=false;
+std::atomic<PacketInterpolationRecorder> recorder{nullptr};
 uint64_t hash(uint64_t seed,uint32_t value) {
     for(unsigned i=0;i<4;++i) seed=(seed^((value>>(i*8))&255))*1099511628211ULL;
     return seed;
 }
+}
+extern "C" void packet_interpolation_set_recorder(PacketInterpolationRecorder callback) {
+    recorder.store(callback,std::memory_order_release);
+}
+extern "C" void packet_interpolation_record(const PacketInterpolationSource *source) {
+    auto callback=recorder.load(std::memory_order_acquire);
+    if(callback) callback(source);
 }
 extern "C" int packet_interpolation_stream_enabled(void) {
     static const bool enabled=[] {
@@ -37,9 +46,9 @@ extern "C" void packet_interpolation_stream_begin(uint64_t epoch,uint64_t sequen
 extern "C" void packet_interpolation_stream_append(const PacketInterpolationSource *s) {
     if(!s || stream.failed) return;
     PacketInterpolationPrimitive p{};
-    p.vertices=3;p.spatial=s->valid_mask!=0;
+    p.vertices=3;p.spatial=(s->valid_mask|s->spatial_mask)!=0;
     if(s->valid_mask!=7) {
-        if(s->valid_mask) ++stream.missing;
+        if(p.spatial) ++stream.missing;
         // Partial provenance stays in the census as invalid, never becomes HUD.
     }
     uint64_t a=14695981039346656037ULL,b=7809847782465536322ULL;

@@ -43,6 +43,7 @@ struct PacketInterpolation {
     std::vector<PacketInterpolationPrimitive> a,b;
     std::vector<size_t> matches;
     PacketInterpolationStats stats{};
+    bool ready=false;
 };
 extern "C" PacketInterpolation *packet_interpolation_create(void) {
     try { return new PacketInterpolation; } catch(...) { return nullptr; }
@@ -96,12 +97,13 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
             }
         }
         for(const auto& p:c->a) if(p.spatial && !new_count.count(key(p))) ++c->stats.disappeared;
+        c->ready=true;
         return 1;
     } catch(...) { *c=PacketInterpolation{}; return 0; }
 }
 extern "C" int packet_interpolation_sample(const PacketInterpolation *c,double t,
     PacketInterpolationPrimitive *out,size_t capacity) {
-    if(!c || capacity<c->b.size() || (!out && !c->b.empty()) || !std::isfinite(t)) return 0;
+    if(!c || !c->ready || capacity<c->b.size() || (!out && !c->b.empty()) || !std::isfinite(t)) return 0;
     t=std::clamp(t,0.0,1.0);
     for(size_t i=0;i<c->b.size();++i) {
         out[i]=c->b[i];
