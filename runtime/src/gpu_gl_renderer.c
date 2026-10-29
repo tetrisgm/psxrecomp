@@ -2079,7 +2079,6 @@ static const char *GEO_VS =
     "uniform float u_raster_grid;\n"
     "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
     "uniform float u_yhalf; /* target clip half-height */\n"
-    "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
     "noperspective out vec4 v_col;\n"
     "noperspective out float v_iw; noperspective out vec3 v_col_p;   /* perspective-correct colour (PGXP, G1.14) */\n"
     "flat out int v_cp;\n"
@@ -2098,7 +2097,7 @@ static const char *GEO_VS =
     "  bool far_code = a < -1.5;\n"
     "  if (far_code) { uint bits = floatBitsToUint(-a); m = float(bits & 1u); cp = float((bits >> 1u) & 1u); dth = float((bits >> 2u) & 1u); sz = uintBitsToFloat(bits & 0xfffffff8u) - 2.0; }\n"
     "  v_dith = int(dth);\n"
-    "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz * (1.0 - u_zbias) - (u_zbias > 0.0 ? 48.0 : 0.0), 1.0) + 256.0); if (cp > 0.5) w = sz / 1024.0; }\n"
+    "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz, 1.0) + 256.0); if (cp > 0.5) w = sz / 1024.0; }\n"
     "  v_col = vec4(a_col.rgb, m); v_col_p = a_col.rgb / w; v_iw = 1.0/w; v_cp = int(cp);\n"
     "  v_b3d = ((a >= 0.0 || far_code) && sz > 0.5) ? 1.0 : 0.0;\n"
     "  v_npos += sz > 0.5 ? u_origin : vec2(0.0);\n"
@@ -2164,7 +2163,6 @@ static const char *TEX_VS =
     "uniform float u_raster_grid;\n"
     "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
     "uniform float u_yhalf; /* target clip half-height */\n"
-    "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
     "noperspective out vec2 g_uv; noperspective out vec4 g_col;\n"
     "noperspective out vec2 g_uv_p;  /* perspective-correct UV (used when g_persp!=0) */\n"
     "flat out int g_persp;\n"
@@ -2206,7 +2204,7 @@ static const char *TEX_VS =
     "  float pz = a_col.a < 0.0 ? -a_col.a : 0.0;\n"
     "  float cp = pz >= 65536.0 ? 1.0 : 0.0, sz = pz - 65536.0 * cp, zn = 0.0;\n"
     "  if (a_col.a > 1.5) { uint bits = floatBitsToUint(a_col.a); cp = float((bits >> 1u) & 1u); sz = uintBitsToFloat(bits & 0xfffffff8u) - 2.0; }\n"
-    "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz * (1.0 - u_zbias) - (u_zbias > 0.0 ? 48.0 : 0.0), 1.0) + 256.0); if (a_q <= 0.0 && cp > 0.5) w = sz / 1024.0; }\n"
+    "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz, 1.0) + 256.0); if (a_q <= 0.0 && cp > 0.5) w = sz / 1024.0; }\n"
     "  g_uv_p = a_uv/w; g_col_p = a_col.rgb/w; g_iw = 1.0/w; g_cp = int(cp); g_b3d = sz > 0.5 ? 1.0 : 0.0; g_npos += sz > 0.5 ? u_origin : vec2(0.0);\n"
     "  zn -= 2.0*u_depth_probe;\n"
     "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
@@ -2767,40 +2765,17 @@ static void hr_end(void) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
 }
 
-/* PGXP depth state for one draw (G1.14). 0: no depth (the default GL state
- * everywhere else), 1: opaque 3D polygon.
- *
- * Mode 1 is two passes so that near-coplanar surfaces keep the PS1's
- * painter order (R4's lane markings and decals are separate polygons drawn
- * after the road, a hair off its plane once SZ is quantised per vertex): the
- * colour pass tests LEQUAL with its depth pulled toward the camera by a
- * relative tolerance (u_zbias, s_pgxp_depth_tol of the distance) and writes
- * no depth; depth_restore then lays down the true depth in a colourless
- * pass. A later polygon within the tolerance of what is already there wins,
- * as in painter order; anything clearly behind is still occluded.
- * DuckStation's depth buffer is a plain LEQUAL with no bias and has this
- * decal problem; this tolerance is our own. Every caller that applies depth
- * calls depth_restore after its draw (tex: textured program bound). */
-static GLint s_geo_uZbias = -1, s_tex_uZbias = -1;
-static float s_pgxp_depth_tol = -1.0f;
-static float pgxp_depth_tol(void) {
-    if (s_pgxp_depth_tol < 0.0f) {
-        const char *e = getenv("PSX_PGXP_DEPTH_TOL");
-        s_pgxp_depth_tol = e && *e ? (float)atof(e) : 0.02f;
-        if (s_pgxp_depth_tol < 0.0f) s_pgxp_depth_tol = 0.0f;
-        if (s_pgxp_depth_tol > 0.5f) s_pgxp_depth_tol = 0.5f;
-    }
-    return s_pgxp_depth_tol;
-}
+/* Opaque PGXP colour and unbiased geometric depth share one visibility test.
+ * Masked and transparent fragments must not write invisible depth. Diagnostic
+ * epsilon probes below are opt-in observations, never a production depth pass. */
 static void depth_apply_ex(int mode, int tex) {
     if (mode == 0) return;
     glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
+    (void)tex;
+    glDepthMask(GL_TRUE);
     glDepthFunc(GL_LEQUAL);
-    p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, pgxp_depth_tol());
 }
-/* After the colour pass of mode 1: the depth-only pass (n vertices of the
- * bound buffer), then back to the default state. */
+/* Restore the host default after the single colour/depth draw. */
 static void depth_restore_ex(int mode, int tex, int n) {
     if (mode == 0) return;
     if (mode == 1) {
@@ -2820,17 +2795,9 @@ static void depth_restore_ex(int mode, int tex, int n) {
             s_ra_failed+=samples[0];if(samples[0]>=samples[1])s_ra_near+=samples[0]-samples[1];
             p_glUniform1f(tex?s_tex_uDepthProbe:s_geo_uDepthProbe,0.0f);
             glStencilMask((GLuint)write_mask);glDepthFunc(GL_LEQUAL);
+            glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
         }
-        p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, 0.0f);
-        GLboolean st = glIsEnabled(GL_STENCIL_TEST), bl = glIsEnabled(GL_BLEND);
-        glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-        glDepthMask(GL_TRUE);
-        if (tex) p_glUniform1i(s_uSemipass, 0);
-        glDrawArrays(GL_TRIANGLES, 0, n);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        if (st) glEnable(GL_STENCIL_TEST);
-        if (bl) glEnable(GL_BLEND);
+
     }
     glDepthMask(GL_TRUE);
     glDisable(GL_DEPTH_TEST);
@@ -5129,13 +5096,12 @@ static void snap_bary(const float x[3], const float y[3], const float cx[3], con
         }
 }
 /* A strip's depth: behind its own plane by more than the depth agreement
- * that paired the two surfaces (PGXP_SNAP_DEPTH_TOL) and the colour pass's
- * near tolerance (u_zbias, plus its 48-unit term), so it never wins against
+ * that paired the two surfaces (PGXP_SNAP_DEPTH_TOL), so it never wins against
  * either surface or anything near their plane -- a kerb face beside a road
  * row, the road under a lane mark -- and only shows where the gap really
  * opens onto what is behind. */
 static float snap_strip_depth(float z) {
-    return z * (1.0f + PGXP_SNAP_DEPTH_TOL + 1.5f * pgxp_depth_tol()) + 64.0f;
+    return z * (1.0f + PGXP_SNAP_DEPTH_TOL) + 64.0f;
 }
 static uint64_t s_snap_strip_tris = 0;
 /* The frame's edge index (allocated on first use, reset at every present).
@@ -7031,8 +6997,6 @@ static int init_gpu_raster(void) {
         s_geo_uDither = s_tex_uDither = -1;
         dither_apply_uniforms();
         s_tex_uShift = p_glGetUniformLocation(s_tex_prog, "u_shift");
-        s_geo_uZbias = p_glGetUniformLocation(s_geo_prog, "u_zbias");
-        s_tex_uZbias = p_glGetUniformLocation(s_tex_prog, "u_zbias");
         p_glUseProgram(s_geo_prog);
         p_glUniform1f(s_geo_uShift, shift);
         /* Native-wide projection defaults: x translation 0, clip half-extent
@@ -11646,64 +11610,116 @@ static GLuint pt_target_fbo(void) {
     return s_pts_fbo[i];
 }
 
-/* Opt-in presenter-local receipt: one 8x8 downsample/readback, never an 8K
- * download. Changed sample hashes are a lower bound on distinct images. */
+/* Optional distinct-image receipt. Pixel sampling is queued into a bounded
+ * PBO ring; only signalled fences are mapped. Changed hashes prove a lower
+ * bound on distinct images, without a synchronous presenter readback. */
+#define PT_TRACE_SLOTS 8
+#define PT_TRACE_W 32
+#define PT_TRACE_H 18
+#define PT_TRACE_BYTES (PT_TRACE_W*PT_TRACE_H*4)
 static FILE *s_pt_trace;
 static int s_pt_trace_init;
 static GLuint s_pt_trace_tex,s_pt_trace_fbo;
-static uint64_t s_pt_trace_start,s_pt_trace_second,s_pt_trace_hash;
-static unsigned s_pt_trace_frames,s_pt_trace_changes;
+static StreamWait s_pt_trace_wait;
+static struct PtTraceRead {
+    GLuint pbo; void *fence; PtTiming timing; uint64_t time;
+} s_pt_reads[PT_TRACE_SLOTS];
+static uint64_t s_pt_trace_read,s_pt_trace_write,s_pt_trace_hash;
 static int s_pt_trace_has_hash;
-static int pt_trace_sample(int slot,uint64_t *hash) {
+static void pt_trace_emit(const PtTiming *t,uint64_t now,uint64_t hash,int changed) {
+    fprintf(s_pt_trace,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%016llX,%d\n",
+        (unsigned long long)now,(unsigned long long)t->epoch,
+        (unsigned long long)t->generation,(unsigned long long)t->index,t->alpha_q16,
+        (unsigned long long)t->not_before_ns,(unsigned long long)t->expires_ns,
+        (unsigned long long)hash,changed);
+}
+static void pt_trace_resolve(void) {
+    GLint pack=0;glGetIntegerv(0x88ED /* PIXEL_PACK_BUFFER_BINDING */,&pack);
+    while(s_pt_trace_read<s_pt_trace_write) {
+        struct PtTraceRead *r=&s_pt_reads[s_pt_trace_read%PT_TRACE_SLOTS];
+        if(!r->time)break;
+        GLenum ready=s_pt_trace_wait(r->fence,0,0);
+        if(ready!=0x911A && ready!=0x911C)break;
+        p_glBindBuffer(0x88EB,r->pbo);
+        const uint8_t *pixels=p_glMapBuffer(0x88EB,0x88B8 /* READ_ONLY */);
+        if(pixels) {
+            uint64_t hash=1469598103934665603ull;
+            for(unsigned i=0;i<PT_TRACE_BYTES;++i)hash=(hash^pixels[i])*1099511628211ull;
+            int changed=!s_pt_trace_has_hash || hash!=s_pt_trace_hash;
+            pt_trace_emit(&r->timing,r->time,hash,changed);
+            s_pt_trace_has_hash=1;s_pt_trace_hash=hash;
+            p_glUnmapBuffer(0x88EB);
+        } else pt_trace_emit(&r->timing,r->time,0,-1);
+        p_glDeleteSync(r->fence);r->fence=NULL;r->time=0;++s_pt_trace_read;
+    }
+    p_glBindBuffer(0x88EB,(GLuint)pack);
+}
+static int pt_trace_sample(int slot,uint64_t *token) {
     if(!s_pt_trace_init) {
         s_pt_trace_init=1;
         const char *path=getenv("PSX_PRESENT_TRACE");
-        if(path && *path) s_pt_trace=fopen(path,"wb");
-        if(s_pt_trace) fprintf(s_pt_trace,"time_ns,epoch,generation,index,alpha_q16,deadline_ns,expires_ns,sample_hash,changed\n");
+        s_pt_trace_wait=(StreamWait)SDL_GL_GetProcAddress("glClientWaitSync");
+        if(path && *path && s_pt_trace_wait && p_glMapBuffer && p_glUnmapBuffer)
+            s_pt_trace=fopen(path,"wb");
+        if(s_pt_trace) {
+            setvbuf(s_pt_trace,NULL,_IOFBF,256*1024);
+            fprintf(s_pt_trace,"time_ns,epoch,generation,index,alpha_q16,deadline_ns,expires_ns,sample_hash,changed\n");
+        }
     }
-    if(!s_pt_trace) return 0;
-    GLint read=0,draw=0,tex=0,pack=0,row=0;
-    glGetIntegerv(0x8CAA,&read); glGetIntegerv(0x8CA6,&draw);
+    if(!s_pt_trace)return 0;
+    pt_trace_resolve();
+    if(s_pt_trace_write-s_pt_trace_read==PT_TRACE_SLOTS) {
+        PtTiming t={0};pt_present_timing((unsigned)slot,&t);
+        pt_trace_emit(&t,pt_clock_ns(),0,-1);
+        return 0;
+    }
+    GLint read=0,draw=0,tex=0,pack=0,row=0,pbo=0;
+    glGetIntegerv(0x8CAA,&read);glGetIntegerv(0x8CA6,&draw);
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&tex);
-    glGetIntegerv(GL_PACK_ALIGNMENT,&pack); glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+    glGetIntegerv(GL_PACK_ALIGNMENT,&pack);glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+    glGetIntegerv(0x88ED,&pbo);
     if(!s_pt_trace_fbo) {
-        glGenTextures(1,&s_pt_trace_tex); glBindTexture(GL_TEXTURE_2D,s_pt_trace_tex);
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,8,8,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glGenTextures(1,&s_pt_trace_tex);glBindTexture(GL_TEXTURE_2D,s_pt_trace_tex);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,PT_TRACE_W,PT_TRACE_H,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
         p_glGenFramebuffers(1,&s_pt_trace_fbo);
         p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
         p_glFramebufferTexture2D(PSXGL_DRAW_FRAMEBUFFER,PSXGL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s_pt_trace_tex,0);
     }
+    struct PtTraceRead *r=&s_pt_reads[s_pt_trace_write%PT_TRACE_SLOTS];
+    if(!r->pbo) {
+        p_glGenBuffers(1,&r->pbo);p_glBindBuffer(0x88EB,r->pbo);
+        p_glBufferData(0x88EB,PT_TRACE_BYTES,NULL,0x88E1 /* STREAM_READ */);
+    } else p_glBindBuffer(0x88EB,r->pbo);
     p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_ptp_fbo[slot]);
     p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
-    p_glBlitFramebuffer(0,0,s_pts_w[slot],s_pts_h[slot],0,0,8,8,GL_COLOR_BUFFER_BIT,GL_LINEAR);
+    p_glBlitFramebuffer(0,0,s_pts_w[slot],s_pts_h[slot],0,0,PT_TRACE_W,PT_TRACE_H,GL_COLOR_BUFFER_BIT,GL_NEAREST);
     p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_pt_trace_fbo);
-    glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
-    uint8_t pixels[8*8*4]; glReadPixels(0,0,8,8,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
-    *hash=1469598103934665603ull;
-    for(size_t i=0;i<sizeof pixels;i++) *hash=(*hash^pixels[i])*1099511628211ull;
-    glPixelStorei(GL_PACK_ALIGNMENT,pack); glPixelStorei(GL_PACK_ROW_LENGTH,row);
+    glPixelStorei(GL_PACK_ALIGNMENT,1);glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    glReadPixels(0,0,PT_TRACE_W,PT_TRACE_H,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    r->fence=p_glFenceSync(PT_SYNC_GPU_COMMANDS_COMPLETE,0);
+    pt_present_timing((unsigned)slot,&r->timing);r->time=0;
+    *token=s_pt_trace_write%PT_TRACE_SLOTS;++s_pt_trace_write;
+    p_glBindBuffer(0x88EB,(GLuint)pbo);
+    glPixelStorei(GL_PACK_ALIGNMENT,pack);glPixelStorei(GL_PACK_ROW_LENGTH,row);
     glBindTexture(GL_TEXTURE_2D,(GLuint)tex);
     p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,(GLuint)read);
     p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,(GLuint)draw);
     return 1;
 }
-static void pt_trace_record(int slot,uint64_t hash) {
-    PtTiming timing={0}; (void)pt_present_timing((unsigned)slot,&timing);
-    uint64_t now=pt_clock_ns();
-    if(!s_pt_trace_start) s_pt_trace_start=now;
-    uint64_t second=(now-s_pt_trace_start)/1000000000u;
-    if(second!=s_pt_trace_second) {
-        fprintf(stderr,"present_trace second=%llu presented=%u sample_changes=%u\n",
-                (unsigned long long)s_pt_trace_second,s_pt_trace_frames,s_pt_trace_changes);
-        fflush(s_pt_trace); s_pt_trace_frames=s_pt_trace_changes=0; s_pt_trace_second=second;
+static void pt_trace_record(int slot,uint64_t token) {
+    (void)slot;s_pt_reads[token].time=pt_clock_ns();
+}
+static void pt_trace_shutdown(void) {
+    if(s_pt_trace) {glFinish();pt_trace_resolve();fclose(s_pt_trace);s_pt_trace=NULL;}
+    for(unsigned i=0;i<PT_TRACE_SLOTS;++i) {
+        if(s_pt_reads[i].fence)p_glDeleteSync(s_pt_reads[i].fence);
+        if(s_pt_reads[i].pbo)p_glDeleteBuffers(1,&s_pt_reads[i].pbo);
     }
-    int changed=!s_pt_trace_has_hash || hash!=s_pt_trace_hash;
-    s_pt_trace_has_hash=1; s_pt_trace_hash=hash; s_pt_trace_frames++; s_pt_trace_changes+=changed;
-    fprintf(s_pt_trace,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%016llX,%d\n",
-            (unsigned long long)now,(unsigned long long)timing.epoch,
-            (unsigned long long)timing.generation,(unsigned long long)timing.index,timing.alpha_q16,
-            (unsigned long long)timing.not_before_ns,(unsigned long long)timing.expires_ns,
-            (unsigned long long)hash,changed);
+    memset(s_pt_reads,0,sizeof s_pt_reads);
+    if(s_pt_trace_fbo)p_glDeleteFramebuffers(1,&s_pt_trace_fbo);
+    if(s_pt_trace_tex)glDeleteTextures(1,&s_pt_trace_tex);
+    s_pt_trace_fbo=s_pt_trace_tex=0;s_pt_trace_init=0;
+    s_pt_trace_read=s_pt_trace_write=s_pt_trace_hash=0;s_pt_trace_has_hash=0;
 }
 static int pt_cb_ctx(void *user, int current) {
     (void)user;
@@ -11717,11 +11733,7 @@ static int pt_cb_ctx(void *user, int current) {
         s_ptp_fbo[i] = 0;
         s_ptp_gen[i] = 0;
     }
-    if(s_pt_trace) { fflush(s_pt_trace); fclose(s_pt_trace); s_pt_trace=NULL; }
-    if(s_pt_trace_fbo) p_glDeleteFramebuffers(1,&s_pt_trace_fbo);
-    if(s_pt_trace_tex) glDeleteTextures(1,&s_pt_trace_tex);
-    s_pt_trace_fbo=s_pt_trace_tex=0; s_pt_trace_init=0;
-    s_pt_trace_start=s_pt_trace_second=0; s_pt_trace_frames=s_pt_trace_changes=0; s_pt_trace_has_hash=0;
+    pt_trace_shutdown();
     glFinish();
     SDL_GL_MakeCurrent(s_win, NULL);
     return 1;

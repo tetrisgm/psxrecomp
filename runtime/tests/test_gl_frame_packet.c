@@ -200,7 +200,7 @@ int main(void) {
     glFinish(); /* Test-only completion before inspecting asynchronous telemetry. */
     packet_timer_resolve();
     uint64_t timing[5];gl_renderer_packet_gpu_stats(timing);
-    check(timing[0]==2,"only consumed packets timed");
+    check(timing[0]==3,"two forward packets and one historical replay timed");
     check(timing[1]>0 && timing[3]>0 && timing[3]<=timing[1],"packet timestamp totals");
     check(timing[2]<=timing[1] && timing[4]==0,"bounded nonblocking packet telemetry");
     printf("checks=%d failures=%d\n",checks,failures);

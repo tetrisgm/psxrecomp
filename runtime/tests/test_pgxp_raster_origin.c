@@ -123,7 +123,7 @@ static int run_scale(int scale) {
         float v[18]={10,10,1,0,0,60000, 80,10,0,1,0,60000, 10,80,0,0,1,60000};
         hr_begin(1);p_glUseProgram(s_geo_prog);p_glBindVertexArray(s_geo_vao);
         p_glBindBuffer(PSXGL_ARRAY_BUFFER,s_geo_vbo);
-        p_glUniform1f(s_geo_uZbias,0);p_glUniform1f(s_geo_uDepthProbe,0);
+        p_glUniform1f(s_geo_uDepthProbe,0);
         glDisable(GL_STENCIL_TEST);glEnable(GL_DEPTH_TEST);glDepthMask(GL_TRUE);
         glDepthFunc(GL_ALWAYS);glClearDepth(1);glClear(GL_DEPTH_BUFFER_BIT);
         vertex_stream_upload(0,v,sizeof v);
@@ -138,6 +138,25 @@ static int run_scale(int scale) {
           (unsigned long long)s_ra_failed,(unsigned long long)s_ra_near);
         hr_end();p_glBindVertexArray(0);
     }
+    /* A mask-rejected nearer primitive cannot overwrite invisible depth.
+     * A colourless replay with stencil disabled violated this contract. */
+    gr_set_draw_area(0,0,319,239);
+    gr_fill_rect(0,0,320,240,0);DEPTH_REQUEST_CLEAR(DCLR_AREA);
+    gr_set_precise_triangle(1,20*65536,20*65536,100*65536,20*65536,20*65536,100*65536);
+    gr_set_perspective_triangle(1,1,1,1);
+    gr_set_mask_bits(1,0);gr_set_depth_triangle(1,1024,1024,1024);
+    gr_draw_flat_triangle(20,20,100,20,20,100,0x001f);
+    flush_flat_batch();
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_hr_fbo);
+    float mask_depth_before=0,mask_depth_after=0;
+    glReadPixels(40*scale,40*scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&mask_depth_before);
+    gr_set_mask_bits(0,1);gr_set_depth_triangle(1,512,512,512);
+    gr_draw_flat_triangle(20,20,100,20,20,100,0x03e0);
+    flush_flat_batch();
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_hr_fbo);
+    glReadPixels(40*scale,40*scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&mask_depth_after);
+    check(mask_depth_before==mask_depth_after,"masked fragments preserve geometric depth");
+    gr_set_mask_bits(0,0);
     /* Depth clears must retain neighbouring draw domains, colour and mask.
      * Read depth only on this fixture's GL owner. */
     flush_flat_batch();flush_tex_batch();hiw_flush_queue();

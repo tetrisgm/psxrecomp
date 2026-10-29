@@ -4,12 +4,11 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include "worker_event.h"
-#include <condition_variable>
 #include <cstring>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -34,6 +33,19 @@ struct NativeRasterInputs {
 };
 
 namespace {
+thread_local bool producer_timing_enabled=false;
+thread_local uint64_t producer_submit_ns=0,producer_sync_ns=0;
+struct ProducerTimer {
+    uint64_t *total;
+    std::chrono::steady_clock::time_point start;
+    explicit ProducerTimer(uint64_t &counter):total(producer_timing_enabled?&counter:nullptr) {
+        if(total)start=std::chrono::steady_clock::now();
+    }
+    ~ProducerTimer() {
+        if(total)*total+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-start).count();
+    }
+};
 constexpr size_t vram_words = 1024 * 512;
 constexpr size_t queue_budget = 4 * 1024 * 1024;
 enum class Kind { Draw, Packet, Read, Snapshot, Restore, Observe, Visit };
@@ -193,17 +205,17 @@ void draw(const Job &j) {
 struct NativeRaster {
     std::array<uint16_t, vram_words> vram{};
     SwRendererContext *context = nullptr;
-    std::mutex mutex;
-
-    WorkerEvent available;
-    std::condition_variable space;
-    std::vector<Job> queue=std::vector<Job>(queue_budget/sizeof(Job));
-    size_t head=0,count=0;
+    WorkerEvent available,space;
+    static constexpr uint64_t queue_slots=4096;
+    std::array<Job,queue_slots> queue;
+    alignas(64) std::atomic<uint64_t> published{0};
+    uint64_t produced_bytes=0;
+    alignas(64) std::atomic<uint64_t> retired{0},retired_bytes{0};
+    std::atomic<bool> consumer_waiting{false},producer_waiting{false};
     uint64_t submitted=0,executed=0; /* producer / consumer owned */
     Job checkpoint;
     std::atomic<bool> checkpoint_pending{false};
-    size_t bytes = 0;
-    bool stop = false;
+    std::atomic<bool> stop{false};
 
     std::atomic<uint64_t> completed{0};
     std::thread thread;
@@ -286,17 +298,28 @@ struct NativeRaster {
     }
 
     void push(Job job) {
+        ProducerTimer timer(producer_submit_ns);
         if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore || job.borrowed_words)
             read_row_y=-1;
         const size_t cost = job.bytes();
 
-        std::unique_lock<std::mutex> lock(mutex);
-        space.wait(lock, [&] { return bytes + cost <= queue_budget && count<queue.size(); });
+        const uint64_t write=published.load(std::memory_order_relaxed);
+        auto fits=[&] {
+            return write-retired.load(std::memory_order_acquire)<queue_slots &&
+                produced_bytes-retired_bytes.load(std::memory_order_acquire)+cost<=queue_budget;
+        };
+        if(!fits()) {
+            producer_waiting.store(true);
+            while(!fits())space.wait();
+            producer_waiting.store(false);
+        }
         job.sequence=submitted++;
-        queue[(head+count)%queue.size()]=std::move(job);count++;
-        bytes += cost;
-        lock.unlock();
-        available.notify();
+        queue[write%queue_slots]=std::move(job);
+        produced_bytes+=cost;
+        // SC publication and parking flags prevent both sides missing each
+        // other. Retained events avoid taking a mutex even when waking.
+        published.store(write+1);
+        if(consumer_waiting.load())available.notify();
     }
     /* The one outstanding rewind checkpoint never contends for the draw
      * queue mutex/space. Its sequence is the boundary before the next draw.
@@ -308,8 +331,8 @@ struct NativeRaster {
         if(job.borrowed_words)read_row_y=-1;
         job.sequence=submitted;
         checkpoint=std::move(job);
-        checkpoint_pending.store(true,std::memory_order_release);
-        available.notify();
+        checkpoint_pending.store(true);
+        if(consumer_waiting.load())available.notify();
     }
     void execute(Job &job) {
 
@@ -370,23 +393,22 @@ struct NativeRaster {
         sw_context_bind(context);
         sw_renderer_init(vram.data());
         sw_set_faithful_authority(1);
+        uint64_t read=0,consumed_bytes=0;
         for (;;) {
             service_checkpoint(executed);
-            Job job;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                if (!count) {
-                    if(stop && !checkpoint_pending.load(std::memory_order_acquire))break;
-                    lock.unlock();
+            if(read==published.load()) {
+                consumer_waiting.store(true);
+                if(read==published.load() && !checkpoint_pending.load() && !stop.load())
                     available.wait();
-                    continue;
-                }
-                const size_t cost = queue[head].bytes();
-                job = std::move(queue[head]);
-                head=(head+1)%queue.size();count--;
-                bytes -= cost;
+                consumer_waiting.store(false);
+                if(stop.load() && read==published.load() && !checkpoint_pending.load())break;
+                continue;
             }
-            space.notify_one();
+            Job job=std::move(queue[read%queue_slots]);
+            consumed_bytes+=job.bytes();
+            retired_bytes.store(consumed_bytes,std::memory_order_release);
+            retired.store(++read);
+            if(producer_waiting.load())space.notify();
 
             /* A checkpoint can be published between the loop's first check
              * and dequeuing this job; never execute a later sequence first. */
@@ -412,10 +434,7 @@ extern "C" NativeRaster *native_raster_create(const uint16_t *initial) {
 }
 extern "C" void native_raster_destroy(NativeRaster *r) {
     if (!r) return;
-    {
-        std::lock_guard<std::mutex> lock(r->mutex);
-        r->stop = true;
-    }
+    r->stop.store(true);
     r->available.notify();
     r->thread.join();
     sw_context_destroy(r->context);
@@ -461,7 +480,13 @@ static void sync_job(NativeRaster *r, Job job) {
     auto result = done.get_future();
     job.completion = &done;
     r->push(std::move(job));
+    ProducerTimer timer(producer_sync_ns);
     result.get();
+}
+extern "C" void native_raster_producer_timing(int enable,uint64_t *submit_ns,uint64_t *sync_ns) {
+    producer_timing_enabled=enable!=0;
+    if(submit_ns)*submit_ns=producer_submit_ns;
+    if(sync_ns)*sync_ns=producer_sync_ns;
 }
 extern "C" void native_raster_set_observer(NativeRaster *r,NativeRasterObserver observer,void *user) {
     Job job;job.kind=Kind::Observe;job.observer=observer;job.user=user;

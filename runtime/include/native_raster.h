@@ -154,6 +154,9 @@ NativeRasterCheckpoint *native_raster_checkpoint_async(NativeRaster *raster,
 int native_raster_checkpoint_ready(NativeRasterCheckpoint *checkpoint);
 void native_raster_checkpoint_release(NativeRasterCheckpoint *checkpoint);
 uint64_t native_raster_completed(NativeRaster *raster);
+/* Opt-in producer-thread timing. Cumulative nanoseconds; reading does not
+ * synchronize with the worker or alter guest state. */
+void native_raster_producer_timing(int enable, uint64_t *submit_ns, uint64_t *sync_ns);
 #ifdef __cplusplus
 }
 #endif

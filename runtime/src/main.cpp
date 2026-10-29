@@ -1,5 +1,6 @@
 ﻿#include "audio_sync.h"
 #include "audio_catchup.h"
+#include "native_raster.h"
 /* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
@@ -4639,7 +4640,6 @@ struct RuntimePerfState {
 
 static RuntimePerfState g_runtime_perf;
 
-#ifndef PSX_NO_DEBUG_TOOLS
 /* Opt-in main-thread wall cadence. TCP commands execute on this thread.
  * Intervals include guest work, presentation and pacing, not just CPU work.
  * Reset after loading/unpausing: debugger pauses are deliberately not hidden. */
@@ -4647,18 +4647,66 @@ struct MainCadenceStats {
     bool enabled = false;
     uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
+    uint64_t stage_start = 0, stage_ticks[5] = {}, worst_ticks[5] = {};
+    uint64_t previous_cpu = 0, worst_cpu = 0, worst_index = 0, over20 = 0;
+    unsigned stage = 0; /* guest, frontend, packet publication, epilogue, pacing */
+    uint64_t return_previous=0, return_max=0, return_over20=0;
+    uint64_t native_submit=0,native_sync=0,worst_submit=0,worst_sync=0;
 };
 static MainCadenceStats s_main_cadence;
+static uint64_t main_cadence_cpu() {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if(GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user))
+        return ((uint64_t)kernel.dwHighDateTime<<32)+kernel.dwLowDateTime+
+               ((uint64_t)user.dwHighDateTime<<32)+user.dwLowDateTime;
+#endif
+    return 0;
+}
+static void main_cadence_stage(unsigned stage) {
+    auto &s=s_main_cadence;
+    if(!s.enabled) return;
+    const uint64_t now=SDL_GetPerformanceCounter();
+    if(s.stage_start) s.stage_ticks[s.stage]+=now-s.stage_start;
+    s.stage=stage;s.stage_start=now;
+}
+struct MainCadenceExit { ~MainCadenceExit(){
+    main_cadence_stage(0);
+    auto &s=s_main_cadence;
+    if(!s.enabled) return;
+    const uint64_t now=SDL_GetPerformanceCounter();
+    if(s.return_previous) {
+        const uint64_t dt=now-s.return_previous;
+        if(dt>s.return_max)s.return_max=dt;
+        if(dt>SDL_GetPerformanceFrequency()/50)++s.return_over20;
+    }
+    s.return_previous=now;
+} };
 static void main_cadence_frame() {
     if (!s_main_cadence.enabled) return;
-    const uint64_t now = SDL_GetPerformanceCounter();
+    main_cadence_stage(1);
+    const uint64_t now = s_main_cadence.stage_start;
+    const uint64_t cpu = main_cadence_cpu();
+    uint64_t submit=0,sync=0;
+    native_raster_producer_timing(1,&submit,&sync);
     if (s_main_cadence.previous && now >= s_main_cadence.previous) {
         const uint64_t elapsed = now - s_main_cadence.previous;
         ++s_main_cadence.intervals;
         s_main_cadence.ticks += elapsed;
-        if (elapsed > s_main_cadence.max_ticks) s_main_cadence.max_ticks = elapsed;
+        if(elapsed > SDL_GetPerformanceFrequency()/50) ++s_main_cadence.over20;
+        if (elapsed > s_main_cadence.max_ticks) {
+            s_main_cadence.max_ticks = elapsed;
+            memcpy(s_main_cadence.worst_ticks,s_main_cadence.stage_ticks,sizeof s_main_cadence.worst_ticks);
+            s_main_cadence.worst_cpu=cpu-s_main_cadence.previous_cpu;
+            s_main_cadence.worst_index=s_main_cadence.intervals;
+            s_main_cadence.worst_submit=submit-s_main_cadence.native_submit;
+            s_main_cadence.worst_sync=sync-s_main_cadence.native_sync;
+        }
     }
     s_main_cadence.previous = now;
+    s_main_cadence.previous_cpu=cpu;
+    s_main_cadence.native_submit=submit;s_main_cadence.native_sync=sync;
+    memset(s_main_cadence.stage_ticks,0,sizeof s_main_cadence.stage_ticks);
 }
 static void main_cadence_pace(uint64_t now) {
     if (!s_main_cadence.enabled || !s_frame_pacer.next_deadline) return;
@@ -4687,8 +4735,18 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         s.intervals ? s.ticks * ms / s.intervals : 0.0, s.max_ticks * ms,
         (unsigned long long)s.pace_checks, (unsigned long long)s.late,
         (unsigned long long)s.missed, s.max_late_ticks * ms);
+    const size_t used=std::strlen(out);
+    if(used<cap) std::snprintf(out+used,cap-used,
+        ",\"over20\":%llu,\"worst_index\":%llu,\"worst_cpu_ms\":%.3f,"
+        "\"worst_guest_ms\":%.3f,\"worst_frontend_ms\":%.3f,\"worst_packet_ms\":%.3f,"
+        "\"worst_epilogue_ms\":%.3f,\"worst_pacer_ms\":%.3f,"
+        "\"return_max_ms\":%.3f,\"return_over20\":%llu,"
+        "\"worst_native_submit_ms\":%.3f,\"worst_native_sync_ms\":%.3f",
+        (unsigned long long)s.over20,(unsigned long long)s.worst_index,s.worst_cpu*.0001,
+        s.worst_ticks[0]*ms,s.worst_ticks[1]*ms,s.worst_ticks[2]*ms,
+        s.worst_ticks[3]*ms,s.worst_ticks[4]*ms,s.return_max*ms,(unsigned long long)s.return_over20,
+        s.worst_submit*1e-6,s.worst_sync*1e-6);
 }
-#endif
 
 static bool runtime_perf_parse_window(const char *text, uint64_t *start,
                                       uint64_t *end) {
@@ -4785,11 +4843,15 @@ static void runtime_perf_bench_tick(uint64_t now) {
         if (s_frame_count == g_runtime_perf.bench_start_frame) {
             g_runtime_perf.bench_start = runtime_perf_snapshot(now);
             g_runtime_perf.bench_started = true;
+            s_main_cadence=MainCadenceStats{};
+            s_main_cadence.enabled=true;
         }
         return;
     }
     if (s_frame_count != g_runtime_perf.bench_end_frame) return;
 
+    char cadence[768];psx_debug_main_cadence_json(0,cadence,sizeof cadence);
+    std::fprintf(stdout,"[BENCH_CADENCE] {%s}\n",cadence);
     RuntimePerfSnapshot end = runtime_perf_snapshot(now);
     const RuntimePerfSnapshot &start = g_runtime_perf.bench_start;
     std::fprintf(stdout,
@@ -9914,10 +9976,10 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         uint64_t perf_start = runtime_perf_section_begin();
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
-#ifndef PSX_NO_DEBUG_TOOLS
             main_cadence_pace(dyn_t0);
-#endif
+            main_cadence_stage(4);
             frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+            main_cadence_stage(1);
             const uint64_t waited = SDL_GetPerformanceCounter() - dyn_t0;
             if (g_dynres.active) g_dynres.pacer_ticks += waited;
             g_frame_report_wait_ticks += waited;
@@ -11333,12 +11395,13 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
 
 
 static void sdl_vblank_present(void) {
-#ifndef PSX_NO_DEBUG_TOOLS
     main_cadence_frame();
-#endif
+    MainCadenceExit cadence_exit;
     sync_guest_cadence_to_video_standard();
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
+    main_cadence_stage(2);
     render_thread_vblank();
+    main_cadence_stage(3);
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
      * on the same VBlank boundary (BB fast-poll tails forked #2 vs #3). */
