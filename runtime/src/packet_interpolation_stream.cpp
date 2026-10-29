@@ -106,6 +106,10 @@ extern "C" void packet_interpolation_stream_reset(void) {
     stream.older.clear();stream.current.clear();stream.old_epoch=stream.old_sequence=0;
     std::lock_guard<std::mutex> lock(stats_mutex);
     published={};published_sequence=published_missing=published_count=0;published_failed=false;
+    for(unsigned i=0;i<2;++i) {
+        captured[i].clear();captured_sources[i].clear();captured_sequence[i]=0;
+    }
+    capture_requested.store(false);
 }
 extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
     std::lock_guard<std::mutex> lock(stats_mutex);
@@ -126,6 +130,7 @@ extern "C" void packet_interpolation_capture_request(void) {
 }
 extern "C" int packet_interpolation_capture_json(char *out,size_t capacity,int older,size_t start) {
     std::lock_guard<std::mutex> lock(stats_mutex);
+    if(!out || !capacity) return -1;
     const unsigned side=older?0:1;
     const auto& list=captured[side];const auto& sources=captured_sources[side];
     size_t used=0;

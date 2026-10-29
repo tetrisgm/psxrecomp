@@ -89,20 +89,25 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
             for(size_t i=1;i<ng.size();++i)
                 if(same_geometry(c->b[ng[0]],c->b[ng[i]])) ++c->stats.duplicate_equal;
             if(ng.size()==og.size()) {
-                for(size_t k=0;k<ng.size();++k) accept(ng[k],og[k]);
-                if(ng.size()>1) ++c->stats.resolved_occurrence;
+                bool resolved=true;
+                for(size_t k=0;k<ng.size();++k) resolved=accept(ng[k],og[k])&&resolved;
+                if(resolved && ng.size()>1) ++c->stats.resolved_occurrence;
                 continue;
             }
             // Rectangular Hungarian assignment with private dummy columns.
             // Dummy cost dominates all allowed edges: first maximize the
             // number of gated matches, then minimize centroid displacement.
             // Stable input ordering and strict comparisons break ties.
-            const size_t rows=ng.size(),cols=og.size()+rows;
+            const bool new_rows=ng.size()<og.size();
+            const auto& row_group=new_rows?ng:og;
+            const auto& col_group=new_rows?og:ng;
+            const size_t rows=row_group.size(),cols=col_group.size()+rows;
             const double gate=max_motion>0?max_motion:0.5;
             const double penalty=double(rows+1),forbidden=penalty*double(rows+2);
             auto cost=[&](size_t r,size_t col) {
-                if(col>=og.size()) return penalty;
-                const auto& n=c->b[ng[r]];const auto& o=c->a[og[col]];
+                if(col>=col_group.size()) return penalty;
+                const auto& n=c->b[new_rows?row_group[r]:col_group[col]];
+                const auto& o=c->a[new_rows?col_group[col]:row_group[r]];
                 if(!valid(n)||!valid(o)||n.vertices!=o.vertices) return forbidden;
                 double distance=0,depth=0;
                 for(unsigned d=0;d<3;++d) {
@@ -137,9 +142,12 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                 do {size_t prev=way[col];assignment[col]=assignment[prev];col=prev;} while(col);
             }
             bool resolved=false;
-            for(size_t col=1;col<=og.size();++col)
-                if(assignment[col] && cost(assignment[col]-1,col-1)<penalty)
-                    resolved=accept(ng[assignment[col]-1],og[col-1])||resolved;
+            for(size_t col=1;col<=col_group.size();++col)
+                if(assignment[col] && cost(assignment[col]-1,col-1)<penalty) {
+                    const size_t r=assignment[col]-1;
+                    resolved=accept(new_rows?row_group[r]:col_group[col-1],
+                                    new_rows?col_group[col-1]:row_group[r])||resolved;
+                }
             if(resolved) ++c->stats.resolved_assignment;
         }
         for(size_t i=0;i<b->count;++i) if(c->b[i].spatial && c->matches[i]==missing) {

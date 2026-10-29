@@ -104,6 +104,14 @@ int main() {
     assert(stats.resolved_assignment==1);
     assert(packet_interpolation_sample(ctx,0.5,out.data(),out.size()));
     assert(out[0].vertex[0].view[0]==21);
+    // Global assignment beats choosing each new primitive's nearest old one.
+    repeated_a={primitive(7,0,100),primitive(7,4,100),primitive(7,100,100)};
+    repeated_b={primitive(7,3,100),primitive(7,5,100)};
+    ra.primitives=repeated_a.data();ra.count=3;rb.primitives=repeated_b.data();rb.count=2;
+    assert(packet_interpolation_pair(ctx,&ra,&rb,0.5));
+    assert(packet_interpolation_sample(ctx,0.5,out.data(),out.size()));
+    assert(out[0].vertex[0].view[0]==1.5 && out[1].vertex[0].view[0]==4.5);
+    rb.count=1;rb.primitives=&repeated_b[1];
     // Gating must leave a distant new instance unresolved, never force a match.
     repeated_b[1]=primitive(7,1000,100);
     assert(packet_interpolation_pair(ctx,&ra,&rb,0.5));

@@ -2206,3 +2206,11 @@ ring backpressure remains. No phase-2 acceptance, merge or performance claim.
 2026-10-29 frame phase 2 continuation: native command transport now SPSC with bounded-full/order tests; permanent GL owner starts before guest execution; asynchronous live allocation and diagnostic captures preserve native pixels. Current guest deadline admission prevents optional redraw spending while late. With 50 ms render-owner delay, hidden 18x race holds60.093VBlanks/s, zero starved samples and zero queue/context waits; Car Effects draw activity explicitly verified after R4 session callback lifecycle repair. Full framework build passed; non-hardware CTest300 listed,2disabled,3skipped,295passed; R4 32/32 passed. Hidden smoke/live-paused queries/live scales and asynchronous capture marks passed, zero misses. Remaining surface/interpolation ownership cleanup continues in subsequent phases; no generated or faithful timing changes.
 
 2026-10-29 phase 4 interpolation topic: added a renderer-only owned packet-pair sampler and absolute rational cadence, with exact-key matching, duplicate rejection, view-space projection, packet-N attributes and cut/epoch snapping. PGXP carries pre-projection coordinates, H/OFX/OFY and candidate model/caller provenance through validated shadows. Opt-in packet_interpolation TCP audit is integrated without changing production presentation. Unit sampler and PGXP transport checks pass; isolated R4 build and 32/32 tests pass; hidden boot-to-race smoke has zero dispatch/segment misses. Moving-race candidate audit has up to 332 unmatched and 32 ambiguous primitives, so phase 4 is NOT accepted. Identity instance provenance, presenter cutover, metadata, deletion and 8K distinct-image gates remain; no faithful timing changes.
+
+
+### 2026-10-29 renderer packet interpolation continuation
+
+RAM-origin transport through PGXP and deterministic duplicate correspondence
+are covered by focused tests. Added frozen-pair TCP provenance inspection.
+No guest timing changes. Production cutover remains behind identity and
+visual gates; see ../PACKET_INTERPOLATION.md.

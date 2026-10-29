@@ -30,8 +30,20 @@ int main() {
     assert(std::strstr(json,"\"ambiguous\":1,"));
     assert(std::strstr(json,"\"resolved_assignment\":1,"));
     assert(std::strstr(json,"\"duplicate_equal\":1,"));
+    // A frozen debug capture owns its pair across subsequent packet reuse.
+    packet_interpolation_capture_request();
+    packet_interpolation_stream_begin(1,5);
+    packet_interpolation_stream_append(&source);packet_interpolation_stream_end();
+    char detail[16384];
+    assert(packet_interpolation_capture_json(detail,sizeof detail,1,0)>0);
+    assert(std::strstr(detail,"\"count\":2,"));
+    assert(packet_interpolation_capture_json(detail,sizeof detail,0,0)>0);
+    assert(std::strstr(detail,"\"count\":1,"));
+    assert(packet_interpolation_capture_json(nullptr,0,0,0)==-1);
     // Reset removes the pair rather than interpolating across a rewind.
     packet_interpolation_stream_reset();
+    assert(packet_interpolation_capture_json(detail,sizeof detail,0,0)>0);
+    assert(std::strstr(detail,"\"count\":0,"));
     packet_interpolation_stream_begin(2,1);
     packet_interpolation_stream_append(&source);packet_interpolation_stream_end();
     packet_interpolation_stream_json(json,sizeof json);

@@ -5027,17 +5027,8 @@ uint32_t gpu_texture_correction_hits(void) {
  * is the G1.1 crack the tri_mixed counter measures. The integer delta folds
  * in draw offsets and any widescreen adjustment already applied by the
  * caller. */
-static void prepare_precise_triangle(int i0, int i1, int i2,
-                                     const int32_t vx[3], const int32_t vy[3]) {
-    if (gr_backend() == GR_BACKEND_OPENGL) {
-        const int indices[3] = {i0,i1,i2};
-        int32_t raw_x[3], raw_y[3];
-        for (unsigned i=0; i<3; ++i)
-            parse_vertex(gp0_cmd_buf[indices[i]], &raw_x[i], &raw_y[i]);
-        gl_renderer_note_wide_triangle_recovery(s_native_wide_projection_correction &&
-            ws_native_wide_active() &&
-            psx_gpu_triangle_oversize(raw_x,raw_y,0,1,2));
-    }
+static void record_interpolation_triangle(int i0,int i1,int i2,
+                                           const int32_t vx[3],const int32_t vy[3]) {
     if (gr_backend() == GR_BACKEND_OPENGL && packet_interpolation_stream_enabled()) {
         PacketInterpolationSource source={0};
         source.primitive_type=gp0_cmd_buf[0]>>24;
@@ -5059,6 +5050,20 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
         }
         packet_interpolation_record(&source);
     }
+}
+
+static void prepare_precise_triangle(int i0, int i1, int i2,
+                                     const int32_t vx[3], const int32_t vy[3]) {
+    if (gr_backend() == GR_BACKEND_OPENGL) {
+        const int indices[3] = {i0,i1,i2};
+        int32_t raw_x[3], raw_y[3];
+        for (unsigned i=0; i<3; ++i)
+            parse_vertex(gp0_cmd_buf[indices[i]], &raw_x[i], &raw_y[i]);
+        gl_renderer_note_wide_triangle_recovery(s_native_wide_projection_correction &&
+            ws_native_wide_active() &&
+            psx_gpu_triangle_oversize(raw_x,raw_y,0,1,2));
+    }
+    record_interpolation_triangle(i0,i1,i2,vx,vy);
     if (gr_backend() == GR_BACKEND_OPENGL &&
         gl_renderer_frame_generation() != gte_fg_source_enabled())
         gte_fg_source_set(gl_renderer_frame_generation());   /* from the next projection */
@@ -5632,10 +5637,19 @@ static int native_wide_projective_draw(void) {
     const uint16_t tpage=gp0_cmd_buf[2+stride]>>16;
     set_tpage_from_poly(tpage);
     const int semi=(op&2u)?(int)semi_transparency:-1;
+    int32_t audit_x[4],audit_y[4];
+    for(unsigned i=0;i<n;++i) {
+        parse_vertex(gp0_cmd_buf[1+stride*i],&audit_x[i],&audit_y[i]);
+        audit_x[i]+=draw_offset_x;audit_y[i]+=draw_offset_y;
+    }
+    record_interpolation_triangle(1,1+stride,1+2*stride,audit_x,audit_y);
     gl_renderer_draw_projected_triangle(vertices,tpage&0x1ff,
         (clut&63)*16,(clut>>6)&511,op&1u,semi,render_projective || s_texture_correction_enabled);
     if (n==4) {
         const PSXProjectedVertex second[3]={vertices[2],vertices[1],vertices[3]};
+        const int32_t ax[3]={audit_x[2],audit_x[1],audit_x[3]};
+        const int32_t ay[3]={audit_y[2],audit_y[1],audit_y[3]};
+        record_interpolation_triangle(1+2*stride,1+stride,1+3*stride,ax,ay);
         gl_renderer_draw_projected_triangle(second,tpage&0x1ff,
             (clut&63)*16,(clut>>6)&511,op&1u,semi,render_projective || s_texture_correction_enabled);
     }

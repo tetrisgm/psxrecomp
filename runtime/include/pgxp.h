@@ -188,8 +188,8 @@ typedef struct PGXPProjection {
     /* Immutable pre-projection provenance for presentation interpolation.
      * Carried by the same validated full-word shadow as homogeneous position;
      * arithmetic, partial writes and timeline invalidation discard both.
-     * model/caller identify a candidate, NOT an instance of repeated meshes.
-     * Consumers must report duplicate candidates rather than guessing. */
+     * RAM origins and model/caller identify candidate primitive groups.
+     * Repeated instances require deterministic consumer-side disambiguation. */
     float view[3], h, ofx, ofy, x_scale;
     int16_t model[3];
     uint16_t interpolation_valid;

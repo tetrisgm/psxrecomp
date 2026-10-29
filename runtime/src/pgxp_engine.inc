@@ -1485,6 +1485,7 @@ PGXP_API void pgxp_gte_push_sxy(int32_t x16, int32_t y16, uint16_t sz3,
     s_gte[12] = s_gte[13];
     s_gte[13] = s_gte[14];
     PGXPValue *pv = &s_gte[14];
+    pv->source_address = 0;
     pv->x16 = x16;
     pv->y16 = y16;
     pv->z = sz3;

@@ -23,8 +23,8 @@ transport stability, **not unique primitive identity in a race**.
 
 Set `PSX_PACKET_INTERPOLATION_AUDIT=1` before starting a hidden runtime and
 query `{"cmd":"packet_interpolation"}`. The candidate is a 128-bit hash of
-ordered model vertices and callers, independent of packet addresses, draw
-order, colour and UV. Repeated mesh instances can collide semantically.
+ordered model vertices, original RAM origins, matrix RAM origin, callers,
+primitive type, texpage and CLUT; guest DMA packet addresses are excluded. Repeated mesh instances can collide semantically.
 Duplicate candidates now pair by occurrence for equal counts and by gated
 minimum-cost view-centroid assignment otherwise. Counters distinguish resolved
 occurrence groups, resolved assignment groups, and unresolved primitives.
@@ -86,3 +86,37 @@ The debug command accepts `capture:1` to freeze the next pair and `detail:1`,
 `older:0|1`, `start:N` to read eight provenance records per page. Capture data
 is owned, read under a short mutex, and does not access live guest or GL state.
 The audit remains opt-in; this is not presenter acceptance.
+
+
+## Inclusive census follow-up
+
+The near-plane/projective GPU path bypassed the first-pass census. It now
+records both triangle halves with their original signed projection provenance.
+The native-wide fixture verifies two records, complete validity masks and
+retained negative depth. This is an audit fix, not signed-depth sampler support:
+the sampler still requires positive view depth, and production clipping must
+operate on interpolated homogeneous vertices rather than divide across z=0.
+
+The last hidden 18x R4 race gate, with PGXP full, Rewind enabled and Car Effects
+active, failed all 45 samples: max 1592 unclassified unmatched, zero ambiguous,
+one invalid, zero partial provenance. This includes the first pairs after
+leaving turbo navigation; it is not a controlled performance interval. Earlier
+ordinary-path-only sampling failed 35/45, max 448 unmatched. Neither run proves
+that all missing keys are genuine appearances; neither is acceptance evidence.
+Three frozen ordinary-path pairs had 30/32/16 missing keys and no equal ordered
+model-coordinate tuple under a different key. This narrows the investigation
+to changing visible geometry/topology but does not establish no-pop behavior.
+
+Original-data identity across animated/procedural geometry and model invocation
+ordinals remain unproven in moving packets. The missing work also includes
+signed-depth clipping, visibility transitions, complete replay integration,
+packet-owned interpolated effects metadata, title FPS cutover, legacy removal,
+and distinct-image/guest/audio measurements at 60 and 120 output. Do not infer
+completion from zero duplicate ambiguity or relabel candidates as proven births.
+
+Final validation: R4 build/32 CTests; five focused framework tests (sampler,
+stream, PGXP, native-wide projection, render-pass provenance); hidden race
+boot/navigation with zero dispatch/segment misses. The sampler tests include a
+minimum-cost case that defeats greedy nearest-neighbour selection. Assignment
+uses the smaller group as Hungarian rows to avoid cubic work for one-to-many
+birth/death groups. Frozen debug captures clear on timeline reset.
