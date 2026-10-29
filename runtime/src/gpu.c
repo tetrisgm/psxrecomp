@@ -4016,6 +4016,7 @@ static int c0_capture_slot_fwd = -1;
 
 /* Vblank presentation callback */
 static gpu_vblank_cb vblank_callback;
+static gpu_vblank_cb vblank_pacer;
 
 /* Shaded quad vertex capture (Phase 4.5 debug) — forward declarations
  * so gpu_vblank_tick can reference sq_cap_armed. */
@@ -4409,6 +4410,7 @@ void gpu_vblank_flush_present(void) {
 }
 
 void gpu_vblank_tick(void) {
+    if(vblank_pacer)vblank_pacer();
     lcf ^= 1;
     gpu_timeline_note(GTL_VBLANK, lcf, 0);
     /* GPUSTAT.13 (interlace FIELD): on real hardware this alternates per
@@ -4851,6 +4853,9 @@ void gpu_get_crtc_debug(uint32_t *x1, uint32_t *x2, uint32_t *y1, uint32_t *y2,
 
 void gpu_set_vblank_callback(gpu_vblank_cb cb) {
     vblank_callback = cb;
+}
+void gpu_set_vblank_pacer(gpu_vblank_cb cb) {
+    vblank_pacer=cb;
 }
 
 /* Sign-extend an N-bit value to int32_t */

@@ -193,6 +193,9 @@ void     gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest);
  * busy-waits are not interrupted by MotK-style BB-edge commit. */
 typedef void (*gpu_vblank_cb)(void);
 void gpu_set_vblank_callback(gpu_vblank_cb cb);
+/* Optional host wall-clock gate before the guest VBlank event. It must not
+ * advance guest state; netplay/resimulation policy belongs to the host. */
+void gpu_set_vblank_pacer(gpu_vblank_cb cb);
 void gpu_vblank_flush_present(void);
 void gpu_vblank_clear_deferred_present(void);
 /* Queue one deferred present (netplay RB resume when I_STAT already has

@@ -615,6 +615,8 @@ static uint64_t s_fps_last_frame = 0;
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
+static bool s_pre_vblank_allowed=false,s_pre_vblank_ran=false;
+static uint64_t s_pre_vblank_wait_ticks=0;
 static int      s_turbo_present_skip = 0;
 static int      s_fmv_skip_present_skip = 0;
 /* Netplay + depth24: present every other vblank (admit still every tick). */
@@ -4602,6 +4604,8 @@ struct RuntimePerfSnapshot {
     uint64_t pacer_ticks = 0;
     uint64_t autocapture_ticks = 0;
     uint64_t provider_poll_ticks = 0;
+    uint64_t audio_starved = 0;
+    uint64_t gpu_packet[5] = {};
     uint64_t dirty_insns = 0;
     uint64_t dirty_dispatches = 0;
     uint32_t overlay_loads = 0;
@@ -4835,6 +4839,11 @@ static RuntimePerfSnapshot runtime_perf_snapshot(uint64_t now) {
     s.pacer_ticks = g_runtime_perf.pacer_ticks;
     s.autocapture_ticks = g_runtime_perf.autocapture_ticks;
     s.provider_poll_ticks = g_runtime_perf.provider_poll_ticks;
+    double fill=0,target=0,correction=0;uint64_t overflow=0;int legacy=0,rate=0;
+    psx_audio_out_stats(&fill,&target,&s.audio_starved,&overflow,&correction,&legacy,&rate);
+#ifndef PSX_SDL_NO_RENDER
+    gl_renderer_packet_gpu_stats(s.gpu_packet);
+#endif
     s.dirty_insns = g_dirty_ram_insns_run;
     s.dirty_dispatches = g_dirty_window_dispatches;
     overlay_loader_get_counters(&s.overlay_loads, &s.overlay_invalidations,
@@ -4878,7 +4887,7 @@ static void runtime_perf_bench_tick(uint64_t now) {
     std::fprintf(stdout,
         "[BENCH] window=%llu:%llu frames=%llu wall_ms=%.3f "
         "guest_work_ms=%.3f pacer_ms=%.3f autocapture_main_ms=%.3f "
-        "provider_poll_ms=%.3f "
+        "provider_poll_ms=%.3f audio_starved=+%llu gpu_packets=+%llu gpu_packet_ms=%.3f "
         "dirty_insns=+%llu dirty_dispatches=+%llu "
         "overlay_native=+%llu overlay_interp=+%llu overlay_loads=+%u "
         "overlay_invalidations=+%u overlay_unregistered=+%u "
@@ -4892,6 +4901,10 @@ static void runtime_perf_bench_tick(uint64_t now) {
         runtime_perf_ticks_ms(end.pacer_ticks - start.pacer_ticks),
         runtime_perf_ticks_ms(end.autocapture_ticks - start.autocapture_ticks),
         runtime_perf_ticks_ms(end.provider_poll_ticks - start.provider_poll_ticks),
+        (unsigned long long)(end.audio_starved-start.audio_starved),
+        (unsigned long long)(end.gpu_packet[0]-start.gpu_packet[0]),
+        end.gpu_packet[0]>start.gpu_packet[0]?
+            (double)(end.gpu_packet[1]-start.gpu_packet[1])/(end.gpu_packet[0]-start.gpu_packet[0])*1e-6:0.0,
         (unsigned long long)(end.dirty_insns - start.dirty_insns),
         (unsigned long long)(end.dirty_dispatches - start.dirty_dispatches),
         (unsigned long long)(end.overlay_native - start.overlay_native),
@@ -4914,8 +4927,9 @@ static void runtime_perf_frame_begin() {
     uint64_t now = SDL_GetPerformanceCounter();
     if (g_runtime_perf.last_frame_exit_counter &&
         now >= g_runtime_perf.last_frame_exit_counter) {
-        g_runtime_perf.guest_work_ticks +=
-            now - g_runtime_perf.last_frame_exit_counter;
+        const uint64_t elapsed=now-g_runtime_perf.last_frame_exit_counter;
+        g_runtime_perf.guest_work_ticks += elapsed>s_pre_vblank_wait_ticks?
+            elapsed-s_pre_vblank_wait_ticks:0;
     }
     runtime_perf_bench_tick(now);
 }
@@ -9832,6 +9846,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Render passes (render_pass.c) stay off while presentation is sped up. */
     s_presentation_fast_forward =
         (turbo_loads_active || fmv_skip_active) ? 1 : 0;
+    s_pre_vblank_allowed=!manual_turbo_requested && !turbo_loads_active && !fmv_skip_active;
 
     /* Guest-affecting per-frame services run on EVERY guest frame, before any
      * presentation early-out (headless, TCP turbo, load/FMV present skips).
@@ -9907,7 +9922,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 host_osd_push(msg, 900);
             }
             turbo_was_down = 1;
-            if (mult >= 2 && g_frame_period_ms > 0.0) {
+            if (mult >= 2 && g_frame_period_ms > 0.0 && !s_pre_vblank_ran) {
                 uint64_t perf_start = runtime_perf_section_begin();
                 frame_pacer_wait(&s_frame_pacer,
                                  g_frame_period_ms / (double)mult);
@@ -9941,7 +9956,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * the divided period; the presentation skip below remains independent
          * so rendering cost does not distort the selected multiplier. */
         if (g_turbo_load_wall_multiplier >= 2 &&
-            g_frame_period_ms > 0.0) {
+            g_frame_period_ms > 0.0 && !s_pre_vblank_ran) {
             uint64_t perf_start = runtime_perf_section_begin();
             frame_pacer_wait(
                 &s_frame_pacer,
@@ -10008,7 +10023,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * resim. */
     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
         uint64_t perf_start = runtime_perf_section_begin();
-        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
+        if (!s_pre_vblank_ran && !manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
             main_cadence_pace(dyn_t0);
             main_cadence_stage(4);
@@ -11427,6 +11442,31 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
         c.down_block_until > now_s ? c.down_block_until - now_s : 0.0, blocked);
 }
 
+
+/* Pace the actual guest event, before FIELD/LCF, mod VBlank hooks and IRQ0.
+ * Waiting after IRQ publication bunched a preceding light tick's sleep with
+ * the next heavy guest quantum, producing 33-37ms event intervals at 60Hz.
+ * Fast-forward policy is sampled by the frontend; transitions take effect
+ * at the next event. Never apply this gate to netplay or resimulation. */
+static void sdl_vblank_pace(void) {
+    s_pre_vblank_ran=false;s_pre_vblank_wait_ticks=0;
+    if(!s_pre_vblank_allowed || psx_netplay_active() || psx_selfcheck_resim_active())return;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if(debug_server_turbo_enabled())return;
+#endif
+    sync_guest_cadence_to_video_standard();
+    if(!present_should_wall_pace())return;
+    const uint64_t start=SDL_GetPerformanceCounter();
+    main_cadence_pace(start);main_cadence_stage(4);
+    frame_pacer_wait(&s_frame_pacer,g_frame_period_ms);
+    main_cadence_stage(0);
+    s_pre_vblank_wait_ticks=SDL_GetPerformanceCounter()-start;
+    s_pre_vblank_ran=true;
+    g_frame_report_wait_ticks+=s_pre_vblank_wait_ticks;
+    if(g_runtime_perf.enabled)g_runtime_perf.pacer_ticks+=s_pre_vblank_wait_ticks;
+    if(g_dynres.active)g_dynres.pacer_ticks+=s_pre_vblank_wait_ticks;
+    latency_ring_mark(LAT_PACED);
+}
 
 static void sdl_vblank_present(void) {
     main_cadence_frame();
@@ -22021,6 +22061,7 @@ session_reboot:
     }
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
+    gpu_set_vblank_pacer(sdl_vblank_pace);
 
     /* Delay-sync LAN (recomp-net). Menu/lobby UI is later work — CLI/env only.
      * Must start after SDL so local pad capture has devices; before the guest

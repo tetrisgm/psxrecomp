@@ -398,7 +398,30 @@ static void test_immutable_replay(void) {
     s_replay = NULL; gpu_replay_release(capture);
 }
 
+static unsigned vblank_test_step;
+static int vblank_old_lcf;
+static uint64_t vblank_old_cycles;
+static void before_vblank(void) {
+    assert(vblank_test_step++==0);
+    assert(lcf==vblank_old_lcf && !fixture_vblank_mods && !fixture_vblank_irqs);
+    assert(psx_cycle_count==vblank_old_cycles);
+}
+static void after_vblank(void) {
+    assert(vblank_test_step++==1);
+    assert(lcf==(vblank_old_lcf^1) && fixture_vblank_mods==1 && fixture_vblank_irqs==1);
+    assert(psx_cycle_count==vblank_old_cycles);
+}
+static void test_vblank_host_gate(void) {
+    fixture_vblank_mods=fixture_vblank_irqs=vblank_test_step=0;
+    vblank_old_lcf=lcf;vblank_old_cycles=psx_cycle_count;
+    gpu_set_vblank_pacer(before_vblank);gpu_set_vblank_callback(after_vblank);
+    gpu_vblank_tick();
+    assert(vblank_test_step==2);
+    gpu_set_vblank_pacer(NULL);gpu_set_vblank_callback(NULL);
+}
+
 int main(void) {
+    test_vblank_host_gate();
     test_replay_ot_identity();
     test_immutable_replay();
     test_retagged_canonical_packet();

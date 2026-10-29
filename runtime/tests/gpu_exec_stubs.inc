@@ -245,7 +245,8 @@ int32_t ws_ui_anchor_for_bounds(int32_t x, int32_t width,
 }
 #endif
 
-void psx_irq_raise(uint32_t bit, uint32_t detail) { (void)bit; (void)detail; }
+static unsigned fixture_vblank_irqs,fixture_vblank_mods;
+void psx_irq_raise(uint32_t bit, uint32_t detail) { if(!bit)++fixture_vblank_irqs; (void)detail; }
 void event_ring_record_aux(uint16_t kind, uint8_t detail, uint32_t aux) {
     (void)kind; (void)detail; (void)aux;
 }
@@ -255,7 +256,7 @@ int sio_hold_present_for_card(void) { return 0; }
 uint32_t psx_compiled_irq_resume_pc(void) { return 0; }
 uint32_t psx_last_irq_check_pc(void) { return 0; }
 uint32_t psx_netplay_rb_sticky_bb_pc(void) { return 0; }
-void mod_runtime_on_vblank(void) {}
+void mod_runtime_on_vblank(void) { ++fixture_vblank_mods; }
 bool screen_kind_from_name(const char *name, ScreenKind *out) {
     (void)name;
     if (out) *out = SCREEN_RAW;
