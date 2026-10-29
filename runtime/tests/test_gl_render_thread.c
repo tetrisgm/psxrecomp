@@ -78,8 +78,9 @@ void gpu_vram_dirty_mark_rect(int x,int y,int w,int h){(void)x;(void)y;(void)w;(
 void gpu_vram_dirty_mark_all(void){}
 int psx_netplay_active(void){return 0;}
 const GpuRenderBackend *vk_backend_get(void){return NULL;}
-int gpu_display_is_depth24(void){return 0;}
-void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));out->width=320;out->height=240;}
+static int fixture_depth24;
+int gpu_display_is_depth24(void){return fixture_depth24;}
+void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));out->width=320;out->height=240;out->depth24=fixture_depth24;}
 /* Guest state the backend reads per primitive. It changes with every
  * primitive here, so a replay that read it live (instead of the value
  * captured when the primitive was recorded) would draw a different image. */
@@ -164,7 +165,10 @@ static void cpu_upload_ex(int x, int y, int w, int h, const uint16_t *src, int c
         for (int c = 0; c < w; c++) {
             int vx = (x + c) & 1023, vy = (y + r) & 511;
             uint16_t px = src[r * w + c];
-            if (s_check_mask && (gr_vram_read(vx, vy) & 0x8000)) continue;
+            if (s_check_mask) {
+                uint16_t old=gr_vram_read(vx,vy);
+                if(old&0x8000) { vram[vy*1024+vx]=old;continue; }
+            }
             if (s_set_mask) px |= 0x8000;
             vram[vy * 1024 + vx] = px;
         }
@@ -322,6 +326,9 @@ int main(int argc, char **argv) {
     gr_set_backend(GR_BACKEND_OPENGL);
     gr_init(vram);
     gr_set_scale(scale);
+    gl_renderer_set_pgxp_depth(1);
+    gl_renderer_set_pgxp_color_perspective(1);
+    gl_renderer_set_pgxp_seam(2);
     if (dynres) gl_renderer_set_dynamic_resolution(1);
     gl_renderer_set_swap_interval(0);
     if (!gl_renderer_init_context(win)) { fprintf(stderr, "FAIL context\n"); return 2; }
@@ -331,6 +338,61 @@ int main(int argc, char **argv) {
     if (threaded) {
         check(gl_renderer_render_thread_start(2) == 1, "render thread started");
         check(gl_renderer_render_thread_active(), "render thread active");
+        RtStats before,after;
+        rt_get_stats(&before);
+        gl_renderer_set_display_aspect(16,9);
+        gl_renderer_set_post_gamma(1.0f);
+        gl_renderer_set_scanlines(0,0.5f);
+        gl_renderer_set_pgxp_depth(1);
+        gl_renderer_set_pgxp_color_perspective(1);
+        gl_renderer_set_pgxp_seam(2);
+        check(gl_renderer_set_post_aa(GL_POST_AA_FXAA)==1,"AA setting accepted");
+        gl_renderer_flush_cpu_uploads();
+        rt_drain(); /* Fixture barrier; runtime callers never need this. */
+        rt_get_stats(&after);
+        int an=0,ad=0;
+        gl_renderer_get_display_aspect(&an,&ad);
+        check(an==16 && ad==9,"ordered render-owner controls applied");
+        check(gl_renderer_post_aa()==GL_POST_AA_FXAA,"AA applied on render owner");
+        (void)gl_renderer_post_aa_passes();
+        (void)gl_renderer_fmv_chroma_frames();
+        rt_get_stats(&after);
+        check(after.acquires==before.acquires && !after.held,
+              "controls never acquire the graphics context");
+        check(after.records>=before.records+8,"controls recorded by value");
+        gl_renderer_set_post_aa(GL_POST_AA_OFF);
+        gl_renderer_set_display_aspect(4,3);
+    } else {
+        gl_renderer_set_display_aspect(4,3);
+    }
+    {
+        /* Payload plus overlays exceeds half of the 32 MiB command ring. */
+        enum { image_side=2048 };
+        static uint32_t cpu_image[image_side*image_side],read_image[image_side*image_side];
+        for(unsigned i=0;i<image_side*image_side;++i) cpu_image[i]=0xff000000u|(i*97u);
+        uint64_t expected=fnv(cpu_image,sizeof cpu_image,0xcbf29ce484222325ull);
+        RtStats before,after;
+        if(threaded) rt_get_stats(&before);
+        fixture_depth24=1;
+        gl_renderer_note_present_depth24(1);
+        gl_renderer_present(cpu_image,image_side,image_side,0,1,image_side,10,1,1,1,0,0,0);
+        memset(cpu_image,0,sizeof cpu_image);
+        fixture_depth24=0; /* Recorded state must survive the guest moving on. */
+        if(threaded) {
+            rt_drain();
+            rt_get_stats(&after);
+            check(after.acquires==before.acquires && !after.held,
+                  "depth24 presentation does not move GL context");
+            check(after.oversize==before.oversize+1,"large image transported intact");
+            check(s_rths_display.depth24==1,"display mode captured in stream");
+            gl_renderer_render_thread_sync("fixture CPU-image readback");
+        }
+        glBindTexture(GL_TEXTURE_2D,s_present_tex);
+        glGetTexImage(GL_TEXTURE_2D,0,GL_BGRA,GL_UNSIGNED_BYTE,read_image);
+        check(fnv(read_image,sizeof read_image,0xcbf29ce484222325ull)==expected,
+              "CPU present owns immutable image bytes");
+        gl_renderer_note_present_depth24(0);
+        if(threaded) gl_renderer_render_thread_frame_boundary();
     }
     test_live_resolution(scale);
     GlDynresStats live_baseline;
@@ -379,7 +441,7 @@ int main(int argc, char **argv) {
     static uint16_t native[1024 * 512];
     gr_vram_transfer_out(0, 0, 1024, 512, native);
     uint64_t digest = fnv(native, sizeof native, 0xcbf29ce484222325ull);
-    check(memcmp(native, vram, sizeof native) == 0, "readback landed in the guest-visible array");
+    check(memcmp(native, s_vram, sizeof native) == 0, "readback matches presentation mirror");
     int fw = FRAME_W * scale, fh = FRAME_H * scale, ow = 0, oh = 0;
     uint32_t *img = (uint32_t *)malloc((size_t)fw * fh * 4);
     int n = img ? gl_renderer_read_display_hires(512, 0, FRAME_W, FRAME_H, img, fw * fh, &ow, &oh) : 0;

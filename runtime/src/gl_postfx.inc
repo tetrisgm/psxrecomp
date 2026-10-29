@@ -777,7 +777,7 @@ static void postfx_release(void) {
 
 /* [video] post_shader (PSX_POST_SHADER overrides): a .pfx chain, "" = none. */
 void gl_renderer_set_post_shader(const char *path) {
-    GL_RT_SYNC("post_shader");
+    RTH_CALLS(gl_renderer_set_post_shader,path);
     if (!s_pfx_user_env) {
         const char *e = getenv("PSX_POST_SHADER");
         if (e) { snprintf(s_pfx_user_path, sizeof s_pfx_user_path, "%s", e); s_pfx_user_env = 1; }
@@ -797,22 +797,25 @@ void gl_renderer_set_post_shader(const char *path) {
 }
 /* Debug: the user chain's last load outcome and the live uniforms, as JSON members. */
 int gl_renderer_post_shader_debug(char *out, int cap) {
-    GL_RT_SYNC("post_shader_debug");
+    RthDiagnostics d;
+    int published=rth_read_diagnostics(&d);
     PfxLive live[PFX_LIVE_MAX]; int count;
     SDL_LockSpinlock(&s_pfx_live_lock);
     count = s_pfx_nlive; memcpy(live,s_pfx_live,sizeof live);
     SDL_UnlockSpinlock(&s_pfx_live_lock);
-    return pfx_debug_json(out,cap,s_pfx_user_path,s_pfx_user_status,live,count);
+    return pfx_debug_json(out,cap,published?d.post_path:s_pfx_user_path,
+                          published?d.post_status:s_pfx_user_status,live,count);
 }
 
 int gl_renderer_post_shader_loaded(void) {
-    GL_RT_SYNC("post_shader");
+    RthDiagnostics d;
+    if(rth_read_diagnostics(&d)) return d.post_loaded;
     return s_pfx[PFX_STAGE_USER].loaded && !s_pfx[PFX_STAGE_USER].failed;
 }
 
 /* PSX_BLOOM=<0..2> overrides [video] bloom. */
 void gl_renderer_set_bloom(float strength) {
-    GL_RT_SYNC("set_bloom");
+    RTH_CALLF(gl_renderer_set_bloom,strength);
     const char *e = getenv("PSX_BLOOM");
     if (e && *e) strength = (float)atof(e);
     if (!(strength >= 0.0f)) strength = 0.0f;

@@ -132,15 +132,19 @@ static void test_order_and_wrap(void) {
     CHECK(atomic_load(&ctx_violations) == 0, "context never current on two threads");
 }
 
-/* 2. Oversize records are refused (caller runs them directly). */
+/* 2. Large immutable records execute intact on the consumer, never by moving
+ * its context onto the producer. Exercise several fragments and ring wraps. */
 static void test_oversize(void) {
     reset_state();
     CHECK(start(1u << 20, 2), "start");
-    CHECK(rt_cmd_begin(OP_DATA, 0, (1u << 19)) == NULL, "half-ring record refused");
+    CHECK(emit(1u << 19), "half-ring record transported");
+    CHECK(emit((3u << 20)+37), "multi-ring record transported");
     CHECK(emit((1u << 19) - 64), "just under half fits");
     rt_drain();
     RtStats st; rt_get_stats(&st);
-    CHECK(st.oversize == 1, "oversize counted");
+    CHECK(st.oversize == 2, "large records counted");
+    CHECK(exec_count==3 && !exec_errors,"large records delivered intact and ordered");
+    CHECK(!st.acquires && !exec_off_thread && !exec_without_ctx,"large record keeps context on consumer");
     rt_stop();
 }
 

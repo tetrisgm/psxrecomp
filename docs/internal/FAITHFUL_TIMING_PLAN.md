@@ -2079,3 +2079,20 @@ parser debug/production check, dev build, and 32 R4 tests. Hidden race smoke
 passed with zero dispatch misses. The integrated 18x all-on run remains below
 target at 39.716 VBlanks/s, max 77.948 ms, 224724 starved samples. Render queue
 backpressure and presentation work remain. No phase accepted or merged.
+
+### 2026-10-28 - Queued presentation ownership (phase 1 ongoing)
+
+Renderer settings and frequently queried diagnostics now use ordered controls
+and CPU-published results. CPU/depth24, blank and held images are queued with
+owned pixels, overlays and display state. Removed VRAM mirror publication on
+context handoffs. Large records fragment through the bounded transport rather
+than moving GL to the producer; hidden GL tests verify a >16 MiB CPU image.
+The transport test exposed stale release acknowledgements; the CPU ownership
+handshake now consumes each acknowledgement before another acquisition.
+Dev build and 32 R4 tests pass; all six hidden GL modes match direct/threaded
+hashes; transport tests pass five repeats (8860 checks each). Native authority
+commit is 066006db. Runtime context acquisitions measured zero in two all-on
+18x runs, but cadence varied from 9.643 to 43.031 VBlanks/s. Queue backpressure,
+legacy diagnostics/transaction paths and later architecture phases remain.
+No phase accepted or merged. Evidence: R4 analysis/perf-20261028/
+native-owner-large-gate/rth-qda5fuft and native-owner-memory18.json.

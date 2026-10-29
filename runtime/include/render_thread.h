@@ -78,11 +78,12 @@ void rt_stop(void);
 int  rt_running(void);
 int  rt_on_render_thread(void);
 
-/* Append a record with room for payload_bytes; returns the payload pointer
- * (16-byte aligned) or NULL when the record can never fit (larger than half
- * the ring) — the caller then acquires and runs the work directly. Blocks
- * while the ring is full. Must be followed by rt_cmd_commit() before any other
- * rt_* call. op 0 is reserved. */
+/* Append a record with room for payload_bytes; returns a 16-byte aligned
+ * payload or NULL on invalid input/allocation failure. Large records are
+ * fragmented through the bounded ring and assembled by the consumer; exec
+ * sees one intact immutable payload. Blocks while the ring is full. Must be
+ * followed by rt_cmd_commit() before any other rt_* call. Ops 0 and UINT16_MAX
+ * are reserved. Private batches still reject oversized records atomically. */
 void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes);
 void  rt_cmd_commit(void);
 /* Optional producer transaction. Records stay private until try_commit;
