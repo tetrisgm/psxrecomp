@@ -5764,6 +5764,7 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
     mask_stencil(s_mask_set);
     p_glUseProgram(s_geo_prog);
     if (s_hiw) p_glUniform1f(s_geo_uShift, s_shift_hi);
+    p_glUniform1f(s_geo_uYhalf,VRAM_H*.5f);
     p_glUniform1f(s_geo_uXoff, 0.0f);
     p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
     p_glBindVertexArray(s_geo_vao);
@@ -5771,6 +5772,7 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
     vertex_stream_upload(0, verts, sizeof verts);
     BCLS_DRAW(semi, 0, (int)s_mask_set, s_mask_check, 0, glDrawArrays(GL_TRIANGLES, 0, 6));
     if (s_hiw) p_glUniform1f(s_geo_uShift, s_shift_hr);
+    p_glUniform1f(s_geo_uYhalf,s_raster_height*.5f);
     p_glUniform1f(s_geo_uXoff, 0.0f);
     p_glUniform1f(s_geo_uXhalf, 512.0f);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
@@ -5896,7 +5898,8 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
 /* VRAM->VRAM copy: blit the source region to the scratch texture (resolves
  * overlap), then draw it back at the destination through the BLIT program so
  * mask set/check and the stencil mirror apply, exactly like sw_copy_rect. */
-static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
+                              int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -5919,11 +5922,11 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
      * high-resolution window stages its S-scaled source in a scratch of its
      * own (hiw_mirror_copy), so this one never grows past the hr surface. */
     if (!scratch_ensure(w * S, h * S)) return;
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer((sx-s_hr_origin_x)*S,(sy-s_hr_origin_y)*S,
-                        (sx+w-s_hr_origin_x)*S,(sy+h-s_hr_origin_y)*S,
+    p_glBlitFramebuffer((sx-source_x)*S,(sy-source_y)*S,
+                        (sx+w-source_x)*S,(sy+h-source_y)*S,
                         0, 0, w*S, h*S,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
@@ -5960,6 +5963,10 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
         s_gpu_dirty = 1;
     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
     coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+}
+
+static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+    gpu_copy_rect_from(s_hr_fbo,s_hr_origin_x,s_hr_origin_y,sx,sy,dx,dy,w,h);
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */

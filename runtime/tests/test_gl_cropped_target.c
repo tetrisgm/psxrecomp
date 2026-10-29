@@ -33,6 +33,13 @@ static void scene(int x,int y,int textured) {
     gr_vram_transfer_in(x+10,y+10,8,8,patch);
     gr_copy_rect(x+10,y+10,x+40,y+40,8,8);
     flush_cpu_upload();
+    gr_set_precise_triangle(0,0,0,0,0,0,0);
+    gr_set_depth_triangle(0,0,0,0);
+    gr_set_perspective_triangle(0,0,0,0);
+    gr_set_semi_transparency(1,0);
+    gr_draw_flat_rect(x,y,320,240,0x4210);
+    flush_flat_batch();flush_tex_batch();hiw_flush_queue();
+    gr_set_semi_transparency(0,0);
 }
 static int run_scale(int scale) {
     if(SDL_Init(SDL_INIT_VIDEO)!=0)return 77;
@@ -84,6 +91,26 @@ static int run_scale(int scale) {
         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
         glReadPixels(0,0,320*scale,240*scale,GL_DEPTH_COMPONENT,GL_UNSIGNED_INT,cropped);
         check(!memcmp(reference,cropped,bytes),"cropped depth equals full-surface rectangle");
+        /* Independent source and destination allocations must retain enhanced
+         * subpixel colour, including mask checks, without native reseeding. */
+        for(int mask=0;mask<4;++mask) {
+            gr_set_mask_bits(mask&1,mask>>1);
+            s_hr_fbo=full_fbo;s_hr_tex=full_tex;s_hr_rb=full_rb;
+            s_hr_origin_x=s_hr_origin_y=0;s_hr_width=1024;s_hr_height=512;
+            gpu_copy_rect(x+10,y+10,x+150,y+150,32,32);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,full_fbo);
+            glReadPixels((x+150)*scale,(y+150)*scale,32*scale,32*scale,
+                GL_RGBA,GL_UNSIGNED_BYTE,reference);
+            s_hr_fbo=fbo;s_hr_tex=tex;s_hr_rb=rb;
+            s_hr_origin_x=x;s_hr_origin_y=y;s_hr_width=320;s_hr_height=240;
+            gpu_copy_rect_from(full_fbo,0,0,x+10,y+10,x+150,y+150,32,32);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+            glReadPixels(150*scale,150*scale,32*scale,32*scale,
+                GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+            check(!memcmp(reference,cropped,(size_t)32*32*scale*scale*4),
+                "cross-target enhanced copy preserves mask semantics");
+        }
+        gr_set_mask_bits(0,0);
     }
     s_hr_fbo=full_fbo;s_hr_tex=full_tex;s_hr_rb=full_rb;
     s_hr_origin_x=s_hr_origin_y=0;s_hr_width=1024;s_hr_height=512;
