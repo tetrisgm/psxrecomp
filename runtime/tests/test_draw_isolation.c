@@ -8,6 +8,7 @@ static uint64_t ram[256], scratch[128];
 uint32_t g_psx_ram_size = sizeof ram;
 uint32_t g_psx_ram_mask = sizeof ram - 1;
 uint32_t g_debug_last_store_pc;
+unsigned g_debug_write_hooks = 1; /* Keep an independently enabled trace hook. */
 void (*g_psx_ram_write_observer)(uint32_t, uint32_t);
 void (*g_psx_exception_edge_observer)(int);
 void (*g_psx_mmio_observer)(uint32_t, int);
@@ -21,6 +22,7 @@ int main(void) {
     ram[0] = 1;
     cpu.gte_data[0] = 3;
     assert(psx_draw_iso_begin(&cpu, 0));
+    assert(g_debug_write_hooks == 3);
     assert(psx_draw_iso_enter(&cpu));
     ram[0] = 2;
     cpu.gte_data[0] = 4;
@@ -48,6 +50,7 @@ int main(void) {
     psx_draw_iso_get_stats(&stats);
     assert(stats.spans == 1 && stats.exception_swaps == 0);
     psx_draw_iso_end();
+    assert(g_debug_write_hooks == 1);
     assert(ram[0] == 2 && ram[1] == 8 && ram[2] == 9);
     return 0;
 }
