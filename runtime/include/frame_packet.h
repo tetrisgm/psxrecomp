@@ -30,8 +30,12 @@ FramePacketQueue *frame_packet_create(size_t initial_limit,size_t record_limit);
 void frame_packet_destroy(FramePacketQueue *queue); /* stopped owners only */
 int frame_packet_begin(FramePacketQueue *queue,uint64_t sequence,
                        const void *initial,size_t bytes);
+/* Reserve the owned seed directly, avoiding an intermediate full native VRAM
+ * copy. Fill every byte before publish; the pointer expires on publication. */
+int frame_packet_reserve_initial(FramePacketQueue *queue,uint64_t sequence,size_t bytes,void **initial);
 /* Takes ownership only on success. One immutable CPU-only attachment per
- * packet, accounted against initial_limit along with the seed. Its disposer
+ * packet, accounted against initial_limit along with the seed. Failure
+ * invalidates the open frame, so missing provenance cannot be published. Its disposer
  * runs on slot reuse/destruction, never while the consumer holds that slot;
  * it must not call GL, wait for another owner, or reference live guest data. */
 int frame_packet_attach(FramePacketQueue *queue,void *attachment,size_t bytes,

@@ -24,6 +24,7 @@ struct OwnerTest {
     std::atomic<unsigned> acquire{0},release{0};
     std::atomic<uint64_t> last{0};
     std::atomic<unsigned> ticks{0};
+    std::atomic<unsigned> requests{0},stale_requests{0};
     FrameOwner *owner=nullptr;
 };
 static uint64_t owner_clock() {
@@ -52,6 +53,15 @@ static void execute(void *user,const FramePacketView *packet) {
     if(packet->sequence==10000) frame_owner_tick_at(state.owner,owner_clock()+1000000);
     state.last.store(packet->sequence,std::memory_order_release);
 }
+static void request_done(void *user,const void *payload,size_t bytes,int stale) {
+    auto &state=*static_cast<OwnerTest *>(user);
+    assert(frame_owner_is_thread());
+    assert(bytes==sizeof(uint64_t));
+    const auto expected=*static_cast<const uint64_t *>(payload);
+    if(stale) ++state.stale_requests;
+    else assert(state.last.load(std::memory_order_acquire)>=expected);
+    state.requests.fetch_add(1,std::memory_order_release);
+}
 static void test_attachments() {
     struct Owned { int* destroyed; uint64_t value; };
     const auto dispose=[](void* data) {
@@ -64,6 +74,8 @@ static void test_attachments() {
     auto* rejected=new Owned{&destroyed,0};
     assert(!frame_packet_attach(queue,rejected,sizeof(Owned)+1,dispose));
     delete rejected; // rejected attachment still belongs to caller
+    assert(!frame_packet_publish(queue));
+    assert(frame_packet_begin(queue,1,nullptr,0));
     assert(frame_packet_attach(queue,new Owned{&destroyed,1},sizeof(Owned),dispose));
     assert(frame_packet_publish(queue));
     FramePacketView held{};
@@ -101,13 +113,43 @@ int main() {
      * and context ownership never returns to the producer during execution. */
     assert(frame_owner_replaced(owner)==9998);
     assert(state.acquire==1 && state.release==1);
+    uint64_t requested=10000;
+    for(unsigned n=0;n<64;++n)
+        assert(frame_owner_request(owner,requested,request_done,&state,&requested,sizeof requested));
+    assert(!frame_owner_request(owner,requested,request_done,&state,&requested,sizeof requested));
+    requested=UINT64_MAX; // accepted requests own their bytes
     state.unblock.store(true,std::memory_order_release);
     while(frame_owner_completed(owner)<2) std::this_thread::yield();
     assert(state.last.load(std::memory_order_acquire)==10000);
+    while(state.requests.load(std::memory_order_acquire)<64) std::this_thread::yield();
+    assert(state.stale_requests==0);
     /* Timed presentation work continues while the guest publishes nothing. */
     while(state.ticks.load(std::memory_order_acquire)<2) std::this_thread::yield();
     frame_owner_stop(owner);
     assert(state.acquire==2 && state.release==2);
+    {
+        OwnerTest reset;
+        const FrameOwnerConfig reset_config{8,4096,execute,context,&reset,nullptr,nullptr};
+        reset.owner=frame_owner_start(&reset_config);assert(reset.owner);
+        uint64_t seq=1;
+        assert(frame_owner_begin(reset.owner,seq,&seq,sizeof seq));
+        assert(frame_owner_publish(reset.owner));
+        while(!reset.entered.load(std::memory_order_acquire)) std::this_thread::yield();
+        seq=2;
+        assert(frame_owner_begin(reset.owner,seq,&seq,sizeof seq));
+        assert(frame_owner_publish(reset.owner));
+        assert(frame_owner_request(reset.owner,seq,request_done,&reset,&seq,sizeof seq));
+        frame_owner_invalidate(reset.owner);
+        reset.unblock.store(true,std::memory_order_release);
+        while(reset.requests.load(std::memory_order_acquire)<1) std::this_thread::yield();
+        assert(reset.stale_requests==1 && reset.last==1);
+        // Idle requests still complete without another guest frame.
+        seq=0;
+        assert(frame_owner_request(reset.owner,seq,request_done,&reset,&seq,sizeof seq));
+        while(reset.requests.load(std::memory_order_acquire)<2) std::this_thread::yield();
+        assert(reset.stale_requests==1);
+        frame_owner_stop(reset.owner);
+    }
     /* The C renderer's owned packet carries its seed independently of all
      * skipped packets. Neither caller buffers nor later appends may mutate
      * the consumer's current packet. Overflow rejects a whole packet. */

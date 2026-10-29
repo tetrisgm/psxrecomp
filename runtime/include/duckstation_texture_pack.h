@@ -129,15 +129,22 @@ void duck_texture_pack_invalidate(DuckTexturePack* pack,
                                   uint16_t x, uint16_t y,
                                   uint16_t width_words, uint16_t height);
 void duck_texture_pack_reset_tracking(DuckTexturePack* pack);
+/* Record native sampling even when replacement lookup/dumping happens on
+ * another owner. A sampled upload must not coalesce with a later write. */
+void duck_texture_pack_observe_usage(DuckTexturePack* pack,const HdTextureDrawQuery* query);
 /* Packet-owned provenance. Capture runs on the source owner; the resulting
  * immutable object may be applied on another thread after publication. It
- * owns all source pixels/observations and never shares dump history or pack
- * pointers. Apply replaces residency, preserving the destination's assets.
+ * retains immutable upload pixels and owns residency/copy metadata, never
+ * dump observations/history or pack pointers. Authoring stays on its owner.
+ * Apply replaces residency, preserving the destination's assets.
  * A failed capture/apply leaves the destination unchanged. */
 typedef struct DuckTextureTrackingSnapshot DuckTextureTrackingSnapshot;
 DuckTextureTrackingSnapshot* duck_texture_pack_capture_tracking(const DuckTexturePack* pack);
 int duck_texture_pack_apply_tracking(DuckTexturePack* pack, const DuckTextureTrackingSnapshot* snapshot);
 void duck_texture_pack_free_tracking(DuckTextureTrackingSnapshot* snapshot);
+/* Logical owned metadata plus retained immutable source pixels, for bounded
+ * packet admission. Pixel storage is shared, never recopied by capture/apply. */
+size_t duck_texture_pack_tracking_bytes(const DuckTextureTrackingSnapshot* snapshot);
 /* Same-session reload only: clone immutable sources and owned observations
  * while the caller keeps native VRAM unchanged. Lookup/image caches remain
  * independent; only same-root filename deduplication history is shared.

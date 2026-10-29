@@ -45,6 +45,31 @@ typedef struct NativeRasterState {
     /* 0 draws every line; 1 skips even native rows, 2 skips odd rows. */
     uint32_t skip_field;
 } NativeRasterState;
+
+/* CPU-native provenance observation, ordered with the original writes. All
+ * pointers are borrowed only for the callback. before is 1 before the write,
+ * 0 after; restore marks a full machine restore. For GP0, state/packet are
+ * provided; otherwise command/upload describe the native operation. These
+ * callbacks run on the native worker, must not call GL or re-enter its queue,
+ * and cannot modify VRAM. Observer user storage must outlive registration. */
+typedef struct NativeRasterEvent {
+    int before, restore;
+    int has_writes, written_bounds[4]; /* post-write conservative native spans */
+    const NativeRasterCommand *command;
+    const NativeRasterState *state;
+    const uint32_t *packet;
+    size_t packet_words;
+    const uint16_t *upload;
+    size_t upload_words;
+    const uint16_t *vram;
+} NativeRasterEvent;
+typedef void (*NativeRasterObserver)(void *user,const NativeRasterEvent *event);
+typedef void (*NativeRasterVisit)(void *user,const uint16_t *vram);
+/* CPU-only barriers. Registration and visits occur after all preceding native
+ * work, without touching presentation. Visits configure/capture provenance
+ * on its owner, and may not retain the borrowed VRAM pointer after shutdown. */
+void native_raster_set_observer(NativeRaster *raster,NativeRasterObserver observer,void *user);
+void native_raster_visit(NativeRaster *raster,NativeRasterVisit visit,void *user);
 /* Complete fixed-length draw/fill/copy packets only. Environment and partial
  * transfers use the existing state/fragment operations. */
 int native_raster_gp0(NativeRaster *raster,const NativeRasterState *state,

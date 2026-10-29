@@ -78,6 +78,7 @@ struct SwRendererContext {
     int g_uv_lim[4];
     int private_dirty;
     uint64_t dirty_rows[8];
+    int observe_writes, written_bounds[4];
     struct { uint32_t tag; uint16_t words[4]; } native_texture[256];
     uint16_t native_palette[256];
     uint32_t native_palette_key, native_page;
@@ -120,12 +121,31 @@ void sw_context_take_dirty(uint64_t rows[8]) {
     memcpy(rows, s_sw->dirty_rows, sizeof s_sw->dirty_rows);
     memset(s_sw->dirty_rows, 0, sizeof s_sw->dirty_rows);
 }
+void sw_context_begin_write_observation(int enabled) {
+    s_sw->observe_writes=enabled;
+    s_sw->written_bounds[0]=1024;s_sw->written_bounds[1]=512;
+    s_sw->written_bounds[2]=s_sw->written_bounds[3]=-1;
+}
+int sw_context_written_bounds(int bounds[4]) {
+    if(bounds) memcpy(bounds,s_sw->written_bounds,sizeof s_sw->written_bounds);
+    return s_sw->written_bounds[0]<=s_sw->written_bounds[2];
+}
+static inline void sw_note_span(int x,int y,int width) {
+    if(!s_sw->observe_writes || width<=0) return;
+    x&=1023;y&=511;
+    int right=width>=1024?1024:x+width-1;
+    if(right>=1024) { x=0;right=1023; }
+    int* b=s_sw->written_bounds;
+    if(x<b[0]) b[0]=x;if(y<b[1]) b[1]=y;
+    if(right>b[2]) b[2]=right;if(y>b[3]) b[3]=y;
+}
 static void sw_dirty_row(uint32_t y) {
     if (!s_sw->private_dirty) { gpu_vram_dirty_mark_row(y); return; }
     y &= 511;
     s_sw->dirty_rows[y >> 6] |= UINT64_C(1) << (y & 63);
 }
 static void sw_dirty_rect(int x, int y, int w, int h) {
+    for(int i=0;s_sw->observe_writes && i<h && i<512;++i) sw_note_span(x,y+i,w);
     if (!s_sw->private_dirty) { gpu_vram_dirty_mark_rect(x, y, w, h); return; }
     if (w <= 0 || h <= 0) return;
     for (int i = 0; i < h && i < 512; ++i) sw_dirty_row((uint32_t)(y+i));
@@ -357,8 +377,10 @@ static inline void put_opaque(const RTarget *t, int x, int y, uint16_t color) {
 
     t->buf[idx] = color;
     /* Canonical VRAM only (hi-res / wide mirrors are present-side). */
-    if (t->buf == g_vram)
+    if (t->buf == g_vram) {
+        sw_note_span(x,y,1);
         sw_dirty_row((uint32_t)y);
+    }
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
@@ -403,8 +425,10 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
     if (g_mask_set_bit) color |= 0x8000;
 
     t->buf[idx] = color;
-    if (t->buf == g_vram)
+    if (t->buf == g_vram) {
+        sw_note_span(x,y,1);
         sw_dirty_row((uint32_t)y);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -500,6 +524,7 @@ void sw_native_copy(int sx,int sy,int dx,int dy,int w,int h) {
                     *dst=pixels[i]|(g_mask_set_bit?0x8000:0);
             }
         }
+        sw_note_span(dx,target_y,w);
         sw_dirty_row((uint32_t)target_y);
     }
 }
@@ -652,7 +677,7 @@ void sw_draw_native_triangle(const SwNativeVertex input[3],uint16_t cx,uint16_t 
             *dst=color|stp|(g_mask_set_bit?0x8000:0);
             wrote=1;
         }
-        if(wrote) sw_dirty_row((uint32_t)py);
+        if(wrote) { sw_note_span(left,py,right-left);sw_dirty_row((uint32_t)py); }
       }
     }
 }
@@ -691,7 +716,7 @@ void sw_draw_native_line(const SwNativeVertex input[2],unsigned flags) {
                                                (flags&8)?matrix[py&3][px&3]:0);
                 if(g_semi_trans_enabled) value=blend_pixels(*dst,value,g_semi_trans_mode);
                 *dst=value|(g_mask_set_bit?0x8000:0);
-                sw_dirty_row((uint32_t)py);
+                sw_note_span(px,py,1);sw_dirty_row((uint32_t)py);
             }
         }
         for(int c=0;c<3;++c) color[c]+=delta[c];
@@ -727,7 +752,7 @@ void sw_draw_native_rect(int x,int y,int w,int h,uint32_t rgb,int u,int v,
             *dst=color|stp|(g_mask_set_bit?0x8000:0);
             wrote=1;
         }
-        if(wrote) sw_dirty_row((uint32_t)py);
+        if(wrote) { sw_note_span(left,py,right-left);sw_dirty_row((uint32_t)py); }
     }
 }
 
@@ -1092,7 +1117,7 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
                 }
             }
         }
-        sw_dirty_row((uint32_t)dy);
+        sw_note_span(dst_x,dy,w);sw_dirty_row((uint32_t)dy);
     }
 
     if (hr_rows) free(hr_rows);
@@ -1930,6 +1955,7 @@ void sw_vram_write(int x, int y, uint16_t pixel) {
     x &= (VRAM_WIDTH - 1);
     y &= (VRAM_HEIGHT - 1);
     g_vram[y * VRAM_WIDTH + x] = pixel;
+    sw_note_span(x,y,1);
     sw_dirty_row((uint32_t)y);
 
     if (g_hr) {
@@ -2033,7 +2059,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
                 }
             }
         }
-        sw_dirty_row((uint32_t)py);
+        sw_note_span(x,py,w);sw_dirty_row((uint32_t)py);
     }
 }
 

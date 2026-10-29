@@ -873,7 +873,8 @@ if(BUILD_TESTING)
     target_link_libraries(duckstation_texture_pack_test PRIVATE psx_texture_image_decode)
     add_test(NAME duckstation_texture_pack_test COMMAND duckstation_texture_pack_test)
     add_executable(gpu_hd_context_test tests/test_gpu_hd_context.cpp
-        src/gpu_hd_textures.cpp src/hd_texture_pack.cpp src/duckstation_texture_pack.cpp)
+        src/gpu_hd_textures.cpp src/hd_texture_pack.cpp src/duckstation_texture_pack.cpp
+        src/native_raster.cpp src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
     target_include_directories(gpu_hd_context_test PRIVATE include)
     target_link_libraries(gpu_hd_context_test PRIVATE Threads::Threads psx_texture_image_decode)
     add_test(NAME gpu_hd_context_test COMMAND gpu_hd_context_test)

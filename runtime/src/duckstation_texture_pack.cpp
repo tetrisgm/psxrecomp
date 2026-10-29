@@ -156,7 +156,9 @@ struct Observation {
 struct Source {
     Rect rect{};
     uint64_t hash = 0;
-    std::vector<uint16_t> words;
+    /* Original upload pixels never change. Packet snapshots share this storage
+     * while keeping mutable crop/palette/dump observations owner-local. */
+    std::shared_ptr<const std::vector<uint16_t>> words;
     std::vector<Observation> records;
     DuckTexturePack* dump_owner = nullptr;
     uint8_t kind = DUCK_TEXTURE_UPLOAD;
@@ -387,7 +389,6 @@ template<class Tracking>
 DuckTextureTrackingSnapshot clone_tracking(const Tracking& source, DuckTexturePack* owner) {
     DuckTextureTrackingSnapshot result;
     result.uploads = source.uploads;
-    result.pages = source.pages;
     result.copy_updates = source.copy_updates;
     result.copy_destination = source.copy_destination;
     result.copy_pending = source.copy_pending;
@@ -395,18 +396,20 @@ DuckTextureTrackingSnapshot clone_tracking(const Tracking& source, DuckTexturePa
     const auto clone = [&](const std::shared_ptr<Source>& item) {
         const auto found = cloned.find(item.get());
         if (found != cloned.end()) return found->second;
-        auto copy = std::make_shared<Source>(*item);
+        auto copy = std::make_shared<Source>();
+        copy->rect=item->rect;copy->hash=item->hash;copy->words=item->words;
+        copy->kind=item->kind;copy->used=item->used;
         copy->dump_owner = owner;
         cloned.emplace(item.get(), copy);
         result.sources.push_back(copy);
-        result.bytes += copy->words.size() * sizeof(uint16_t);
+        result.bytes += copy->words->size() * sizeof(uint16_t);
         result.records += copy->records.size();
         return copy;
     };
     for (auto& upload : result.uploads) upload.source = clone(upload.source);
-    for (auto& page : result.pages) page.source = clone(page.source);
-    /* Retired sources may still own observations awaiting a dump checkpoint. */
-    for (const auto& source_item : source.sources) clone(source_item);
+    /* Authoring observations/page dumps stay on the native owner. Replaying
+     * them in a droppable presentation packet would duplicate disk work and
+     * let presentation timing decide which captured palette wins. */
     return result;
 }
 }
@@ -437,6 +440,13 @@ int duck_texture_pack_apply_tracking(DuckTexturePack* pack, const DuckTextureTra
     } catch (...) { return 0; }
 }
 void duck_texture_pack_free_tracking(DuckTextureTrackingSnapshot* snapshot) { delete snapshot; }
+size_t duck_texture_pack_tracking_bytes(const DuckTextureTrackingSnapshot* snapshot) {
+    if(!snapshot) return 0;
+    return sizeof(*snapshot)+snapshot->bytes+snapshot->records*sizeof(Observation)+
+        snapshot->sources.size()*(sizeof(Source)+sizeof(std::shared_ptr<Source>))+
+        snapshot->uploads.size()*sizeof(Upload)+snapshot->pages.size()*sizeof(PageSource)+
+        snapshot->copy_updates.size()*sizeof(CopyUpdate);
+}
 
 namespace {
 void note(DuckTexturePack& p, const std::string& s) {
@@ -569,7 +579,7 @@ uint64_t snapshot_hash(const Source& source, Rect crop) {
     XXH3_state_t state; XXH3_64bits_reset(&state);
     std::array<uint8_t,2048> bytes{};
     for (unsigned y = crop.y; y < crop.y+crop.h; ++y) {
-        const uint16_t* row = source.words.data()+size_t(y)*source.rect.w+crop.x;
+        const uint16_t* row = source.words->data()+size_t(y)*source.rect.w+crop.x;
         for (unsigned x = 0; x < crop.w; ++x) { bytes[2*x] = row[x]&255; bytes[2*x+1] = row[x]>>8; }
         XXH3_64bits_update(&state,bytes.data(),crop.w*2);
     }
@@ -621,7 +631,7 @@ bool finalize_source(DuckTexturePack& p, Source& source, bool keep_observations 
                 const unsigned bits = record.depth == 0 ? 4 : 8;
                 for (unsigned y = crop.y; y < crop.y+crop.h; ++y)
                     for (unsigned x = crop.x; x < crop.x+crop.w; ++x) {
-                        const uint16_t word = source.words[size_t(y)*source.rect.w+x];
+                        const uint16_t word = (*source.words)[size_t(y)*source.rect.w+x];
                         for (unsigned n = 0; n < ppw; ++n) {
                             const unsigned index = (word>>(n*bits))&mask;
                             minimum = std::min(minimum,index); maximum = std::max(maximum,index);
@@ -640,7 +650,7 @@ bool finalize_source(DuckTexturePack& p, Source& source, bool keep_observations 
         auto image = std::make_shared<Image>(); image->w = key.width; image->h = key.height;
         image->rgba.resize(size_t(image->w)*image->h*4);
         for (unsigned y = 0; y < image->h; ++y) for (unsigned x = 0; x < image->w; ++x) {
-            uint16_t color = source.words[size_t(crop.y+y)*source.rect.w+crop.x+x/ppw];
+            uint16_t color = (*source.words)[size_t(crop.y+y)*source.rect.w+crop.x+x/ppw];
             if (record.depth < 2) {
                 const unsigned bits = record.depth == 0 ? 4 : 8;
                 const unsigned index = (color>>((x%ppw)*bits))&(record.depth == 0 ? 15 : 255);
@@ -674,7 +684,7 @@ void retire_unused(DuckTexturePack& p) {
             p.lifecycle_error = p.lifecycle_error.empty() ? "texture dump could not be finalized" : p.lifecycle_error;
             ++it; continue;
         }
-        p.snapshot_bytes -= (*it)->words.size()*sizeof(uint16_t); it = p.sources.erase(it);
+        p.snapshot_bytes -= (*it)->words->size()*sizeof(uint16_t); it = p.sources.erase(it);
     }
 }
 std::shared_ptr<Source> capture_source(DuckTexturePack& p, Rect rect, const uint16_t* vram, uint8_t kind) {
@@ -690,14 +700,15 @@ std::shared_ptr<Source> capture_source(DuckTexturePack& p, Rect rect, const uint
         ++p.tracking_generation;
         p.uploads.erase(std::remove_if(p.uploads.begin(),p.uploads.end(),[&](const Upload& u) { return u.source == victim; }),p.uploads.end());
         p.pages.erase(std::remove_if(p.pages.begin(),p.pages.end(),[&](const PageSource& u) { return u.source == victim; }),p.pages.end());
-        p.snapshot_bytes -= victim->words.size()*sizeof(uint16_t); p.sources.pop_front();
+        p.snapshot_bytes -= victim->words->size()*sizeof(uint16_t); p.sources.pop_front();
         p.match_cache.clear();
     }
     auto source = std::make_shared<Source>(); source->rect = rect; source->kind = kind; source->dump_owner = &p;
-    source->words.resize(size_t(rect.w)*rect.h);
+    auto pixels=std::make_shared<std::vector<uint16_t>>(size_t(rect.w)*rect.h);
     for (unsigned y = 0; y < rect.h; ++y)
-        std::copy_n(vram+(rect.y+y)*1024+rect.x,rect.w,source->words.data()+size_t(y)*rect.w);
-    source->hash = duck_texture_hash_words_le(source->words.data(),source->words.size());
+        std::copy_n(vram+(rect.y+y)*1024+rect.x,rect.w,pixels->data()+size_t(y)*rect.w);
+    source->words=std::move(pixels);
+    source->hash = duck_texture_hash_words_le(source->words->data(),source->words->size());
     p.snapshot_bytes += bytes; p.sources.push_back(source);
     return source;
 }
@@ -1002,6 +1013,14 @@ void duck_texture_pack_reset_tracking(DuckTexturePack* p) {
     if (flushed) { p->sources.clear(); p->snapshot_bytes = 0; p->palette_records = 0; }
     p->rect_cache.clear(); p->match_cache.clear(); ++p->revision; ++p->tracking_generation;
 }
+void duck_texture_pack_observe_usage(DuckTexturePack* p,const HdTextureDrawQuery* query) {
+    if(!p || !query) return;
+    Rect wanted{};
+    if(!query_rect(query,wanted)) return;
+    for(const auto& upload:p->uploads) if(!upload.source->used && intersects(upload.active,wanted)) {
+        upload.source->used=true;++p->tracking_generation;
+    }
+}
 int duck_texture_pack_copy_tracking(DuckTexturePack* destination, const DuckTexturePack* source) {
     if (!destination || !source) return 0;
     if (destination == source) return 1;
@@ -1017,7 +1036,7 @@ int duck_texture_pack_copy_tracking(DuckTexturePack* destination, const DuckText
             auto copy = std::make_shared<Source>(*item); copy->dump_owner = destination;
             if (destination->root != source->root && !copy->records.empty()) copy->dump_dirty = true;
             cloned.emplace(item.get(),copy); sources.push_back(copy);
-            bytes += copy->words.size()*sizeof(uint16_t); records += copy->records.size();
+            bytes += copy->words->size()*sizeof(uint16_t); records += copy->records.size();
             return copy;
         };
         for (auto& upload : uploads) upload.source = clone(upload.source);

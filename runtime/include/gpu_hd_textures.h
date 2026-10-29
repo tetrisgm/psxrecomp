@@ -23,6 +23,20 @@ typedef struct GpuHdTextureTracking GpuHdTextureTracking;
 GpuHdTextureTracking* gpu_hd_textures_capture_tracking(void);
 int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracking);
 void gpu_hd_textures_free_tracking(GpuHdTextureTracking* tracking);
+size_t gpu_hd_textures_tracking_bytes(const GpuHdTextureTracking* tracking);
+struct NativeRasterEvent;
+/* NativeRasterObserver callback; user is a native GpuHdTextureContext. */
+void gpu_hd_textures_native_event(void* user,const struct NativeRasterEvent* event);
+struct NativeRaster;
+/* Bind the machine's native owner before guest execution. Configuration is
+ * prepared on both owners before either session changes. With presentation
+ * quiescent, detach before destroying a raster shorter-lived than the process. */
+int gpu_hd_textures_attach_native(struct NativeRaster* raster,char* error,size_t capacity);
+struct SwNativeTextureState;
+/* One CPU-owner boundary captures native pixels/cache/provenance together,
+ * without consuming rewind dirty rows. Optional pixel/cache destinations are
+ * caller-owned; the returned provenance is independently owned. */
+GpuHdTextureTracking* gpu_hd_textures_capture_native(uint16_t* vram,struct SwNativeTextureState* cache);
 
 /* Emulation-thread configuration. Roots are external user-owned directories;
  * a successful replacement session selects native CPU VRAM authority on GL.

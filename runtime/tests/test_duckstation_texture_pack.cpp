@@ -378,6 +378,23 @@ void packet_tracking(const fs::path& root) {
           "destination owns provenance after packet release");
 }
 
+void native_usage(const fs::path& root) {
+    config(root,"MaxVRAMWriteCoalesceWidth: 8\n");
+    png(root/"replacements"/"texupload-C16-000CA76CB9B329DC-4x2-0-0-4x2.png");
+    std::vector<uint16_t> vram(1024*512);place(vram,0,0,4,words(8));place(vram,4,0,4,words(8));
+    const auto q=query(vram,0,0,2,0,3,0,1);
+    for(int sampled=0;sampled<2;++sampled) {
+        auto pack=create(root);
+        check(duck_texture_pack_track_upload(pack.get(),0,0,4,2,vram.data(),vram.size()),"native usage first upload");
+        if(sampled) duck_texture_pack_observe_usage(pack.get(),&q);
+        check(duck_texture_pack_track_upload(pack.get(),4,0,4,2,vram.data(),vram.size()),"native usage adjacent upload");
+        DuckTextureMatch match{};
+        const int found=duck_texture_pack_match(pack.get(),&q,&match);
+        check(found==(sampled?HD_TEXTURE_LOOKUP_FOUND:HD_TEXTURE_LOOKUP_NONE),
+              "native sampling prevents coalescing even without a presentation query or dump");
+    }
+}
+
 void st_alias_duplicates(const fs::path& root) {
     const char* ordinary = "texpage-C16-000CA76CB9B329DC-256x256-0-0-4x2.png";
     const char* st = "texpage-STC16-000CA76CB9B329DC-256x256-0-0-4x2.png";
@@ -765,7 +782,8 @@ int main(int argc, char** argv) {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
         fixed_hash_vectors(); names(); page_and_decode(root/"page"); upload(root/"upload"); reload_tracking(root/"reload");
-        palettes(root/"palettes"); packet_tracking(root/"packet"); st_alias_duplicates(root/"keys"); failed_payloads(root/"invalid"); dumping(root/"dump");
+        palettes(root/"palettes"); packet_tracking(root/"packet"); native_usage(root/"native-usage");
+        st_alias_duplicates(root/"keys"); failed_payloads(root/"invalid"); dumping(root/"dump");
         official_binary_oracle(root/"official-oracle"); defaults_and_options(root/"defaults");
         immutable_palettes_and_pages(root/"snapshots"); split_coalesce_copy_parts(root/"lifecycle"); copied_pack_ownership(root/"ownership");
         resident_checkpoint(root/"resident"); preload(root/"preload"); preload_pool();

@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 #include <memory>
+#include <new>
 #include <cstring>
 #include "native_raster_oracle_fixtures.h"
 
@@ -28,7 +29,61 @@ static uint16_t pixel(NativeRaster *r,int x,int y) {
     native_raster_read(r,x,y,1,1,&p);
     return p;
 }
+static void provenance_observation() {
+    struct Sample { int before,restore; uint16_t first,second,drawn; uint32_t opcode; };
+    struct Observer {
+        std::thread::id producer=std::this_thread::get_id(),worker;
+        std::vector<Sample> samples;
+        uint16_t visited=0;
+    } owner;
+    std::vector<uint16_t> initial(1024*512);initial[0]=0x8001;
+    auto* raster=native_raster_create(initial.data());assert(raster);
+    native_raster_set_observer(raster,[](void* user,const NativeRasterEvent* event) {
+        auto& owner=*static_cast<Observer*>(user);
+        assert(std::this_thread::get_id()!=owner.producer);
+        if(owner.samples.empty()) owner.worker=std::this_thread::get_id();
+        assert(owner.worker==std::this_thread::get_id());
+        owner.samples.push_back({event->before,event->restore,event->vram[0],event->vram[1],
+            event->vram[4],event->packet ? event->packet[0] : 0});
+        if(event->command) {
+            assert(event->command->op==NR_CPU_UPLOAD && event->upload_words==2);
+            assert(event->upload[0]==2 && event->upload[1]==3);
+        }
+        if(event->before) assert(!event->has_writes);
+        else {
+            assert(event->has_writes);
+            const int* bounds=event->written_bounds;
+            if(event->restore) assert(bounds[0]==0 && bounds[1]==0 && bounds[2]==1023 && bounds[3]==511);
+            else if(event->command) assert(bounds[0]==1 && bounds[1]==0 && bounds[2]==1 && bounds[3]==0);
+            else assert(bounds[0]==4 && bounds[1]==0 && bounds[2]==5 && bounds[3]==0);
+        }
+    },&owner);
+    NativeRasterCommand upload{};upload.op=NR_CPU_UPLOAD;
+    upload.args[2]=2;upload.args[3]=1;upload.args[5]=upload.args[6]=1;
+    uint16_t words[2]={2,3};assert(native_raster_submit(raster,&upload,words,2));
+    words[0]=words[1]=0; // observer sees owned input, then post-mask output
+    NativeRasterState state{};state.right=1023;state.bottom=511;
+    const uint32_t primitive[3]={0x600000ff,4,0x00010002};
+    assert(native_raster_gp0(raster,&state,primitive,3));
+    native_raster_visit(raster,[](void* user,const uint16_t* vram) {
+        auto& owner=*static_cast<Observer*>(user);
+        assert(owner.worker==std::this_thread::get_id());owner.visited=vram[1];
+    },&owner);
+    assert(owner.visited==0x8003 && owner.samples.size()==4);
+    assert(owner.samples[0].before && owner.samples[0].first==0x8001 && owner.samples[0].second==0);
+    assert(!owner.samples[1].before && owner.samples[1].first==0x8001 && owner.samples[1].second==0x8003);
+    assert(owner.samples[2].opcode==primitive[0] && owner.samples[2].drawn==0);
+    assert(owner.samples[3].drawn==31);
+    initial[0]=123;native_raster_restore(raster,initial.data());
+    assert(owner.samples.size()==6 && owner.samples[4].restore && owner.samples[4].first==0x8001);
+    assert(owner.samples[5].restore && owner.samples[5].first==123);
+    native_raster_set_observer(raster,nullptr,nullptr);
+    send(raster,NR_FILL,{0,0,16,1,0});
+    assert(pixel(raster,0,0)==0 && owner.samples.size()==6);
+    native_raster_destroy(raster);
+}
 int main() {
+    provenance_observation();
     auto *r = native_raster_create(nullptr);
     auto *other = native_raster_create(nullptr);
     assert(r && other);
@@ -248,8 +303,10 @@ int main() {
     assert(frames);
     FramePacketView held{};
     for(unsigned tick=1;tick<=64;++tick) {
-        native_raster_checkpoint(r,seed->pixels.data(),nullptr,&seed->texture);
-        assert(frame_packet_begin(frames,tick,seed.get(),sizeof(Seed)));
+        void* storage=nullptr;
+        assert(frame_packet_reserve_initial(frames,tick,sizeof(Seed),&storage));
+        auto* writable=new(storage) Seed;
+        native_raster_checkpoint(r,writable->pixels.data(),nullptr,&writable->texture);
         NativeRasterState draw_state={0,0,1023,511,0,0,0,0,tick&1u,(tick>>1)&1u,0};
         const Draw draws[]={
             {draw_state,{0x600000ffu,80u|(120u<<16),32u|(8u<<16),0},3},

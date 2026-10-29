@@ -33,24 +33,35 @@ extern "C" FramePacketQueue *frame_packet_create(size_t initial,size_t records) 
     try { return new FramePacketQueue(initial,records); } catch(...) { return nullptr; }
 }
 extern "C" void frame_packet_destroy(FramePacketQueue *q) { delete q; }
-extern "C" int frame_packet_begin(FramePacketQueue *q,uint64_t sequence,const void *initial,size_t bytes) {
+extern "C" int frame_packet_reserve_initial(FramePacketQueue *q,uint64_t sequence,size_t bytes,void **initial) {
+    if(!initial) return 0;
+    *initial=nullptr;
     if(!q || q->open) return 0;
     q->open=true;q->valid=false;q->command_sequence=0;
     auto &p=q->mailbox.writing();
     p.clear_attachment();
-    if(bytes>q->initial_limit || (bytes && !initial)) return 0;
+    if(bytes>q->initial_limit) return 0;
     try { p.initial.resize(blocks(bytes)); } catch(...) { return 0; }
-    if(bytes) std::memcpy(p.initial.data(),initial,bytes);
     p.sequence=sequence;p.epoch=q->epoch.load(std::memory_order_relaxed);
     p.initial_bytes=bytes;p.record_bytes=0;
-    p.records.clear();q->valid=true;
+    q->valid=true;
+    *initial=p.initial.data();
+    return 1;
+}
+extern "C" int frame_packet_begin(FramePacketQueue *q,uint64_t sequence,const void *initial,size_t bytes) {
+    void* destination=nullptr;
+    if(!frame_packet_reserve_initial(q,sequence,bytes,&destination)) return 0;
+    if(bytes && !initial) { q->valid=false;return 0; }
+    if(bytes) std::memcpy(destination,initial,bytes);
     return 1;
 }
 extern "C" int frame_packet_attach(FramePacketQueue *q,void *attachment,size_t bytes,
                                      void (*dispose)(void*)) {
-    if(!q || !q->open || !q->valid || !attachment || !dispose) return 0;
+    if(!q || !q->open || !q->valid) return 0;
     auto &p=q->mailbox.writing();
-    if(p.attachment || bytes>q->initial_limit-p.initial_bytes) return 0;
+    if(!attachment || !dispose || p.attachment || bytes>q->initial_limit-p.initial_bytes) {
+        q->valid=false;return 0;
+    }
     p.attachment=attachment;p.dispose=dispose;
     return 1;
 }
@@ -61,10 +72,15 @@ extern "C" void *frame_packet_append(FramePacketQueue *q,uint16_t op,uint16_t fl
     if(!op || op==UINT16_MAX || size>q->record_limit-p.record_bytes) {
         q->valid=false;return nullptr;
     }
-    const size_t offset=p.records.size();
-    try { p.records.resize(offset+size/RT_ALIGN); } catch(...) { q->valid=false;return nullptr; }
+    const size_t offset=p.record_bytes/RT_ALIGN;
+    const size_t needed=offset+size/RT_ALIGN;
+    try { if(p.records.size()<needed) p.records.resize(needed); } catch(...) { q->valid=false;return nullptr; }
     auto *cmd=reinterpret_cast<RtCmd *>(p.records.data()+offset);
     *cmd=RtCmd{uint32_t(size),op,flags,bytes,q->command_sequence++};
+    /* Retain allocated storage between frames; only alignment padding needs
+     * clearing. The producer fills the payload, so clearing it first would
+     * add another full draw-stream write on every guest frame. */
+    std::memset(reinterpret_cast<unsigned char*>(cmd+1)+bytes,0,size-sizeof(RtCmd)-bytes);
     p.record_bytes+=size;
     return cmd+1;
 }

@@ -2,8 +2,11 @@
 #include "gpu_gl_renderer.h"
 #include "hd_texture_pack.h"
 #include "duckstation_texture_pack.h"
+#include "native_raster.h"
+#include "gpu_uv.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <vector>
@@ -72,6 +75,8 @@ struct GpuHdTextureContext {
     uint64_t token = 1, last_config = 0, last_beetle = 0, last_duck = 0;
     bool dumps_suppressed = false;
     bool presentation = false;
+    uint32_t native_window = 0;
+    int native_semi = 0;
 };
 
 struct GpuHdTextureTracking {
@@ -90,6 +95,9 @@ struct PresentationContextInit {
     PresentationContextInit() { presentation_context.presentation = true; }
 } presentation_context_init;
 thread_local GpuHdTextureContext* context = &presentation_context;
+NativeRaster* native_owner = nullptr;
+std::unique_ptr<GpuHdTextureContext> native_context;
+std::atomic<bool> native_attached{false};
 
 
 struct DecodedParts {
@@ -283,6 +291,7 @@ std::shared_ptr<Composition> compose(const HdTextureDrawQuery& query,
 
 void dump_query(const HdTextureDrawQuery& query, int semi) {
     if (!context->session->dump || context->session->dump_failed || context->dumps_suppressed) return;
+    if(context->presentation && native_attached.load(std::memory_order_acquire)) return;
     char error[256]{};
     const int status = duck_texture_pack_dump_draw(context->session->duck, &query, semi, error, sizeof(error));
     if (status == HD_TEXTURE_LOOKUP_FOUND) ++context->session->diag.dumped_textures;
@@ -351,6 +360,244 @@ extern "C" int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracki
     } catch (...) { return 0; }
 }
 extern "C" void gpu_hd_textures_free_tracking(GpuHdTextureTracking* tracking) { delete tracking; }
+extern "C" size_t gpu_hd_textures_tracking_bytes(const GpuHdTextureTracking* tracking) {
+    if(!tracking) return 0;
+    return sizeof(*tracking)+tracking->root.size()+tracking->beetle.size()+
+        tracking->learned.size()*sizeof(tracking->learned[0])+duck_texture_pack_tracking_bytes(tracking->duck);
+}
+
+namespace {
+int native_coordinate(uint32_t xy) { return int(xy&1023)-int(xy&1024); }
+void observe_native_triangle(const int* x,const int* y,const int* u,const int* v,
+                             unsigned page,unsigned clut,uint32_t window,int semi) {
+    int limits[4];psx_uv_tri_limits(x,y,u,v,limits);
+    gpu_hd_textures_observe_draw(page,(clut&63)*16,(clut>>6)&511,limits,window,semi);
+}
+void observe_native_rect(int u,int v,int end_u,int end_v,unsigned page,unsigned cx,unsigned cy,
+                         uint32_t window,int semi) {
+    int limits[4];psx_uv_rect_limits(u,v,end_u,end_v,limits);
+    gpu_hd_textures_observe_draw(page,cx,cy,limits,window,semi);
+}
+void observe_native_draw(const NativeRasterEvent& event) {
+    if(!gpu_hd_textures_active()) return;
+    if(event.packet) {
+        const auto* p=event.packet;const auto& state=*event.state;
+        unsigned op=p[0]>>24,page=state.page,clut=0;
+        if(op>=0x20 && op<0x40 && (op&4)) {
+            int x[4],y[4],u[4],v[4];unsigned at=1,count=(op&8)?4:3;
+            for(unsigned i=0;i<count;++i) {
+                if(i && (op&16)) ++at;
+                const auto xy=p[at++],uv=p[at++];
+                x[i]=native_coordinate(xy);y[i]=native_coordinate(xy>>16);
+                u[i]=uv&255;v[i]=(uv>>8)&255;
+                if(!i) clut=uv>>16;
+                if(i==1) page=(page&~511u)|((uv>>16)&511);
+            }
+            observe_native_triangle(x,y,u,v,page,clut,state.window,!!(op&2));
+            if(count==4) observe_native_triangle(x+1,y+1,u+1,v+1,page,clut,state.window,!!(op&2));
+        } else if(op>=0x60 && op<0x80 && (op&4)) {
+            int w,h;
+            switch(op&24) {
+            case 8:w=h=1;break;
+            case 16:w=h=8;break;
+            case 24:w=h=16;break;
+            default:w=p[3]&1023;h=(p[3]>>16)&511;break;
+            }
+            int u=p[2]&255,v=(p[2]>>8)&255;clut=p[2]>>16;
+            if(page&4096) u|=1;
+            observe_native_rect(u,v,u+((page&4096)?-w:w),v+((page&8192)?-h:h),
+                page,(clut&63)*16,(clut>>6)&511,state.window,!!(op&2));
+        }
+        return;
+    }
+    if(!event.command) return;
+    const auto& c=*event.command;const auto* a=c.args;
+    if(c.op==NR_TEXTURED_TRIANGLE || c.op==NR_SHADED_TEXTURED_TRIANGLE ||
+       (c.op==NR_NATIVE_TRIANGLE && (a[18]&1))) {
+        const int stride=c.op==NR_TEXTURED_TRIANGLE?4:5;
+        const int uv=c.op==NR_NATIVE_TRIANGLE?3:2;
+        int x[3],y[3],u[3],v[3];
+        for(int i=0;i<3;++i) { x[i]=a[i*stride];y[i]=a[i*stride+1];u[i]=a[i*stride+uv];v[i]=a[i*stride+uv+1]; }
+        const int base=3*stride;
+        observe_native_triangle(x,y,u,v,a[base+2],(a[base]/16)|(a[base+1]<<6),context->native_window,context->native_semi);
+    } else if(c.op==NR_TEXTURED_RECT || c.op==NR_TEXTURED_RECT_SCALED ||
+              (c.op==NR_NATIVE_RECT && (a[10]&1))) {
+        if(c.op==NR_TEXTURED_RECT_SCALED)
+            observe_native_rect(a[4],a[5],a[6],a[7],a[10],a[8],a[9],context->native_window,context->native_semi);
+        else if(c.op==NR_TEXTURED_RECT)
+            observe_native_rect(a[4],a[5],a[4]+a[2],a[5]+a[3],a[8],a[6],a[7],context->native_window,context->native_semi);
+        else {
+            int u=a[5];if(a[10]&16) u|=1;
+            observe_native_rect(u,a[6],u+((a[10]&16)?-a[2]:a[2]),a[6]+((a[10]&32)?-a[3]:a[3]),
+                a[9],a[7],a[8],context->native_window,context->native_semi);
+        }
+    }
+}
+}
+extern "C" void gpu_hd_textures_native_event(void* user,const NativeRasterEvent* event) {
+    auto* owner=static_cast<GpuHdTextureContext*>(user);
+    if(!owner || owner->presentation || !event) std::abort();
+    auto* previous=gpu_hd_textures_select_context(owner);
+    gpu_hd_textures_bind_vram(event->vram);
+    if(event->command && event->before) {
+        if(event->command->op==NR_WINDOW) context->native_window=event->command->args[0];
+        if(event->command->op==NR_SEMI) context->native_semi=event->command->args[0];
+    }
+    if(gpu_hd_textures_active()) {
+        const auto* p=event->packet;
+        const auto* c=event->command;
+        const unsigned op=p?p[0]>>24:0;
+        if(event->restore) {
+            if(!event->before) gpu_hd_textures_restage();
+        } else if(p && op>=0x80 && op<0xa0) {
+            if(event->before) gpu_hd_textures_begin_copy(p[1]&1023,(p[1]>>16)&511,p[2]&1023,(p[2]>>16)&511,
+                ((p[3]-1)&1023)+1,(((p[3]>>16)-1)&511)+1);
+            else gpu_hd_textures_end_copy();
+        } else if(c && c->op==NR_COPY) {
+            const auto* a=c->args;
+            if(event->before) gpu_hd_textures_begin_copy(a[0],a[1],a[2],a[3],a[4],a[5]);
+            else gpu_hd_textures_end_copy();
+        } else if(c && (c->op==NR_UPLOAD || c->op==NR_CPU_UPLOAD)) {
+            const auto* a=c->args;
+            if(event->before) {
+                if(c->op==NR_UPLOAD || !a[4]) gpu_hd_textures_begin_upload(a[0],a[1],a[2],a[3]);
+            } else if(c->op==NR_UPLOAD || size_t(a[4])+event->upload_words==size_t(a[2])*size_t(a[3]))
+                gpu_hd_textures_track_upload(a[0],a[1],a[2],a[3],nullptr);
+        } else if(event->before) observe_native_draw(*event);
+        else if(event->has_writes) {
+            const auto* b=event->written_bounds;
+            gpu_hd_textures_invalidate(b[0],b[1],b[2]-b[0]+1,b[3]-b[1]+1);
+        }
+    }
+    gpu_hd_textures_select_context(previous);
+}
+
+namespace {
+std::unique_ptr<Session> prepare_session(const char* root,int replacements,int dump,bool presentation,char* error,size_t capacity) {
+    auto next = std::make_unique<Session>();
+    next->root = root; next->replacements = replacements != 0; next->dump = dump != 0;
+    const bool beetle = is_beetle_root(std::filesystem::u8path(root));
+    if (beetle) {
+        if (!hd_texture_pack_create(root, &next->beetle, error, capacity)) return {};
+    } else {
+        char ignored[256]{};
+        hd_texture_pack_create(root, &next->beetle, ignored, sizeof(ignored));
+    }
+    if (!next->beetle) {
+        auto directory = std::filesystem::u8path(root);
+        if (directory.filename().u8string() == "replacements") directory = directory.parent_path();
+        std::filesystem::create_directories(directory / "replacements");
+        std::filesystem::create_directories(directory / "dumps");
+    }
+    if (!duck_texture_pack_create(root, &next->duck, error, capacity)) return {};
+    if (presentation && next->replacements) {
+        /* Replacements decoded and resident before the game draws, within
+         * kPreloadMaxBytes; the rest stays on the budgeted async path. */
+        const auto t0 = std::chrono::steady_clock::now();
+        HdTexturePreloadResult dr{}, br{};
+        const int dstatus = duck_texture_pack_preload(next->duck, kPreloadMaxBytes,
+                                                      kPreloadThreads, &dr);
+        int bstatus = 1;
+        if (next->beetle) {
+            const size_t left = dr.bytes < kPreloadMaxBytes ? kPreloadMaxBytes - dr.bytes : 0;
+            bstatus = hd_texture_pack_preload(next->beetle, left, kPreloadThreads, &br);
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        const int requested = dr.requested + br.requested;
+        if (requested > 0 || dstatus < 0 || bstatus < 0)
+            std::fprintf(stdout, "psxrecomp: texture pack: preloaded %d/%d images (%.1f MiB) in %lld ms"
+                         "%s; %d over the %u MiB preload cap, %d failed (%d worker errors);"
+                         " the rest decode on demand\n",
+                         dr.loaded + br.loaded, requested, (dr.bytes + br.bytes) / 1048576.0,
+                         static_cast<long long>(ms),
+                         (dstatus < 0 || bstatus < 0) ? " (preload error)" :
+                         (dstatus == 1 && bstatus == 1) ? " (complete)" : " (partial)",
+                         dr.over_budget + br.over_budget, static_cast<unsigned>(kPreloadMaxBytes / (1024u * 1024u)),
+                         dr.failed + br.failed, dr.worker_errors + br.worker_errors);
+    }
+    return next;
+}
+bool preserve_tracking(Session* next,Session* previous,char* error,size_t capacity) {
+    if (previous && (previous->replacements || previous->dump) && previous->root == next->root) {
+        if (!duck_texture_pack_copy_tracking(next->duck, previous->duck)) {
+            fail(error, capacity, "Could not preserve texture-upload tracking during reload."); return 0;
+        }
+        if (previous->beetle && next->beetle) {
+            uint8_t* saved = nullptr; size_t saved_size = 0;
+            if (!hd_texture_pack_tracking_state_save(previous->beetle, &saved, &saved_size)) {
+                fail(error, capacity, "Could not save Beetle texture-upload tracking during reload."); return 0;
+            }
+            const int restored = hd_texture_pack_tracking_state_load(next->beetle, saved, saved_size);
+            std::free(saved);
+            if (!restored) { fail(error, capacity, "Could not restore Beetle texture-upload tracking during reload."); return 0; }
+            /* Restage after rewind/load rehashes these bounded upload
+             * rectangles against restored VRAM. A same-pack reload must
+             * preserve that knowledge as well as current residency. */
+            next->learned = previous->learned;
+        }
+    }
+    return true;
+}
+struct NativePrepared {
+    const char* root;
+    int replacements,dump;
+    char* error;
+    size_t capacity;
+    std::unique_ptr<Session> session;
+    bool ok=false;
+};
+void prepare_native(void* data,const uint16_t*) {
+    auto& request=*static_cast<NativePrepared*>(data);
+    try {
+        request.session=prepare_session(request.root,request.replacements,request.dump,false,request.error,request.capacity);
+        if(!request.session) return;
+        auto* previous=native_context->session.get();
+        if(previous && duck_texture_pack_flush_dumps(previous->duck,request.error,request.capacity)<0) return;
+        request.ok=preserve_tracking(request.session.get(),previous,request.error,request.capacity);
+    } catch(const std::exception& exception) { fail(request.error,request.capacity,exception.what()); }
+}
+void commit_native(void* data,const uint16_t* vram) {
+    auto& request=*static_cast<NativePrepared*>(data);
+    native_context->session=std::move(request.session);
+    native_context->native_vram=vram;
+    ++native_context->generation;
+}
+}
+
+extern "C" int gpu_hd_textures_attach_native(NativeRaster* raster,char* error,size_t capacity) {
+    if(native_owner==raster) return 1;
+    if(native_owner) native_raster_set_observer(native_owner,nullptr,nullptr);
+    native_context.reset();native_owner=nullptr;
+    native_attached.store(false,std::memory_order_release);
+    if(!raster) return 1;
+    try { native_context=std::make_unique<GpuHdTextureContext>(); }
+    catch(...) { fail(error,capacity,"Cannot allocate native texture tracker.");return 0; }
+    if(presentation_context.session) {
+        const auto& session=*presentation_context.session;
+        NativePrepared request{session.root.c_str(),session.replacements,session.dump,error,capacity};
+        native_raster_visit(raster,prepare_native,&request);
+        if(!request.ok) { native_context.reset();return 0; }
+        native_raster_visit(raster,commit_native,&request);
+    }
+    native_owner=raster;
+    native_raster_set_observer(raster,gpu_hd_textures_native_event,native_context.get());
+    native_attached.store(true,std::memory_order_release);
+    return 1;
+}
+extern "C" GpuHdTextureTracking* gpu_hd_textures_capture_native(uint16_t* vram,SwNativeTextureState* cache) {
+    if(!native_owner) return nullptr;
+    struct Capture { uint16_t* vram;SwNativeTextureState* cache;GpuHdTextureTracking* tracking; } request{vram,cache,nullptr};
+    native_raster_visit(native_owner,[](void* data,const uint16_t* pixels) {
+        auto& request=*static_cast<Capture*>(data);
+        if(request.vram) std::memcpy(request.vram,pixels,kVramWords*sizeof(uint16_t));
+        if(request.cache) sw_native_texture_save(request.cache);
+        auto* previous=gpu_hd_textures_select_context(native_context.get());
+        request.tracking=gpu_hd_textures_capture_tracking();
+        gpu_hd_textures_select_context(previous);
+    },&request);
+    return request.tracking;
+}
 
 extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
                                           int dump, char* error, size_t capacity) {
@@ -360,48 +607,8 @@ extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
     }
     if (!root || !root[0]) { fail(error, capacity, "Select an external texture-pack directory."); return 0; }
     try {
-        auto next = std::make_unique<Session>();
-        next->root = root; next->replacements = replacements != 0; next->dump = dump != 0;
-        const bool beetle = is_beetle_root(std::filesystem::u8path(root));
-        if (beetle) {
-            if (!hd_texture_pack_create(root, &next->beetle, error, capacity)) return 0;
-        } else {
-            char ignored[256]{};
-            hd_texture_pack_create(root, &next->beetle, ignored, sizeof(ignored));
-        }
-        if (!next->beetle) {
-            auto directory = std::filesystem::u8path(root);
-            if (directory.filename().u8string() == "replacements") directory = directory.parent_path();
-            std::filesystem::create_directories(directory / "replacements");
-            std::filesystem::create_directories(directory / "dumps");
-        }
-        if (!duck_texture_pack_create(root, &next->duck, error, capacity)) return 0;
-        if (context->presentation && next->replacements) {
-            /* Replacements decoded and resident before the game draws, within
-             * kPreloadMaxBytes; the rest stays on the budgeted async path. */
-            const auto t0 = std::chrono::steady_clock::now();
-            HdTexturePreloadResult dr{}, br{};
-            const int dstatus = duck_texture_pack_preload(next->duck, kPreloadMaxBytes,
-                                                          kPreloadThreads, &dr);
-            int bstatus = 1;
-            if (next->beetle) {
-                const size_t left = dr.bytes < kPreloadMaxBytes ? kPreloadMaxBytes - dr.bytes : 0;
-                bstatus = hd_texture_pack_preload(next->beetle, left, kPreloadThreads, &br);
-            }
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - t0).count();
-            const int requested = dr.requested + br.requested;
-            if (requested > 0 || dstatus < 0 || bstatus < 0)
-                std::fprintf(stdout, "psxrecomp: texture pack: preloaded %d/%d images (%.1f MiB) in %lld ms"
-                             "%s; %d over the %u MiB preload cap, %d failed (%d worker errors);"
-                             " the rest decode on demand\n",
-                             dr.loaded + br.loaded, requested, (dr.bytes + br.bytes) / 1048576.0,
-                             static_cast<long long>(ms),
-                             (dstatus < 0 || bstatus < 0) ? " (preload error)" :
-                             (dstatus == 1 && bstatus == 1) ? " (complete)" : " (partial)",
-                             dr.over_budget + br.over_budget, static_cast<unsigned>(kPreloadMaxBytes / (1024u * 1024u)),
-                             dr.failed + br.failed, dr.worker_errors + br.worker_errors);
-        }
+        auto next=prepare_session(root,replacements,dump,context->presentation,error,capacity);
+        if(!next) return 0;
         /* Quiesce renderer users (GL render thread: dump_draw appends to the
          * old session's sources) before flushing its dumps or reading its
          * residency; the cache is rebuilt from the new session. */
@@ -413,29 +620,18 @@ extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
                 fail(error, capacity, dump_error); return 0;
             }
         }
-        if (context->session && (context->session->replacements || context->session->dump) && context->session->root == next->root) {
-            if (!duck_texture_pack_copy_tracking(next->duck, context->session->duck)) {
-                fail(error, capacity, "Could not preserve texture-upload tracking during reload."); return 0;
-            }
-            if (context->session->beetle && next->beetle) {
-                uint8_t* saved = nullptr; size_t saved_size = 0;
-                if (!hd_texture_pack_tracking_state_save(context->session->beetle, &saved, &saved_size)) {
-                    fail(error, capacity, "Could not save Beetle texture-upload tracking during reload."); return 0;
-                }
-                const int restored = hd_texture_pack_tracking_state_load(next->beetle, saved, saved_size);
-                std::free(saved);
-                if (!restored) { fail(error, capacity, "Could not restore Beetle texture-upload tracking during reload."); return 0; }
-                /* Restage after rewind/load rehashes these bounded upload
-                 * rectangles against restored VRAM. A same-pack reload must
-                 * preserve that knowledge as well as current residency. */
-                next->learned = context->session->learned;
-            }
+        if(!preserve_tracking(next.get(),context->session.get(),error,capacity)) return 0;
+        NativePrepared native{root,replacements,dump,error,capacity};
+        if(context->presentation && native_owner) {
+            native_raster_visit(native_owner,prepare_native,&native);
+            if(!native.ok) return 0;
         }
         /* This also flushes all queued users before old replacement textures
          * and pixel leases may be destroyed. */
         if (context->presentation) gl_renderer_set_hd_texture_mode(next->replacements || next->dump);
         if (context->presentation) gl_renderer_clear_hd_texture_cache();
         context->session = std::move(next); ++context->generation;
+        if(context->presentation && native_owner) native_raster_visit(native_owner,commit_native,&native);
         DuckTexturePackInfo info{};
         duck_texture_pack_get_info(context->session->duck, &info);
         size_t replacements_found = info.replacement_count;
@@ -459,6 +655,10 @@ extern "C" void gpu_hd_textures_shutdown(void) {
     if (context->presentation) gl_renderer_set_hd_texture_mode(0);
     if (context->presentation) gl_renderer_clear_hd_texture_cache();
     context->session.reset(); ++context->generation;
+    if(context->presentation && native_owner) {
+        NativePrepared empty{};
+        native_raster_visit(native_owner,commit_native,&empty);
+    }
 }
 extern "C" int gpu_hd_textures_reload(char* error, size_t capacity) {
     if (!context->session) { fail(error, capacity, "No texture-pack session is active."); return 0; }
@@ -467,6 +667,13 @@ extern "C" int gpu_hd_textures_reload(char* error, size_t capacity) {
 }
 extern "C" void gpu_hd_textures_set_dump_enabled(int enabled) {
     if (!context->session || context->session->dump == (enabled != 0)) return;
+    if(context->presentation && native_owner) {
+        const auto root=context->session->root;
+        char error[512]{};
+        if(!gpu_hd_textures_configure(root.c_str(),context->session->replacements,enabled,error,sizeof error))
+            context->session->dump_error=error;
+        return;
+    }
     /* The render thread may be dumping (dump_draw) or tracking residency. */
     if (context->presentation) gl_renderer_render_thread_sync("hd_set_dump");
     if (enabled && !context->session->replacements) gpu_hd_textures_reset_tracking();
@@ -519,6 +726,24 @@ extern "C" void gpu_hd_textures_get_diag(GpuHdTextureDiag* out) {
     if (context->session->beetle) { HdTexturePackInfo beetle_info{}; hd_texture_pack_get_info(context->session->beetle, &beetle_info); out->replacement_count = beetle_info.unique_key_count; }
     else out->replacement_count = info.replacement_count;
     std::string diagnostic = info.diagnostic ? info.diagnostic : "";
+    if(context->presentation && native_owner) {
+        struct DumpDiag { uint64_t queued=0,pending=0;bool failed=false;char error[512]{}; } native;
+        native_raster_visit(native_owner,[](void* data,const uint16_t*) {
+            auto& out=*static_cast<DumpDiag*>(data);
+            if(!native_context->session) return;
+            DuckTexturePackInfo info{};
+            duck_texture_pack_get_info(native_context->session->duck,&info);
+            out.queued=info.queued_dump_count;out.pending=info.pending_dump_sources;
+            out.failed=native_context->session->dump_failed;
+            std::snprintf(out.error,sizeof out.error,"%s",native_context->session->dump_error.c_str());
+        },&native);
+        out->dumped_textures=native.queued;out->pending_dump_sources=native.pending;
+        out->dump=out->dump && !native.failed;
+        if(native.error[0]) {
+            if(!diagnostic.empty()) diagnostic+="; ";
+            diagnostic+=native.error;
+        }
+    }
     if (!context->session->dump_error.empty()) {
         if (!diagnostic.empty()) diagnostic += "; ";
         diagnostic += context->session->dump_error;
@@ -771,9 +996,10 @@ extern "C" void gpu_hd_textures_release_image(GpuHdTextureImage* image) {
 }
 extern "C" void gpu_hd_textures_observe_draw(uint16_t tp, uint16_t cx, uint16_t cy,
     const int limits[4], uint32_t window, int semi) {
-    if (!context->session || !context->session->dump || context->session->dump_failed) return;
+    if (!gpu_hd_textures_active()) return;
     HdTextureDrawQuery query{};
     if (make_query(tp, cx, cy, limits, window, query)) {
+        duck_texture_pack_observe_usage(context->session->duck,&query);
         ++context->session->diag.draw_queries; dump_query(query, semi);
     }
 }

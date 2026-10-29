@@ -15,7 +15,7 @@
 namespace {
 constexpr size_t vram_words = 1024 * 512;
 constexpr size_t queue_budget = 4 * 1024 * 1024;
-enum class Kind { Draw, Packet, Read, Snapshot, Restore };
+enum class Kind { Draw, Packet, Read, Snapshot, Restore, Observe, Visit };
 struct Job {
     Kind kind = Kind::Draw;
     NativeRasterCommand command{};
@@ -27,6 +27,9 @@ struct Job {
     std::promise<void> *completion = nullptr;
     SwNativeTextureState *texture_destination = nullptr;
     std::unique_ptr<SwNativeTextureState> texture_source;
+    NativeRasterObserver observer = nullptr;
+    NativeRasterVisit visit = nullptr;
+    void *user = nullptr;
     size_t bytes() const { return sizeof(Job) + upload.size() * sizeof(uint16_t)
                                   +(texture_source?sizeof(SwNativeTextureState):0); }
 };
@@ -174,6 +177,8 @@ struct NativeRaster {
      * worker wake, including GPUREAD's halfword-at-a-time interface. */
     std::array<uint16_t,1024> read_row{};
     int read_row_y = -1;
+    NativeRasterObserver observer = nullptr;
+    void *observer_user = nullptr;
 
     void push(Job job) {
         if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore)
@@ -203,6 +208,20 @@ struct NativeRaster {
             }
             space.notify_one();
             const auto *a = job.command.args;
+            const bool mutation = job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore;
+            if(mutation) sw_context_begin_write_observation(observer!=nullptr);
+            NativeRasterEvent event{};
+            if (observer && mutation) {
+                event.before=1;event.restore=job.kind==Kind::Restore;
+                if(job.kind==Kind::Draw) event.command=&job.command;
+                if(job.kind==Kind::Packet) {
+                    event.state=&job.state;event.packet=job.packet.data();
+                    event.packet_words=packet_size(job.packet[0]>>24);
+                }
+                event.upload=job.upload.data();event.upload_words=job.upload.size();
+                event.vram=vram.data();
+                observer(observer_user,&event);
+            }
             switch (job.kind) {
             case Kind::Draw: draw(job); break;
             case Kind::Packet: packet(job); break;
@@ -217,6 +236,13 @@ struct NativeRaster {
                 sw_native_cache_clear(1);
                 if(job.texture_source) sw_native_texture_load(job.texture_source.get());
                 break;
+            case Kind::Observe: observer=job.observer;observer_user=job.user;break;
+            case Kind::Visit: job.visit(job.user,vram.data());break;
+            }
+            if(observer && mutation) {
+                event.before=0;
+                event.has_writes=sw_context_written_bounds(event.written_bounds);
+                observer(observer_user,&event);
             }
             completed.fetch_add(1, std::memory_order_release);
             if (job.completion) job.completion->set_value();
@@ -283,6 +309,15 @@ static void sync_job(NativeRaster *r, Job job) {
     job.completion = &done;
     r->push(std::move(job));
     result.get();
+}
+extern "C" void native_raster_set_observer(NativeRaster *r,NativeRasterObserver observer,void *user) {
+    Job job;job.kind=Kind::Observe;job.observer=observer;job.user=user;
+    sync_job(r,std::move(job));
+}
+extern "C" void native_raster_visit(NativeRaster *r,NativeRasterVisit visit,void *user) {
+    if(!visit) return;
+    Job job;job.kind=Kind::Visit;job.visit=visit;job.user=user;
+    sync_job(r,std::move(job));
 }
 extern "C" void native_raster_read(NativeRaster *r, int x,int y,int w,int h,uint16_t *out) {
     if(h==1 && w>0 && w<=32) {

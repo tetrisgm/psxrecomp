@@ -61,6 +61,7 @@ extern "C" int g_psx_track_last_store;
 extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "gpu_hd_textures.h"
 #include "draw_distance.h"
 #include "mod_immediate.h"
 #include "display_scanout.h"
@@ -21015,6 +21016,13 @@ session_reboot:
                      g_headless && g_video_renderer != 0 ? " (headless)" : "");
     }
     gpu_init();
+    {
+        char error[512]{};
+        if(!gpu_hd_textures_attach_native(gpu_native_owner(),error,sizeof error)) {
+            std::fprintf(stderr,"psxrecomp: native texture tracking: %s\n",error);
+            return 1;
+        }
+    }
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init.
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */

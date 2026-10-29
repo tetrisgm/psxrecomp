@@ -63,7 +63,7 @@ def main():
             parser.error('--hd-pack requires --webp-include and --webp-decoder')
         cppflags=[arg if arg!='-std=gnu11' else '-std=c++17' for arg in flags]
         cppflags+=['-I',args.webp_include]
-        for name in ('gpu_hd_textures','hd_texture_pack','duckstation_texture_pack','texture_image_decode'):
+        for name in ('gpu_hd_textures','hd_texture_pack','duckstation_texture_pack','texture_image_decode','native_raster'):
             obj=out/(name+'.o')
             run([args.cxx,*cppflags,'-c',fw/'runtime/src'/(name+'.cpp'),'-o',obj])
             objects.append(obj)

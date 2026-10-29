@@ -4156,6 +4156,7 @@ void gpu_init(void) {
     (void)psx_video_timing_set_pal((int)video_mode);
     gpu_display_info_changed();
 }
+NativeRaster* gpu_native_owner(void) { return s_native_raster; }
 
 void gpu_set_power_on_video_mode(int pal) {
     gpu_display_info_changed();

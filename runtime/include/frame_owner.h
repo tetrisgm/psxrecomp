@@ -22,10 +22,22 @@ FrameOwner *frame_owner_start(const FrameOwnerConfig *config);
 void frame_owner_stop(FrameOwner *owner);
 /* Producer-only recording API. Failed append invalidates this whole frame. */
 int frame_owner_begin(FrameOwner *owner,uint64_t sequence,const void *initial,size_t bytes);
+int frame_owner_reserve_initial(FrameOwner *owner,uint64_t sequence,size_t bytes,void **initial);
 int frame_owner_attach(FrameOwner *owner,void *attachment,size_t bytes,void (*dispose)(void*));
 void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags,uint32_t bytes);
 int frame_owner_publish(FrameOwner *owner);
 void frame_owner_invalidate(FrameOwner *owner);
+/* Durable asynchronous controls/diagnostics, separate from droppable frames.
+ * Copies payload on submission; callback runs on the owner outside all locks.
+ * after_sequence must name an already published frame (or zero). A newer
+ * frame satisfies the dependency. Timeline reset/shutdown invokes callback
+ * with stale=1, so a paused/reset guest cannot strand a diagnostic request.
+ * Returns zero on invalid input/allocation failure/full bounded queue; never
+ * waits for graphics. Caller must report busy, not execute GL itself.
+ * user must outlive completion; payload is borrowed only during callback. */
+typedef void (*FrameOwnerRequest)(void *user,const void *payload,size_t bytes,int stale);
+int frame_owner_request(FrameOwner *owner,uint64_t after_sequence,
+                        FrameOwnerRequest callback,void *user,const void *payload,size_t bytes);
 /* Consumer check before presenting; producer invalidation never frees a
  * consumer lease. Keep the image's epoch with any subsequent present job. */
 int frame_owner_current(const FrameOwner *owner,const FramePacketView *packet);
