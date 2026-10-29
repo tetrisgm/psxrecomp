@@ -349,6 +349,8 @@ static void wake_render(int force) {
     }
 }
 
+void rt_flush(void) { if(rt_running()) wake_render(1); }
+
 /* Block until pred() holds; the render thread wakes us after every record. */
 typedef int (*Pred)(uint64_t arg);
 static void emu_wait(Pred pred, uint64_t arg) {

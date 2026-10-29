@@ -10,18 +10,21 @@ RENDERER = (ROOT / "runtime" / "src" / "gpu_gl_renderer.c").read_text(
 )
 
 # The only second context is the present thread's ([video] present_thread,
-# docs/RENDER_THREAD.md), created in pt_begin under the render thread, which
-# frame interpolation makes ineligible.
+# docs/RENDER_THREAD.md), created in pt_begin for the presentation consumer.
 assert RENDERER.count("SDL_GL_CreateContext(") == 2, (
     "temporal blending must not create a second GL context"
 )
 _pt = RENDERER[RENDERER.index("static int pt_begin(void)"):]
 _pt = _pt[:_pt.index("\n}\n")]
 assert "SDL_GL_CreateContext(" in _pt, "the second GL context belongs to the present thread"
-assert "SDL_CreateThread(" not in RENDERER, (
+# CPU seam preparation has a worker and mutex; it owns no GL context. Scope
+# this guard to temporal presentation instead of banning unrelated CPU work.
+_interp = RENDERER[RENDERER.index("static void interp_reset_history_unlocked(void)"):
+                   RENDERER.index("/* ==== Render passes")]
+assert "SDL_CreateThread(" not in _interp, (
     "temporal blending must not create a presentation thread"
 )
-assert "SDL_LockMutex(" not in RENDERER, (
+assert "SDL_LockMutex(" not in _interp, (
     "the GL renderer must not hold an application mutex across driver work"
 )
 # gl_window_swap holds the swap once per SDL backend (#if PSX_SDL3 / #else).

@@ -2096,3 +2096,36 @@ commit is 066006db. Runtime context acquisitions measured zero in two all-on
 legacy diagnostics/transaction paths and later architecture phases remain.
 No phase accepted or merged. Evidence: R4 analysis/perf-20261028/
 native-owner-large-gate/rth-qda5fuft and native-owner-memory18.json.
+
+### 2026-10-28 - Asynchronous renderer diagnostics (phase 1 ongoing)
+
+Pure-renderer TCP handlers now queue an owned request and publish their reply
+from the render owner; the emulation thread does not wait. IO_EXEC keeps one
+response owner even after a client timeout, and thread-local append ownership
+prevents unrelated emulation watchpoints from writing a renderer response.
+The completed-image history ring publishes CPU thumbnails under a short copy
+lock; conversion and GL capture happen outside it. Readers and freeze control
+no longer drain GL. A concurrent Windows writer/reader fixture passes across
+multiple ring wraps. Hidden runtime queries (coherency/present history,
+post-AA, shader, bloom, batch sites, interpolation, image-history stats) pass
+live and host-paused with zero acquisitions/releases. Hidden boot-to-race
+smoke reports zero dispatch/segment misses. All six GL ownership fixture modes
+match, including copied diagnostic callbacks. Repeated R4 ctest is 32/32.
+Framework-wide unit build is in progress, not yet a passed gate. Evidence:
+R4 analysis/perf-20261028/native-diagnostic-runtime/, native-diagnostic-expanded/,
+and native-owned-controls-gate/rth-6jr2ya5c/. Phase remains unaccepted.
+
+2026-10-28 frame architecture continuation: original GP0/native authority remains
+on phase-1 topic. Renderer diagnostics now execute owned copied requests on the
+render thread (including FBO peek/diff); native display history replaces the
+per-VBlank GPU readback and its reader drains. Deleted deferred raw-pointer peek
+transport. Completed thumbnail publication is CPU-synchronized, not GL-drained.
+Release configuration publication remains active separately from debug counters.
+Framework full build passed after repairing stale fixture links; non-hardware
+CTest: 297 listed, 2 disabled, 3 skipped, remaining 292 passed after three stale
+guards were repaired. R4 32/32 passed. Six hidden GL modes have exact matching
+hashes; live and paused TCP diagnostics have zero context acquisitions. Hidden
+smoke frame 8767 has zero dispatch/segment misses. Same-save 18x/all-on15s:
+53.075 VBlanks/s, max67.360ms,79173starved,53.16swap completions/s;
+scene/presentGPU3.670/12.813ms,zero acquisitions. Render queue backpressure still
+exists; neither real-time nor distinct-image acceptance is claimed.

@@ -41,6 +41,12 @@
 /* gpu_render.c (the facade) observes draws for HD texture packs: no pack here. */
 static int test_hd_active, test_hd_overlap;
 static uint64_t test_hd_tracking;
+static _Atomic uint32_t diagnostic_result;
+static void diagnostic_on_owner(const void *data) {
+    uint32_t value;
+    memcpy(&value,data,sizeof value);
+    diagnostic_result=rt_on_render_thread()?value:UINT32_MAX;
+}
 uint64_t gpu_hd_textures_tracking_generation(void){return test_hd_tracking;}
 int gpu_hd_textures_invalidation_changes(int x,int y,int w,int h){
     (void)x;(void)y;(void)w;(void)h;return test_hd_overlap==1 || (test_hd_overlap==2 && x==256);}
@@ -346,14 +352,27 @@ int main(int argc, char **argv) {
         gl_renderer_set_pgxp_depth(1);
         gl_renderer_set_pgxp_color_perspective(1);
         gl_renderer_set_pgxp_seam(2);
+        gr_set_scale(scale);
+        gl_renderer_set_interpolation_source(0);
+        gl_renderer_set_interpolation_blend(0);
+        gl_renderer_set_frame_generation(gl_renderer_frame_generation());
+        gl_renderer_set_frame_generation_method(gl_renderer_frame_generation_method());
         check(gl_renderer_set_post_aa(GL_POST_AA_FXAA)==1,"AA setting accepted");
         gl_renderer_flush_cpu_uploads();
+        uint32_t request=0x12345678;
+        check(gl_renderer_queue_diagnostic(diagnostic_on_owner,&request,sizeof request),
+              "diagnostic queued on owner");
+        request=0; /* copied request must survive producer reuse */
         rt_drain(); /* Fixture barrier; runtime callers never need this. */
         rt_get_stats(&after);
         int an=0,ad=0;
         gl_renderer_get_display_aspect(&an,&ad);
         check(an==16 && ad==9,"ordered render-owner controls applied");
         check(gl_renderer_post_aa()==GL_POST_AA_FXAA,"AA applied on render owner");
+        GlScaleInfo published_scale;
+        check(gl_renderer_scale_info(&published_scale) && published_scale.effective==scale,
+              "production configuration published without debug instrumentation");
+        check(diagnostic_result==0x12345678,"diagnostic owns request and executes on render thread");
         (void)gl_renderer_post_aa_passes();
         (void)gl_renderer_fmv_chroma_frames();
         rt_get_stats(&after);

@@ -346,7 +346,7 @@ static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits s
  * 0 = normal, 1 = skip the whole mirror pass, 2 = full mirror state churn but no
  * draw calls, 3 = mirror draws land in the hr FBO (no per-pass FBO rebind; wide
  * margins go stale + hr gets garbage — perf probe only). */
-static int s_ws_ablate = 0;
+static _Atomic int s_ws_ablate = 0;
 static void flush_tex_batch_impl(void); /* textured-prim batch — defined below, flushed from coherency points */
 static void flush_flat_batch_impl(void); /* flat/gouraud GEO batch (MotK starfield 0x68 dots) */
 /* Every flush call site is attributed (gl_renderer_batch_sites): a flush that
@@ -499,7 +499,7 @@ static int       s_rths_flat_bd = 0, s_rths_vp_w = 0, s_rths_bg_full = 0;
 static GpuDisplayInfo s_rths_display;
 static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread(); }
 /* Frame generation (defined with the render-thread code near the end). */
-static int       s_fg_on;
+static _Atomic int s_fg_on;
 static int       s_fg_drawing, s_fg_presenting, s_fg_broken, s_fg_capture_real;
 static void      fg_capture(const RtCmd *c, const void *payload);
 static int       fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stale);
@@ -544,10 +544,10 @@ enum {
     RTH_OFFSET, RTH_WIDE_CONFIGURE, RTH_WIDE_VIEW, RTH_WIDE_TARGET,
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
-    RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
+    RTH_PRESENT_WIDE, RTH_STATE, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
     RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_INIT,
-    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_GROUP
+    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_DEBUG_CALL, RTH_GROUP
 };
 /* Producer-side geometry publication for an optional seam-prepared pass.
  * Collection never reads the render owner's mutable snap index. */
@@ -623,11 +623,14 @@ static int  s_rthm_cur = 0;
 /* Controls are ordered work, not reasons to move the graphics context. The
  * record owns its arguments; no guest stack pointer survives publication. */
 typedef struct RthControl {
-    enum { RTH_CALL_0, RTH_CALL_I, RTH_CALL_II, RTH_CALL_F, RTH_CALL_IF, RTH_CALL_S } kind;
+    enum { RTH_CALL_0, RTH_CALL_I, RTH_CALL_II, RTH_CALL_F, RTH_CALL_IF, RTH_CALL_S,
+           RTH_CALL_INTERPOLATION } kind;
     union { void (*v)(void); void (*i)(int); void (*ii)(int,int);
-            void (*f)(float); void (*ifn)(int,float); void (*s)(const char *); } fn;
+            void (*f)(float); void (*ifn)(int,float); void (*s)(const char *);
+            void (*interpolation)(int,double,double,double,int); } fn;
     int a,b;
     float f;
+    double d[3];
     char text[1024];
 } RthControl;
 static int rth_control(const RthControl *call) {
@@ -638,6 +641,20 @@ static int rth_control(const RthControl *call) {
     if(!p) abort();
     memcpy(p,call,sizeof *call);
     rt_cmd_commit();
+    return 1;
+}
+int gl_renderer_queue_diagnostic(void (*callback)(const void *),
+                                 const void *request,uint32_t bytes) {
+    if(!s_rth_on || rt_on_render_thread() || rt_held()) return 0;
+    if(!callback || (bytes && !request) || bytes>UINT32_MAX-sizeof callback) abort();
+    rth_send_state();
+    if(!rth_group_flush()) abort();
+    uint8_t *p=rt_cmd_begin(RTH_DEBUG_CALL,0,(uint32_t)sizeof callback+bytes);
+    if(!p) abort();
+    memcpy(p,&callback,sizeof callback);
+    if(bytes) memcpy(p+sizeof callback,request,bytes);
+    rt_cmd_commit();
+    rt_flush(); /* also services a request while guest execution is paused */
     return 1;
 }
 #define RTH_CALL0(func) do { const RthControl c={.kind=RTH_CALL_0,.fn.v=(func)}; \
@@ -817,9 +834,10 @@ static GLint         s_interp_uAlpha = -1, s_interp_uUvRect = -1;
 static GLint         s_interp_uBlendMode = -1, s_interp_uGamma = -1;
 static GLint         s_interp_uScanline = -1, s_interp_uScanStrength = -1;
 static GLint         s_interp_uScanLines = -1, s_interp_uScanScale = -1;
-static int           s_interp_enabled = 0, s_interp_valid = 0;
-static int           s_interp_suspended = 0;
-static int           s_interp_blend_mode = 0;
+static _Atomic int   s_interp_enabled = 0;
+static int           s_interp_valid = 0;
+static _Atomic int   s_interp_suspended = 0;
+static _Atomic int s_interp_blend_mode = 0;
 static int           s_interp_prev = 0, s_interp_cur = 0;
 static int           s_interp_w = 0, s_interp_h = 0, s_interp_linear = 0;
 static int           s_interp_src_w = 0, s_interp_src_h = 0; /* source band, S px */
@@ -828,9 +846,9 @@ static int           s_interp_force_4_3 = 0, s_interp_source_path = -1;
 static uint64_t      s_interp_swaps = 0;
 static uint64_t      s_interp_captures = 0;
 static int           s_interp_diag = 0;
-static double        s_interp_host_hz = 0.0;
-static double        s_interp_target_hz = 0.0;
-static double        s_interp_source_hz = 0.0;
+static _Atomic double s_interp_host_hz = 0.0;
+static _Atomic double s_interp_target_hz = 0.0;
+static _Atomic double s_interp_source_hz = 0.0;
 static FrameInterpolationSchedule s_interp_schedule;
 /* Blend source (psx_mod_set_frame_interpolation_source). VBLANK (0, the
  * default) treats every guest VBlank present as a new frame, exactly as
@@ -838,14 +856,14 @@ static FrameInterpolationSchedule s_interp_schedule;
  * moved or the displayed rect was redrawn -- and spreads one crossfade over
  * the measured flip period, so 30 Hz content blends for the whole frame
  * instead of blending for one VBlank and holding for the next. */
-static int           s_interp_source = 0;
+static _Atomic int s_interp_source = 0;
 static FrameFlipTracker s_interp_flip;
 static int           s_interp_origin_x = -1, s_interp_origin_y = -1;
 static double        s_interp_phase_lo = 0.0, s_interp_phase_hi = 1.0;
 static uint64_t      s_interp_duplicates = 0;
 /* PSX_MOD_FRAME_INTERPOLATION_HOLD: no crossfade, repeat the newest frame
  * wherever render passes supply no in-between image. */
-static int           s_interp_hold = 0;
+static _Atomic int s_interp_hold = 0;
 static void pass_gens_invalidate(void);
 static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
                                 int pw, int ph);
@@ -1192,13 +1210,12 @@ static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
 static int    s_wide_suppress = 0;
 /* Diagnostic only. The frontend admits proven world geometry into both the
  * canonical and wide passes so a face cannot split at the center-copy edge. */
-static uint64_t s_wide_triangle_recovery_count;
+static _Atomic uint64_t s_wide_triangle_recovery_count;
 void gl_renderer_note_wide_triangle_recovery(int recovered) {
     if (rth_record_mode()) { RTH_REC(RTH_WIDE_RECOVERY, 0, recovered); return; }
     if (recovered && s_raster_ok && g_wide_cur) ++s_wide_triangle_recovery_count;
 }
 uint64_t gl_renderer_wide_triangle_recovery_count(void) {
-    GL_RT_SYNC("wide_triangle_recovery_count");
     return s_wide_triangle_recovery_count;
 }
 
@@ -7618,21 +7635,6 @@ int gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out) {
     return 1;
 }
 
-/* fbo_peek at this point of the command stream without a sync point: with
- * the render thread recording, the readback is queued and lands in out when
- * the render thread reaches it (a reader of out must sync first). Otherwise
- * it is gl_renderer_fbo_peek. Used by the per-frame display ring. */
-int gl_renderer_fbo_peek_deferred(int x, int y, int w, int h, uint16_t *out) {
-    if (rth_record_mode()) {
-        if (!s_raster_ok || !s_ctx || x < 0 || y < 0 || w < 1 || h < 1 ||
-            x + w > VRAM_W || y + h > VRAM_H) return 0;
-        uint64_t ptr = (uint64_t)(uintptr_t)out;
-        RTH_REC(RTH_PEEK, 0, x, y, w, h, (int32_t)(ptr & 0xFFFFFFFFu), (int32_t)(ptr >> 32));
-        return 1;
-    }
-    return gl_renderer_fbo_peek(x, y, w, h, out);
-}
-
 /* Diagnostic (debug server "gl_vram_diff"): full-VRAM comparison of the
  * GPU-side truth (FBO via pack) against the CPU array, WITHOUT writing
  * either. Reports mismatch count + bounding box + a few sample coords.
@@ -8407,7 +8409,7 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
 
 /* Native-wide mirror ablation (perf attribution): see s_ws_ablate. */
 void gl_renderer_set_ws_ablate(int mode) {
-    GL_RT_SYNC("set_ws_ablate"); s_ws_ablate = (mode >= 0 && mode <= 3) ? mode : 0; }
+    RTH_CALLI(gl_renderer_set_ws_ablate,mode); s_ws_ablate = (mode >= 0 && mode <= 3) ? mode : 0; }
 int  gl_renderer_get_ws_ablate(void)     { return s_ws_ablate; }
 
 static void interp_reset_history_unlocked(void) {
@@ -8433,7 +8435,10 @@ static void interp_reset_history(void) {
 
 void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz,
                                    double source_hz, int blend_mode) {
-    GL_RT_SYNC("set_interpolation");
+    const RthControl call={.kind=RTH_CALL_INTERPOLATION,
+        .fn.interpolation=gl_renderer_set_interpolation,.a=enabled,.b=blend_mode,
+        .d={host_hz,target_hz,source_hz}};
+    if(rth_control(&call)) return;
     double effective_hz = target_hz > 0.0 ? target_hz : host_hz;
     if (effective_hz < source_hz) effective_hz = source_hz;
     int active = (enabled && source_hz >= 1.0 && source_hz <= 1000.0 &&
@@ -8463,7 +8468,7 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
 }
 
 void gl_renderer_set_interpolation_blend(int blend_mode) {
-    GL_RT_SYNC("set_interpolation_blend");
+    RTH_CALLI(gl_renderer_set_interpolation_blend,blend_mode);
     s_interp_blend_mode = blend_mode == 1 ? 1 : 0;
     s_interp_hold = blend_mode == 2 ? 1 : 0;
 }
@@ -8476,7 +8481,7 @@ void gl_renderer_set_interpolation_suspended(int suspended) {
 }
 
 void gl_renderer_set_interpolation_source(int source) {
-    GL_RT_SYNC("set_interpolation_source");
+    RTH_CALLI(gl_renderer_set_interpolation_source,source);
     source = source == 1 ? 1 : 0;
     if (source != s_interp_source) interp_reset_history_unlocked();
     s_interp_source = source;
@@ -11013,8 +11018,8 @@ uint32_t gl_renderer_pass_image_textures(uint64_t *bytes) {
 }
 
 static void rth_publish_diagnostics(void) {
-#ifndef PSX_NO_DEBUG_TOOLS
     RthDiagnostics d={0};
+#ifndef PSX_NO_DEBUG_TOOLS
     gl_renderer_pgxp_render_stats(&d.pgxp[0],&d.pgxp[1],&d.pgxp[2]);
     gl_renderer_pgxp_depth_clear_reasons(d.reasons);
     gl_renderer_seam_snap_stats(&d.seam[0],&d.seam[1],&d.seam[2],&d.seam[3]);
@@ -11025,6 +11030,9 @@ static void rth_publish_diagnostics(void) {
     for(int i=0;i<3;++i) gl_renderer_perf_aggregate(i-1,d.perf[i]);
     gl_renderer_batch_diag(d.batch);
     gl_renderer_scene_prim_counts(&d.prims,&d.textured);
+#endif
+    /* Configuration queries are production API, not tracing. Publish these
+     * even when instrumentation is compiled out. */
     gl_renderer_scale_info(&d.scale);
     memcpy(d.post_path,s_pfx_user_path,sizeof d.post_path);
     memcpy(d.post_status,s_pfx_user_status,sizeof d.post_status);
@@ -11032,7 +11040,6 @@ static void rth_publish_diagnostics(void) {
     SDL_LockSpinlock(&s_rth_diag_lock);
     s_rth_diag=d;
     SDL_UnlockSpinlock(&s_rth_diag_lock);
-#endif
 }
 
 static uint64_t s_idle_ticks_accum_fwd(uint64_t add) {
@@ -11047,7 +11054,7 @@ static uint64_t s_present_ticks_accum_fwd(uint64_t add) {
 }
 
 void gl_renderer_pass_set_flip_shown(int shown) {
-    GL_RT_SYNC("pass_set_flip_shown"); s_pass_flip_shown = shown ? 1 : 0; }
+    RTH_CALLI(gl_renderer_pass_set_flip_shown,shown); s_pass_flip_shown = shown ? 1 : 0; }
 
 /* FLIP source saw a new frame: it is the flip a pending generation was built
  * for (render_pass_gen_flip_matches) or a frame without passes. */
@@ -13556,7 +13563,7 @@ static int rp_is_car(const FgList *L, uint32_t pi);
 /* Raw triangle captured while recording a list (absolute coords). */
 typedef struct { uint32_t rec, key0, vid[3]; float x[3], y[3], p[3][3], h[3], pz[3]; int area[4]; } FgRaw;
 
-static int       s_fg_on = 0;                 /* configured (any thread reads) */
+static _Atomic int s_fg_on = 0;                 /* configured (any thread reads) */
 static int       s_fg_force = 0;              /* PSX_FRAME_GEN_FORCE: tests */
 static _Atomic double s_fg_refresh_hz = 0.0, s_fg_guest_hz = 59.94;
 static _Atomic int s_fg_late = 0;             /* emulation thread: a late frame */
@@ -13586,7 +13593,7 @@ static FgVert   *s_fg_verts = NULL; static uint32_t s_fg_verts_cap = 0;
 static float    *s_fg_px = NULL, *s_fg_py = NULL; static uint32_t s_fg_pos_cap = 0;
 static FgCamFit  s_fg_fit;
 static float     s_fg_margin[FG_MAX_VIEWS][4];   /* fg_cam_place, per generated frame */
-static int       s_fg_reproject = 0;            /* [video] frame_generation_method: reprojection (opt-in), else redraw */
+static _Atomic int s_fg_reproject = 0;            /* [video] frame_generation_method: reprojection (opt-in), else redraw */
 static void      rp_snapshot_list(int li, const int disp[4]);
 static void fg_blit2(GLuint src, GLuint dst, int sx, int sy, int dx, int dy, int w, int h);
 static int       s_fg_replay_objects_only = 0;  /* fg_replay: cars only */
@@ -15923,7 +15930,7 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
 
 /* ---- frame generation: public ---- */
 void gl_renderer_set_frame_generation(int on) {
-    GL_RT_SYNC("frame_generation");
+    RTH_CALLI(gl_renderer_set_frame_generation,on);
     s_fg_on = on ? 1 : 0;
     const char *e = getenv("PSX_FRAME_GEN_FORCE");
     s_fg_force = e && e[0] == '1';
@@ -15940,7 +15947,7 @@ int gl_renderer_frame_generation(void) { return s_fg_on; }
  * generated frame; reprojection (a title opts in) warps the newer real frame.
  * Redraw allocates and runs nothing of reprojection's. */
 void gl_renderer_set_frame_generation_method(int method) {
-    GL_RT_SYNC("frame_generation_method");
+    RTH_CALLI(gl_renderer_set_frame_generation_method,method);
     const int rp = method == GL_FG_METHOD_REPROJECTION;
     if (rp == s_fg_reproject) return;
     s_fg_reproject = rp;
@@ -16109,7 +16116,7 @@ static void rtb_init(uint16_t *vram) {
     } else glb_init(vram);
     if (s_hd_authority_pending) gl_renderer_set_hd_texture_mode(1);
 }
-static void rtb_set_scale(int sc) { GL_RT_SYNC("set_scale"); glb_set_scale(sc); }
+static void rtb_set_scale(int sc) { RTH_CALLI(rtb_set_scale,sc); glb_set_scale(sc); }
 /* The scale changes under a sync point, or by a recorded dynamic-resolution
  * step: while recording, the level as of the recording position. */
 static int  rtb_scale(void) {
@@ -16473,6 +16480,13 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
     }
     (void)user;
     const int32_t *v = (const int32_t *)payload;
+    if(c->op==RTH_DEBUG_CALL) {
+        void (*callback)(const void *);
+        if(c->payload<sizeof callback) abort();
+        memcpy(&callback,payload,sizeof callback);
+        callback((const uint8_t *)payload+sizeof callback);
+        return;
+    }
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
     s_rthx_tagged = (c->flags & RTHF_TAGGED) != 0;
     s_rthx_backdrop = (c->flags >> RTHF_BD_SHIFT) & 3;
@@ -16491,11 +16505,15 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         switch(control.kind) {
         case RTH_CALL_0: control.fn.v();break;
         case RTH_CALL_I: control.fn.i(control.a);break;
+        case RTH_CALL_INTERPOLATION:
+            control.fn.interpolation(control.a,control.d[0],control.d[1],control.d[2],control.b);
+            break;
         case RTH_CALL_II: control.fn.ii(control.a,control.b);break;
         case RTH_CALL_F: control.fn.f(control.f);break;
         case RTH_CALL_IF: control.fn.ifn(control.a,control.f);break;
         case RTH_CALL_S: control.fn.s(control.text);break;
         }
+        rth_publish_diagnostics();
         return;
     }
     if (s_pass_dead && c->op != RTH_PASS_END && c->op != RTH_FRAME &&
@@ -16755,11 +16773,6 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         s_async_seam_active = NULL;
         s_async_seam_failed = 0;
         s_async_seam_reset_pending = 0;
-        break;
-    }
-    case RTH_PEEK: {
-        uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);
-        (void)gl_renderer_fbo_peek(v[0], v[1], v[2], v[3], (uint16_t *)(uintptr_t)ptr);
         break;
     }
     default: break;

@@ -86,6 +86,8 @@ int  rt_on_render_thread(void);
  * are reserved. Private batches still reject oversized records atomically. */
 void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes);
 void  rt_cmd_commit(void);
+/* Publish committed work and wake the owner without waiting for execution. */
+void  rt_flush(void);
 /* Optional producer transaction. Records stay private until try_commit;
  * overflow or insufficient ring space drops the entire batch without waiting.
  * No frame markers/context acquisition inside a batch. A NULL cmd_begin while

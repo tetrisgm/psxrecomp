@@ -1,6 +1,7 @@
 #include "present_image_ring.h"
 
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 typedef struct {
@@ -15,23 +16,35 @@ static PresentImage s_ring[PRESENT_IMAGE_RING_CAP];
 static uint16_t *s_pixels = NULL;
 static uint32_t s_head = 0;
 static uint32_t s_sequence = 0;
-static int s_enabled = -1;
-static int s_frozen = 0;
-
+static _Atomic int s_ready = 0; /* 0 uninitialized, 1 ready, -1 disabled */
+static _Atomic int s_frozen = 0;
+static atomic_flag s_lock = ATOMIC_FLAG_INIT;
+static void ring_lock(void) {
+    while(atomic_flag_test_and_set_explicit(&s_lock,memory_order_acquire)) {}
+}
+static void ring_unlock(void) { atomic_flag_clear_explicit(&s_lock,memory_order_release); }
+/* Conversion happens outside the publication lock. Only a completed native
+ * thumbnail and its metadata are copied while readers are excluded. */
+static _Thread_local uint16_t s_staging[PRESENT_IMAGE_RING_MAX_W*PRESENT_IMAGE_RING_H];
 static int ring_ready(void) {
-    if (s_enabled < 0) {
-        const char *e = getenv("PSX_PRESENT_IMAGE_RING");
-        s_enabled = (!e || !*e || *e != '0') ? 1 : 0;
+    int ready=atomic_load_explicit(&s_ready,memory_order_acquire);
+    if(ready) return ready>0;
+    ring_lock();
+    if(!s_ready) {
+        const char *e=getenv("PSX_PRESENT_IMAGE_RING");
+        if(e && *e=='0') s_ready=-1;
+        else {
+            const size_t per=(size_t)PRESENT_IMAGE_RING_MAX_W*PRESENT_IMAGE_RING_H;
+            s_pixels=calloc(PRESENT_IMAGE_RING_CAP*per,sizeof(uint16_t));
+            if(s_pixels) {
+                for(int i=0;i<PRESENT_IMAGE_RING_CAP;++i) s_ring[i].px=s_pixels+i*per;
+                atomic_store_explicit(&s_ready,1,memory_order_release);
+            } else s_ready=-1;
+        }
     }
-    if (!s_enabled) return 0;
-    if (!s_pixels) {
-        const size_t per = (size_t)PRESENT_IMAGE_RING_MAX_W * PRESENT_IMAGE_RING_H;
-        s_pixels = (uint16_t *)calloc((size_t)PRESENT_IMAGE_RING_CAP * per, sizeof(uint16_t));
-        if (!s_pixels) { s_enabled = 0; return 0; }
-        for (int i = 0; i < PRESENT_IMAGE_RING_CAP; i++)
-            s_ring[i].px = s_pixels + (size_t)i * per;
-    }
-    return 1;
+    ready=s_ready;
+    ring_unlock();
+    return ready>0;
 }
 
 int present_image_ring_thumb_w(int ww, int wh) {
@@ -46,14 +59,15 @@ int present_image_ring_accepting(void) {
     return !s_frozen && ring_ready();
 }
 
-static PresentImage *next_slot(uint32_t frame, int w) {
-    PresentImage *e = &s_ring[s_head];
-    s_head = (s_head + 1) % PRESENT_IMAGE_RING_CAP;
-    e->frame = frame;
-    e->sequence = ++s_sequence;
-    e->w = (uint16_t)w;
-    e->valid = 1;
-    return e;
+static void publish_thumbnail(uint32_t frame,int w) {
+    ring_lock();
+    if(!s_frozen) {
+        PresentImage *e=&s_ring[s_head];
+        memcpy(e->px,s_staging,(size_t)w*PRESENT_IMAGE_RING_H*sizeof(uint16_t));
+        e->frame=frame; e->sequence=++s_sequence; e->w=(uint16_t)w; e->valid=1;
+        s_head=(s_head+1)%PRESENT_IMAGE_RING_CAP;
+    }
+    ring_unlock();
 }
 
 static uint16_t pack565(unsigned r, unsigned g, unsigned b) {
@@ -64,14 +78,14 @@ void present_image_ring_push(uint32_t frame, const uint8_t *rgba, int w,
                              int pitch, int bottom_up) {
     if (!rgba || w <= 0 || w > PRESENT_IMAGE_RING_MAX_W) return;
     if (!present_image_ring_accepting()) return;
-    PresentImage *e = next_slot(frame, w);
     for (int y = 0; y < PRESENT_IMAGE_RING_H; y++) {
         const int sy = bottom_up ? (PRESENT_IMAGE_RING_H - 1 - y) : y;
         const uint8_t *src = rgba + (size_t)sy * pitch;
-        uint16_t *dst = e->px + (size_t)y * w;
+        uint16_t *dst = s_staging + (size_t)y * w;
         for (int x = 0; x < w; x++)
             dst[x] = pack565(src[4 * x], src[4 * x + 1], src[4 * x + 2]);
     }
+    publish_thumbnail(frame,w);
 }
 
 void present_image_ring_push_argb(uint32_t frame, const uint32_t *argb,
@@ -79,7 +93,6 @@ void present_image_ring_push_argb(uint32_t frame, const uint32_t *argb,
     if (!argb || sw <= 0 || sh <= 0) return;
     if (!present_image_ring_accepting()) return;
     const int w = present_image_ring_thumb_w(sw, sh);
-    PresentImage *e = next_slot(frame, w);
     for (int y = 0; y < PRESENT_IMAGE_RING_H; y++) {
         const int y0 = (int)((long)y * sh / PRESENT_IMAGE_RING_H);
         int y1 = (int)((long)(y + 1) * sh / PRESENT_IMAGE_RING_H);
@@ -95,15 +108,17 @@ void present_image_ring_push_argb(uint32_t frame, const uint32_t *argb,
                     r += (p >> 16) & 0xFF; g += (p >> 8) & 0xFF; b += p & 0xFF; n++;
                 }
             if (!n) n = 1;
-            e->px[(size_t)y * w + x] = pack565(r / n, g / n, b / n);
+            s_staging[(size_t)y * w + x] = pack565(r / n, g / n, b / n);
         }
     }
+    publish_thumbnail(frame,w);
 }
 
-void present_image_ring_set_frozen(int frozen) { s_frozen = frozen ? 1 : 0; }
+void present_image_ring_set_frozen(int frozen) { ring_lock(); s_frozen = frozen ? 1 : 0; ring_unlock(); }
 int  present_image_ring_frozen(void) { return s_frozen; }
 
 void present_image_ring_span(uint32_t *oldest, uint32_t *newest, int *count) {
+    ring_lock();
     uint32_t lo = UINT32_MAX, hi = 0;
     int n = 0;
     for (int i = 0; i < PRESENT_IMAGE_RING_CAP; i++) {
@@ -115,9 +130,11 @@ void present_image_ring_span(uint32_t *oldest, uint32_t *newest, int *count) {
     if (oldest) *oldest = n ? lo : 0;
     if (newest) *newest = hi;
     if (count) *count = n;
+    ring_unlock();
 }
 
 void present_image_ring_sequence_span(uint32_t *oldest, uint32_t *newest) {
+    ring_lock();
     uint32_t lo = UINT32_MAX, hi = 0;
     for (int i = 0; i < PRESENT_IMAGE_RING_CAP; i++) {
         if (!s_ring[i].valid) continue;
@@ -126,30 +143,39 @@ void present_image_ring_sequence_span(uint32_t *oldest, uint32_t *newest) {
     }
     if (oldest) *oldest = hi ? lo : 0;
     if (newest) *newest = hi;
+    ring_unlock();
 }
 
 static int get_rgb(uint32_t key, int by_sequence, uint8_t **rgb, int *w, int *h,
                    uint32_t *frame) {
-    if (!rgb || !s_pixels) return 0;
-    for (int i = 0; i < PRESENT_IMAGE_RING_CAP; i++) {
-        const PresentImage *e = &s_ring[i];
-        if (!e->valid || (by_sequence ? e->sequence : e->frame) != key) continue;
-        const size_t n = (size_t)e->w * PRESENT_IMAGE_RING_H;
-        uint8_t *out = (uint8_t *)malloc(n * 3);
-        if (!out) return 0;
-        for (size_t k = 0; k < n; k++) {
-            const uint16_t p = e->px[k];
-            out[3 * k]     = (uint8_t)(((p >> 11) & 31) << 3);
-            out[3 * k + 1] = (uint8_t)(((p >> 5) & 63) << 2);
-            out[3 * k + 2] = (uint8_t)((p & 31) << 3);
-        }
-        *rgb = out;
-        if (w) *w = e->w;
-        if (h) *h = PRESENT_IMAGE_RING_H;
-        if (frame) *frame = e->frame;
-        return 1;
+    if(!rgb || atomic_load_explicit(&s_ready,memory_order_acquire)!=1) return 0;
+    uint16_t *copy=malloc(sizeof s_staging);
+    if(!copy) return 0;
+    unsigned width=0; uint32_t captured_frame=0;
+    ring_lock();
+    for(int i=0;i<PRESENT_IMAGE_RING_CAP;++i) {
+        const PresentImage *e=&s_ring[i];
+        if(!e->valid || (by_sequence?e->sequence:e->frame)!=key) continue;
+        width=e->w; captured_frame=e->frame;
+        memcpy(copy,e->px,(size_t)width*PRESENT_IMAGE_RING_H*sizeof(uint16_t));
+        break;
     }
-    return 0;
+    ring_unlock();
+    if(!width) { free(copy); return 0; }
+    const size_t n=(size_t)width*PRESENT_IMAGE_RING_H;
+    uint8_t *out=malloc(n*3);
+    if(!out) { free(copy); return 0; }
+    for(size_t k=0;k<n;++k) {
+        uint16_t p=copy[k];
+        out[k*3]=(uint8_t)(((p>>11)&31)<<3);
+        out[k*3+1]=(uint8_t)(((p>>5)&63)<<2);
+        out[k*3+2]=(uint8_t)((p&31)<<3);
+    }
+    free(copy); *rgb=out;
+    if(w) *w=(int)width;
+    if(h) *h=PRESENT_IMAGE_RING_H;
+    if(frame) *frame=captured_frame;
+    return 1;
 }
 
 int present_image_ring_get_rgb(uint32_t frame, uint8_t **rgb, int *w, int *h) {

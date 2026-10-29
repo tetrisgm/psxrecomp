@@ -10,6 +10,9 @@
 #include <string.h>
 
 struct CPUState;
+/* No private draw service exists in this isolated scheduler fixture. */
+int g_draw_service_enabled;
+void draw_service_poll(void) { abort(); }
 
 /* ---- Guest state owned by the fixture (memory.c / psx_cycles.c in the runtime) ---- */
 uint8_t  g_test_ram[0x200000];

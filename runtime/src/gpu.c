@@ -8601,9 +8601,6 @@ uint64_t gpu_pass_state_hash(void) {
     return h;
 }
 
-uint16_t* gpu_get_vram_ptr(void){ return vram; }
-uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }
-
 int gpu_replay_list_begin(uint32_t root) {
     if(!s_replay) return 0;
     gpu_ws_begin_linked_list(); gpu_ws_prepass_linked_list(root);

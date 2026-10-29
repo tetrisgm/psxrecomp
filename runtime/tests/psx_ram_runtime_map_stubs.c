@@ -174,6 +174,13 @@ uint32_t spu_get_ram_bytes(void) { return (uint32_t)sizeof s_spu_ram; }
 
 static uint16_t s_vram[1024u * 512u];
 const uint16_t *gpu_get_vram(void) { return s_vram; }
+int gpu_snapshot_valid_size(uint32_t size) { return size==gpu_snapshot_bytes(); }
+void gpu_native_vram_restore(const uint16_t *source) { memcpy(s_vram,source,sizeof s_vram); }
+void gpu_native_vram_read(int x,int y,int w,int h,uint16_t *destination) {
+    for(int row=0;row<h;++row)
+        for(int col=0;col<w;++col)
+            destination[row*w+col]=s_vram[((y+row)&511)*1024+((x+col)&1023)];
+}
 int gpu_vram_dirty_tracking(void) { return 0; }
 int gpu_vram_dirty_verify_enabled(void) { return 0; }
 uint32_t gpu_vram_dirty_row_count(void) { return 512u; }

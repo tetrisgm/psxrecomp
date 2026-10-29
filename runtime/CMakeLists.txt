@@ -1062,6 +1062,7 @@ if(BUILD_TESTING)
     foreach(_pgxp_session_test IN ITEMS pgxp_session_test pgxp_session_hooks_test)
         add_executable(${_pgxp_session_test} tests/test_pgxp_session.cpp
             src/pgxp_session.cpp src/mod_builtin_pgxp.c src/pgxp.cpp
+            src/func_override.c src/host_overlay.c
             src/mod_immediate.c
             src/psx_ram_geometry.c
             src/mod_runtime.cpp
@@ -1603,6 +1604,7 @@ if(BUILD_TESTING)
     target_compile_features(resident_sector_test PRIVATE cxx_std_17)
     add_test(NAME resident_sector_test COMMAND resident_sector_test)
     add_executable(netplay_view_mods_test
+        src/func_override.c src/host_overlay.c
         tests/test_netplay_view_mods.cpp
         src/mod_immediate.c
         src/iso_reader_c.cpp
@@ -1649,6 +1651,7 @@ if(BUILD_TESTING)
     add_test(NAME mod_runtime_cache_test COMMAND mod_runtime_cache_test)
 
     add_executable(mod_resident_test
+        src/func_override.c src/host_overlay.c
         tests/test_mod_resident.cpp
         src/mod_immediate.c
         src/mod_resident.cpp
@@ -2343,6 +2346,10 @@ if(BUILD_TESTING)
         add_test(NAME bios_registry_zero_entry_guard_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bios_registry_zero_entry.py)
+        add_test(NAME render_diagnostics_test COMMAND ${Python3_EXECUTABLE}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_render_diagnostics.py)
+        set_tests_properties(render_diagnostics_test PROPERTIES SKIP_RETURN_CODE 77
+                             LABELS "integration;external-runtime" TIMEOUT 180)
         # Exercises runtime/psx_check_mod_catalog.cmake -- the build-time guard
         # that fails a build when a title's mod packages land in the legacy
         # mods/packages layout instead of mods/bundled (bead beads-eio.3.101).
