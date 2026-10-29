@@ -109,6 +109,18 @@ static int run_scale(int scale) {
                 GL_RGBA,GL_UNSIGNED_BYTE,cropped);
             check(!memcmp(reference,cropped,(size_t)32*32*scale*scale*4),
                 "cross-target enhanced copy preserves mask semantics");
+            s_hr_fbo=full_fbo;s_hr_tex=full_tex;s_hr_rb=full_rb;
+            s_hr_origin_x=s_hr_origin_y=0;s_hr_width=1024;s_hr_height=512;
+            gpu_copy_rect(x+10,y+10,x+200,y+100,32,32);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,full_fbo);
+            glReadPixels((x+200)*scale,(y+100)*scale,32*scale,32*scale,
+                GL_RGBA,GL_UNSIGNED_BYTE,reference);
+            gpu_copy_rect_from(fbo,x,y,x+10,y+10,x+200,y+100,32,32);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,full_fbo);
+            glReadPixels((x+200)*scale,(y+100)*scale,32*scale,32*scale,
+                GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+            check(!memcmp(reference,cropped,(size_t)32*32*scale*scale*4),
+                "cross-target copy translates cropped source origin");
         }
         gr_set_mask_bits(0,0);
     }
