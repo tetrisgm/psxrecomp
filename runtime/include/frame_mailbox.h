@@ -60,5 +60,6 @@ public:
         consumer=-1;
     }
     unsigned long long dropped() const { return replaced.load(std::memory_order_relaxed); }
+    bool has_pending() const { return pending.load(std::memory_order_acquire)>=0; }
 };
 #endif

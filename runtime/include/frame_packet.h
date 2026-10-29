@@ -53,6 +53,7 @@ int frame_packet_publish(FramePacketQueue *queue);
 int frame_packet_acquire(FramePacketQueue *queue,FramePacketView *view);
 void frame_packet_release(FramePacketQueue *queue);
 uint64_t frame_packet_replaced(const FramePacketQueue *queue);
+int frame_packet_pending(const FramePacketQueue *queue);
 /* Producer: load/rewind changes timeline. Discard pending/open packets;
  * an already leased packet remains immutable, but is no longer presentable.
  * Consumer checks current immediately before handing an image to present. */

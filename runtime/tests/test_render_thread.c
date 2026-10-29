@@ -42,6 +42,7 @@ int main(void) {
         if(n==1) while(!atomic_load(&entered)) yield();
     }
     RtStats stats;rt_get_stats(&stats);
+    CHECK(rt_frames_ahead()==1); /* optional replay must see the pending packet */
     CHECK(stats.frames_produced==10000 && stats.frames_replaced==9998);
     CHECK(stats.backpressure_waits==0 && stats.acquires==0 && !rt_held());
     uint64_t expected=10000;
@@ -49,6 +50,7 @@ int main(void) {
     atomic_store(&unblock,1);
     while(!atomic_load(&diagnostics)) yield();
     CHECK(atomic_load(&count)==2 && atomic_load(&last)==10000);
+    CHECK(rt_frames_ahead()==0);
     /* The guest stops publishing, but another diagnostic must still finish. */
     expected=10000;CHECK(rt_request(diagnostic,&expected,sizeof expected));
     while(atomic_load(&diagnostics)!=2) yield();

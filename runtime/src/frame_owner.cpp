@@ -218,6 +218,7 @@ extern "C" int frame_owner_current(const FrameOwner *owner,const FramePacketView
     return frame_packet_current(owner->queue,packet);
 }
 extern "C" uint64_t frame_owner_replaced(const FrameOwner *owner) { return frame_packet_replaced(owner->queue); }
+extern "C" int frame_owner_pending(const FrameOwner *owner) { return frame_packet_pending(owner->queue); }
 extern "C" uint64_t frame_owner_completed(const FrameOwner *owner) { return owner->completed.load(std::memory_order_acquire); }
 extern "C" uint64_t frame_owner_idle_ns(const FrameOwner *owner) { return owner->idle_ns.load(std::memory_order_relaxed); }
 extern "C" int frame_owner_is_thread(void) { return current_owner!=nullptr; }

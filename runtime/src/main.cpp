@@ -4874,6 +4874,10 @@ static uint64_t g_frame_report_wait_ticks = 0;   /* offline pacer waits */
 /* Host ticks the emulation thread has spent in the offline pacer: its idle
  * time (render_pass.c budgets queued passes from it). */
 extern "C" uint64_t psx_frame_pacer_wait_ticks(void) { return g_frame_report_wait_ticks; }
+extern "C" uint64_t psx_frame_pacer_spare_ticks(void) {
+    const uint64_t now = SDL_GetPerformanceCounter();
+    return s_frame_pacer.next_deadline > now ? s_frame_pacer.next_deadline - now : 0;
+}
 static uint64_t g_openxr_ready_execution_generation = 0;
 static PSXOpenXRReadyLoadRequest g_openxr_ready_load_request{};
 
@@ -10511,9 +10515,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 
 /* Render thread: start once, then close every frame (after its present,
  * before pacing, so the render thread draws while the guest waits). */
+static void video_res_service(void);
 static void render_thread_vblank(void) {
+    video_res_service();
 #ifndef PSX_SDL_NO_RENDER
-    if (!g_render_thread) return;
+    if (!g_gl_active || gr_backend()!=GR_BACKEND_OPENGL) return;
+    g_render_thread=1; /* GL presentation always has a permanent owner. */
     if (!s_render_thread_tried) {
         s_render_thread_tried = 1;
         gl_renderer_set_present_thread(g_present_thread, g_present_thread_slots);
@@ -10532,11 +10539,9 @@ static void render_thread_vblank(void) {
                              "from surplus only)\n");
             }
         } else {
-            std::fprintf(stdout, "psxrecomp: render thread requested but not started "
-                         "(needs the OpenGL backend without netplay, frame interpolation "
-                         "or a 24-bit display)\n");
-            if (g_frame_generation)
-                std::fprintf(stdout, "psxrecomp: Smooth motion (frame generation) needs the render thread; off\n");
+            std::fputs("psxrecomp: cannot start the permanent graphics owner\n",stdout);
+            std::fflush(stdout);
+            std::abort();
         }
         std::fflush(stdout);
     }
@@ -10637,6 +10642,9 @@ static int g_video_res_applied_ss = 1000;
 static std::mutex g_video_res_applied_mutex;
 static std::atomic<bool> g_video_res_live_failed{false};
 static std::atomic<bool> g_video_res_live_capable{false};
+static std::atomic<int> g_video_res_result{-1};
+static bool g_video_res_pending = false; // emulation thread only
+static int g_video_res_pending_ir = PSX_IR_UNSET, g_video_res_pending_ss = 1000;
 
 static void video_res_set_applied(int ir, int ss) {
     std::lock_guard<std::mutex> lock(g_video_res_applied_mutex);
@@ -10647,6 +10655,46 @@ static void video_res_set_applied(int ir, int ss) {
 static void video_res_refresh_capable(void) {
     g_video_res_live_capable.store(g_gl_active && g_video_scale_applies &&
                                    gl_renderer_internal_scale_live_capable() != 0);
+}
+
+/* Owner allocation completion never waits on the emulation thread. */
+static void video_res_complete(void*,int scale) {
+    g_video_res_result.store(scale,std::memory_order_release);
+}
+static void video_res_submit(void) {
+    if(g_video_res_pending) return;
+    video_res_refresh_capable();
+    if(!g_video_res_live_capable.load()) {
+        g_video_res_live_failed.store(true);
+        return;
+    }
+    const int previous_scale=g_video_scale;
+    apply_internal_resolution(match_display_px_h(sdl_window));
+    const int requested_scale=g_video_scale;
+    g_video_scale=previous_scale;
+    g_video_res_pending_ir=g_video_internal_res;
+    g_video_res_pending_ss=g_video_ss_milli;
+    g_video_res_result.store(-1);
+    g_video_res_pending=true;
+    g_video_res_live_failed.store(false);
+    if(!gl_renderer_request_internal_scale_complete(requested_scale,video_res_complete,nullptr)) {
+        g_video_res_pending=false;
+        g_video_res_live_failed.store(true);
+    }
+}
+static void video_res_service(void) {
+    if(!g_video_res_pending) return;
+    const int applied=g_video_res_result.exchange(-1,std::memory_order_acq_rel);
+    if(applied<0) return;
+    g_video_res_pending=false;
+    g_video_res_live_failed.store(applied==0);
+    if(applied) {
+        g_video_scale=applied;
+        video_res_set_applied(g_video_res_pending_ir,g_video_res_pending_ss);
+        dynres_setup();
+    }
+    if(g_video_internal_res!=g_video_res_pending_ir || g_video_ss_milli!=g_video_res_pending_ss)
+        video_res_submit();
 }
 
 /* Other restart-only settings still compare against boot. Resolution compares
@@ -10746,35 +10794,15 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
         else { dynres_setup(); if (!g_dynres.active && gl_renderer_dynamic_resolution_ceiling() >= 2) g_dynres.active = true; }
     }
     if (m & PSX_VIDEO_LIVE_RESOLUTION) {
-        /* The GL owner confirms allocation/application before this returns. */
         if (next->internal_resolution != PSX_IR_UNSET)
             g_video_internal_res = next->internal_resolution;
         if (next->supersample_milli >= PSX_SS_MILLI_MIN &&
             next->supersample_milli <= PSX_SS_MILLI_MAX)
             g_video_ss_milli = next->supersample_milli;
-        /* The request is kept (and saved) either way; the session's scale
-         * only moves when the backend takes it. Otherwise the change waits
-         * for a relaunch and the restart bits say so. */
-        const int prev_scale = g_video_scale;
-        video_res_refresh_capable();
-        int applied = 0;
-        if (g_video_res_live_capable.load()) {
-            apply_internal_resolution(match_display_px_h(sdl_window));
-            applied = gl_renderer_set_internal_scale_live(g_video_scale);
-        }
-        if (applied) {
-            std::fprintf(stdout, "psxrecomp: internal scale %dx (live)\n", applied);
-            g_video_scale = applied;
-            video_res_set_applied(g_video_internal_res, g_video_ss_milli);
-            g_video_res_live_failed.store(false);
-            dynres_setup();   /* the new scale is the controller's ceiling */
-        } else {
-            g_video_scale = prev_scale;
-            g_video_res_live_failed.store(true);
-            std::fprintf(stdout, "psxrecomp: internal resolution change needs a "
-                                 "relaunch (live change unavailable)\n");
-        }
+        /* Persist the request now, confirm application after owner completion. */
+        video_res_submit();
     }
+
     if ((m & PSX_VIDEO_LIVE_FRAME_GEN) && g_gl_active) {
         g_frame_generation = next->frame_generation ? 1 : 0;
         gl_renderer_set_frame_generation(g_frame_generation);
@@ -17823,6 +17851,7 @@ static void recomp_overlay_detach(void) {
 }
 
 static void host_pause_service(void) {
+    video_res_service();
     if (!g_ovl_on) return;
     mh_refresh_snapshot();
     if (const int disc = g_ovl_disc_req.exchange(0)) {
@@ -20892,6 +20921,8 @@ session_reboot:
     video_res_set_applied(PSX_IR_UNSET, 1000);
     g_video_res_live_failed.store(false);
     g_video_res_live_capable.store(false);
+    g_video_res_pending=false;
+    g_video_res_result.store(-1);
     g_openxr_ready_execution_generation++;
     if (g_openxr_ready_execution_generation == 0)
         g_openxr_ready_execution_generation = 1;
@@ -21169,8 +21200,6 @@ session_reboot:
     g_render_thread_pref = g_render_thread;
     g_present_thread_pref = g_present_thread;
     g_frame_generation_pref = g_frame_generation;
-    if (const char* e = std::getenv("PSX_RENDER_THREAD"))
-        g_render_thread = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PRESENT_THREAD"))
         g_present_thread = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PRESENT_THREAD_SLOTS"))
@@ -22235,6 +22264,9 @@ session_reboot:
     /* Solo rollback resim self-check (PSX_RB_SELFCHECK=1, offline only). */
     psx_selfcheck_init(&cpu, memory_get_bios_checksum(), game_entry_pc);
 
+    /* Finish GL initialization before guest code starts. Every subsequent
+     * guest draw is a packet record, including the first BIOS/game frame. */
+    render_thread_vblank();
     /* Execute. */
     std::fprintf(stdout, "psxrecomp runtime: executing from PC=0x%08X\n", cpu.pc);
 

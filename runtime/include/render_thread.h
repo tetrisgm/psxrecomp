@@ -92,7 +92,8 @@ void rt_batch_discard(void);
 /* Seal/publish a complete frame and capture the next native seed. No GPU wait. */
 void rt_frame_end(void);
 
-/* Legacy FIFO query, always zero for the newest-wins mailbox. */
+/* Number of complete packets awaiting acquisition (zero or one). This is an
+ * advisory admission signal, never a reason to block guest publication. */
 int  rt_frames_ahead(void);
 /* Consumer running total of idle time awaiting packets or tick deadlines. */
 uint64_t rt_render_idle_ns(void);

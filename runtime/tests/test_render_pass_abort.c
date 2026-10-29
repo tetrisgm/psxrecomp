@@ -212,6 +212,8 @@ void gl_renderer_pass_end(uint32_t alpha_q16, int keep) {
 uint32_t gl_renderer_pass_leaks(void) { return 0; }
 int gl_renderer_pass_queued(void) { return 0; }
 uint64_t psx_frame_pacer_wait_ticks(void) { return 0; }
+static uint64_t s_pacer_spare = UINT64_MAX;
+uint64_t psx_frame_pacer_spare_ticks(void) { return s_pacer_spare; }
 int gl_renderer_pass_verify_vram(void) { return 1; }
 void gl_renderer_pass_note_cost(uint64_t t) { (void)t; }
 void gl_renderer_pass_service_presents(void) {}

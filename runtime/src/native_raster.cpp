@@ -6,7 +6,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -189,9 +188,13 @@ struct NativeRaster {
     SwRendererContext *context = nullptr;
     std::mutex mutex;
     std::condition_variable available, space;
-    std::deque<Job> queue;
-    size_t bytes = 0;
-    bool stop = false;
+    static constexpr uint64_t queue_slots = 4096;
+    std::array<Job,queue_slots> queue;
+    alignas(64) std::atomic<uint64_t> published{0};
+    uint64_t produced_bytes = 0; // producer only
+    alignas(64) std::atomic<uint64_t> retired{0}, retired_bytes{0};
+    std::atomic<bool> consumer_waiting{false}, producer_waiting{false};
+    std::atomic<bool> stop{false};
     std::atomic<uint64_t> completed{0};
     std::thread thread;
     /* Producer-only read cache. Any queued mutation invalidates it before
@@ -276,30 +279,51 @@ struct NativeRaster {
         if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore)
             read_row_y=-1;
         const size_t cost = job.bytes();
-        std::unique_lock<std::mutex> lock(mutex);
-        space.wait(lock, [&] { return bytes + cost <= queue_budget; });
-        queue.push_back(std::move(job));
-        bytes += cost;
-        lock.unlock();
-        available.notify_one();
+        const uint64_t write = published.load(std::memory_order_relaxed);
+        auto fits = [&] {
+            return write-retired.load() < queue_slots &&
+                   produced_bytes-retired_bytes.load(std::memory_order_acquire)+cost <= queue_budget;
+        };
+        if(!fits()) {
+            std::unique_lock<std::mutex> lock(mutex);
+            producer_waiting.store(true);
+            space.wait(lock,fits);
+            producer_waiting.store(false);
+        }
+        queue[write%queue_slots] = std::move(job);
+        produced_bytes += cost;
+        /* Sequentially consistent publication and sleeping flags close the
+         * store/load race in the parking handshake. No mutex on a running
+         * consumer's submission path. */
+        published.store(write+1);
+        if(consumer_waiting.load()) {
+            std::lock_guard<std::mutex> lock(mutex);
+            available.notify_one();
+        }
     }
+
     void run() {
         psx_host_schedule_thread(PsxHostThreadRole::NativeRaster);
         sw_context_bind(context);
         sw_renderer_init(vram.data());
         sw_set_faithful_authority(1);
+        uint64_t read = 0, consumed_bytes = 0;
         for (;;) {
-            Job job;
-            {
+            if(read==published.load()) {
                 std::unique_lock<std::mutex> lock(mutex);
-                available.wait(lock, [&] { return stop || !queue.empty(); });
-                if (queue.empty()) break;
-                const size_t cost = queue.front().bytes();
-                job = std::move(queue.front());
-                queue.pop_front();
-                bytes -= cost;
+                consumer_waiting.store(true);
+                available.wait(lock,[&] { return stop.load() || read!=published.load(); });
+                consumer_waiting.store(false);
+                if(read==published.load()) break;
             }
-            space.notify_one();
+            Job job = std::move(queue[read%queue_slots]);
+            consumed_bytes += job.bytes();
+            retired_bytes.store(consumed_bytes,std::memory_order_release);
+            retired.store(++read);
+            if(producer_waiting.load()) {
+                std::lock_guard<std::mutex> lock(mutex);
+                space.notify_one();
+            }
             const auto *a = job.command.args;
             const bool mutation = job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore;
             if(mutation) sw_context_begin_write_observation(observer!=nullptr || inputs_enabled);

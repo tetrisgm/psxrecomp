@@ -290,6 +290,7 @@ static uint32_t s_plan_period = 2;
  * passes that fit, so a host that cannot hold them settles on long steady
  * stretches instead of alternating frame by frame. */
 extern uint64_t psx_frame_pacer_wait_ticks(void);
+extern uint64_t psx_frame_pacer_spare_ticks(void);
 static double s_ms_per_tick;   /* defined with the pass timing below */
 #define RP_QUEUED_MARGIN_MS 0.3
 #define RP_QUEUED_REST_MIN  15u
@@ -321,6 +322,16 @@ static int queued_budget_allows(void) {
     }
     if (s_q_rest > 0) {
         s_q_rest--;
+        s_q_ran_last = 0;
+        s_q_shed++;
+        return 0;
+    }
+    /* A delayed render owner can intermittently accept packets while the guest
+     * is already repaying clock debt. Historical idle credit is not permission
+     * to delay that deadline further. Optional redraws must fit the current
+     * guest deadline, including their measured execution cost. */
+    if ((double)psx_frame_pacer_spare_ticks() * s_ms_per_tick <=
+        s_q_cost_ms + RP_QUEUED_MARGIN_MS) {
         s_q_ran_last = 0;
         s_q_shed++;
         return 0;

@@ -127,6 +127,7 @@ extern "C" int frame_packet_acquire(FramePacketQueue *q,FramePacketView *view) {
 }
 extern "C" void frame_packet_release(FramePacketQueue *q) { q->mailbox.release(); }
 extern "C" uint64_t frame_packet_replaced(const FramePacketQueue *q) { return q->mailbox.dropped(); }
+extern "C" int frame_packet_pending(const FramePacketQueue *q) { return q->mailbox.has_pending(); }
 extern "C" void frame_packet_invalidate(FramePacketQueue *q) {
     q->epoch.fetch_add(1,std::memory_order_release);
     q->valid=false;q->open=false;

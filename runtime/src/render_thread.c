@@ -165,7 +165,7 @@ void rt_invalidate(void) {
     rt_batch_discard();frame_owner_invalidate(owner);
     atomic_store(&published,0);begin_frame();
 }
-int rt_frames_ahead(void) { return 0; } /* mailbox replacement, never a FIFO backlog */
+int rt_frames_ahead(void) { return owner?frame_owner_pending(owner):0; }
 uint64_t rt_backpressure_events(void) { return 0; }
 uint64_t rt_render_idle_ns(void) { return owner?frame_owner_idle_ns(owner):0; }
 void rt_tick_at(uint64_t deadline) { if(owner) frame_owner_tick_at(owner,deadline); }
