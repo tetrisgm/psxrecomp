@@ -213,6 +213,17 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- 2026-10-29, frame-architecture phase 5 topic: per-frame streaming native
+  page deltas, ordered asynchronous native VRAM/cache checkpoint, hold-to-rewind
+  at resumable guest edges. Incomplete snapshots are never published. Release
+  re-dispatches the restored PC, clears abandoned audio and reseeds presentation.
+  No GL reads or generated-code edits. Snapshot/hold/native-worker fixtures pass.
+  R4 hidden dummy-audio race: 122 byte-exact restores; capture mean 0.382 ms
+  (605 frames), then 0.407/0.407/0.427 ms in three additional windows on Ryzen 7
+  9800X3D. Host capture cost, not a hard maximum or phase-2/4 acceptance.
+  Topic only; supervisor integrates.
+
+
 - **2026-10-28 (`feat/frame-arch-1-native-authority`, in progress):** Separate
   software-raster contexts and an independent CPU native queue now have fixture
   coverage for ownership isolation, masks/CLUTs/wrapping, queue ordering,

@@ -129,3 +129,5 @@ uint64_t crash_trace_dispatch_seq_get(void) { return 0; }
 void psx_unknown_dispatch_record(uint32_t a, uint32_t p) { (void)a; (void)p; }
 void psx_crash_trace_dump(const char *r, void *i) { (void)i; fprintf(stderr, "crash: %s\n", r); }
 void psx_fatal_halt(const char *r) { fprintf(stderr, "FATAL: %s\n", r); exit(2); }
+
+int g_psx_rewind_pending;

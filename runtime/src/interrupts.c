@@ -1136,6 +1136,12 @@ void psx_check_interrupts(CPUState* cpu) {
     psx_cyc_batch_flush();
     extern int g_ls_suppress_record;
     extern int psx_netplay_active(void);
+    /* A requested frame snapshot belongs to the first safe edge, not the
+     * throttled debug-maintenance poll several thousand blocks later. */
+    extern int g_psx_rewind_pending;
+    extern void psx_rewind_poll(CPUState *, uint32_t);
+    if(g_psx_rewind_pending && !in_exception)
+        psx_rewind_poll(cpu, g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc);
     const int np_active = psx_netplay_active();
     /* Publish this edge's resume PC BEFORE deferred present flush. The MotK
      * CDA0 gate reads s_last_interrupt_check_pc; leaving it at the previous

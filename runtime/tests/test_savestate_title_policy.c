@@ -25,6 +25,7 @@ void interrupts_resync_after_restore(void) { assert(0); }
 void psx_cycles_resync_after_restore(struct CPUState* cpu) { (void)cpu; assert(0); }
 void cdrom_accelerate_after_savestate(void) { assert(0); }
 void psx_scheduler_resume_at(uint32_t pc) { (void)pc; assert(0); }
+uint32_t psx_rewind_discard_history(void) { assert(0); return 0; }
 void psx_frontend_on_savestate_loaded(void) { assert(0); }
 void psx_frontend_on_savestate_notify(int load, int slot, int ok) {
     (void)load; (void)slot; (void)ok; assert(0);
@@ -140,3 +141,4 @@ int main(void) {
     puts("savestate title policy tests passed");
     return 0;
 }
+

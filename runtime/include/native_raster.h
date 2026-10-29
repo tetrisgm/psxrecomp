@@ -70,6 +70,13 @@ void native_raster_checkpoint(NativeRaster *raster,uint16_t *vram,
                               uint64_t dirty_rows[8],SwNativeTextureState *texture);
 void native_raster_restore_checkpoint(NativeRaster *raster,const uint16_t *vram,
                                       const SwNativeTextureState *texture);
+/* Caller-owned destinations remain alive until release; release waits for
+ * CPU completion even when the raster itself has already been destroyed. */
+typedef struct NativeRasterCheckpoint NativeRasterCheckpoint;
+NativeRasterCheckpoint *native_raster_checkpoint_async(NativeRaster *raster,
+    uint16_t *vram,uint64_t dirty_rows[8],SwNativeTextureState *texture);
+int native_raster_checkpoint_ready(NativeRasterCheckpoint *checkpoint);
+void native_raster_checkpoint_release(NativeRasterCheckpoint *checkpoint);
 uint64_t native_raster_completed(NativeRaster *raster);
 #ifdef __cplusplus
 }

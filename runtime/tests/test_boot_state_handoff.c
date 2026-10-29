@@ -3,6 +3,7 @@
 #include "boot_state.c"
 #include "fntrace.c"
 #include <assert.h>
+#include "rewind_delta.h"
 
 static uint8_t ram[2*1024*1024], spad[1024], spuram[512*1024];
 static uint16_t vram[1024*512];
@@ -58,6 +59,15 @@ const uint64_t* gpu_vram_dirty_mask(void){static const uint64_t mask[8]={0};retu
 void gpu_vram_dirty_clear(void){}
 void gr_vram_transfer_in(int x,int y,int w,int h,const uint16_t* p){(void)x;(void)y;memcpy(vram,p,(size_t)w*h*2);}
 void gr_vram_transfer_out(int x,int y,int w,int h,uint16_t* p){(void)x;(void)y;memcpy(p,vram,(size_t)w*h*2);}
+struct GpuNativeCapture { uint16_t vram[1024*512]; uint8_t wire[4]; };
+GpuNativeCapture *gpu_native_capture_create(void) { return calloc(1,sizeof(GpuNativeCapture)); }
+void gpu_native_capture_destroy(GpuNativeCapture *c) { free(c); }
+int gpu_native_capture_begin(GpuNativeCapture *c) { memcpy(c->vram,vram,sizeof(vram));return 1; }
+int gpu_native_capture_ready(GpuNativeCapture *c) { return c!=NULL; }
+void gpu_native_capture_result(GpuNativeCapture *c,const uint8_t **gpu,uint32_t *size,const uint16_t **image) {
+    *gpu=c->wire;*size=4;*image=c->vram;
+}
+const uint16_t *gpu_snapshot_native_vram(void) { return vram; }
 void gpu_native_vram_read(int x,int y,int w,int h,uint16_t* p){gr_vram_transfer_out(x,y,w,h,p);}
 void gpu_native_vram_restore(const uint16_t* p){memcpy(vram,p,sizeof vram);}
 
@@ -127,6 +137,33 @@ int main(void) {
         assert(boot_state_load_buffer(saved,len,123,0x801b0000,&cpu));
         assert(fntrace_is_game_started()==started && cpu.pc==0x80050044);
         free(edited); free(saved);
+    }
+    {
+        CPUState cpu={0}; cpu.pc=0x80010000;
+        uint8_t *reused=NULL, *raw=NULL;
+        size_t capacity=0, n=0, raw_n=0;
+        assert(boot_state_save_buffer_reuse(&cpu,123,0x801b0000,&reused,&capacity,&n));
+        assert(boot_state_save_buffer_raw(&cpu,123,0x801b0000,&raw,&raw_n));
+        assert(n==raw_n && !memcmp(raw,reused,n));
+        ram[4096]=0x7a; vram[1023]=0x1234; spuram[519]=0x42;
+        free(raw); raw=NULL;
+        assert(boot_state_save_buffer_reuse(&cpu,123,0x801b0000,&reused,&capacity,&n));
+        assert(boot_state_save_buffer_raw(&cpu,123,0x801b0000,&raw,&raw_n));
+        assert(n==raw_n && !memcmp(raw,reused,n));
+        RwHistory history={0};
+        assert(rw_begin(&history,4));
+        assert(boot_state_visit_native(&cpu,123,0x801b0000,rw_write,&history));
+        assert(rw_finish(&history,1));
+        assert(history.size==raw_n && !memcmp(history.image,raw,raw_n));
+        rw_clear(&history);
+        BootStatePending *pending=boot_state_pending_create();assert(pending);
+        assert(rw_begin(&history,4));
+        assert(boot_state_begin_native(&cpu,123,0x801b0000,rw_write,&history,pending));
+        assert(boot_state_pending_finish(pending,rw_patch,&history)==1);
+        assert(rw_finish(&history,2));
+        assert(history.size==raw_n && !memcmp(history.image,raw,raw_n));
+        boot_state_pending_destroy(pending);rw_clear(&history);
+        free(reused); free(raw);
     }
     puts("snapshot handoff: cold/warm, BIOS/game, compressed/raw and atomic rejection passed");
     return 0;

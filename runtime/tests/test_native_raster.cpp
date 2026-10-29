@@ -3,6 +3,7 @@
 #include "gpu_vram_dirty.h"
 #include <array>
 #include <cassert>
+#include <cstring>
 #include <initializer_list>
 #include <thread>
 #include <vector>
@@ -222,6 +223,18 @@ int main() {
         }
         assert(digest==fixture.digest);
     }
+    // Async checkpoint owns the exact queue position, despite later writes;
+    // release is safe after worker destruction and preserves texture caches.
+    native_raster_checkpoint(r,saved.data(),dirty,&texture);
+    SwNativeTextureState async_texture{};
+    NativeRasterCheckpoint *pending=native_raster_checkpoint_async(r,restored.data(),dirty,&async_texture);
+    assert(pending);
+    send(r,NR_WRITE,{11,12,0x1234});
+    native_raster_destroy(r);r=nullptr;
+    assert(native_raster_checkpoint_ready(pending));
+    assert(saved==restored);
+    assert(!memcmp(&texture,&async_texture,sizeof(texture)));
+    native_raster_checkpoint_release(pending);
     native_raster_destroy(other);
     native_raster_destroy(r);
 }

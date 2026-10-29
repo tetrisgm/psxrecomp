@@ -8336,6 +8336,46 @@ void gpu_snapshot_write(uint8_t *p) {
     pst_w_pod(&w,texture.palette,sizeof texture.palette,2);
     pst_w_u32(&w,texture.palette_key);pst_w_u32(&w,texture.page);
 }
+struct GpuNativeCapture {
+    NativeRasterCheckpoint *job;
+    uint16_t vram[1024*512];
+    uint64_t rows[8];
+    SwNativeTextureState texture;
+    uint8_t *wire;
+    uint32_t size;
+};
+GpuNativeCapture *gpu_native_capture_create(void) {
+    GpuNativeCapture *c=(GpuNativeCapture*)calloc(1,sizeof(*c));
+    if(!c)return NULL;
+    c->size=gpu_snapshot_bytes();c->wire=(uint8_t*)malloc(c->size);
+    if(!c->wire) { free(c);return NULL; }return c;
+}
+void gpu_native_capture_destroy(GpuNativeCapture *c) {
+    if(!c)return;
+    native_raster_checkpoint_release(c->job);free(c->wire);free(c);
+}
+int gpu_native_capture_begin(GpuNativeCapture *c) {
+    native_raster_checkpoint_release(c->job);c->job=NULL;
+    native_flush_upload();
+    PstW w;pst_w_init(&w,c->wire,c->size);(void)gpu_snap_emit(&w);
+    pst_w_u32(&w,native_polyline_color);pst_w_u32(&w,native_polyline_previous);
+    pst_w_u32(&w,native_sprite_flip);
+    c->job=native_raster_checkpoint_async(s_native_raster,c->vram,c->rows,&c->texture);
+    return c->job!=NULL;
+}
+int gpu_native_capture_ready(GpuNativeCapture *c) { return native_raster_checkpoint_ready(c->job); }
+void gpu_native_capture_result(GpuNativeCapture *c,const uint8_t **gpu,
+    uint32_t *size,const uint16_t **vram) {
+    PstW w;uint32_t offset=c->size-NATIVE_GPU_WIRE_BYTES+12;
+    pst_w_init(&w,c->wire+offset,c->size-offset);
+    pst_w_pod(&w,c->texture.tags,sizeof c->texture.tags,4);
+    pst_w_pod(&w,c->texture.words,sizeof c->texture.words,2);
+    pst_w_pod(&w,c->texture.palette,sizeof c->texture.palette,2);
+    pst_w_u32(&w,c->texture.palette_key);pst_w_u32(&w,c->texture.page);
+    for(unsigned y=0;y<512;y++) if(c->rows[y/64]&(UINT64_C(1)<<(y%64))) gpu_vram_dirty_mark_row(y);
+    *gpu=c->wire;*size=c->size;*vram=c->vram;
+}
+const uint16_t *gpu_snapshot_native_vram(void) { return s_native_readback; }
 uint32_t gpu_cosim_snapshot_bytes(void) { return gpu_snapshot_bytes(); }
 void gpu_cosim_snapshot_write(uint8_t *p) { gpu_snapshot_write(p); }
 void gpu_cosim_dump(char *out, int cap) {

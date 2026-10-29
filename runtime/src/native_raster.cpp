@@ -331,3 +331,23 @@ extern "C" void native_raster_restore_checkpoint(NativeRaster *r,const uint16_t 
 extern "C" uint64_t native_raster_completed(NativeRaster *r) {
     return r->completed.load(std::memory_order_acquire);
 }
+
+struct NativeRasterCheckpoint {
+    std::promise<void> promise;
+    std::future<void> future=promise.get_future();
+};
+extern "C" NativeRasterCheckpoint *native_raster_checkpoint_async(NativeRaster *r,
+    uint16_t *vram,uint64_t dirty[8],SwNativeTextureState *texture) {
+    try {
+        auto c=std::make_unique<NativeRasterCheckpoint>();
+        Job job;job.kind=Kind::Snapshot;job.destination=vram;job.dirty=dirty;
+        job.texture_destination=texture;job.completion=&c->promise;
+        r->push(std::move(job));return c.release();
+    } catch(...) { return nullptr; }
+}
+extern "C" int native_raster_checkpoint_ready(NativeRasterCheckpoint *c) {
+    return c && c->future.wait_for(std::chrono::seconds(0))==std::future_status::ready;
+}
+extern "C" void native_raster_checkpoint_release(NativeRasterCheckpoint *c) {
+    if(c) { c->future.wait();delete c; }
+}
