@@ -194,9 +194,13 @@ typedef struct PGXPProjection {
     int16_t model[3];
     uint16_t interpolation_valid;
     uint32_t caller;
+    uint32_t source_vertex, source_matrix; /* canonical RAM origins, zero if unknown */
+    uint64_t transform; /* value fingerprint: invocation evidence, not temporal identity */
 } PGXPProjection;
 void pgxp_set_projection_tracking(int enabled);
 int pgxp_projection_tracking(void);
+/* source_vertex 1..6 requests the corresponding GTE input register origin;
+ * stored projections contain the resolved RAM address, never a register ID. */
 void pgxp_gte_set_projection(const PGXPProjection *projection);
 int pgxp_load_projection(uint32_t addr, uint32_t packed, PGXPProjection *out);
 int pgxp_get_gte_projection(uint32_t index, uint32_t packed, PGXPProjection *out);

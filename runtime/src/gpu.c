@@ -5040,6 +5040,12 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
     }
     if (gr_backend() == GR_BACKEND_OPENGL && packet_interpolation_stream_enabled()) {
         PacketInterpolationSource source={0};
+        source.primitive_type=gp0_cmd_buf[0]>>24;
+        if(source.primitive_type&4) {
+            const int gouraud=(source.primitive_type&16)!=0;
+            source.clut=gp0_cmd_buf[2]>>16;
+            source.texpage=gp0_cmd_buf[gouraud?5:4]>>16;
+        }
         const int indices[3]={i0,i1,i2};
         for(unsigned i=0;i<3;++i) {
             source.x[i]=vx[i];source.y[i]=vy[i];

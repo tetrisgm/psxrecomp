@@ -8,8 +8,8 @@ extern "C" {
 
 /* Renderer-only, immutable input. Identity is provenance, never colour, UV,
  * packet address, screen position, depth bucket or order in a draw list.
- * A producer must distinguish instances of the same mesh. Duplicate keys
- * are rejected and reported, never paired by occurrence or nearest position. */
+ * Duplicate instances pair by occurrence when counts agree; otherwise a
+ * gated minimum-cost centroid assignment resolves the group. */
 typedef struct FramePrimitiveIdentity { uint64_t object, primitive; } FramePrimitiveIdentity;
 typedef struct PacketInterpolationVertex {
     double view[3];
@@ -32,7 +32,8 @@ typedef struct PacketInterpolationPacket {
 } PacketInterpolationPacket;
 typedef struct PacketInterpolationStats {
     uint64_t matched, unmatched, disappeared, ambiguous, invalid;
-    uint64_t duplicate_equal; /* diagnostic only; still ambiguous/unmatched */
+    uint64_t duplicate_equal;
+    uint64_t resolved_occurrence, resolved_assignment, appeared_candidates;
     int snapped;
 } PacketInterpolationStats;
 typedef struct PacketInterpolation PacketInterpolation;

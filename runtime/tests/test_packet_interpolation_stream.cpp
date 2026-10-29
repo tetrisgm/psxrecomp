@@ -27,7 +27,8 @@ int main() {
     packet_interpolation_stream_begin(1,4);
     packet_interpolation_stream_append(&source);packet_interpolation_stream_append(&source);
     packet_interpolation_stream_end();packet_interpolation_stream_json(json,sizeof json);
-    assert(std::strstr(json,"\"ambiguous\":2,"));
+    assert(std::strstr(json,"\"ambiguous\":1,"));
+    assert(std::strstr(json,"\"resolved_assignment\":1,"));
     assert(std::strstr(json,"\"duplicate_equal\":1,"));
     // Reset removes the pair rather than interpolating across a rewind.
     packet_interpolation_stream_reset();

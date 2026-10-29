@@ -25,9 +25,11 @@ Set `PSX_PACKET_INTERPOLATION_AUDIT=1` before starting a hidden runtime and
 query `{"cmd":"packet_interpolation"}`. The candidate is a 128-bit hash of
 ordered model vertices and callers, independent of packet addresses, draw
 order, colour and UV. Repeated mesh instances can collide semantically.
-Duplicate candidates are rejected, not matched by occurrence or distance.
+Duplicate candidates now pair by occurrence for equal counts and by gated
+minimum-cost view-centroid assignment otherwise. Counters distinguish resolved
+occurrence groups, resolved assignment groups, and unresolved primitives.
 `duplicate_equal` diagnoses repeats with identical view-space geometry; they
-still count as ambiguous. `partial_provenance` includes depth-backed polygons
+do not imply ambiguity after deterministic assignment. `partial_provenance` includes depth-backed polygons
 without complete projection provenance, rather than silently calling them HUD.
 
 The diagnostic compares successive nonempty polygon packets. Empty VBlank
@@ -66,3 +68,21 @@ feature and remove guest re-execution machinery. Only then measure distinct
 images/s, VBlanks/s and starved samples at 18x and 60/120 output.
 
 The module intentionally has no dependency on the phase-3 surface allocator.
+
+## Continuation: stronger provenance and duplicate resolution
+
+Packet identity includes original vertex RAM origin (preserved through exact
+scratchpad copies), matrix RAM origin when available, ordered model coordinates,
+projecting caller, primitive type, texpage and CLUT. The GTE also transports a
+rotation/translation value fingerprint for diagnosing model invocations; values
+change with motion and therefore are not exact temporal keys. No guest DMA
+packet address enters identity. Equal-count duplicate groups pair k-th to k-th;
+unequal counts use rectangular Hungarian assignment with normalized view-space
+centroid gating and dummy unmatched columns. Deterministic tie breaking follows
+packet order. `appeared_candidates` remains part of `unmatched`: absence of a
+key alone does not prove visibility change.
+
+The debug command accepts `capture:1` to freeze the next pair and `detail:1`,
+`older:0|1`, `start:N` to read eight provenance records per page. Capture data
+is owned, read under a short mutex, and does not access live guest or GL state.
+The audit remains opt-in; this is not presenter acceptance.

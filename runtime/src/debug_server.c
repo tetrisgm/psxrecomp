@@ -11293,9 +11293,12 @@ static void handle_render_thread(int id, const char *json)
  *   match counts, breaker. Not a sync point (render-thread counters, racy). */
 static void handle_packet_interpolation(int id, const char *json)
 {
-    (void)json;
-    char buf[1024];
-    packet_interpolation_stream_json(buf,sizeof buf);
+    char buf[16384];
+    if(json_get_int(json,"capture",0)) packet_interpolation_capture_request();
+    if(json_get_int(json,"detail",0))
+        packet_interpolation_capture_json(buf,sizeof buf,json_get_int(json,"older",0),
+                                          (size_t)json_get_int(json,"start",0));
+    else packet_interpolation_stream_json(buf,sizeof buf);
     send_fmt("{\"id\":%d,\"ok\":true,\"interpolation\":%s}",id,buf);
 }
 

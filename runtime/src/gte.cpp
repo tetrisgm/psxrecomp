@@ -1413,6 +1413,13 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
             projection.x_scale=(float)((double)x_num/(double)x_den);
             for(int i=0;i<3;++i) projection.model[i]=V[i];
             projection.caller=gte->projection_caller;
+            projection.source_vertex=V==gte->V0?1:V==gte->V1?3:5;
+            uint64_t transform=14695981039346656037ULL;
+            for(int r=0;r<3;++r) {
+                for(int c=0;c<3;++c) transform=(transform^uint16_t(gte->RT[r][c]))*1099511628211ULL;
+                transform=(transform^uint32_t(gte->TR[r]))*1099511628211ULL;
+            }
+            projection.transform=transform;
             projection.interpolation_valid=1;
             GTE_PGXP(gte, gte_set_projection, &projection);
         }

@@ -10,6 +10,7 @@ extern "C" {
 typedef struct PacketInterpolationSource {
     PGXPProjection projection[3];
     int32_t x[3],y[3];
+    uint32_t primitive_type, texpage, clut;
     uint32_t valid_mask;
     uint32_t spatial_mask; /* depth evidence, including missing provenance */
 } PacketInterpolationSource;
@@ -24,6 +25,8 @@ void packet_interpolation_stream_append(const PacketInterpolationSource *source)
 void packet_interpolation_stream_end(void);
 void packet_interpolation_stream_reset(void);
 int packet_interpolation_stream_json(char *output,size_t capacity);
+void packet_interpolation_capture_request(void);
+int packet_interpolation_capture_json(char *output,size_t capacity,int older,size_t start);
 #ifdef __cplusplus
 }
 #endif

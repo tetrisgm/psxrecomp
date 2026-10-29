@@ -61,11 +61,12 @@ int main() {
     b[0].identity=b[1].identity;
     assert(packet_interpolation_pair(ctx,&pa,&pb,2));
     stats=packet_interpolation_stats(ctx);
-    assert(stats.ambiguous==2 && stats.unmatched==2 && stats.matched==2);
+    assert(stats.ambiguous==1 && stats.unmatched==1 && stats.matched==3);
+    assert(stats.resolved_assignment==1);
     b[0]=primitive(4,80,200);
     a[0].identity=a[1].identity;
     assert(packet_interpolation_pair(ctx,&pa,&pb,2));
-    assert(packet_interpolation_stats(ctx).ambiguous==1);
+    assert(packet_interpolation_stats(ctx).resolved_assignment==1);
     a[0]=primitive(1,10,100);
     b[0].vertex[0].view[2]=0;
     assert(packet_interpolation_pair(ctx,&pa,&pb,2));
@@ -84,6 +85,30 @@ int main() {
     assert(packet_interpolation_pair(ctx,&pa,&pb,2)); assert(packet_interpolation_stats(ctx).snapped);
     assert(!packet_interpolation_sample(ctx,std::numeric_limits<double>::quiet_NaN(),out.data(),4));
     assert(!packet_interpolation_sample(ctx,0.5,out.data(),3));
+    // Same mesh repeated twice: stable occurrence pairing, independent buffers.
+    std::vector<PacketInterpolationPrimitive> repeated_a={primitive(7,0,100),primitive(7,20,100)};
+    std::vector<PacketInterpolationPrimitive> repeated_b={primitive(7,2,100),primitive(7,22,100)};
+    PacketInterpolationPacket ra{1,1,repeated_a.data(),repeated_a.size(),0};
+    PacketInterpolationPacket rb{1,2,repeated_b.data(),repeated_b.size(),0};
+    assert(packet_interpolation_pair(ctx,&ra,&rb,0.5));
+    stats=packet_interpolation_stats(ctx);
+    assert(stats.matched==2 && stats.unmatched==0 && stats.resolved_occurrence==1);
+    assert(packet_interpolation_sample(ctx,0.5,out.data(),out.size()));
+    assert(out[0].vertex[0].view[0]==1 && out[1].vertex[0].view[0]==21);
+    // A vanished instance changes counts. Greedy first-fit would choose the
+    // wrong survivor; minimum total cost must select the closer old instance.
+    rb.count=1;rb.primitives=&repeated_b[1];
+    assert(packet_interpolation_pair(ctx,&ra,&rb,0.5));
+    stats=packet_interpolation_stats(ctx);
+    assert(stats.matched==1 && stats.unmatched==0 && stats.disappeared==1);
+    assert(stats.resolved_assignment==1);
+    assert(packet_interpolation_sample(ctx,0.5,out.data(),out.size()));
+    assert(out[0].vertex[0].view[0]==21);
+    // Gating must leave a distant new instance unresolved, never force a match.
+    repeated_b[1]=primitive(7,1000,100);
+    assert(packet_interpolation_pair(ctx,&ra,&rb,0.5));
+    stats=packet_interpolation_stats(ctx);
+    assert(stats.matched==0 && stats.unmatched==1 && stats.ambiguous==1);
     // Exact endpoints after 24 hours at every requested refresh rate.
     for(uint32_t rate:{60u,90u,120u,144u}) {
         uint64_t last=100;

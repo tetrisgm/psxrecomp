@@ -30,6 +30,7 @@ struct PGXPValue {
     uint16_t flags;
     uint32_t value;      /* the guest word this shadow describes              */
     uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
+    uint32_t source_address; /* original load address, valid with generation/value */
     PGXPProjection projection;
 };
 

@@ -60,33 +60,17 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
         if(b->count) c->b.assign(b->primitives,b->primitives+b->count);
         const size_t missing=std::numeric_limits<size_t>::max();
         c->matches.assign(b->count,missing);
-        std::unordered_map<Key,size_t,Hash> old_index,new_count,new_first;
-        for(size_t i=0;i<a->count;++i) if(c->a[i].spatial) {
-            auto pair=old_index.emplace(key(c->a[i]),i);
-            if(!pair.second) pair.first->second=missing;
-        }
-        for(size_t i=0;i<c->b.size();++i) if(c->b[i].spatial) {
-            const auto& p=c->b[i];++new_count[key(p)];
-            auto inserted=new_first.emplace(key(p),i);
-            if(!inserted.second && same_geometry(c->b[inserted.first->second],p)) ++c->stats.duplicate_equal;
-        }
+        using Group=std::vector<size_t>;
+        std::unordered_map<Key,Group,Hash> old_groups,new_groups;
+        std::vector<bool> used(a->count,false);
+        for(size_t i=0;i<a->count;++i) if(c->a[i].spatial) old_groups[key(c->a[i])].push_back(i);
+        for(size_t i=0;i<b->count;++i) if(c->b[i].spatial) new_groups[key(c->b[i])].push_back(i);
         c->stats.snapped=a->epoch!=b->epoch || b->sequence<=a->sequence ||
                          a->discontinuity || b->discontinuity;
-        for(size_t i=0;i<b->count;++i) {
-            const auto& n=c->b[i];
-            if(!n.spatial) continue;
-            auto old=old_index.find(key(n));
-            if(new_count[key(n)]!=1 || (old!=old_index.end() && old->second==missing)) {
-                ++c->stats.ambiguous; ++c->stats.unmatched; continue;
-            }
-            if(!valid(n)) { ++c->stats.invalid; ++c->stats.unmatched; continue; }
-            if(old==old_index.end()) { ++c->stats.unmatched; continue; }
-            const auto& o=c->a[old->second];
-            if(!valid(o) || o.vertices!=n.vertices) {
-                ++c->stats.invalid; ++c->stats.unmatched; continue;
-            }
-            c->matches[i]=old->second;
-            ++c->stats.matched;
+        auto accept=[&](size_t ni,size_t oi) {
+            const auto& n=c->b[ni]; const auto& o=c->a[oi];
+            if(!valid(n) || !valid(o) || n.vertices!=o.vertices) return false;
+            c->matches[ni]=oi; used[oi]=true; ++c->stats.matched;
             if(max_motion>0) for(unsigned v=0;v<n.vertices;++v) {
                 double distance=0;
                 for(unsigned d=0;d<3;++d) {
@@ -95,8 +79,76 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                 }
                 if(std::sqrt(distance)/n.vertex[v].view[2]>max_motion) c->stats.snapped=1;
             }
+            return true;
+        };
+        for(const auto& entry:new_groups) {
+            const auto& ng=entry.second;
+            auto previous=old_groups.find(entry.first);
+            if(previous==old_groups.end()) continue;
+            const auto& og=previous->second;
+            for(size_t i=1;i<ng.size();++i)
+                if(same_geometry(c->b[ng[0]],c->b[ng[i]])) ++c->stats.duplicate_equal;
+            if(ng.size()==og.size()) {
+                for(size_t k=0;k<ng.size();++k) accept(ng[k],og[k]);
+                if(ng.size()>1) ++c->stats.resolved_occurrence;
+                continue;
+            }
+            // Rectangular Hungarian assignment with private dummy columns.
+            // Dummy cost dominates all allowed edges: first maximize the
+            // number of gated matches, then minimize centroid displacement.
+            // Stable input ordering and strict comparisons break ties.
+            const size_t rows=ng.size(),cols=og.size()+rows;
+            const double gate=max_motion>0?max_motion:0.5;
+            const double penalty=double(rows+1),forbidden=penalty*double(rows+2);
+            auto cost=[&](size_t r,size_t col) {
+                if(col>=og.size()) return penalty;
+                const auto& n=c->b[ng[r]];const auto& o=c->a[og[col]];
+                if(!valid(n)||!valid(o)||n.vertices!=o.vertices) return forbidden;
+                double distance=0,depth=0;
+                for(unsigned d=0;d<3;++d) {
+                    double nc=0,oc=0;
+                    for(unsigned v=0;v<n.vertices;++v) {nc+=n.vertex[v].view[d];oc+=o.vertex[v].view[d];}
+                    double delta=(nc-oc)/n.vertices;distance+=delta*delta;
+                    if(d==2) depth=std::min(nc,oc)/n.vertices;
+                }
+                double normalized=distance/(depth*depth*gate*gate);
+                return normalized<=1?normalized:forbidden;
+            };
+            std::vector<double> u(rows+1),v(cols+1);
+            std::vector<size_t> assignment(cols+1),way(cols+1);
+            for(size_t row=1;row<=rows;++row) {
+                assignment[0]=row;size_t col=0;
+                std::vector<double> best(cols+1,forbidden*double(rows+cols+1));
+                std::vector<bool> visited(cols+1,false);
+                do {
+                    visited[col]=true;size_t r=assignment[col],next=0;
+                    double delta=forbidden*double(rows+cols+1);
+                    for(size_t j=1;j<=cols;++j) if(!visited[j]) {
+                        double candidate=cost(r-1,j-1)-u[r]-v[j];
+                        if(candidate<best[j]) {best[j]=candidate;way[j]=col;}
+                        if(best[j]<delta) {delta=best[j];next=j;}
+                    }
+                    for(size_t j=0;j<=cols;++j) {
+                        if(visited[j]) {u[assignment[j]]+=delta;v[j]-=delta;}
+                        else best[j]-=delta;
+                    }
+                    col=next;
+                } while(assignment[col]);
+                do {size_t prev=way[col];assignment[col]=assignment[prev];col=prev;} while(col);
+            }
+            bool resolved=false;
+            for(size_t col=1;col<=og.size();++col)
+                if(assignment[col] && cost(assignment[col]-1,col-1)<penalty)
+                    resolved=accept(ng[assignment[col]-1],og[col-1])||resolved;
+            if(resolved) ++c->stats.resolved_assignment;
         }
-        for(const auto& p:c->a) if(p.spatial && !new_count.count(key(p))) ++c->stats.disappeared;
+        for(size_t i=0;i<b->count;++i) if(c->b[i].spatial && c->matches[i]==missing) {
+            ++c->stats.unmatched;
+            if(!valid(c->b[i])) ++c->stats.invalid;
+            else if(!old_groups.count(key(c->b[i]))) ++c->stats.appeared_candidates;
+            else ++c->stats.ambiguous;
+        }
+        for(size_t i=0;i<a->count;++i) if(c->a[i].spatial && !used[i]) ++c->stats.disappeared;
         c->ready=true;
         return 1;
     } catch(...) { *c=PacketInterpolation{}; return 0; }
