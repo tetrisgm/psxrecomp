@@ -11,6 +11,12 @@ typedef struct PacketSeed { uint64_t tick; RthFrameState state; uint16_t pixels[
 static _Atomic int packet_entered,packet_unblock,packet_acquires,packet_releases;
 static uint16_t packet_private[1024*512];
 static FrameOwner *packet_owner;
+static PFN_glGetQueryObjectiv real_query_status;
+static void APIENTRY delayed_query_status(GLuint query,GLenum name,GLint *value) {
+    if(name==GL_QUERY_RESULT_AVAILABLE){*value=0;return;}
+    real_query_status(query,name,value);
+}
+
 static void packet_context(void *unused,int current) {
     (void)unused;
     if(current) {
@@ -210,9 +216,15 @@ int main(void) {
     check(atomic_load(&packet_acquires)==2 && atomic_load(&packet_releases)==2,
           "context transfers only at lifecycle boundaries");
     glFinish(); /* Test-only completion before inspecting asynchronous telemetry. */
+    real_query_status=p_glGetQueryObjectiv;p_glGetQueryObjectiv=delayed_query_status;
+    /* Add a completed packet whose availability bit remains false. Its
+     * post-timestamp fence must be sufficient to retire it without waiting. */
+    packet_timer_begin();packet_timer_end();glFinish();
     packet_timer_resolve();
+    p_glGetQueryObjectiv=real_query_status;
+    check(s_pkt_fence_retired>0,"completed fence retires delayed availability result");
     uint64_t timing[5];gl_renderer_packet_gpu_stats(timing);
-    check(timing[0]==3,"two forward packets and one historical replay timed");
+    check(timing[0]==4,"forward, historical and delayed-availability packets timed");
     check(timing[1]>0 && timing[3]>0 && timing[3]<=timing[1],"packet timestamp totals");
     check(timing[2]<=timing[1] && timing[4]==0,"bounded nonblocking packet telemetry");
     check(s_pkt_wait_ns<=timing[1] && !s_pkt_wait_dropped,

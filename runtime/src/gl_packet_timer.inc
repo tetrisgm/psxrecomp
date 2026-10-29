@@ -8,18 +8,28 @@
 typedef struct PacketTimerSlot {
     GLuint query[PACKET_TIMER_QUERIES];
     unsigned presents,waits;
+    void *fence;
 } PacketTimerSlot;
 static PacketTimerSlot s_pkt_time[PACKET_TIMER_SLOTS];
+static StreamWait s_pkt_fence_wait;
 static uint64_t s_pkt_head,s_pkt_tail;
 static int s_pkt_enabled=-1,s_pkt_active=-1,s_pkt_present_open;
 static int s_pkt_wait_open;
 static _Atomic uint64_t s_pkt_samples,s_pkt_ns,s_pkt_present_ns,s_pkt_max_ns,s_pkt_dropped;
 static _Atomic uint64_t s_pkt_wait_ns,s_pkt_wait_dropped;
+static _Atomic uint64_t s_pkt_fence_retired;
 static void packet_timer_resolve(void) {
     while(s_pkt_tail<s_pkt_head) {
         PacketTimerSlot *slot=&s_pkt_time[s_pkt_tail%PACKET_TIMER_SLOTS];
         GLint ready=0;p_glGetQueryObjectiv(slot->query[1],GL_QUERY_RESULT_AVAILABLE,&ready);
-        if(!ready)break;
+        if(!ready) {
+            GLenum completed=slot->fence?s_pkt_fence_wait(slot->fence,0,0):0;
+            if(completed!=0x911A && completed!=0x911C)break;
+            /* Some drivers leave QUERY_RESULT_AVAILABLE false across
+             * shared-context presentation. A signalled fence placed after
+             * the end timestamp proves that both results have completed. */
+            atomic_fetch_add(&s_pkt_fence_retired,1);
+        }
         GLuint64 begin=0,end=0,present=0,wait=0;
         p_glGetQueryObjectui64v(slot->query[0],GL_QUERY_RESULT,&begin);
         p_glGetQueryObjectui64v(slot->query[1],GL_QUERY_RESULT,&end);
@@ -43,13 +53,15 @@ static void packet_timer_resolve(void) {
             atomic_fetch_add(&s_pkt_wait_ns,wait);
             if(ns>atomic_load(&s_pkt_max_ns))atomic_store(&s_pkt_max_ns,ns);
         }
+        if(slot->fence){p_glDeleteSync(slot->fence);slot->fence=NULL;}
         ++s_pkt_tail;
     }
 }
 static void packet_timer_begin(void) {
     if(s_pkt_enabled<0) {
         const char *value=getenv("PSX_GL_ASYNC_GPU_TIMER");
-        s_pkt_enabled=value && *value && *value!='0' && p_glQueryCounter &&
+        s_pkt_fence_wait=(StreamWait)SDL_GL_GetProcAddress("glClientWaitSync");
+        s_pkt_enabled=value && *value && *value!='0' && s_pkt_fence_wait && p_glFenceSync && p_glDeleteSync && p_glQueryCounter &&
             p_glGenQueries && p_glDeleteQueries && p_glGetQueryObjectiv && p_glGetQueryObjectui64v;
         if(s_pkt_enabled) for(unsigned i=0;i<PACKET_TIMER_SLOTS;++i)
             p_glGenQueries(PACKET_TIMER_QUERIES,s_pkt_time[i].query);
@@ -81,6 +93,7 @@ static void packet_timer_end(void) {
     if(s_pkt_active<0)return;
     packet_timer_present_end();
     p_glQueryCounter(s_pkt_time[s_pkt_active].query[1],GL_TIMESTAMP);
+    s_pkt_time[s_pkt_active].fence=p_glFenceSync(0x9117 /* GPU_COMMANDS_COMPLETE */,0);
     ++s_pkt_head;s_pkt_active=-1;
 }
 /* Measure a server-side wait separately; keep the original inclusive packet
@@ -100,12 +113,15 @@ static void packet_timer_wait_end(void) {
     ++slot->waits;s_pkt_wait_open=0;
 }
 static void packet_timer_reset(void) {
-    if(s_pkt_enabled>0)for(unsigned i=0;i<PACKET_TIMER_SLOTS;++i)
+    if(s_pkt_enabled>0)for(unsigned i=0;i<PACKET_TIMER_SLOTS;++i) {
+        if(s_pkt_time[i].fence)p_glDeleteSync(s_pkt_time[i].fence);
         p_glDeleteQueries(PACKET_TIMER_QUERIES,s_pkt_time[i].query);
+    }
     memset(s_pkt_time,0,sizeof s_pkt_time);
     s_pkt_head=s_pkt_tail=0;s_pkt_enabled=-1;s_pkt_active=-1;s_pkt_present_open=0;
     atomic_store(&s_pkt_samples,0);atomic_store(&s_pkt_ns,0);
     atomic_store(&s_pkt_present_ns,0);atomic_store(&s_pkt_max_ns,0);atomic_store(&s_pkt_dropped,0);
+    atomic_store(&s_pkt_fence_retired,0);
     atomic_store(&s_pkt_wait_ns,0);atomic_store(&s_pkt_wait_dropped,0);s_pkt_wait_open=0;
 }
 void gl_renderer_packet_gpu_stats(uint64_t out[5]) {

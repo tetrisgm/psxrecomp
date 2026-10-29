@@ -101,6 +101,40 @@ static void immutable_texture_inputs() {
     native_raster_inputs_destroy(wrapped);native_raster_inputs_destroy(restored);
     native_raster_inputs_destroy(overflow);native_raster_inputs_destroy(recovery);
 }
+static void immutable_copy_inputs() {
+    std::vector<uint16_t> initial(1024*512);
+    for(unsigned i=0;i<initial.size();++i)initial[i]=(uint16_t)(i*37u+(i/1024)*13u);
+    auto* raster=native_raster_create(initial.data());assert(raster);
+    native_raster_inputs_enable(raster,1);
+    NativeRasterState state{0,0,1023,511,0,0,0,0,0,0,0};
+    const unsigned cases[][5]={{1020,510,8,4,4},{63,63,2,2,4},
+                               {0,0,0,0,128},{128,64,64,64,1}};
+    for(const auto& c:cases) {
+        native_raster_restore(raster,initial.data());
+        const uint32_t copy[]={0x80000000u,c[0]|(c[1]<<16),
+            ((c[0]+1)&1023)|(((c[1]+1)&511)<<16),c[2]|(c[3]<<16)};
+        const auto source=native_raster_gp0_identified(raster,&state,copy,4);assert(source);
+        send(raster,NR_FILL,{0,0,1024,512,0});
+        auto* inputs=native_raster_inputs_seal(raster);assert(native_raster_inputs_valid(inputs));
+        NativeRasterTile tiles[128];
+        const int count=native_raster_inputs_get(inputs,source,tiles,128);
+        assert(count==int(c[4]));
+        bool expected[128]{};
+        const unsigned w=c[2]?c[2]:1024,h=c[3]?c[3]:512;
+        for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)
+            expected[(((c[1]+y)&511)/64)*16+(((c[0]+x)&1023)/64)]=true;
+        for(int t=0;t<count;++t) {
+            const auto& tile=tiles[t];
+            assert(expected[(tile.y/64)*16+tile.x/64]);
+            for(unsigned row=0;row<64;++row)
+                assert(!memcmp(tile.pixels+row*64,initial.data()+(tile.y+row)*1024+tile.x,128));
+        }
+        // Capture is pre-copy even for overlap, and survives later writes.
+        assert(pixel(raster,0,0)==0);
+        native_raster_inputs_destroy(inputs);
+    }
+    native_raster_destroy(raster);
+}
 static void dropped_texture_input_packets() {
     auto* raster=native_raster_create(nullptr);assert(raster);
     native_raster_inputs_enable(raster,1);
@@ -223,6 +257,7 @@ static void bounded_queue_wrap() {
 int main() {
     bounded_queue_wrap();
     immutable_texture_inputs();
+    immutable_copy_inputs();
     dropped_texture_input_packets();
     provenance_observation();
     auto *r = native_raster_create(nullptr);

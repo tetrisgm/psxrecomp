@@ -2279,3 +2279,12 @@ return34.424ms,zero starved/misses,29.998distinct/s,GPU packet16.628ms,
 1.44GB native staged bytes/30s. No cadence acceptance. Present-slot GPU server
 wait timestamps added separately without changing inclusive packet span;
 914 packet/history/timer checks pass in phase3-slot-wait-timer/rth-a54ztt2_.
+2026-10-29 phase3 copy preparation: NativeRaster packet inputs now capture
+pre-copy source tiles, with wrap and zero-size encoding tests; native_raster_test
+passes. Native-seeded sparse enhanced copy fixture passes1/4/9/18x in
+phase3-sparse-copy-seed/rth-cdr48agl. Present-slot GPU fence timing is only
+0.000589ms/packet in phase3-slot-wait18, not the16.641ms packet span's cause.
+Guest59.997Hz,entry33.609ms,return30.283ms,zero starved/misses,35.566distinct/s.
+Production full-HR allocation/pool routing still open; no acceptance.
+2026-10-29 phase3: whole-image asynchronous receipts replace 32x18 sampling; single-pixel corner/odd-size fixture passes40 swaps/20 changes. phase3-whole-image18:49.667distinct/s,0.411ms GPU hash,60.023Hz,35.250ms entry/24.623ms return,zero starved/misses. Packet timestamp retirement stalled without GL error; completion-fence probe underway, GPU frame result invalid. Copy application separated from gather, cropped1/4/9/18x passes; full-HR pool cutover still pending.
+2026-10-29 phase3 receipt follow-up: phase3-whole-image-fence18 completes1804 packet GPU samples with zero drops using completion fences;9.730ms packet/1.431ms present,0.410ms whole-image hash,58.166distinct/s. Guest60.001Hz,entry33.822ms/return23.175ms,zero starved/misses. No full-surface cutover or10-minute gate yet; no promotion.

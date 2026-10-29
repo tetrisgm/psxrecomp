@@ -19,12 +19,21 @@ int main(void) {
     if(!gl_renderer_init_context(win))return 77;
     GLuint texture=make_tex(GL_RGBA8,320,240,GL_RGBA,GL_UNSIGNED_BYTE),fbo=0;
     check(make_fbo(&fbo,texture,0),"receipt source allocation");
-    s_ptp_fbo[0]=fbo;s_pts_w[0]=320;s_pts_h[0]=240;
+    s_pts_tex[0]=texture;s_ptp_fbo[0]=fbo;s_pts_w[0]=320;s_pts_h[0]=240;
     for(int frame=0;frame<40;++frame) {
+        if(frame==20) {
+            glBindTexture(GL_TEXTURE_2D,texture);
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,321,241,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+            s_pts_w[0]=321;s_pts_h[0]=241;
+        }
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER,fbo);
         glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);
-        glClearColor((frame/2)&1?1.f:0.f,.25f,.5f,1.f);
+        glClearColor(0.f,.25f,.5f,1.f);
         glClear(GL_COLOR_BUFFER_BIT);
+        /* A single corner pixel is invisible to the old 32x18 sampler. */
+        glEnable(GL_SCISSOR_TEST);glScissor(s_pts_w[0]-1,s_pts_h[0]-1,1,1);
+        glClearColor((frame/2)&1?1.f:0.f,.25f,.5f,1.f);
+        glClear(GL_COLOR_BUFFER_BIT);glDisable(GL_SCISSOR_TEST);
         uint64_t token=0;
         check(pt_trace_sample(0,&token),"receipt queued");
         pt_trace_record(0,token);
@@ -47,7 +56,7 @@ int main(void) {
         fclose(f);
     }
     check(rows==40 && changes==20,"forty swaps contain twenty changed images");
-    s_ptp_fbo[0]=0;p_glDeleteFramebuffers(1,&fbo);glDeleteTextures(1,&texture);
+    s_pts_tex[0]=0;s_ptp_fbo[0]=0;p_glDeleteFramebuffers(1,&fbo);glDeleteTextures(1,&texture);
     check(glGetError()==GL_NO_ERROR,"asynchronous receipt GL state valid");
     gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();
     printf("distinct receipts rows=%u changes=%u failures=%d\n",rows,changes,failures);

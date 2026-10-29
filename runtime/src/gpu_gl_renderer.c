@@ -2728,6 +2728,7 @@ static void native_texture_upload_rect(int x,int y,int w,int h) {
     const size_t bytes=(size_t)w*h*sizeof(uint16_t);
     const size_t offset=buffer_stream_upload(&s_unpack_stream,PSXGL_PIXEL_UNPACK_BUFFER,
         s_raw_pbo,VRAM_W*VRAM_H*sizeof(uint16_t),source,bytes);
+    p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D,s_raw_tex);
     glPixelStorei(PSXGL_UNPACK_ROW_LENGTH,0);
     glPixelStorei(GL_UNPACK_ALIGNMENT,2);
@@ -5874,12 +5875,47 @@ typedef struct GlCopyRegion {
     int offset_x,offset_y;
 } GlCopyRegion;
 
+static void gpu_copy_rect_apply(GLuint source_tex,int sx,int sy,int dx,int dy,int w,int h) {
+    const int S=s_hr_scale;
+    hr_begin(0);   /* copies ignore the draw area */
+    glScissor((dx-s_hr_origin_x)*S,(dy-s_hr_origin_y)*S,w*S,h*S);
+    glDisable(GL_BLEND);
+    p_glUseProgram(s_blit_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source_tex);
+    p_glUniform1i(s_uBlitSrc, 0);
+    p_glUniform1i(s_uBlitMaskset, s_mask_set);
+    /* Scratch holds the source at its origin: texel = frag - dst*S. */
+    p_glUniform1i(s_uBlitSrcDiv, 1);
+    p_glUniform2i(s_uBlitSrcOff,(s_hr_origin_x-dx)*S,(s_hr_origin_y-dy)*S);
+    float fx0 = (float)dx, fy0 = (float)dy, fx1 = (float)(dx + w), fy1 = (float)(dy + h);
+    float verts[6 * 2] = {
+        fx0, fy0,  fx1, fy0,  fx0, fy1,
+        fx1, fy0,  fx0, fy1,  fx1, fy1,
+    };
+    p_glBindVertexArray(s_blit_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
+    vertex_stream_upload(2, verts, sizeof verts);
+    /* Two passes split by source bit15 so stencil tracks the copied mask. */
+    mask_stencil(s_mask_set); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
+    mask_stencil(1);          p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
+    hr_end();
+    hiw_mirror_copy(sx, sy, dx, dy, w, h);   /* scratch still holds the 1x source */
+
+    if(!s_rth_packet_replaying)rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
+    if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, dx, dy, dx + w - 1, dy + h - 1);
+    if (!cpu_vram_authoritative())
+        s_gpu_dirty = 1;
+    coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
+    coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+}
+
 /* Gather enhanced source regions before writing any destination. A copy may
  * cross independently allocated RT tiles or overlap its own source. Sources
  * are ordered back to front; the caller supplies complete coverage (native
  * seed first, then any retained enhanced regions). */
-static void gpu_copy_rect_regions(const GlCopyRegion *sources,int source_count,
-                                 int sx,int sy,int dx,int dy,int w,int h) {
+static void gpu_copy_rect_regions_seeded(const GlCopyRegion *sources,int source_count,int seed_native,
+                                        int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -5914,6 +5950,11 @@ static void gpu_copy_rect_regions(const GlCopyRegion *sources,int source_count,
      * high-resolution window stages its S-scaled source in a scratch of its
      * own (hiw_mirror_copy), so this one never grows past the hr surface. */
     if (!scratch_ensure(w * S, h * S)) return;
+    if(seed_native) {
+        native_texture_upload_rect(sx,sy,w,h);
+        DirtyRect source={0};rect_add(&source,sx,sy,sx+w-1,sy+h-1);
+        native_surface_upload(s_scratch_fbo,sx,sy,w,h,S,&source,1);
+    }
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
     glDisable(GL_SCISSOR_TEST);
     for(int i=0;i<source_count;++i) {
@@ -5931,37 +5972,12 @@ static void gpu_copy_rect_regions(const GlCopyRegion *sources,int source_count,
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 
-    hr_begin(0);   /* copies ignore the draw area */
-    glScissor((dx-s_hr_origin_x)*S,(dy-s_hr_origin_y)*S,w*S,h*S);
-    glDisable(GL_BLEND);
-    p_glUseProgram(s_blit_prog);
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_scratch_tex);
-    p_glUniform1i(s_uBlitSrc, 0);
-    p_glUniform1i(s_uBlitMaskset, s_mask_set);
-    /* Scratch holds the source at its origin: texel = frag - dst*S. */
-    p_glUniform1i(s_uBlitSrcDiv, 1);
-    p_glUniform2i(s_uBlitSrcOff,(s_hr_origin_x-dx)*S,(s_hr_origin_y-dy)*S);
-    float fx0 = (float)dx, fy0 = (float)dy, fx1 = (float)(dx + w), fy1 = (float)(dy + h);
-    float verts[6 * 2] = {
-        fx0, fy0,  fx1, fy0,  fx0, fy1,
-        fx1, fy0,  fx0, fy1,  fx1, fy1,
-    };
-    p_glBindVertexArray(s_blit_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
-    vertex_stream_upload(2, verts, sizeof verts);
-    /* Two passes split by source bit15 so stencil tracks the copied mask. */
-    mask_stencil(s_mask_set); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
-    mask_stencil(1);          p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
-    hr_end();
-    hiw_mirror_copy(sx, sy, dx, dy, w, h);   /* scratch still holds the 1x source */
+    gpu_copy_rect_apply(s_scratch_tex,sx,sy,dx,dy,w,h);
+}
 
-    if(!s_rth_packet_replaying)rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
-    if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, dx, dy, dx + w - 1, dy + h - 1);
-    if (!cpu_vram_authoritative())
-        s_gpu_dirty = 1;
-    coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
-    coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+static void gpu_copy_rect_regions(const GlCopyRegion *sources,int source_count,
+                                 int sx,int sy,int dx,int dy,int w,int h) {
+    gpu_copy_rect_regions_seeded(sources,source_count,0,sx,sy,dx,dy,w,h);
 }
 
 static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
@@ -11636,28 +11652,38 @@ static GLuint pt_target_fbo(void) {
     return s_pts_fbo[i];
 }
 
-/* Optional distinct-image receipt. Pixel sampling is queued into a bounded
- * PBO ring; only signalled fences are mapped. Changed hashes prove a lower
- * bound on distinct images, without a synchronous presenter readback. */
+/* Optional whole-image receipt. Every RGBA8 output pixel participates in a
+ * block hash; only signalled asynchronous PBOs are mapped. Repeated swaps
+ * do not count as distinct images. Hash collisions remain theoretically
+ * possible, as with any finite image signature. */
 #define PT_TRACE_SLOTS 8
-#define PT_TRACE_W 32
-#define PT_TRACE_H 18
-#define PT_TRACE_BYTES (PT_TRACE_W*PT_TRACE_H*4)
+#define PT_TRACE_BLOCK 16
+static const char *PT_TRACE_FS =
+    "#version 330\n"
+    "uniform sampler2D u_image; out vec4 o_hash;\n"
+    "void main(){ ivec2 base=ivec2(gl_FragCoord.xy)*16;\n"
+    " ivec2 size=textureSize(u_image,0); uint h=2166136261u;\n"
+    " for(int y=0;y<16;++y)for(int x=0;x<16;++x){\n"
+    "  ivec2 p=base+ivec2(x,y); if(any(greaterThanEqual(p,size)))continue;\n"
+    "  uvec4 c=uvec4(texelFetch(u_image,p,0)*255.0+0.5);\n"
+    "  uint v=c.x|(c.y<<8)|(c.z<<16)|(c.w<<24);h=(h^v)*16777619u; }\n"
+    " o_hash=vec4(uvec4(h,h>>8,h>>16,h>>24)&255u)/255.0; }\n";
 static FILE *s_pt_trace;
 static int s_pt_trace_init;
-static GLuint s_pt_trace_tex,s_pt_trace_fbo;
+static GLuint s_pt_trace_tex,s_pt_trace_fbo,s_pt_trace_prog,s_pt_trace_vao;
+static int s_pt_trace_w,s_pt_trace_h;
 static StreamWait s_pt_trace_wait;
 static struct PtTraceRead {
-    GLuint pbo; void *fence; PtTiming timing; uint64_t time;
+    GLuint pbo,query[2]; void *fence; PtTiming timing; uint64_t time; size_t bytes,capacity; unsigned width,height;
 } s_pt_reads[PT_TRACE_SLOTS];
 static uint64_t s_pt_trace_read,s_pt_trace_write,s_pt_trace_hash;
 static int s_pt_trace_has_hash;
-static void pt_trace_emit(const PtTiming *t,uint64_t now,uint64_t hash,int changed) {
-    fprintf(s_pt_trace,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%016llX,%d\n",
+static void pt_trace_emit(const PtTiming *t,uint64_t now,uint64_t hash,uint64_t hash_ns,int changed) {
+    fprintf(s_pt_trace,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%016llX,%llu,%d\n",
         (unsigned long long)now,(unsigned long long)t->epoch,
         (unsigned long long)t->generation,(unsigned long long)t->index,t->alpha_q16,
         (unsigned long long)t->not_before_ns,(unsigned long long)t->expires_ns,
-        (unsigned long long)hash,changed);
+        (unsigned long long)hash,(unsigned long long)hash_ns,changed);
 }
 static void pt_trace_resolve(void) {
     GLint pack=0;glGetIntegerv(0x88ED /* PIXEL_PACK_BUFFER_BINDING */,&pack);
@@ -11666,16 +11692,24 @@ static void pt_trace_resolve(void) {
         if(!r->time)break;
         GLenum ready=s_pt_trace_wait(r->fence,0,0);
         if(ready!=0x911A && ready!=0x911C)break;
+        uint64_t hash_ns=0;
+        if(r->query[0]) {
+            GLuint64 a=0,b=0;
+            p_glGetQueryObjectui64v(r->query[0],GL_QUERY_RESULT,&a);
+            p_glGetQueryObjectui64v(r->query[1],GL_QUERY_RESULT,&b);
+            if(b>=a)hash_ns=b-a;
+        }
         p_glBindBuffer(0x88EB,r->pbo);
         const uint8_t *pixels=p_glMapBuffer(0x88EB,0x88B8 /* READ_ONLY */);
         if(pixels) {
-            uint64_t hash=1469598103934665603ull;
-            for(unsigned i=0;i<PT_TRACE_BYTES;++i)hash=(hash^pixels[i])*1099511628211ull;
+            uint64_t hash=(1469598103934665603ull^r->width)*1099511628211ull;
+            hash=(hash^r->height)*1099511628211ull;
+            for(size_t i=0;i<r->bytes;++i)hash=(hash^pixels[i])*1099511628211ull;
             int changed=!s_pt_trace_has_hash || hash!=s_pt_trace_hash;
-            pt_trace_emit(&r->timing,r->time,hash,changed);
+            pt_trace_emit(&r->timing,r->time,hash,hash_ns,changed);
             s_pt_trace_has_hash=1;s_pt_trace_hash=hash;
             p_glUnmapBuffer(0x88EB);
-        } else pt_trace_emit(&r->timing,r->time,0,-1);
+        } else pt_trace_emit(&r->timing,r->time,0,hash_ns,-1);
         p_glDeleteSync(r->fence);r->fence=NULL;r->time=0;++s_pt_trace_read;
     }
     p_glBindBuffer(0x88EB,(GLuint)pack);
@@ -11689,14 +11723,14 @@ static int pt_trace_sample(int slot,uint64_t *token) {
             s_pt_trace=fopen(path,"wb");
         if(s_pt_trace) {
             setvbuf(s_pt_trace,NULL,_IOFBF,256*1024);
-            fprintf(s_pt_trace,"time_ns,epoch,generation,index,alpha_q16,deadline_ns,expires_ns,sample_hash,changed\n");
+            fprintf(s_pt_trace,"time_ns,epoch,generation,index,alpha_q16,deadline_ns,expires_ns,image_hash,gpu_hash_ns,changed\n");
         }
     }
     if(!s_pt_trace)return 0;
     pt_trace_resolve();
     if(s_pt_trace_write-s_pt_trace_read==PT_TRACE_SLOTS) {
         PtTiming t={0};pt_present_timing((unsigned)slot,&t);
-        pt_trace_emit(&t,pt_clock_ns(),0,-1);
+        pt_trace_emit(&t,pt_clock_ns(),0,0,-1);
         return 0;
     }
     GLint read=0,draw=0,tex=0,pack=0,row=0,pbo=0;
@@ -11704,24 +11738,60 @@ static int pt_trace_sample(int slot,uint64_t *token) {
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&tex);
     glGetIntegerv(GL_PACK_ALIGNMENT,&pack);glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
     glGetIntegerv(0x88ED,&pbo);
+    const int width=(s_pts_w[slot]+PT_TRACE_BLOCK-1)/PT_TRACE_BLOCK;
+    const int height=(s_pts_h[slot]+PT_TRACE_BLOCK-1)/PT_TRACE_BLOCK;
+    const size_t bytes=(size_t)width*height*4;
     if(!s_pt_trace_fbo) {
-        glGenTextures(1,&s_pt_trace_tex);glBindTexture(GL_TEXTURE_2D,s_pt_trace_tex);
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,PT_TRACE_W,PT_TRACE_H,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glGenTextures(1,&s_pt_trace_tex);
         p_glGenFramebuffers(1,&s_pt_trace_fbo);
-        p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
-        p_glFramebufferTexture2D(PSXGL_DRAW_FRAMEBUFFER,PSXGL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s_pt_trace_tex,0);
+        s_pt_trace_prog=build_program(PACK_VS,PT_TRACE_FS);
+        p_glGenVertexArrays(1,&s_pt_trace_vao);
     }
-    struct PtTraceRead *r=&s_pt_reads[s_pt_trace_write%PT_TRACE_SLOTS];
-    if(!r->pbo) {
-        p_glGenBuffers(1,&r->pbo);p_glBindBuffer(0x88EB,r->pbo);
-        p_glBufferData(0x88EB,PT_TRACE_BYTES,NULL,0x88E1 /* STREAM_READ */);
-    } else p_glBindBuffer(0x88EB,r->pbo);
-    p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_ptp_fbo[slot]);
+    if(!s_pt_trace_prog) {
+        PtTiming t={0};pt_present_timing((unsigned)slot,&t);
+        pt_trace_emit(&t,pt_clock_ns(),0,0,-1);
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D,s_pt_trace_tex);
+    if(width!=s_pt_trace_w || height!=s_pt_trace_h) {
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        s_pt_trace_w=width;s_pt_trace_h=height;
+    }
     p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
-    p_glBlitFramebuffer(0,0,s_pts_w[slot],s_pts_h[slot],0,0,PT_TRACE_W,PT_TRACE_H,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    p_glFramebufferTexture2D(PSXGL_DRAW_FRAMEBUFFER,PSXGL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s_pt_trace_tex,0);
+    struct PtTraceRead *r=&s_pt_reads[s_pt_trace_write%PT_TRACE_SLOTS];
+    if(!r->pbo)p_glGenBuffers(1,&r->pbo);
+    p_glBindBuffer(0x88EB,r->pbo);
+    if(bytes>r->capacity) {
+        p_glBufferData(0x88EB,bytes,NULL,0x88E1 /* STREAM_READ */);r->capacity=bytes;
+    }
+    r->bytes=bytes;r->width=s_pts_w[slot];r->height=s_pts_h[slot];
+    GLint program=0,vao=0,viewport[4],active=0,source_binding=0;
+    glGetIntegerv(0x8B8D,&program);glGetIntegerv(0x85B5,&vao);
+    glGetIntegerv(GL_VIEWPORT,viewport);glGetIntegerv(0x84E0,&active);
+    p_glActiveTexture(PSXGL_TEXTURE0);glGetIntegerv(GL_TEXTURE_BINDING_2D,&source_binding);
+    const GLenum caps[]={GL_BLEND,GL_DEPTH_TEST,GL_STENCIL_TEST,GL_SCISSOR_TEST,GL_DITHER,0x8DB9 /* FRAMEBUFFER_SRGB */};
+    GLboolean enabled[6],mask[4];glGetBooleanv(GL_COLOR_WRITEMASK,mask);
+    for(unsigned i=0;i<6;++i){enabled[i]=glIsEnabled(caps[i]);glDisable(caps[i]);}
+    glColorMask(1,1,1,1);glViewport(0,0,width,height);
+    p_glUseProgram(s_pt_trace_prog);p_glBindVertexArray(s_pt_trace_vao);
+    glBindTexture(GL_TEXTURE_2D,s_pts_tex[slot]);
+    p_glUniform1i(p_glGetUniformLocation(s_pt_trace_prog,"u_image"),0);
+    if(!r->query[0] && p_glGenQueries && p_glQueryCounter && p_glGetQueryObjectui64v)
+        p_glGenQueries(2,r->query);
+    if(r->query[0])p_glQueryCounter(r->query[0],GL_TIMESTAMP);
+    glDrawArrays(GL_TRIANGLES,0,3);
+    if(r->query[0])p_glQueryCounter(r->query[1],GL_TIMESTAMP);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)source_binding);p_glActiveTexture((GLenum)active);
+    p_glUseProgram((GLuint)program);p_glBindVertexArray((GLuint)vao);
+    glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
+    glColorMask(mask[0],mask[1],mask[2],mask[3]);
+    for(unsigned i=0;i<6;++i)if(enabled[i])glEnable(caps[i]);
     p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_pt_trace_fbo);
     glPixelStorei(GL_PACK_ALIGNMENT,1);glPixelStorei(GL_PACK_ROW_LENGTH,0);
-    glReadPixels(0,0,PT_TRACE_W,PT_TRACE_H,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
     r->fence=p_glFenceSync(PT_SYNC_GPU_COMMANDS_COMPLETE,0);
     pt_present_timing((unsigned)slot,&r->timing);r->time=0;
     *token=s_pt_trace_write%PT_TRACE_SLOTS;++s_pt_trace_write;
@@ -11740,10 +11810,14 @@ static void pt_trace_shutdown(void) {
     for(unsigned i=0;i<PT_TRACE_SLOTS;++i) {
         if(s_pt_reads[i].fence)p_glDeleteSync(s_pt_reads[i].fence);
         if(s_pt_reads[i].pbo)p_glDeleteBuffers(1,&s_pt_reads[i].pbo);
+        if(s_pt_reads[i].query[0])p_glDeleteQueries(2,s_pt_reads[i].query);
     }
     memset(s_pt_reads,0,sizeof s_pt_reads);
     if(s_pt_trace_fbo)p_glDeleteFramebuffers(1,&s_pt_trace_fbo);
     if(s_pt_trace_tex)glDeleteTextures(1,&s_pt_trace_tex);
+    if(s_pt_trace_prog)p_glDeleteProgram(s_pt_trace_prog);
+    if(s_pt_trace_vao)p_glDeleteVertexArrays(1,&s_pt_trace_vao);
+    s_pt_trace_prog=s_pt_trace_vao=0;s_pt_trace_w=s_pt_trace_h=0;
     s_pt_trace_fbo=s_pt_trace_tex=0;s_pt_trace_init=0;
     s_pt_trace_read=s_pt_trace_write=s_pt_trace_hash=0;s_pt_trace_has_hash=0;
 }
@@ -17515,11 +17589,12 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
     uint64_t gpu[5];gl_renderer_packet_gpu_stats(gpu);
     if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
         "\"gpu_packet\":{\"samples\":%llu,\"total_ns\":%llu,\"present_ns\":%llu,\"max_ns\":%llu,\"dropped\":%llu,"
-        "\"slot_wait_ns\":%llu,\"slot_wait_dropped\":%llu},",
+        "\"slot_wait_ns\":%llu,\"slot_wait_dropped\":%llu,\"fence_retired\":%llu},",
         (unsigned long long)gpu[0],(unsigned long long)gpu[1],(unsigned long long)gpu[2],
         (unsigned long long)gpu[3],(unsigned long long)gpu[4],
         (unsigned long long)atomic_load(&s_pkt_wait_ns),
-        (unsigned long long)atomic_load(&s_pkt_wait_dropped));
+        (unsigned long long)atomic_load(&s_pkt_wait_dropped),
+        (unsigned long long)atomic_load(&s_pkt_fence_retired));
     if (k > 0 && (size_t)k < cap) k += gl_renderer_present_thread_json(out + k, cap - (size_t)k);
     return k;
 }

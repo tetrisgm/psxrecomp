@@ -226,6 +226,35 @@ static int run_scale(int scale) {
         glReadPixels(100*scale,150*scale,16*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
         check(!memcmp(reference,cropped,(size_t)16*16*scale*scale*4),
             "enhanced copy excludes wide reveal margins from guest VRAM coverage");
+        /* No enhanced allocation exists beyond the canonical wide region.
+         * Seed that portion from native, then overlay the retained enhanced
+         * pixels. Neither the reveal margin nor an unrelated framebuffer is
+         * a valid source for the missing neighbouring region. */
+        uint16_t native_before[16*16];
+        for(int row=0;row<16;++row)for(int col=0;col<16;++col) {
+            const size_t pos=(size_t)(y+60+row)*1024+x+312+col;
+            native_before[row*16+col]=s_vram[pos];s_vram[pos]=0x801f;
+        }
+        for(int row=0;row<16*scale;++row)for(int col=8*scale;col<16*scale;++col) {
+            uint8_t *pixel=reference+((size_t)row*16*scale+col)*4;
+            pixel[0]=248;pixel[1]=pixel[2]=0;pixel[3]=255;
+        }
+        gpu_copy_rect_regions_seeded(layered+1,1,1,x+312,y+60,x+100,y+150,16,16);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+        glReadPixels(100*scale,150*scale,16*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+        check(!memcmp(reference,cropped,(size_t)16*16*scale*scale*4),
+            "copy seeds missing regions from native and preserves enhanced subpixels");
+        /* The gathered source is immutable across destination writes. A
+         * surface-pool copy can therefore apply one staged piece to several
+         * targets without sampling a destination that was already changed. */
+        gpu_copy_rect_apply(s_scratch_tex,x+312,y+60,x+200,y+170,16,16);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+        glReadPixels(200*scale,170*scale,16*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+        check(!memcmp(reference,cropped,(size_t)16*16*scale*scale*4),
+            "gathered enhanced source survives separate destination application");
+        for(int row=0;row<16;++row)for(int col=0;col<16;++col)
+            s_vram[(size_t)(y+60+row)*1024+x+312+col]=native_before[row*16+col];
+        native_texture_upload_rect(x+312,y+60,16,16);
         /* A full native copy into a cropped destination only stages the
          * intersection. Both axes have a nonzero origin on the second page. */
         int old_scratch_w=s_scratch_w,old_scratch_h=s_scratch_h;

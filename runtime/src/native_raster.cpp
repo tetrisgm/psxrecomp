@@ -238,20 +238,38 @@ struct NativeRaster {
         if(!inputs_enabled || !inputs.valid || job.kind!=Kind::Packet) return;
         const auto* p=job.packet.data();
         const unsigned op=p[0]>>24;
-        if(!(op&4) || !((op>=0x20 && op<0x40) || (op>=0x60 && op<0x80))) return;
+        const bool copy=op>=0x80 && op<0xa0;
+        if(!copy && (!(op&4) || !((op>=0x20 && op<0x40) || (op>=0x60 && op<0x80)))) return;
         try {
-            unsigned page=job.state.page;
-            if(op<0x40) page=(page&~511u)|((p[(op&16)?5:4]>>16)&511);
-            const unsigned depth=(page>>7)&3,clut=p[2]>>16;
             std::array<bool,128> needed{};
-            const unsigned tx=page&15,ty=((page>>4)&1)*4;
-            for(unsigned y=0;y<4;++y)
-                for(unsigned x=0;x<(depth==0?1u:depth==1?2u:4u);++x)
-                    needed[(ty+y)*16+((tx+x)&15)]=true;
-            if(depth<2) {
-                const unsigned cx=(clut&63)*16,cy=(clut>>6)&511;
-                for(unsigned x=0;x<(depth==0?16u:256u);++x)
-                    needed[(cy/64)*16+(((cx+x)&1023)/64)]=true;
+            if(copy) {
+                // A presentation copy can cross unallocated enhanced regions.
+                // Retain its exact pre-copy native source as the seed beneath
+                // any resident enhanced tiles, including both wrap axes.
+                const unsigned sx=p[1]&1023,sy=(p[1]>>16)&511;
+                const unsigned w=((p[3]-1)&1023)+1,h=(((p[3]>>16)-1)&511)+1;
+                for(unsigned y=0;y<h;) {
+                    const unsigned py=(sy+y)&511;
+                    for(unsigned x=0;x<w;) {
+                        const unsigned px=(sx+x)&1023;
+                        needed[(py/64)*16+px/64]=true;
+                        x+=std::min(w-x,64-(px&63));
+                    }
+                    y+=std::min(h-y,64-(py&63));
+                }
+            } else {
+                unsigned page=job.state.page;
+                if(op<0x40) page=(page&~511u)|((p[(op&16)?5:4]>>16)&511);
+                const unsigned depth=(page>>7)&3,clut=p[2]>>16;
+                const unsigned tx=page&15,ty=((page>>4)&1)*4;
+                for(unsigned y=0;y<4;++y)
+                    for(unsigned x=0;x<(depth==0?1u:depth==1?2u:4u);++x)
+                        needed[(ty+y)*16+((tx+x)&15)]=true;
+                if(depth<2) {
+                    const unsigned cx=(clut&63)*16,cy=(clut>>6)&511;
+                    for(unsigned x=0;x<(depth==0?16u:256u);++x)
+                        needed[(cy/64)*16+(((cx+x)&1023)/64)]=true;
+                }
             }
             NativeRasterInputs::Sample sample{job.source,{}, {}};
             if(metadata_capture) {
