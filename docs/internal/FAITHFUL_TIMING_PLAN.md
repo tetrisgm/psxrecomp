@@ -2138,3 +2138,10 @@ passes replacement/ownership/epoch/overflow tests and exact native replay after
 dropped packets; native seed observation does not consume rewind dirty rows.
 This transport is not yet connected to GL; the old render ring still applies
 backpressure. R4 dev build and 32 tests pass. No phase-2 acceptance or merge.
+Phase-2 continuation: dedicated frame owner passes blocked-consumer publication
+(10000 packets), startup/shutdown-only context ownership, and idle timed-work
+tests. GL has a producer draw-state mirror with extra-pass restore, including
+async discard. Six hidden GL modes match pixels, dev build/32 R4 tests pass,
+and hidden boot-to-race smoke plus live/paused diagnostics pass with zero
+misses/context acquisitions. New owner remains unconnected to GL; incremental
+ring backpressure remains. No phase-2 acceptance, merge or performance claim.

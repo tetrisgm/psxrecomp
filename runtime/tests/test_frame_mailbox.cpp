@@ -1,5 +1,6 @@
 #include "frame_mailbox.h"
 #include "frame_packet.h"
+#include "frame_owner.h"
 #undef NDEBUG
 #include <cassert>
 #include <cstdint>
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <chrono>
 
 struct Packet { uint64_t sequence=0; std::array<uint64_t,1024> words{}; };
 static void write(Packet &p,uint64_t sequence) {
@@ -16,7 +18,65 @@ static void write(Packet &p,uint64_t sequence) {
 static void verify(const Packet &p) {
     for(size_t i=0;i<p.words.size();++i) assert(p.words[i]==(p.sequence^(i*UINT64_C(0x123456789))));
 }
+struct OwnerTest {
+    std::thread::id producer=std::this_thread::get_id();
+    std::atomic<bool> entered{false},unblock{false};
+    std::atomic<unsigned> acquire{0},release{0};
+    std::atomic<uint64_t> last{0};
+    std::atomic<unsigned> ticks{0};
+    FrameOwner *owner=nullptr;
+};
+static uint64_t owner_clock() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+static uint64_t tick(void *user,uint64_t now) {
+    auto &state=*static_cast<OwnerTest *>(user);
+    assert(frame_owner_is_thread());
+    return ++state.ticks==1?now+1000000:0;
+}
+static void context(void *user,int current) {
+    auto &state=*static_cast<OwnerTest *>(user);
+    if(current) ++state.acquire;else ++state.release;
+}
+static void execute(void *user,const FramePacketView *packet) {
+    auto &state=*static_cast<OwnerTest *>(user);
+    assert(std::this_thread::get_id()!=state.producer);
+    assert(frame_owner_is_thread());
+    if(packet->sequence==1) {
+        state.entered.store(true,std::memory_order_release);
+        while(!state.unblock.load(std::memory_order_acquire)) std::this_thread::yield();
+    }
+    assert(packet->initial_bytes==8);
+    assert(*static_cast<const uint64_t *>(packet->initial)==packet->sequence);
+    if(packet->sequence==10000) frame_owner_tick_at(state.owner,owner_clock()+1000000);
+    state.last.store(packet->sequence,std::memory_order_release);
+}
 int main() {
+    OwnerTest state;
+    const FrameOwnerConfig config{8,4096,execute,context,&state,tick,owner_clock};
+    FrameOwner *owner=frame_owner_start(&config);assert(owner);
+    state.owner=owner;
+    assert(!frame_owner_is_thread());
+    uint64_t number=1;
+    assert(frame_owner_begin(owner,number,&number,sizeof number));
+    assert(frame_owner_publish(owner));
+    while(!state.entered.load(std::memory_order_acquire)) std::this_thread::yield();
+    for(number=2;number<=10000;++number) {
+        assert(frame_owner_begin(owner,number,&number,sizeof number));
+        assert(frame_owner_publish(owner));
+    }
+    /* The graphics callback is deliberately stuck, but publication finishes
+     * and context ownership never returns to the producer during execution. */
+    assert(frame_owner_replaced(owner)==9998);
+    assert(state.acquire==1 && state.release==1);
+    state.unblock.store(true,std::memory_order_release);
+    while(frame_owner_completed(owner)<2) std::this_thread::yield();
+    assert(state.last.load(std::memory_order_acquire)==10000);
+    /* Timed presentation work continues while the guest publishes nothing. */
+    while(state.ticks.load(std::memory_order_acquire)<2) std::this_thread::yield();
+    frame_owner_stop(owner);
+    assert(state.acquire==2 && state.release==2);
     /* The C renderer's owned packet carries its seed independently of all
      * skipped packets. Neither caller buffers nor later appends may mutate
      * the consumer's current packet. Overflow rejects a whole packet. */

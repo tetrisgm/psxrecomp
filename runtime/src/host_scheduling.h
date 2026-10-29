@@ -1,5 +1,6 @@
 #ifndef PSX_HOST_SCHEDULING_H
 #define PSX_HOST_SCHEDULING_H
+enum class PsxHostThreadRole { Emulation, Audio, Render };
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -17,7 +18,8 @@ class PsxHostScheduling {
     Leave leave=nullptr;
     int old_priority=THREAD_PRIORITY_NORMAL;
 public:
-    explicit PsxHostScheduling(bool audio) {
+    explicit PsxHostScheduling(PsxHostThreadRole role) {
+        const bool audio=role==PsxHostThreadRole::Audio;
         static HMODULE module=LoadLibraryW(L"avrt.dll");
         if(module) {
             auto enter=reinterpret_cast<Enter>(GetProcAddress(module,"AvSetMmThreadCharacteristicsW"));
@@ -33,7 +35,8 @@ public:
         }
         using Name=HRESULT(WINAPI *)(HANDLE,PCWSTR);
         auto name=reinterpret_cast<Name>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"SetThreadDescription"));
-        if(name) name(GetCurrentThread(),audio?L"PSX audio":L"PSX emulation");
+        if(name) name(GetCurrentThread(),audio?L"PSX audio":
+            role==PsxHostThreadRole::Render?L"PSX render":L"PSX emulation");
     }
     ~PsxHostScheduling() {
         if(handle) leave(handle);
@@ -41,10 +44,10 @@ public:
             SetThreadPriority(GetCurrentThread(),old_priority);
     }
 };
-static inline void psx_host_schedule_thread(bool audio) {
-    static thread_local PsxHostScheduling scheduling(audio);
+static inline void psx_host_schedule_thread(PsxHostThreadRole role) {
+    static thread_local PsxHostScheduling scheduling(role);
 }
 #else
-static inline void psx_host_schedule_thread(bool) {}
+static inline void psx_host_schedule_thread(PsxHostThreadRole) {}
 #endif
 #endif

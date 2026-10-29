@@ -3034,7 +3034,7 @@ int g_audio_host_rate = 44100;
 }
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
-    psx_host_schedule_thread(true);
+    psx_host_schedule_thread(PsxHostThreadRole::Audio);
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
     int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
     s_drc.pull(reinterpret_cast<int16_t*>(stream), frames);
@@ -17998,7 +17998,7 @@ static void host_pause_service(void) {
 }
 
 int main(int argc, char** argv) {
-    psx_host_schedule_thread(false);
+    psx_host_schedule_thread(PsxHostThreadRole::Emulation);
     g_main_argc = argc;
     g_main_argv = argv;
     /* Force line-buffered output so messages appear even if killed. */

@@ -603,6 +603,8 @@ static void rth_rebind_vram(uint16_t *vram) {
     gpu_hd_textures_bind_vram(vram);
 }
 static int rth_group_flush(void);
+static void rth_frame_state_push(void);
+static void rth_frame_state_pop(void);
 static void rth_send_state(void);
 static int  rth_rec_ints(uint16_t op, uint16_t flags, int n, const int32_t *v);
 static uint16_t rth_prim_flags(void);
@@ -10229,10 +10231,12 @@ int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
         pgxp_rth_seam_stream_release(&s_async_seam_stream);
         rth_group_flush(); rt_batch_discard(); return 0;
     }
+    rth_frame_state_push();
     return 1;
 }
 int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
     if (!rt_batch_active()) return 0;
+    rth_frame_state_pop();
     s_async_seam_collecting = 0;
     if (!token || token->output.epoch!=s_async_recording.output.epoch ||
         token->output.generation!=s_async_recording.output.generation ||
@@ -13041,7 +13045,29 @@ static const GpuRenderBackend GL_BACKEND = {
  * thread holds the context (rth_mirror_resync). */
 static int s_rthm_wide_w = 0, s_rthm_wide_off = 0;
 static int s_rthm_base[WIDE_MAX_SURF];
-static int s_rthm_area[4] = { 0, 0, VRAM_W - 1, VRAM_H - 1 };
+/* Persistent draw environment on the producer. A frame seed must
+ * not sample the render owner's current state: it may be several frames
+ * behind. Precision overrides are per primitive and remain in its records. */
+typedef struct RthFrameState {
+    int semi[2],mask[2],window,mod[4],dither;
+    int area[4],offset[2],wide[2],view[4],target,target_on;
+    int stream[3];
+    GpuDisplayInfo display;
+} RthFrameState;
+static RthFrameState s_rth_frame_state={.area={0,0,VRAM_W-1,VRAM_H-1}};
+static RthFrameState s_rth_frame_saved;
+static int s_rth_frame_pass;
+static void rth_frame_state_push(void) {
+    if(s_rth_frame_pass) abort();
+    s_rth_frame_saved=s_rth_frame_state;s_rth_frame_pass=1;
+}
+static void rth_frame_state_pop(void) {
+    if(!s_rth_frame_pass) return;
+    s_rth_frame_state=s_rth_frame_saved;s_rth_frame_pass=0;
+    s_rthm_wide_w=s_rth_frame_state.wide[0];
+    s_rthm_wide_off=s_rth_frame_state.wide[1];
+    s_rthm_cur=s_rth_frame_state.target_on;
+}
 /* Last stream state sent (RTH_STATE); -1 forces the first send. */
 static int s_rthe_flat_bd = -1, s_rthe_vp_w = -1, s_rthe_bg_full = -1;
 static GpuDisplayInfo s_rthe_display;
@@ -13058,8 +13084,48 @@ static void rth_mirror_resync(void) {
     s_rthm_cur = g_wide_cur != 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         s_rthm_base[i] = s_wide_fbo[i] ? s_wide_base[i] : -1;
-    s_rthm_area[0] = s_area_x1; s_rthm_area[1] = s_area_y1;
-    s_rthm_area[2] = s_area_x2; s_rthm_area[3] = s_area_y2;
+    RthFrameState *st=&s_rth_frame_state;
+    st->area[0]=s_area_x1;st->area[1]=s_area_y1;
+    st->area[2]=s_area_x2;st->area[3]=s_area_y2;
+    st->offset[0]=s_off_x;st->offset[1]=s_off_y;
+    st->semi[0]=s_semi_en;st->semi[1]=s_semi_mode;
+    st->mask[0]=s_mask_set;st->mask[1]=s_mask_check;
+    st->window=s_tw_mask_x|(s_tw_mask_y<<5)|(s_tw_off_x<<10)|(s_tw_off_y<<15);
+    st->mod[0]=s_mod_r;st->mod[1]=s_mod_g;st->mod[2]=s_mod_b;st->mod[3]=s_mod_raw;
+    st->dither=s_dither_bit;
+    st->wide[0]=g_wide_w;st->wide[1]=g_wide_off;
+    st->view[0]=view_enabled;st->view[1]=view_shift;
+    st->view[2]=view_pad_left;st->view[3]=view_pad_right;
+    st->target=g_wide_cur_base;st->target_on=g_wide_cur!=0;
+    st->stream[0]=gpu_ws_nw_flat_backdrop_enabled()?1:0;
+    st->stream[1]=gpu_ws_netplay_local_viewport_width();
+    st->stream[2]=gpu_ws_background_requires_full_composite()?1:0;
+    gpu_get_display_info(&st->display);
+    s_rth_frame_pass=0;
+}
+
+static void rth_frame_state_record(uint16_t op,const int32_t *v) {
+    RthFrameState *st=&s_rth_frame_state;
+    switch(op) {
+    case RTH_SEMI: memcpy(st->semi,v,sizeof st->semi);break;
+    case RTH_MASK: memcpy(st->mask,v,sizeof st->mask);break;
+    case RTH_TWIN: st->window=v[0];break;
+    case RTH_MOD: memcpy(st->mod,v,sizeof st->mod);break;
+    case RTH_DITHER: st->dither=v[0];break;
+    case RTH_AREA: memcpy(st->area,v,sizeof st->area);break;
+    case RTH_OFFSET: memcpy(st->offset,v,sizeof st->offset);break;
+    case RTH_WIDE_CONFIGURE:
+        if(v[0]<=0 || st->wide[0]!=v[0]) st->target_on=0;
+        memcpy(st->wide,v,sizeof st->wide);break;
+    case RTH_WIDE_VIEW: memcpy(st->view,v,sizeof st->view);break;
+    case RTH_WIDE_TARGET: st->target=v[0];st->target_on=1;break;
+    case RTH_WIDE_DISABLE: st->target_on=0;break;
+    case RTH_STATE:
+        memcpy(st->stream,v,sizeof st->stream);
+        memcpy(&st->display,v+3,sizeof st->display);break;
+    case RTH_PASS_BEGIN: rth_frame_state_push();break;
+    case RTH_PASS_END: rth_frame_state_pop();break;
+    }
 }
 
 /* wide_fbo_for() as it will run on the render thread: the same lookup, limit
@@ -13111,6 +13177,7 @@ static int rth_group_flush(void) {
     return rth_rec_raw(RTH_GROUP,0,(int)n,s_rth_group);
 }
 static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
+    rth_frame_state_record(op,v);
     if (s_async_seam_collecting) {
         if (op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI || op==RTH_TEX_TRI ||
             op==RTH_SHADED_TEX_TRI)
@@ -16278,7 +16345,6 @@ static void rtb_vram_transfer_out(int x, int y, int w, int h, uint16_t *d) {
     GL_RT_SYNC("vram_transfer_out"); glb_vram_transfer_out(x, y, w, h, d); }
 static void rtb_set_draw_area(int x1, int y1, int x2, int y2) {
     if (rth_record_mode()) {
-        s_rthm_area[0] = x1; s_rthm_area[1] = y1; s_rthm_area[2] = x2; s_rthm_area[3] = y2;
         RTH_REC(RTH_AREA, 0, x1, y1, x2, y2);
         return;
     }
@@ -16286,7 +16352,8 @@ static void rtb_set_draw_area(int x1, int y1, int x2, int y2) {
 }
 static void rtb_get_draw_area(int *x1, int *y1, int *x2, int *y2) {
     if (s_rth_on && !rt_on_render_thread() && !rt_held()) {
-        *x1 = s_rthm_area[0]; *y1 = s_rthm_area[1]; *x2 = s_rthm_area[2]; *y2 = s_rthm_area[3];
+        *x1=s_rth_frame_state.area[0];*y1=s_rth_frame_state.area[1];
+        *x2=s_rth_frame_state.area[2];*y2=s_rth_frame_state.area[3];
         return;
     }
     glb_get_draw_area(x1, y1, x2, y2);

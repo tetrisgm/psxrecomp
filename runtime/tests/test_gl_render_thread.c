@@ -193,6 +193,9 @@ static void cpu_upload(int x, int y, int w, int h, const uint16_t *src) {
 static void mask_bits(int set, int chk) {
     s_set_mask = set; s_check_mask = chk;
     gr_set_mask_bits(set, chk);
+    if(s_rth_on && !rt_held())
+        check(s_rth_frame_state.mask[0]==set && s_rth_frame_state.mask[1]==chk,
+              "packet seed follows producer mask state");
 }
 
 #define FRAME_W 320
@@ -210,6 +213,10 @@ static void frame(int f, int buf_x) {
     gr_set_draw_area(buf_x, 0, buf_x + FRAME_W - 1, FRAME_H - 1);
     gr_set_draw_offset(buf_x, 0);
     gr_wide_set_target(buf_x);
+    if(s_rth_on && !rt_held())
+        check(s_rth_frame_state.area[0]==buf_x && s_rth_frame_state.offset[0]==buf_x &&
+              s_rth_frame_state.target==buf_x && s_rth_frame_state.target_on,
+              "packet seed follows producer surface state");
     gr_fill_rect(buf_x, 0, FRAME_W, FRAME_H, (uint16_t)(0x0842 * (f & 7)));
     gr_wide_clear(buf_x, 0, FRAME_H, (uint16_t)(0x0842 * (f & 7)));
     gr_set_color_modulation(128, 128, 128, 0);
@@ -344,6 +351,18 @@ int main(int argc, char **argv) {
     if (threaded) {
         check(gl_renderer_render_thread_start(2) == 1, "render thread started");
         check(gl_renderer_render_thread_active(), "render thread active");
+        {
+            RthFrameState before=s_rth_frame_state;
+            const int32_t offset[2]={1234,-55},mask[2]={1,1};
+            rth_frame_state_push();
+            rth_frame_state_record(RTH_OFFSET,offset);
+            rth_frame_state_record(RTH_MASK,mask);
+            check(s_rth_frame_state.offset[0]==1234,"private pass has its own producer state");
+            rth_frame_state_pop();
+            check(s_rth_frame_state.offset[0]==before.offset[0] &&
+                  s_rth_frame_state.mask[0]==before.mask[0] && !s_rth_frame_pass,
+                  "private pass cannot contaminate the next real frame seed");
+        }
         RtStats before,after;
         rt_get_stats(&before);
         gl_renderer_set_display_aspect(16,9);
