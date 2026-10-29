@@ -163,3 +163,16 @@ zero dispatch/segment misses, and display-history enable/disable. The original
 smoke script ignored failed screenshot responses; tools/smoke.py now saves each
 response and fails on capture errors. No phase is marked accepted by these
 correctness checks alone; the next completed-phase grid gate is pending.
+
+### G1 accepted (Part 2 gate)
+
+Commit 9c1d1019 completed the fresh-grid supervisor gate: **60.04 VBlanks/s,
+zero starved samples, zero packet_allocation_events**, max interval 37.319 ms.
+Cadence reports 1801 intervals / 29988.879 ms and 21437.5 ms guest CPU,
+11.903 ms/VBlank on average. Receipt: analysis/guest-execution-G1-complete.json
+and .txt. The disabled hooks, vector growth/clear and allocator are absent from
+the leading profile. Native submission is 1.4%; remaining PGXP/timing work is
+assigned to G2-G4. The final <8 ms average / <12 ms heavy / <20 ms interval budget
+has NOT passed. Under the owner's Part 2 gate definition, G1 is accepted for
+integration. Its ancestry is the owner-selected 7a46df9e interpolation worktree
+baseline, including that baseline's pre-existing commits beyond fork r4/main.

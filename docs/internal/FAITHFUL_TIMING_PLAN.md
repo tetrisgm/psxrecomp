@@ -2274,3 +2274,5 @@ Native fixture suite and producer allocation check pass. Runtime acceptance is
 still pending; see [GUEST_HOTPATH.md](GUEST_HOTPATH.md) for measurements and gates.
 
 2026-10-29 guest execution G1 continuation: preallocated frame arenas, pooled metadata/input envelopes, batched DMA publication, opt-in display history and lock-safe caller sampling. Native/GL/allocation/CPU-hold tests and verified hidden smoke pass. First completed-phase grid gate failed 58.46/30184 with 35 packet allocations; corrected-phase gate pending. G2-G4 not started or merged. See GUEST_HOTPATH.md.
+
+2026-10-29 G1 accepted under Frame Architecture Part 2: supervisor fresh grid 60.04 VBlanks/s, 0 starved, 0 packet allocations; native/GL fixtures, CTest and verified 40-step hidden smoke pass. Mean guest CPU 11.903 ms, max interval 37.319 ms: final budget remains G4 gate. Integrating fix/guest-hotpath, then fix/static-block-timing (G2).
