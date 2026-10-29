@@ -419,6 +419,7 @@ void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
 static uint64_t fixture_native_source;
 void gr_set_native_source(uint64_t source) { fixture_native_source=source; }
 uint64_t gr_native_source(void) { return fixture_native_source; }
+void gr_bind_native_raster(struct NativeRaster *raster,void (*flush_upload)(void)) { (void)raster;(void)flush_upload; }
 void gr_set_draw_area(int x1, int y1, int x2, int y2) {
     (void)x1; (void)y1; (void)x2; (void)y2;
 }

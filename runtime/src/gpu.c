@@ -4150,6 +4150,7 @@ void gpu_init(void) {
         if(!s_native_raster) psx_fatal_halt("Cannot create native GPU worker");
         atexit(native_shutdown);
     }
+    gr_bind_native_raster(s_native_raster,native_flush_upload);
     gpu_display_info_changed();
     gpu_reset_state(1);
     video_mode = s_power_on_video_mode;
@@ -4157,7 +4158,6 @@ void gpu_init(void) {
     gpu_display_info_changed();
 }
 NativeRaster* gpu_native_owner(void) { return s_native_raster; }
-void gpu_native_flush_upload(void) { native_flush_upload(); }
 
 void gpu_set_power_on_video_mode(int pal) {
     gpu_display_info_changed();

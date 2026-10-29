@@ -497,7 +497,10 @@ static int       s_rthx_prim = 0;         /* current record carries prim tags  *
 static int       s_rthx_tagged = 0, s_rthx_backdrop = 0;
 static int       s_rths_flat_bd = 0, s_rths_vp_w = 0, s_rths_bg_full = 0;
 static GpuDisplayInfo s_rths_display;
-static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread(); }
+static _Thread_local int s_rth_packet_replaying;
+static inline int rth_replaying(void) {
+    return s_rth_packet_replaying || (s_rth_on && rt_on_render_thread());
+}
 /* Frame generation (defined with the render-thread code near the end). */
 static _Atomic int s_fg_on;
 static int       s_fg_drawing, s_fg_presenting, s_fg_broken, s_fg_capture_real;
@@ -13149,6 +13152,31 @@ static void rth_frame_state_record(uint16_t op,const int32_t *v) {
     case RTH_PASS_BEGIN: rth_frame_state_push();break;
     case RTH_PASS_END: rth_frame_state_pop();break;
     }
+}
+
+/* A complete packet starts from its producer's draw environment, not the
+ * last packet the renderer happened to consume. Precision/depth overrides
+ * belong to individual primitive records and cannot leak across packets. */
+static void rth_frame_state_apply(const RthFrameState *st) {
+    flush_flat_batch();flush_tex_batch();
+    s_rths_flat_bd=st->stream[0];s_rths_vp_w=st->stream[1];s_rths_bg_full=st->stream[2];
+    s_rths_display=st->display;
+    s_rths_native_source=0;
+    glb_set_precise_triangle(0,0,0,0,0,0,0);
+    glb_set_perspective_triangle(0,0,0,0);
+    glb_set_depth_triangle(0,0,0,0);
+    glb_set_draw_area(st->area[0],st->area[1],st->area[2],st->area[3]);
+    glb_set_draw_offset(st->offset[0],st->offset[1]);
+    glb_set_semi_transparency(st->semi[0],st->semi[1]);
+    glb_set_mask_bits(st->mask[0],st->mask[1]);
+    glb_set_texture_window((uint32_t)st->window);
+    glb_set_color_modulation(st->mod[0],st->mod[1],st->mod[2],st->mod[3]);
+    glb_set_dither(st->dither);
+    glb_wide_configure(st->wide[0],st->wide[1]);
+    glb_wide_set_view(st->view[0],st->view[1],st->view[2],st->view[3]);
+    if(st->target_on) glb_wide_set_target(st->target);
+    else glb_wide_disable_target();
+    s_selected_bank_failed=!select_texture_bank_now(&st->bank);
 }
 
 /* wide_fbo_for() as it will run on the render thread: the same lookup, limit

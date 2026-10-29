@@ -50,6 +50,9 @@ def parse(stdout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cc", default="cc")
+    ap.add_argument("--cxx", default="c++")
+    ap.add_argument("--packet-owner", action="store_true",
+                    help="link the native raster and complete-packet owner for the packet fixture")
     ap.add_argument("--sdl-include", required=True)
     ap.add_argument("--sdl-library", required=True)
     ap.add_argument("--output", required=True)
@@ -109,7 +112,16 @@ def main():
             return 2
         objs.append(o)
     probe = dest / ("probe.exe" if WINDOWS else "probe")
-    link = [args.cc, *objs, args.sdl_library, "-o", probe]
+    if args.packet_owner:
+        for name in ("native_raster", "frame_packet", "frame_owner"):
+            o = dest / (name + ".o")
+            r = run([args.cxx, "-std=c++17", "-O1", *sections, *includes,
+                     "-c", src / (name + ".cpp"), "-o", o])
+            if r.returncode:
+                print(r.stderr[-3000:])
+                return 2
+            objs.append(o)
+    link = [args.cxx if args.packet_owner else args.cc, *objs, args.sdl_library, "-o", probe]
     if platform.system() == "Darwin":
         for f in MAC_FRAMEWORKS:
             link += ["-framework", f]

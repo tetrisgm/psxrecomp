@@ -446,6 +446,7 @@ void gr_wide_feedback_rect(int sb, int sx, int sy, int dx, int dy, int w, int h,
 void gr_set_draw_area(int l, int t, int r, int b) { (void)l; (void)t; (void)r; (void)b; }
 void gr_set_native_source(uint64_t source) { (void)source; }
 uint64_t gr_native_source(void) { return 0; }
+void gr_bind_native_raster(struct NativeRaster *raster,void (*flush_upload)(void)) { (void)raster;(void)flush_upload; }
 void gr_set_draw_offset(int x, int y) { (void)x; (void)y; }
 void gr_set_mask_bits(int set, int check) { (void)set; (void)check; }
 void gr_set_texture_window(uint32_t value) { (void)value; }

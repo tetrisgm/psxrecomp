@@ -273,6 +273,13 @@ void gr_set_draw_area(int x1, int y1, int x2, int y2){ g_b->set_draw_area(x1, y1
 static uint64_t g_native_source;
 void gr_set_native_source(uint64_t source) { g_native_source=source; }
 uint64_t gr_native_source(void) { return g_native_source; }
+static struct NativeRaster *g_native_raster;
+static void (*g_native_flush_upload)(void);
+void gr_bind_native_raster(struct NativeRaster *raster,void (*flush_upload)(void)) {
+    g_native_raster=raster;g_native_flush_upload=flush_upload;
+}
+struct NativeRaster *gr_native_raster(void) { return g_native_raster; }
+void gr_flush_native_upload(void) { if(g_native_flush_upload) g_native_flush_upload(); }
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2) { g_b->get_draw_area(x1, y1, x2, y2); }
 void gr_set_draw_offset(int x, int y)                { g_b->set_draw_offset(x, y); g_hd_offset_x=x; g_hd_offset_y=y; }
 

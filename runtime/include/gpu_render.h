@@ -131,6 +131,12 @@ void gr_set_draw_area(int x1, int y1, int x2, int y2);
  * host-only work. Presentation captures it, never reads it from its worker. */
 void gr_set_native_source(uint64_t source);
 uint64_t gr_native_source(void);
+struct NativeRaster;
+/* Bind the guest's CPU-only authority before starting presentation. The
+ * flush callback submits a partially received upload before frame capture. */
+void gr_bind_native_raster(struct NativeRaster *raster,void (*flush_upload)(void));
+struct NativeRaster *gr_native_raster(void);
+void gr_flush_native_upload(void);
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2);
 void gr_set_draw_offset(int x, int y);
 

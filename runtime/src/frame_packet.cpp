@@ -91,6 +91,33 @@ extern "C" int frame_packet_publish(FramePacketQueue *q) {
     q->mailbox.publish();q->valid=false;
     return 1;
 }
+extern "C" int frame_packet_append_records(FramePacketQueue *q,const void *records,size_t bytes) {
+    if(!q || !q->open || !q->valid || (bytes && !records)) return 0;
+    auto& p=q->mailbox.writing();
+    if(bytes>q->record_limit-p.record_bytes || bytes%RT_ALIGN) return 0;
+    const auto* source=static_cast<const unsigned char*>(records);
+    for(size_t at=0;at<bytes;) {
+        if(bytes-at<sizeof(RtCmd)) return 0;
+        RtCmd command;std::memcpy(&command,source+at,sizeof command);
+        if(command.size<sizeof command || command.size%RT_ALIGN || command.size>bytes-at ||
+           command.payload>command.size-sizeof command || !command.op || command.op==UINT16_MAX) return 0;
+        at+=command.size;
+    }
+    const size_t offset=p.record_bytes/RT_ALIGN,needed=offset+bytes/RT_ALIGN;
+    try { if(p.records.size()<needed) p.records.resize(needed); } catch(...) { return 0; }
+    if(bytes) std::memcpy(p.records.data()+offset,source,bytes);
+    for(size_t at=offset;at<needed;) {
+        auto* command=reinterpret_cast<RtCmd*>(p.records.data()+at);
+        command->seq=q->command_sequence++;at+=command->size/RT_ALIGN;
+    }
+    p.record_bytes+=bytes;
+    return 1;
+}
+extern "C" void frame_packet_cancel(FramePacketQueue *q) {
+    if(!q || !q->open) return;
+    q->valid=false;q->open=false;
+    q->mailbox.writing().clear_attachment();
+}
 extern "C" int frame_packet_acquire(FramePacketQueue *q,FramePacketView *view) {
     if(!q || !view) return 0;
     const auto *p=q->mailbox.acquire();

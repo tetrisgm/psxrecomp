@@ -42,6 +42,13 @@ int frame_packet_attach(FramePacketQueue *queue,void *attachment,size_t bytes,
                         void (*dispose)(void*));
 void *frame_packet_append(FramePacketQueue *queue,uint16_t op,uint16_t flags,
                           uint32_t bytes);
+/* Append an optional private batch atomically. Invalid/over-budget batches
+ * return zero without invalidating the main frame or appending a prefix.
+ * Records use RtCmd headers/alignment and own all payload bytes afterward. */
+int frame_packet_append_records(FramePacketQueue *queue,const void *records,size_t bytes);
+/* Discard only the open producer frame, preserving the last complete pending
+ * frame and its epoch. Used for a failed native-input capture. */
+void frame_packet_cancel(FramePacketQueue *queue);
 int frame_packet_publish(FramePacketQueue *queue);
 int frame_packet_acquire(FramePacketQueue *queue,FramePacketView *view);
 void frame_packet_release(FramePacketQueue *queue);

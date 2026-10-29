@@ -26,6 +26,8 @@ struct OwnerTest {
     std::atomic<unsigned> ticks{0};
     std::atomic<unsigned> requests{0},stale_requests{0};
     std::atomic<unsigned> controls{0};
+    std::atomic<unsigned> resets{0};
+    bool arm_old_tick=false;
     FrameOwner *owner=nullptr;
 };
 static uint64_t owner_clock() {
@@ -48,11 +50,17 @@ static void execute(void *user,const FramePacketView *packet) {
     if(packet->sequence==1) {
         state.entered.store(true,std::memory_order_release);
         while(!state.unblock.load(std::memory_order_acquire)) std::this_thread::yield();
+        if(state.arm_old_tick) frame_owner_tick_at(state.owner,1);
     }
     assert(packet->initial_bytes==8);
     assert(*static_cast<const uint64_t *>(packet->initial)==packet->sequence);
     if(packet->sequence==10000) frame_owner_tick_at(state.owner,owner_clock()+1000000);
     state.last.store(packet->sequence,std::memory_order_release);
+}
+static void reset_timeline(void *user,uint64_t epoch) {
+    auto &state=*static_cast<OwnerTest *>(user);
+    assert(frame_owner_is_thread() && epoch==2);
+    state.resets.fetch_add(1,std::memory_order_release);
 }
 static void request_done(void *user,const void *payload,size_t bytes,int stale) {
     auto &state=*static_cast<OwnerTest *>(user);
@@ -100,9 +108,39 @@ static void test_attachments() {
     frame_packet_destroy(queue);
     assert(destroyed==100);
 }
+static void test_optional_batches() {
+    auto* queue=frame_packet_create(0,96);assert(queue);
+    assert(frame_packet_begin(queue,1,nullptr,0));
+    auto* first=static_cast<uint64_t*>(frame_packet_append(queue,1,0,8));
+    assert(first);*first=11;
+    alignas(RT_ALIGN) unsigned char batch[64]{};
+    auto* a=reinterpret_cast<RtCmd*>(batch);
+    auto* b=reinterpret_cast<RtCmd*>(batch+32);
+    *a={32,2,0,8,100};*b={0,3,0,8,101};
+    *reinterpret_cast<uint64_t*>(a+1)=22;
+    *reinterpret_cast<uint64_t*>(b+1)=33;
+    assert(!frame_packet_append_records(queue,batch,sizeof batch)); // malformed suffix rejects prefix too
+    b->size=32;
+    assert(frame_packet_append_records(queue,batch,sizeof batch));
+    assert(!frame_packet_append_records(queue,batch,32)); // optional overflow preserves main frame
+    std::memset(batch,0,sizeof batch);
+    assert(frame_packet_publish(queue));
+    assert(frame_packet_begin(queue,2,nullptr,0));
+    assert(frame_packet_append(queue,4,0,8));
+    frame_packet_cancel(queue);
+    assert(!frame_packet_publish(queue));
+    FramePacketView packet{};
+    assert(frame_packet_acquire(queue,&packet) && packet.sequence==1 && packet.record_bytes==96);
+    for(unsigned n=0;n<3;++n) {
+        const auto* record=reinterpret_cast<const RtCmd*>(static_cast<const unsigned char*>(packet.records)+n*32);
+        assert(record->op==n+1 && record->seq==n && *reinterpret_cast<const uint64_t*>(record+1)==11*(n+1));
+    }
+    frame_packet_release(queue);frame_packet_destroy(queue);
+}
 
 int main() {
     test_attachments();
+    test_optional_batches();
     OwnerTest state;
     const FrameOwnerConfig config{8,4096,execute,context,&state,tick,owner_clock};
     FrameOwner *owner=frame_owner_start(&config);assert(owner);
@@ -140,7 +178,8 @@ int main() {
     assert(state.acquire==2 && state.release==2);
     {
         OwnerTest reset;
-        const FrameOwnerConfig reset_config{8,4096,execute,context,&reset,nullptr,nullptr};
+        reset.arm_old_tick=true;
+        const FrameOwnerConfig reset_config{8,4096,execute,context,&reset,tick,owner_clock,reset_timeline};
         reset.owner=frame_owner_start(&reset_config);assert(reset.owner);
         uint64_t seq=1;
         assert(frame_owner_begin(reset.owner,seq,&seq,sizeof seq));
@@ -158,7 +197,7 @@ int main() {
         seq=0;
         assert(frame_owner_request(reset.owner,seq,request_done,&reset,&seq,sizeof seq));
         while(reset.requests.load(std::memory_order_acquire)<2) std::this_thread::yield();
-        assert(reset.stale_requests==1);
+        assert(reset.stale_requests==1 && reset.resets==1 && reset.ticks==0);
         frame_owner_stop(reset.owner);
     }
     /* The C renderer's owned packet carries its seed independently of all

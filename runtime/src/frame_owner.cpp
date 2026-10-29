@@ -37,6 +37,16 @@ struct FrameOwner {
     uint64_t executed_sequence=0; // consumer only, reset for each epoch
     uint64_t executed_epoch=1;
     uint64_t deadline=0; // consumer only
+    uint64_t observed_epoch=1;
+    void observe_epoch() {
+        const uint64_t timeline=epoch.load(std::memory_order_acquire);
+        if(timeline==observed_epoch) return;
+        observed_epoch=timeline;
+        deadline=0;
+        executed_sequence=0;
+        executed_epoch=timeline;
+        if(config.reset) config.reset(config.user,timeline);
+    }
     ~FrameOwner() { frame_packet_destroy(queue); }
     void wake() {
         { std::lock_guard<std::mutex> lock(mutex); ++published; }
@@ -60,6 +70,7 @@ struct FrameOwner {
                 }
                 seen=published;stopping=stop;
             }
+            observe_epoch();
             if(!stopping && deadline) {
                 const uint64_t now=config.clock_ns();
                 if(now>=deadline) {
@@ -71,6 +82,7 @@ struct FrameOwner {
             FramePacketView packet{};
             const bool has_packet=frame_packet_acquire(queue,&packet)!=0;
             for(unsigned n=0;n<64;++n) {
+                observe_epoch();
                 Request request;
                 bool stale;
                 {
@@ -99,6 +111,7 @@ struct FrameOwner {
             }
             // Bounded drain prevents a flood of diagnostics starving frames.
             for(unsigned n=0;n<64;++n) {
+                observe_epoch();
                 Request request;
                 bool stale;
                 {
@@ -158,6 +171,10 @@ extern "C" int frame_owner_publish(FrameOwner *owner) {
     if(result) owner->wake();
     return result;
 }
+extern "C" int frame_owner_append_records(FrameOwner *owner,const void *records,size_t bytes) {
+    return frame_packet_append_records(owner->queue,records,bytes);
+}
+extern "C" void frame_owner_cancel(FrameOwner *owner) { frame_packet_cancel(owner->queue); }
 extern "C" void frame_owner_invalidate(FrameOwner *owner) {
     frame_packet_invalidate(owner->queue);
     owner->epoch.fetch_add(1,std::memory_order_release);

@@ -17,6 +17,10 @@ typedef struct FrameOwnerConfig {
     void *user;
     RtTickFn tick;                 /* optional render-side timed work */
     uint64_t (*clock_ns)(void);    /* same monotonic domain as tick deadlines */
+    /* Owner-side timeline reset, before any subsequent tick/frame/control.
+     * Discard retained interpolation images here. Producer invalidation does
+     * not wait for this callback or acquire the graphics context. */
+    void (*reset)(void *user,uint64_t epoch);
 } FrameOwnerConfig;
 FrameOwner *frame_owner_start(const FrameOwnerConfig *config);
 void frame_owner_stop(FrameOwner *owner);
@@ -25,6 +29,8 @@ int frame_owner_begin(FrameOwner *owner,uint64_t sequence,const void *initial,si
 int frame_owner_reserve_initial(FrameOwner *owner,uint64_t sequence,size_t bytes,void **initial);
 int frame_owner_attach(FrameOwner *owner,void *attachment,size_t bytes,void (*dispose)(void*));
 void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags,uint32_t bytes);
+int frame_owner_append_records(FrameOwner *owner,const void *records,size_t bytes);
+void frame_owner_cancel(FrameOwner *owner);
 int frame_owner_publish(FrameOwner *owner);
 void frame_owner_invalidate(FrameOwner *owner);
 /* Durable asynchronous controls/diagnostics, separate from droppable frames.

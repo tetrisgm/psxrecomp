@@ -18,9 +18,6 @@ extern "C" {
 void     gpu_init(void);
 struct NativeRaster;
 struct NativeRaster* gpu_native_owner(void);
-/* Flush received A0 halfwords before a presentation seed/native input seal.
- * Never waits for GL and does not consume rewind dirty tracking. */
-void gpu_native_flush_upload(void);
 uint32_t gpu_read_gpustat(void);   /* 0x1F801814 read */
 uint32_t gpu_peek_gpustat(void);   /* same value, no read side effects */
 uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
