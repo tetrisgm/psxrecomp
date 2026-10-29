@@ -5090,6 +5090,7 @@ static void runtime_perf_diag_tick() {
     static RuntimePerfSnapshot last;
     static uint64_t last_spu = 0, last_underruns = 0, last_overflows = 0;
     static uint64_t last_up[6] = {0};
+    static uint64_t last_gpu[5] = {0};
     static uint64_t last_overlay_load_us = 0;
     if (!g_runtime_perf.enabled) return;
 
@@ -5107,6 +5108,8 @@ static void runtime_perf_diag_tick() {
     psx_audio_out_stats(&fill_ms, &target_ms, &underruns, &overflows, &correction,
                         &legacy, &host_rate);
     (void)target_ms;
+    uint64_t gpu[5] = {0};
+    gl_renderer_packet_gpu_stats(gpu);
     uint64_t up[6] = {0};
     gl_renderer_runtime_diag(up);
     uint64_t overlay_load_us = 0, overlay_load_max_us = 0, overlay_load_last_us = 0;
@@ -5119,6 +5122,7 @@ static void runtime_perf_diag_tick() {
         last_overflows = overflows;
         last_overlay_load_us = overlay_load_us;
         for (int i = 0; i < 6; i++) last_up[i] = up[i];
+        std::memcpy(last_gpu,gpu,sizeof gpu);
         have_last = true;
         return;
     }
@@ -5172,6 +5176,16 @@ static void runtime_perf_diag_tick() {
         current.capture_triggers - last.capture_triggers,
         current.capture_overlays - last.capture_overlays,
         (unsigned long long)current.capture_last_dispatch_delta);
+    if (gpu[0] > last_gpu[0] && gpu[1] >= last_gpu[1] && gpu[2] >= last_gpu[2]) {
+        const double samples = (double)(gpu[0]-last_gpu[0]);
+        std::fprintf(stdout,
+            "psxrecomp: GPU packets: samples=%.0f elapsed=%.3f present=%.3f ms/packet "
+            "lifetime_max=%.3f ms telemetry_dropped=%llu\n", samples,
+            (double)(gpu[1]-last_gpu[1])/samples/1e6,
+            (double)(gpu[2]-last_gpu[2])/samples/1e6,(double)gpu[3]/1e6,
+            (unsigned long long)gpu[4]);
+    }
+    std::memcpy(last_gpu,gpu,sizeof gpu);
     PSXOpenXRStats xr{};
     psx_openxr_stats(&xr);
     if (xr.enabled) {

@@ -126,10 +126,10 @@ static int run_scale(int scale) {
         p_glUniform1f(s_geo_uZbias,0);p_glUniform1f(s_geo_uDepthProbe,0);
         glDisable(GL_STENCIL_TEST);glEnable(GL_DEPTH_TEST);glDepthMask(GL_TRUE);
         glDepthFunc(GL_ALWAYS);glClearDepth(1);glClear(GL_DEPTH_BUFFER_BIT);
-        p_glBufferData(PSXGL_ARRAY_BUFFER,sizeof v,v,PSXGL_STREAM_DRAW);
+        vertex_stream_upload(0,v,sizeof v);
         glDrawArrays(GL_TRIANGLES,0,3);
         for(int i=0;i<3;i++) v[i*6+5]+=close_depth?2.0f:200.0f;
-        p_glBufferData(PSXGL_ARRAY_BUFFER,sizeof v,v,PSXGL_STREAM_DRAW);
+        vertex_stream_upload(0,v,sizeof v);
         s_ra_near=s_ra_failed=0;s_ra_depth_probe=1;
         depth_restore_ex(1,0,3);s_ra_depth_probe=0;
         check(s_ra_failed>0,"depth probe finds hidden fragments");
@@ -138,6 +138,22 @@ static int run_scale(int scale) {
           (unsigned long long)s_ra_failed,(unsigned long long)s_ra_near);
         hr_end();p_glBindVertexArray(0);
     }
+    /* Depth clears must retain neighbouring draw domains, colour and mask.
+     * Read depth only on this fixture's GL owner. */
+    flush_flat_batch();flush_tex_batch();hiw_flush_queue();
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,s_hr_fbo);
+    glDisable(GL_SCISSOR_TEST);glDepthMask(GL_TRUE);
+    glClearDepth(.25);glClear(GL_DEPTH_BUFFER_BIT);
+    gr_set_draw_area(20,30,39,49);
+    depth_clear_now();
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_hr_fbo);
+    float depths[3]={0};
+    glReadPixels(19*scale,35*scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&depths[0]);
+    glReadPixels(25*scale,35*scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&depths[1]);
+    glReadPixels(40*scale,35*scale,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&depths[2]);
+    check(fabsf(depths[0]-.25f)<.00001f && depths[1]==1.f &&
+          fabsf(depths[2]-.25f)<.00001f,"scissored depth clear preserves neighbouring domains");
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
     check(glGetError()==GL_NO_ERROR,"GL audit has no errors");
     free(a);free(b);gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();
     return failures?1:0;

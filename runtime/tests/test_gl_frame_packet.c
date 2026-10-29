@@ -30,6 +30,7 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
         atomic_store(&packet_entered,1);
         while(!atomic_load(&packet_unblock)) SDL_Delay(1);
     }
+    packet_timer_begin();
     if(packet->initial_bytes!=sizeof(PacketSeed)) abort();
     s_rth_packet_replaying=1;
     const PacketSeed *seed=packet->initial;
@@ -60,6 +61,7 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
         at+=command->size;
     }
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();pack_flush();
+    packet_timer_end();
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_raw_fbo);
     for(unsigned draw=0;draw<2;++draw) {
         uint16_t pixels[16];
@@ -76,6 +78,11 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
     s_rth_packet_replaying=0;
 }
 int main(void) {
+#ifdef _WIN32
+    _putenv_s("PSX_GL_ASYNC_GPU_TIMER","1");
+#else
+    setenv("PSX_GL_ASYNC_GPU_TIMER","1",1);
+#endif
     if(SDL_Init(SDL_INIT_VIDEO)!=0) return 77;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,3);
@@ -152,6 +159,12 @@ int main(void) {
     frame_owner_stop(packet_owner);
     check(atomic_load(&packet_acquires)==2 && atomic_load(&packet_releases)==2,
           "context transfers only at lifecycle boundaries");
+    glFinish(); /* Test-only completion before inspecting asynchronous telemetry. */
+    packet_timer_resolve();
+    uint64_t timing[5];gl_renderer_packet_gpu_stats(timing);
+    check(timing[0]==2,"only consumed packets timed");
+    check(timing[1]>0 && timing[3]>0 && timing[3]<=timing[1],"packet timestamp totals");
+    check(timing[2]<=timing[1] && timing[4]==0,"bounded nonblocking packet telemetry");
     printf("checks=%d failures=%d\n",checks,failures);
     gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();
     return failures?1:0;
