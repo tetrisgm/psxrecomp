@@ -2,6 +2,14 @@
 #include "../src/psx_rewind.c"
 #include <assert.h>
 #include <stdio.h>
+struct RewindWorker {void (*run)(void*);void *context;};
+RewindWorker *rewind_worker_create(void (*fn)(void*),void *ctx) {
+    RewindWorker *w=malloc(sizeof(*w));assert(w);w->run=fn;w->context=ctx;return w;
+}
+int rewind_worker_submit(RewindWorker *w){w->run(w->context);return 1;}
+int rewind_worker_ready(RewindWorker *w){return w!=NULL;}
+void rewind_worker_wait(RewindWorker *w){(void)w;}
+void rewind_worker_destroy(RewindWorker *w){free(w);}
 static uint64_t clock_ns;
 static int muted, presented, resumed, netplay, safe=1;
 static uint8_t ram_image[8193];
@@ -24,6 +32,8 @@ void psx_frontend_rewind_audio(int pause) { muted=pause; }
 void psx_frontend_rewind_service(int present) {
     assert(muted);
     if(present) {
+        const uint32_t *pixels=(const uint32_t*)1;int w=1,h=1;
+        assert(!psx_rewind_overlay_image(&pixels,&w,&h) && !pixels && !w && !h);
         presented++;
         assert(ram_image[8192]==(uint8_t)(5-presented));
         if(presented==3) psx_rewind_set_held(0);
@@ -39,6 +49,7 @@ int boot_state_save_buffer_reuse(const CPUState *cpu,uint32_t b,uint32_t e,
     return 1;
 }
 struct BootStatePending { uint8_t data[sizeof(CPUState)+8193];int polls; };
+void boot_state_native_capture_profile(double out[6]) { memset(out,0,6*sizeof(double)); }
 BootStatePending *boot_state_pending_create(void) { return calloc(1,sizeof(BootStatePending)); }
 void boot_state_pending_destroy(BootStatePending *p) { free(p); }
 int boot_state_begin_native(const CPUState *cpu,uint32_t b,uint32_t e,BootStateSink sink,void *context,BootStatePending *p) {
@@ -63,7 +74,7 @@ int main(void) {
     for(unsigned i=1;i<=5;i++) {
         cpu.gpr[1]=i; ram_image[8192]=(uint8_t)i;
         psx_rewind_note_frame(); psx_rewind_poll(&cpu,cpu.pc);
-        psx_rewind_poll(&cpu,cpu.pc); psx_rewind_poll(&cpu,cpu.pc);
+        while(capturing)psx_rewind_poll(&cpu,cpu.pc);
     }
     assert(stats.captures==5);
     psx_rewind_set_held(1); safe=0; psx_rewind_poll(&cpu,cpu.pc);
@@ -73,14 +84,14 @@ int main(void) {
     assert(cpu.gpr[1]==2 && stats.verified==3 && stats.verify_failures==0);
     assert(history.tick==2 && history.count==1);
     cpu.gpr[1]=99; psx_rewind_note_frame(); psx_rewind_poll(&cpu,cpu.pc);
-        psx_rewind_poll(&cpu,cpu.pc); psx_rewind_poll(&cpu,cpu.pc);
+        while(capturing)psx_rewind_poll(&cpu,cpu.pc);
     assert(history.tick==3 && history.count==2);
     netplay=1; psx_rewind_note_frame(); psx_rewind_poll(&cpu,cpu.pc);
-        psx_rewind_poll(&cpu,cpu.pc); psx_rewind_poll(&cpu,cpu.pc);
+        while(capturing)psx_rewind_poll(&cpu,cpu.pc);
     assert(stats.captures==6);
     netplay=0; psx_rewind_set_title_blocked(1);
     psx_rewind_note_frame(); psx_rewind_poll(&cpu,cpu.pc);
-        psx_rewind_poll(&cpu,cpu.pc); psx_rewind_poll(&cpu,cpu.pc); assert(stats.captures==6);
+        while(capturing)psx_rewind_poll(&cpu,cpu.pc); assert(stats.captures==6);
     psx_rewind_shutdown(); assert(!psx_rewind_snap_count());
     puts("hold rewind: safe boundary, reverse frames, mute, release, branch, gates PASS");
     return 0;

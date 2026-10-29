@@ -8338,6 +8338,7 @@ void gpu_snapshot_write(uint8_t *p) {
 }
 struct GpuNativeCapture {
     NativeRasterCheckpoint *job;
+    uint16_t upload_pixels[1024];
     uint16_t vram[1024*512];
     uint64_t rows[8];
     SwNativeTextureState texture;
@@ -8348,20 +8349,24 @@ GpuNativeCapture *gpu_native_capture_create(void) {
     GpuNativeCapture *c=(GpuNativeCapture*)calloc(1,sizeof(*c));
     if(!c)return NULL;
     c->size=gpu_snapshot_bytes();c->wire=(uint8_t*)malloc(c->size);
-    if(!c->wire) { free(c);return NULL; }return c;
+    c->job=native_raster_checkpoint_create();
+    if(!c->wire || !c->job) { native_raster_checkpoint_release(c->job);free(c->wire);free(c);return NULL; }return c;
 }
 void gpu_native_capture_destroy(GpuNativeCapture *c) {
     if(!c)return;
     native_raster_checkpoint_release(c->job);free(c->wire);free(c);
 }
 int gpu_native_capture_begin(GpuNativeCapture *c) {
-    native_raster_checkpoint_release(c->job);c->job=NULL;
-    native_flush_upload();
+    if(!native_raster_checkpoint_ready(c->job))return 0;
+    const size_t upload_words=s_native_upload_count;
+    if(upload_words)memcpy(c->upload_pixels,s_native_upload_pixels,upload_words*sizeof(uint16_t));
     PstW w;pst_w_init(&w,c->wire,c->size);(void)gpu_snap_emit(&w);
     pst_w_u32(&w,native_polyline_color);pst_w_u32(&w,native_polyline_previous);
     pst_w_u32(&w,native_sprite_flip);
-    c->job=native_raster_checkpoint_async(s_native_raster,c->vram,c->rows,&c->texture);
-    return c->job!=NULL;
+    int ok=native_raster_checkpoint_submit_upload(c->job,s_native_raster,c->vram,c->rows,&c->texture,
+        &s_native_upload,c->upload_pixels,upload_words);
+    if(ok)s_native_upload_count=0;
+    return ok;
 }
 int gpu_native_capture_ready(GpuNativeCapture *c) { return native_raster_checkpoint_ready(c->job); }
 void gpu_native_capture_result(GpuNativeCapture *c,const uint8_t **gpu,

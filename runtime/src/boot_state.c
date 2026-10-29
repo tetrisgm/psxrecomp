@@ -218,13 +218,19 @@ static int sync_vram_mirror_for_save(void)
 }
 
 /* File or growable memory sink — both save paths share one serializer. */
+static uint8_t native_module_scratch[16u*1024u*1024u];
 struct BootStatePending {
     GpuNativeCapture *gpu;
     size_t gpu_offset,vram_offset;
+#if !(defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+    uint8_t vram_wire[VRAM_SIZE];
+#endif
 };
 BootStatePending *boot_state_pending_create(void) {
     BootStatePending *p=(BootStatePending*)calloc(1,sizeof(*p));
     if(!p)return NULL;
+    for(size_t i=0;i<sizeof(native_module_scratch);i+=4096)
+        ((volatile uint8_t*)native_module_scratch)[i]=0;
     p->gpu=gpu_native_capture_create();
     if(!p->gpu){free(p);return NULL;}return p;
 }
@@ -239,10 +245,10 @@ int boot_state_pending_finish(BootStatePending *p,BootStatePatch patch,void *con
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
     return patch(context,p->vram_offset,vram,VRAM_SIZE)?1:-1;
 #else
-    uint8_t *wire=(uint8_t*)malloc(VRAM_SIZE);if(!wire)return -1;
+    uint8_t *wire=p->vram_wire;
     PstW w;pst_w_init(&w,wire,VRAM_SIZE);
     int ok=pst_w_pod(&w,vram,VRAM_SIZE,2) && patch(context,p->vram_offset,wire,VRAM_SIZE);
-    free(wire);return ok?1:-1;
+    return ok?1:-1;
 #endif
 }
 
@@ -297,16 +303,22 @@ static int write_header_le(BsOut* o, const BootStateHeader* h) {
     return bs_write(o, buf, sizeof buf);
 }
 
-static int write_section_raw(BsOut* o, uint32_t tag, uint32_t flags,
-                             const void* data, uint64_t len) {
+static int write_section_header(BsOut* o,uint32_t tag,uint32_t flags,uint64_t len) {
     uint8_t hdr[16];
     PstW w;
     pst_w_init(&w, hdr, sizeof hdr);
     if (!pst_w_u32(&w, tag) || !pst_w_u32(&w, flags) || !pst_w_u64(&w, len))
         return 0;
-    if (!bs_write(o, hdr, sizeof hdr)) return 0;
+    return bs_write(o,hdr,sizeof hdr);
+}
+static int write_section_raw(BsOut* o,uint32_t tag,uint32_t flags,const void *data,uint64_t len) {
+    if(!write_section_header(o,tag,flags,len))return 0;
     if (len && !bs_write(o, data, (size_t)len)) return 0;
     return 1;
+}
+
+static int bs_visit(void *context,const void *data,size_t size) {
+    return bs_write((BsOut*)context,data,size);
 }
 
 /* Prefer zlib for large blobs (smaller disk + faster load on slow storage).
@@ -338,19 +350,14 @@ static int write_section(BsOut* o, uint32_t tag, const void* data, uint64_t len)
 
 /* Emulation-thread-only scratch for the synchronous streaming visitor.
  * A section is consumed before the next module may reuse this allocation. */
-static uint8_t *native_module_scratch;
-static size_t native_module_capacity;
+
 static int write_module_section(BsOut* o, uint32_t tag,
                                 uint32_t (*bytes)(void),
                                 void (*write)(uint8_t*)) {
     uint32_t n = bytes();
     uint8_t *buf;
     if(o->sink) {
-        if(n>native_module_capacity) {
-            uint8_t *grown=(uint8_t*)realloc(native_module_scratch,n);
-            if(!grown)return 0;
-            native_module_scratch=grown;native_module_capacity=n;
-        }
+        if(n>sizeof(native_module_scratch))return 0;
         buf=native_module_scratch;
     } else buf=(uint8_t*)malloc(n?n:1);
     if(!buf && n)return 0;
@@ -491,9 +498,12 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) ok = write_cpu_section(o, cpu);
     if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
-    if (ok && psx_mod_memory_snapshot_bytes())
-        ok = write_module_section(o, BS_SEC_MODMEM, psx_mod_memory_snapshot_bytes,
-                                  psx_mod_memory_snapshot_write);
+    if (ok && psx_mod_memory_snapshot_bytes()) {
+        if(o->sink) ok=write_section_header(o,BS_SEC_MODMEM,0,psx_mod_memory_snapshot_bytes()) &&
+                       psx_mod_memory_snapshot_visit(bs_visit,o);
+        else ok=write_module_section(o,BS_SEC_MODMEM,psx_mod_memory_snapshot_bytes,
+                                     psx_mod_memory_snapshot_write);
+    }
     if (ok) {
         /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
          * rebased every tip to phase 0 and forked MotK wait-loop resim
@@ -574,7 +584,8 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) {
         uint32_t wc = dirty_ram_get_bitmap_word_count();
         uint64_t nbytes = (uint64_t)wc * 4u;
-        uint8_t* db = (uint8_t*)malloc(nbytes ? (size_t)nbytes : 1);
+        uint8_t* db = o->sink ? (nbytes<=sizeof(native_module_scratch)?native_module_scratch:NULL)
+                              : (uint8_t*)malloc(nbytes ? (size_t)nbytes : 1);
         if (!db) ok = 0;
         else {
             PstW w;
@@ -583,7 +594,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
             for (uint32_t i = 0; ok && i < wc; i++)
                 ok = pst_w_u32(&w, dirty_ram_get_bitmap_word(i));
             if (ok) ok = write_section(o, BS_SEC_DIRTY, db, nbytes);
-            free(db);
+            if(!o->sink)free(db);
         }
     }
     if (ok) {

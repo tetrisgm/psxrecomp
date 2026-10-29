@@ -143,7 +143,9 @@ typedef struct BootStatePending BootStatePending;
 typedef int (*BootStatePatch)(void *context,size_t offset,const void *data,size_t size);
 BootStatePending *boot_state_pending_create(void);
 void boot_state_pending_destroy(BootStatePending *pending);
-/* 0 pending, 1 complete, -1 sink failure. No live guest state is read. */
+/* Guest-thread completion: 0 pending, 1 complete, -1 sink failure. No live
+ * guest state is read. Callback byte spans remain valid until the next begin
+ * or pending_destroy, allowing CPU delta finalization on a separate worker. */
 int boot_state_pending_finish(BootStatePending *pending,BootStatePatch patch,void *context);
 void boot_state_native_capture_profile(double out[6]);
 typedef int (*BootStateSink)(void *context,const void *data,size_t size);

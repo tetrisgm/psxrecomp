@@ -9,7 +9,8 @@ extern "C" {
 
 /* One guest producer, one CPU-only consumer. No graphics API or render-queue
  * dependency is permitted here. All command arguments and upload bytes are
- * owned by the queue after submit returns. Native work is never dropped. */
+ * owned by the queue after ordinary submit returns; the checkpoint borrow
+ * API below instead pins caller storage until ready. Native work is never dropped. */
 typedef struct NativeRaster NativeRaster;
 typedef enum NativeRasterOp {
     NR_AREA, NR_OFFSET, NR_SEMI, NR_MASK, NR_WINDOW, NR_MODULATION,
@@ -73,6 +74,15 @@ void native_raster_restore_checkpoint(NativeRaster *raster,const uint16_t *vram,
 /* Caller-owned destinations remain alive until release; release waits for
  * CPU completion even when the raster itself has already been destroyed. */
 typedef struct NativeRasterCheckpoint NativeRasterCheckpoint;
+/* Reusable completion token: allocate at setup, submit only after ready. */
+NativeRasterCheckpoint *native_raster_checkpoint_create(void);
+int native_raster_checkpoint_submit(NativeRasterCheckpoint *checkpoint,NativeRaster *raster,
+    uint16_t *vram,uint64_t dirty[8],SwNativeTextureState *texture);
+/* Apply an unflushed CPU-upload fragment immediately before the checkpoint.
+ * The caller owns pixels until ready; no upload allocation is needed. */
+int native_raster_checkpoint_submit_upload(NativeRasterCheckpoint *checkpoint,NativeRaster *raster,
+    uint16_t *vram,uint64_t dirty[8],SwNativeTextureState *texture,
+    const NativeRasterCommand *upload,const uint16_t *pixels,size_t words);
 NativeRasterCheckpoint *native_raster_checkpoint_async(NativeRaster *raster,
     uint16_t *vram,uint64_t dirty_rows[8],SwNativeTextureState *texture);
 int native_raster_checkpoint_ready(NativeRasterCheckpoint *checkpoint);

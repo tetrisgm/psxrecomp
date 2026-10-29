@@ -2,6 +2,7 @@
 #define PSXRECOMP_MOD_MEMORY_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "psx_memory.h"
 
 #ifdef __cplusplus
@@ -81,6 +82,8 @@ uint32_t psx_mod_memory_alloc(uint32_t size, uint32_t alignment);
  * host pointers; immutable host assets are reconstructed separately. */
 uint32_t psx_mod_memory_snapshot_bytes(void);
 void psx_mod_memory_snapshot_write(uint8_t* out);
+/* Synchronous visitor, identical wire bytes without a staging copy. */
+int psx_mod_memory_snapshot_visit(int (*sink)(void*,const void*,size_t),void *context);
 int psx_mod_memory_snapshot_read(const uint8_t* data, uint32_t size);
 /* 1 iff psx_mod_memory_snapshot_read would accept the section; mutates nothing. */
 int psx_mod_memory_snapshot_validate(const uint8_t* data, uint32_t size);

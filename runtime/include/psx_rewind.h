@@ -14,10 +14,16 @@ extern "C" {
 typedef struct PsxRewindStats {
     uint64_t captures, restores, failures, bytes;
     double capture_ms, max_ms, serialize_ms, delta_ms;
+    double p50_ms,p99_ms;
+    double begin_max_ms,finish_max_ms,poll_max_ms;
+    double worker_ms,worker_max_ms;
+    double worst_begin_profile_ms[6];
+    uint64_t begin_thread_cycles,max_begin_thread_cycles,worst_begin_thread_cycles;
     uint64_t verified, verify_failures;
     uint32_t first_difference;
     uint32_t frame;
 } PsxRewindStats;
+void psx_rewind_reset_stats(void);
 void psx_rewind_get_stats(PsxRewindStats *out);
 void psx_rewind_set_held(int down);
 void psx_rewind_debug_hold(int down);

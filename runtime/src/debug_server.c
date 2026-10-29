@@ -8363,6 +8363,7 @@ extern int sio_get_pad_mode_locked(int slot);
  * and the snapshots held, so scripted runs can check capture and opening. */
 static void handle_rewind_status(int id, const char *json)
 {
+    if(json_get_int(json,"reset_stats",0))psx_rewind_reset_stats();
     int hold=json_get_int(json,"hold",-1);
     if(hold>=0) psx_rewind_debug_hold(hold);
     int verify=json_get_int(json,"verify",-1);
@@ -8372,14 +8373,18 @@ static void handle_rewind_status(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"open\":%s,"
              "\"title_blocked\":%s,\"snaps\":%u,\"frame\":%u,"
              "\"captures\":%llu,\"restores\":%llu,\"failures\":%llu,"
-             "\"bytes\":%llu,\"capture_ms\":%.6f,\"max_ms\":%.6f,\"serialize_ms\":%.6f,\"delta_ms\":%.6f,\"verified\":%llu,\"verify_failures\":%llu,\"first_difference\":%u,\"profile_ms\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f]}\n",
+             "\"bytes\":%llu,\"capture_ms\":%.6f,\"max_ms\":%.6f,\"p50_ms\":%.6f,\"p99_ms\":%.6f,\"begin_max_ms\":%.6f,\"finish_max_ms\":%.6f,\"poll_max_ms\":%.6f,\"worker_ms\":%.6f,\"worker_max_ms\":%.6f,\"serialize_ms\":%.6f,\"delta_ms\":%.6f,\"verified\":%llu,\"verify_failures\":%llu,\"first_difference\":%u,\"profile_ms\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f],\"worst_begin_profile_ms\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f],\"begin_thread_cycles\":%llu,\"max_begin_thread_cycles\":%llu,\"worst_begin_thread_cycles\":%llu}\n",
              id,psx_rewind_enabled()?"true":"false",psx_rewind_is_open()?"true":"false",
              psx_rewind_title_blocked()?"true":"false",psx_rewind_snap_count(),st.frame,
              (unsigned long long)st.captures,(unsigned long long)st.restores,
              (unsigned long long)st.failures,(unsigned long long)st.bytes,
-             st.capture_ms,st.max_ms,st.serialize_ms,st.delta_ms,(unsigned long long)st.verified,
+             st.capture_ms,st.max_ms,st.p50_ms,st.p99_ms,st.begin_max_ms,st.finish_max_ms,st.poll_max_ms,st.worker_ms,st.worker_max_ms,st.serialize_ms,st.delta_ms,(unsigned long long)st.verified,
              (unsigned long long)st.verify_failures,st.first_difference,
-             prof[0],prof[1],prof[2],prof[3],prof[4],prof[5]);
+             prof[0],prof[1],prof[2],prof[3],prof[4],prof[5],
+             st.worst_begin_profile_ms[0],st.worst_begin_profile_ms[1],st.worst_begin_profile_ms[2],
+             st.worst_begin_profile_ms[3],st.worst_begin_profile_ms[4],st.worst_begin_profile_ms[5],
+             (unsigned long long)st.begin_thread_cycles,(unsigned long long)st.max_begin_thread_cycles,
+             (unsigned long long)st.worst_begin_thread_cycles);
 }
 
 static void handle_pad_status(int id, const char *json)

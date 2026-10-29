@@ -5,6 +5,14 @@
 #include <assert.h>
 #include "rewind_delta.h"
 
+static struct {size_t offset,size;const void *data;} delayed_patches[2];
+static unsigned delayed_count;
+static int delayed_patch(void *unused,size_t offset,const void *data,size_t size) {
+    (void)unused;assert(delayed_count<2);
+    delayed_patches[delayed_count].offset=offset;
+    delayed_patches[delayed_count].data=data;
+    delayed_patches[delayed_count++].size=size;return 1;
+}
 static uint8_t ram[2*1024*1024], spad[1024], spuram[512*1024];
 static uint16_t vram[1024*512];
 static int boot_clears, cd_handoffs;
@@ -51,6 +59,7 @@ uint32_t spu_get_ram_bytes(void){return sizeof spuram;}
 uint32_t psx_mod_memory_snapshot_bytes(void){return 0;}
 uint32_t psx_mod_memory_layout_cookie(void){return 0;}
 void psx_mod_memory_snapshot_write(uint8_t* p){(void)p;}
+int psx_mod_memory_snapshot_visit(int (*sink)(void*,const void*,size_t),void *c){(void)sink;(void)c;return 1;}
 int psx_mod_memory_snapshot_read(const uint8_t* p,uint32_t n){(void)p;return n==0;}
 int psx_mod_memory_snapshot_validate(const uint8_t* p,uint32_t n){(void)p;return n==0;}
 int gpu_vram_dirty_tracking(void){return 0;}
@@ -151,15 +160,20 @@ int main(void) {
         assert(boot_state_save_buffer_raw(&cpu,123,0x801b0000,&raw,&raw_n));
         assert(n==raw_n && !memcmp(raw,reused,n));
         RwHistory history={0};
+        assert(rw_prepare(&history,4,8u*1024u*1024u,32u*1024u*1024u));
         assert(rw_begin(&history,4));
         assert(boot_state_visit_native(&cpu,123,0x801b0000,rw_write,&history));
         assert(rw_finish(&history,1));
         assert(history.size==raw_n && !memcmp(history.image,raw,raw_n));
-        rw_clear(&history);
+        rw_reset(&history);
         BootStatePending *pending=boot_state_pending_create();assert(pending);
         assert(rw_begin(&history,4));
         assert(boot_state_begin_native(&cpu,123,0x801b0000,rw_write,&history,pending));
-        assert(boot_state_pending_finish(pending,rw_patch,&history)==1);
+        assert(boot_state_pending_finish(pending,delayed_patch,NULL)==1);
+        uint8_t *churn=(uint8_t*)malloc(VRAM_SIZE);assert(churn);memset(churn,0xa5,VRAM_SIZE);
+        for(unsigned i=0;i<delayed_count;i++)
+            assert(rw_patch(&history,delayed_patches[i].offset,delayed_patches[i].data,delayed_patches[i].size));
+        free(churn);
         assert(rw_finish(&history,2));
         assert(history.size==raw_n && !memcmp(history.image,raw,raw_n));
         boot_state_pending_destroy(pending);rw_clear(&history);

@@ -213,6 +213,25 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- 2026-10-29, phase-5 latency follow-up: preallocated reverse-page pool and
+  capture buffers, reusable native checkpoint tokens and partial-upload storage,
+  fixed native job ring, and a CPU worker for delta comparison/eviction. The
+  ordered checkpoint mailbox bypasses draw-queue locking; retained event wakes
+  avoid timed polling and its missed captures on Windows. Scope emulation-thread
+  above-normal priority to configured rewind, restoring its previous setting on
+  shutdown. No GL snapshot reads, generated edits or renderer-plumbing edits.
+  Delta/allocation, native ordering/two-checkpoint/queue-wrap, worker lifetime,
+  portable serializer and held-rewind fixtures pass; R4 regeneration is unchanged
+  and its 31 permitted tests pass. The hidden 8K race also uncovered and repaired
+  the title's cleared Effects callback. Earlier failed maxima and the rejected
+  timed-polling coverage loss remain in R4 docs/REWIND_PHASE5.md. Enhanced reverse
+  output is still native scanout: full phase-5 acceptance is NOT claimed.
+  Final 600-second 18x run: 35,994 captures with zero frame gap/failures/misses,
+  mean 0.185991 ms, p50 0.178 ms, p99 0.298 ms, max 0.5175 ms. Mapped Y restores
+  151 byte-exact states with closed-menu probes; debug hold restores 154.
+  Enhanced/native presentation artifacts remain documented in that report.
+
+
 - 2026-10-29, frame-architecture phase 5 topic: per-frame streaming native
   page deltas, ordered asynchronous native VRAM/cache checkpoint, hold-to-rewind
   at resumable guest edges. Incomplete snapshots are never published. Release

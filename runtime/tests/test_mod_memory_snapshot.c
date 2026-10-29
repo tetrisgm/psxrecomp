@@ -3,6 +3,10 @@
 #include "memory.c"
 int g_psx_render_pass_active = 0;
 static void check(int ok,const char* text){if(!ok){fprintf(stderr,"FAIL %s\n",text);exit(1);}}
+static size_t visit_offset;
+static int visit_copy(void *out,const void *data,size_t n) {
+    memcpy((uint8_t*)out+visit_offset,data,n);visit_offset+=n;return 1;
+}
 int main(void){
     check(psx_mod_memory_snapshot_bytes()==0 && psx_mod_memory_layout_cookie()==0,"vanilla unchanged");
     psx_mod_memory_snapshot_write(NULL);
@@ -13,6 +17,10 @@ int main(void){
     uint8_t* saved=(uint8_t*)malloc(size);check(saved!=NULL,"test buffer");
     memset(mod_memory,0x12,mod_memory_used);memset(mod_gpu_dma_memory,0x34,mod_gpu_dma_memory_used);
     psx_mod_memory_snapshot_write(saved);
+    uint8_t *streamed=(uint8_t*)malloc(size);visit_offset=0;
+    check(streamed && psx_mod_memory_snapshot_visit(visit_copy,streamed),"stream visit");
+    check(visit_offset==size && !memcmp(saved,streamed,size),"stream wire identity");
+    free(streamed);
     memset(mod_memory,0x56,mod_memory_used);memset(mod_gpu_dma_memory,0x78,mod_gpu_dma_memory_used);
     check(!psx_mod_memory_snapshot_read(saved,size-1),"truncation rejected");
     saved[0]=99;

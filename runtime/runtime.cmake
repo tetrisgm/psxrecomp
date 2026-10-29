@@ -455,6 +455,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/video_telemetry.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
+    ${PSXRECOMP_ROOT}/runtime/src/rewind_worker.cpp
     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_disc_tray.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_runtime_menu.c
