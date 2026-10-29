@@ -2266,3 +2266,9 @@ Focused allocation/retained-history, sampler, presenter, HD context and hidden
 GL tests pass. Cumulative pair failure/admission counters added for timed
 validation. No guest instruction timing or generated code changed; exclusive
 A/B acceptance results are tracked in R4 FRAME_INTERPOLATION_STATUS.md.
+
+### 2026-10-29 guest hot-path work
+
+SPSC native raster submission and upload arena implemented on fix/guest-hotpath.
+Native fixture suite and producer allocation check pass. Runtime acceptance is
+still pending; see [GUEST_HOTPATH.md](GUEST_HOTPATH.md) for measurements and gates.
