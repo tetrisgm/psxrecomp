@@ -19,7 +19,9 @@ typedef enum NativeRasterOp {
     /* GP0(A0) payload fragment: x,y,w,h,pixel_offset,set_mask,check_mask.
      * Upload contains the halfwords actually received so far (odd final
      * halfword excluded). Unlike NR_UPLOAD, this applies guest mask rules. */
-    NR_CPU_UPLOAD
+    NR_CPU_UPLOAD,
+    /* Three (x,y,RGB888,u,v) vertices, CLUT x/y, texpage, native flags. */
+    NR_NATIVE_TRIANGLE
 } NativeRasterOp;
 typedef struct NativeRasterCommand {
     NativeRasterOp op;

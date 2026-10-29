@@ -227,6 +227,13 @@ on a fixed region -> next.
   private guest-draw workers are no longer the phase-4 destination. The central
   Beads path `F:/Software/beads/issues` is absent on this machine; no local
   database was created.
+  Follow-up native polygon input retains RGB888 and uses integer attribute
+  planes plus the native dither matrix. Hand-known gradient and all 16 dither
+  phase checks pass in `native_raster_test`; full oracle parity and runtime
+  routing remain outstanding. Negative edge coordinates now use multiplication
+  rather than undefined signed left shifts. R4 build, 32/32 tests and hidden
+  smoke (zero dispatch/segment misses) passed for the earlier context refactor;
+  these do not certify the new native polygon path as the runtime authority.
 
 - **2026-10-28 (`fix/race-cadence-metrics`):** Added opt-in native debug TCP
   `main_cadence` counters for main-thread VBlank callback wall intervals and

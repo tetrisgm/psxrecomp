@@ -16,6 +16,15 @@ SwRendererContext *sw_context_bind(SwRendererContext *context);
 void sw_context_destroy(SwRendererContext *context);
 void sw_context_take_dirty(uint64_t rows[8]);
 
+/* Guest-native polygon input, before presentation transforms or RGB555
+ * truncation. x/y already include the guest drawing offset. Flags select
+ * texture (1), raw texture (2), Gouraud (4), and guest dithering (8).
+ * This writes only native VRAM, never enhanced mirrors. */
+typedef struct SwNativeVertex { int x, y; uint32_t rgb; int u, v; } SwNativeVertex;
+void sw_draw_native_triangle(const SwNativeVertex vertices[3],
+                             uint16_t clut_x, uint16_t clut_y,
+                             uint16_t texpage, unsigned flags);
+
 /* Maximum internal-resolution supersampling factor (linear, per axis). */
 #define SW_MAX_INTERNAL_SCALE 4
 

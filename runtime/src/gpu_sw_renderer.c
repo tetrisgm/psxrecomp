@@ -452,6 +452,106 @@ static uint16_t texel_fetch(int u, int v, uint16_t texpage,
  * (texel_fetch applies the window instead, which wraps by design). */
 
 
+/* Native attribute planes use 12-bit truncated derivatives with a half-unit
+ * seed, accumulated modulo 32 bits at 24 fractional bits. This preserves
+ * RGB888 until pixel quantization; the presentation raster remains separate.
+ * Reference contract: accuracy/axis5_gpu.md D1/D3 and Mednafen's native
+ * attribute precision (COORD_FBS=12, COORD_POST_PADDING=12). */
+typedef struct NativePlane { uint32_t origin, dx, dy; } NativePlane;
+static NativePlane native_plane(const SwNativeVertex v[3], const int value[3],
+                                 int core, int64_t area) {
+    int64_t ex1=v[1].x-v[0].x, ey1=v[1].y-v[0].y;
+    int64_t ex2=v[2].x-v[0].x, ey2=v[2].y-v[0].y;
+    int64_t d1=value[1]-value[0], d2=value[2]-value[0];
+    NativePlane p;
+    p.dx=(uint32_t)(((d1*ey2-d2*ey1)*4096)/area)*4096u;
+    p.dy=(uint32_t)(((ex1*d2-ex2*d1)*4096)/area)*4096u;
+    p.origin=((uint32_t)value[core]<<24)+0x00800000u
+        -p.dx*(uint32_t)v[core].x-p.dy*(uint32_t)v[core].y;
+    return p;
+}
+static unsigned native_plane_at(NativePlane p,int x,int y) {
+    return (p.origin+p.dx*(uint32_t)x+p.dy*(uint32_t)y)>>24;
+}
+static uint16_t native_quantize(int r,int g,int b,int dither) {
+    r=clamp_i(r+dither,0,255)>>3;
+    g=clamp_i(g+dither,0,255)>>3;
+    b=clamp_i(b+dither,0,255)>>3;
+    return (uint16_t)(r|(g<<5)|(b<<10));
+}
+void sw_draw_native_triangle(const SwNativeVertex input[3],uint16_t cx,uint16_t cy,
+                             uint16_t page,unsigned flags) {
+    SwNativeVertex v[3];
+    memcpy(v,input,sizeof v);
+    int core=0;
+    if (v[1].x<=v[0].x) core=1;
+    if (v[2].x<v[core].x || (core==1 && v[2].x==v[core].x)) core=2;
+    const int64_t area=(int64_t)(v[1].x-v[0].x)*(v[2].y-v[0].y)
+                     -(int64_t)(v[2].x-v[0].x)*(v[1].y-v[0].y);
+    if (!area) return;
+    int xmin=v[0].x,xmax=xmin,ymin=v[0].y,ymax=ymin;
+    for(int i=1;i<3;++i) {
+        xmin=min_i(xmin,v[i].x); xmax=max_i(xmax,v[i].x);
+        ymin=min_i(ymin,v[i].y); ymax=max_i(ymax,v[i].y);
+    }
+    if (xmax-xmin>=1024 || ymax-ymin>=512) return;
+    NativePlane plane[5];
+    for(int channel=0;channel<5;++channel) {
+        int value[3];
+        for(int i=0;i<3;++i) {
+            if(channel<3) value[i]=(int)(((flags&4)?v[i].rgb:v[0].rgb)>>(channel*8))&255;
+            else value[i]=(channel==3?v[i].u:v[i].v)&255;
+        }
+        plane[channel]=native_plane(v,value,core,area);
+    }
+    // Sorting is solely for coverage; planes retain the original core seed.
+    for(int i=1;i<3;++i) {
+        SwNativeVertex current=v[i]; int j=i;
+        while(j>0 && v[j-1].y>current.y) { v[j]=v[j-1]; --j; }
+        v[j]=current;
+    }
+    static const int8_t matrix[4][4]={
+        {-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},{3,-1,2,-2}
+    };
+    const int textured=(flags&1)!=0, raw=(flags&2)!=0;
+    const int dither=(flags&8) && (textured?!raw:(flags&4)!=0);
+    const int top=max_i(max_i(v[0].y,g_clip_y1),0);
+    const int bottom=min_i(min_i(v[2].y,g_clip_y2+1),512);
+    for(int y=top;y<bottom;++y) {
+        int a,b;
+        psx_triangle_edges_at_y(v[0].x,v[0].y,v[1].x,v[1].y,v[2].x,v[2].y,y,&a,&b);
+        int left=max_i(max_i(min_i(a,b),g_clip_x1),0);
+        int right=min_i(min_i(max_i(a,b),g_clip_x2+1),1024);
+        int wrote=0;
+        for(int x=left;x<right;++x) {
+            uint16_t *dst=g_vram+y*1024+x;
+            if(g_mask_check_bit && (*dst&0x8000)) continue;
+            int r=(int)native_plane_at(plane[0],x,y);
+            int g=(int)native_plane_at(plane[1],x,y);
+            int bcol=(int)native_plane_at(plane[2],x,y);
+            uint16_t color,stp=0;
+            if(textured) {
+                uint16_t texel=texel_fetch((int)native_plane_at(plane[3],x,y),
+                                           (int)native_plane_at(plane[4],x,y),page,cx,cy);
+                if(!texel) continue;
+                stp=texel&0x8000;
+                if(raw) color=texel&0x7fff;
+                else {
+                    r=((texel&31)*r)>>4;
+                    g=(((texel>>5)&31)*g)>>4;
+                    bcol=(((texel>>10)&31)*bcol)>>4;
+                    color=native_quantize(r,g,bcol,dither?matrix[y&3][x&3]:0);
+                }
+            } else color=native_quantize(r,g,bcol,dither?matrix[y&3][x&3]:0);
+            if(g_semi_trans_enabled && (!textured || stp))
+                color=blend_pixels(*dst,color,g_semi_trans_mode);
+            *dst=color|stp|(g_mask_set_bit?0x8000:0);
+            wrote=1;
+        }
+        if(wrote) sw_dirty_row((uint32_t)y);
+    }
+}
+
 static uint16_t bl_fetch(int u, int v, uint16_t texpage,
                          uint16_t clut_x, uint16_t clut_y) {
     u &= 0xFF; v &= 0xFF;

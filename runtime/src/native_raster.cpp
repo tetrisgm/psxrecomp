@@ -56,6 +56,13 @@ void draw(const Job &j) {
             sw_vram_write(x,y,j.upload[i] | (a[5] ? 0x8000 : 0));
         }
         break;
+    case NR_NATIVE_TRIANGLE: {
+        SwNativeVertex vertices[3];
+        for (int i=0;i<3;++i)
+            vertices[i]={a[i*5],a[i*5+1],uint32_t(a[i*5+2]),a[i*5+3],a[i*5+4]};
+        sw_draw_native_triangle(vertices,a[15],a[16],a[17],unsigned(a[18]));
+        break;
+    }
     }
 }
 }
@@ -139,7 +146,7 @@ extern "C" void native_raster_destroy(NativeRaster *r) {
 }
 extern "C" int native_raster_submit(NativeRaster *r, const NativeRasterCommand *c,
                                      const uint16_t *upload, size_t words) {
-    if (!r || !c || c->op < NR_AREA || c->op > NR_CPU_UPLOAD) return 0;
+    if (!r || !c || c->op < NR_AREA || c->op > NR_NATIVE_TRIANGLE) return 0;
     if (c->op == NR_UPLOAD || c->op == NR_CPU_UPLOAD) {
         if (c->args[2] <= 0 || c->args[2] > 1024 || c->args[3] <= 0 || c->args[3] > 512 ||
             !upload || !words) return 0;

@@ -7,13 +7,13 @@
  * and right edges. Float-truncated inclusive spans make adjacent polygons
  * disagree by a pixel and draw a shared diagonal twice. */
 static inline int64_t psx_edge_fp(int x) {
-    return ((int64_t)x << 32) + ((1LL << 32) - (1 << 11));
+    return (int64_t)x * INT64_C(4294967296) + ((1LL << 32) - (1 << 11));
 }
 
 static inline int64_t psx_edge_step(int dx, int dy) {
     int64_t rounding = dx < 0 ? -(int64_t)(dy - 1)
                               : (dx > 0 ? (int64_t)(dy - 1) : 0);
-    return (((int64_t)dx << 32) + rounding) / dy;
+    return ((int64_t)dx * INT64_C(4294967296) + rounding) / dy;
 }
 
 static inline int psx_edge_unfp(int64_t fp) {

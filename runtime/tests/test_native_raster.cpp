@@ -96,6 +96,19 @@ int main() {
     assert(pixel(r,1,511)==0x800c);
     assert(!native_raster_submit(r,&fragment,first.data(),2));
 
+    // Keep RGB888 through interpolation. At the midpoint, 31/2 rounds to
+    // 16 before RGB555 conversion, not to the old 5-bit interpolated 1.
+    send(r,NR_NATIVE_TRIANGLE,{10,10,0,0,0,42,10,31,0,0,10,42,0,0,0,0,0,0,4});
+    assert(pixel(r,26,11)==2);
+    // Every native 4x4 dither position, with a constant Gouraud colour.
+    send(r,NR_NATIVE_TRIANGLE,{100,100,0x7f7f7f,0,0,132,100,0x7f7f7f,0,0,
+                              100,132,0x7f7f7f,0,0,0,0,0,12});
+    const int dither[4][4]={{-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},{3,-1,2,-2}};
+    for(int y=0;y<4;++y) for(int x=0;x<4;++x) {
+        const int c=(127+dither[y][x])/8;
+        assert(pixel(r,104+x,104+y)==(c|(c<<5)|(c<<10)));
+    }
+
     // Independent contexts race on different threads while the default
     // renderer remains usable. No graphics/context owner participates.
     std::vector<uint16_t> legacy(1024*512);
