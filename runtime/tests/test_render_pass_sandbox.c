@@ -249,6 +249,8 @@ static int s_queued, s_plan_one;
 static uint64_t s_pacer_ticks;
 int gl_renderer_pass_queued(void) { return s_queued; }
 uint64_t psx_frame_pacer_wait_ticks(void) { return s_pacer_ticks; }
+static uint64_t s_pacer_spare = UINT64_MAX;
+uint64_t psx_frame_pacer_spare_ticks(void) { return s_pacer_spare; }
 uint32_t gl_renderer_pass_plan(uint32_t p, uint32_t s, uint32_t *a,
                                uint32_t max, uint32_t *wanted) {
     (void)p; (void)s;
@@ -1192,6 +1194,18 @@ static void test_queued_budget(void) {
     CHECK(zeros == 30, "queued budget: a failed retry doubles the rest");
     render_pass_get_stats(&st);
     CHECK(st.queued_rests == 2 && st.queued_shed == 45, "queued budget: stats count rests and shed frames");
+    /* Clear the backoff, then prove current clock debt refuses immediately
+     * even when the preceding frame had plentiful historical idle time. */
+    for (int i = 0; i < 480; ++i) {
+        s_pacer_ticks += 10u * ms;
+        (void)psx_mod_render_pass_plan(2, 1, a, 4);
+    }
+    s_pacer_spare = 0;
+    s_pacer_ticks += 10u * ms;
+    CHECK(psx_mod_render_pass_plan(2, 1, a, 4) == 0, "queued budget: guest deadline debt has priority");
+    s_pacer_spare = UINT64_MAX;
+    s_pacer_ticks += 10u * ms;
+    CHECK(psx_mod_render_pass_plan(2, 1, a, 4) == 1, "queued budget: recovered deadline admits presentation again");
     s_queued = 0;
     s_plan_one = 0;
 }

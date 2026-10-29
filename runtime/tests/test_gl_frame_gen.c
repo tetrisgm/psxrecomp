@@ -352,6 +352,12 @@ static void game_frame_part(int g, int bx, int part) {
     gr_copy_rect(bx + 10, 10, 900, 400, 16, 16);                  /* copy out of the display */
 }
 
+static _Atomic int live_scale_result;
+static void live_scale_complete(void *unused,int applied) {
+    (void)unused;
+    check(rt_on_render_thread(),"live allocation completion stays on graphics owner");
+    atomic_store(&live_scale_result,applied);
+}
 static void present(int bx) {
     if (wide_mode) (void)gl_renderer_present_wide_fbo(bx, 0, FRAME_H, 0);
     else gl_renderer_present_vram(bx, 0, FRAME_W, FRAME_H, 0, 0);
@@ -461,6 +467,14 @@ int main(int argc, char **argv) {
     check(native != NULL, "native authority created");
     gr_bind_native_raster(native, NULL);
     check(gl_renderer_render_thread_start(2) == 1, "render thread started");
+    check(gl_renderer_request_internal_scale_complete(1,live_scale_complete,NULL),
+          "live allocation request accepted");
+    rt_drain();
+    check(atomic_load(&live_scale_result)==1,"live allocation completed");
+    check(gl_renderer_request_internal_scale_complete(scale,live_scale_complete,NULL),
+          "original scale request accepted");
+    rt_drain();
+    check(atomic_load(&live_scale_result)==scale,"original scale completed");
     if (pt_mode) check(gl_renderer_present_thread_active(), "present thread started");
     const char *method = getenv("FG_METHOD");
     const int rp = method && !strcmp(method, "reprojection");

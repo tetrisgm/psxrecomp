@@ -54,6 +54,7 @@ int frame_owner_control(FrameOwner *owner,uint64_t before_sequence,
  * consumer lease. Keep the image's epoch with any subsequent present job. */
 int frame_owner_current(const FrameOwner *owner,const FramePacketView *packet);
 uint64_t frame_owner_replaced(const FrameOwner *owner);
+int frame_owner_pending(const FrameOwner *owner);
 uint64_t frame_owner_completed(const FrameOwner *owner);
 uint64_t frame_owner_idle_ns(const FrameOwner *owner);
 int frame_owner_is_thread(void);

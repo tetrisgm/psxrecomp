@@ -3,6 +3,7 @@
 #include "gpu_vram_dirty.h"
 #include "frame_packet.h"
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <initializer_list>
@@ -187,7 +188,40 @@ static void provenance_observation() {
     assert(pixel(raster,0,0)==0 && owner.samples.size()==6);
     native_raster_destroy(raster);
 }
+static void bounded_queue_wrap() {
+    struct State {
+        std::atomic<bool> entered{false},release{false};
+        std::atomic<unsigned> submitted{0};
+        unsigned seen=0;
+    } state;
+    auto* raster=native_raster_create(nullptr);assert(raster);
+    native_raster_set_observer(raster,[](void* user,const NativeRasterEvent* event) {
+        if(!event->before) return;
+        auto& state=*static_cast<State*>(user);
+        assert(event->command && event->command->op==NR_WRITE);
+        assert(unsigned(event->command->args[2])==++state.seen);
+        if(state.seen==1) {
+            state.entered.store(true);
+            while(!state.release.load()) std::this_thread::yield();
+        }
+    },&state);
+    std::thread producer([&] {
+        for(unsigned n=1;n<=10000;++n) {
+            send(raster,NR_WRITE,{0,0,int(n)});
+            state.submitted.store(n);
+        }
+    });
+    while(!state.entered.load() || state.submitted.load()<4097) std::this_thread::yield();
+    /* One leased command plus all 4096 queue slots: submission is bounded,
+     * but release must wake the producer and preserve order across wraps. */
+    assert(state.submitted.load()==4097);
+    state.release.store(true);
+    producer.join();
+    assert(pixel(raster,0,0)==10000 && state.seen==10000);
+    native_raster_destroy(raster);
+}
 int main() {
+    bounded_queue_wrap();
     immutable_texture_inputs();
     dropped_texture_input_packets();
     provenance_observation();

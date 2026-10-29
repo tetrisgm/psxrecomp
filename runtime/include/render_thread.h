@@ -92,6 +92,7 @@ void rt_batch_discard(void);
 /* Seal/publish a complete frame and capture the next native seed. No GPU wait. */
 void rt_frame_end(void);
 
+
 /* Optional rewind presentation history. CPU packets only, no GL readbacks.
  * mark binds the latest completed guest packet to a native snapshot tick. */
 void rt_history_configure(size_t depth,size_t budget);
@@ -103,7 +104,8 @@ size_t rt_history_bytes(void);
 uint64_t rt_history_replays(void);
 uint64_t rt_history_misses(void);
 
-/* Legacy FIFO query, always zero for the newest-wins mailbox. */
+/* Complete packets awaiting acquisition (zero or one), advisory only. */
+
 int  rt_frames_ahead(void);
 /* Consumer running total of idle time awaiting packets or tick deadlines. */
 uint64_t rt_render_idle_ns(void);

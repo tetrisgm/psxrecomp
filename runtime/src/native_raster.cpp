@@ -194,6 +194,7 @@ struct NativeRaster {
     std::array<uint16_t, vram_words> vram{};
     SwRendererContext *context = nullptr;
     std::mutex mutex;
+
     WorkerEvent available;
     std::condition_variable space;
     std::vector<Job> queue=std::vector<Job>(queue_budget/sizeof(Job));
@@ -203,6 +204,7 @@ struct NativeRaster {
     std::atomic<bool> checkpoint_pending{false};
     size_t bytes = 0;
     bool stop = false;
+
     std::atomic<uint64_t> completed{0};
     std::thread thread;
     /* Producer-only read cache. Any queued mutation invalidates it before
@@ -287,6 +289,7 @@ struct NativeRaster {
         if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore || job.borrowed_words)
             read_row_y=-1;
         const size_t cost = job.bytes();
+
         std::unique_lock<std::mutex> lock(mutex);
         space.wait(lock, [&] { return bytes + cost <= queue_budget && count<queue.size(); });
         job.sequence=submitted++;
@@ -309,6 +312,7 @@ struct NativeRaster {
         available.notify();
     }
     void execute(Job &job) {
+
 
             const auto *a = job.command.args;
             const bool mutation = job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore || job.borrowed_words;

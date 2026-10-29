@@ -349,6 +349,10 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
  * disp_x) straight to the window, no CPU readback. Returns 0 if no wide surface
  * exists for disp_x (caller falls back to the CPU readout path). */
 int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear);
+/* Graphics-owner diagnostic. Allocates exact current surface dimensions;
+ * caller owns *pixels. This readback never runs on the guest thread. */
+int gl_renderer_capture_wide_display(int base_x,int y,int height,
+                                    uint32_t **pixels,int *width,int *out_height);
 
 /* Display aspect for the present letterbox (default 4:3). A wide aspect
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
@@ -476,6 +480,10 @@ int  gl_renderer_step_internal_scale_now(int scale);
  * a context-owned sync point (the new ceiling). Returns the scale applied, 0 when
  * the backend cannot change it live. */
 int  gl_renderer_set_internal_scale_live(int scale);
+/* Copied owner control. Return means accepted, not applied; completion runs
+ * on the graphics owner with the actual scale (zero on allocation failure).
+ * User storage must survive until completion. No guest/GPU wait. */
+int gl_renderer_request_internal_scale_complete(int scale,void (*done)(void*,int),void *user);
 /* 1 when gl_renderer_set_internal_scale_live can apply on this session (no
  * windowed high-resolution mode, no CPU-authoritative dual rendering, a live
  * raster context). 0 means a resolution change needs a relaunch. */

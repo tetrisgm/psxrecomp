@@ -630,7 +630,6 @@ typedef struct RthCpuPresent {
     uint32_t serial;
 } RthCpuPresent;
 static int rth_record_cpu_present(const uint32_t *pixels,const RthCpuPresent *cpu);
-static int  rth_mirror_wide_present_ok(int base_x);
 static void rth_ring_capture_now(const int32_t *a);
 /* Emulation-side mirror: the recorded wide target is a live surface. */
 static int  s_rthm_cur = 0;
@@ -8119,6 +8118,23 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     return count;
 }
 
+int gl_renderer_capture_wide_display(int base_x,int y,int height,
+                                    uint32_t **pixels,int *width,int *out_height) {
+    GL_RT_SYNC("capture_wide_display");
+    if(!pixels || !width || !out_height) return 0;
+    *pixels=NULL;*width=*out_height=0;
+    if(y<0) y=0;
+    if(height>VRAM_H-y) height=VRAM_H-y;
+    if(y>=VRAM_H || height<=0 || g_wide_w<=0 || s_out_scale<=0) return 0;
+    const int W=g_wide_w*s_out_scale,H=height*s_out_scale;
+    uint32_t *image=malloc((size_t)W*H*sizeof *image);
+    if(!image) return 0;
+    if(glb_render_wide_display(image,W*4,base_x,y,height)!=W*H) {
+        free(image);return 0;
+    }
+    *pixels=image;*width=W;*out_height=H;return 1;
+}
+
 /* Dump the ENTIRE wide compositor surface for base_x (all double-buffer bands +
  * both reveal margins), g_wide_w x VRAM_H at scale. Debug/inspection tool (TCP
  * wide_full) — the GL analog of sw_wide_dump_full, so native-wide can be
@@ -9386,8 +9402,8 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
         /* VBlank-locked: frame N is shown for period_vblanks outputs, one per
          * VBlank; output k shows phase k / period. Phase 0 is the game's own
          * image, so passes are wanted at k = 1 .. period - 1. They are shed
-         * while the render thread is two frames behind (one is its normal
-         * pipelined state). */
+         * when a complete packet is already waiting for the render owner.
+         * The mailbox has one pending slot, not the old two-frame FIFO. */
         uint32_t n = 0, cap;
         const int live = atomic_exchange(&s_pass_q_intervals, 0) > 0;
         if (wanted) *wanted = 0;
@@ -9396,7 +9412,7 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
             !alpha_q16 || max == 0 || period_vblanks < 2)
             return 0;
         if (wanted) *wanted = period_vblanks - 1u;
-        if (rt_frames_ahead() >= 2) {
+        if (rt_frames_ahead() != 0) {
             atomic_fetch_add(&s_pass_q_shed, 1);
             return 0;
         }
@@ -12341,8 +12357,9 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
 static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear) {
     if (rth_record_mode()) {
-        /* The caller falls back to the CPU path on 0: answer from the mirror. */
-        if (!s_ctx || !s_raster_ok || !rth_mirror_wide_present_ok(disp_x)) return 0;
+        /* Surface existence is decided by the owner after replay. A missing
+         * wide surface must never send the guest through a GL readback. */
+        if (!s_ctx || !s_raster_ok) return 0;
         const int32_t a[4] = { disp_x, disp_y, disp_h, linear };
         if (rth_record_present(RTH_PRESENT_WIDE, 4, a)) return 1;
         abort(); /* large immutable images are fragmented by render_thread */
@@ -12690,7 +12707,7 @@ static int s_dyn_rth_disp_valid = 0, s_dyn_rth_disp[5];
 static atomic_flag s_dyn_stats_lock = ATOMIC_FLAG_INIT;   /* s_dyn_stats: render thread writes */
 static void dyn_stats_lock(void) { while (atomic_flag_test_and_set_explicit(&s_dyn_stats_lock, memory_order_acquire)) {} }
 static void dyn_stats_unlock(void) { atomic_flag_clear_explicit(&s_dyn_stats_lock, memory_order_release); }
-static int s_rthm_scale = 1;                /* emulation-side level (recording) */
+static _Atomic int s_rthm_scale = 1; /* producer request / owner allocation completion */
 
 static int dyn_apply(int snew) {
     /* Never in the windowed high-resolution mode (s_hiw): dyn_eligible keeps
@@ -12992,6 +13009,25 @@ int gl_renderer_set_internal_scale_live(int scale) {
     return scale;
 }
 
+typedef struct RthScaleRequest {
+    int scale;
+    void (*done)(void*,int);
+    void *user;
+} RthScaleRequest;
+static void rth_scale_request(const void *payload) {
+    const RthScaleRequest *request=payload;
+    const int applied=gl_renderer_set_internal_scale_live(request->scale);
+    request->done(request->user,applied);
+}
+int gl_renderer_request_internal_scale_complete(int scale,void (*done)(void*,int),void *user) {
+    if(!done) return 0;
+    const RthScaleRequest request={scale,done,user};
+    if(s_rth_on && !rt_on_render_thread())
+        return rt_control(rth_scale_request,&request,sizeof request);
+    rth_scale_request(&request);
+    return 1;
+}
+
 int gl_renderer_step_internal_scale_now(int scale) {
     if (!s_alloc_scale || !s_raster_ok) return 0;
     if (scale > s_alloc_scale) scale = s_alloc_scale;
@@ -13213,13 +13249,6 @@ static int rth_mirror_wide_for(int base_x) {
         if (s_rthm_base[i] < 0) { s_rthm_base[i] = base_x; return 1; }
     return 0;
 }
-static int rth_mirror_wide_present_ok(int base_x) {
-    if (s_rthm_wide_w <= 0) return 0;
-    for (int i = 0; i < WIDE_MAX_SURF; i++)
-        if (s_rthm_base[i] == base_x) return 1;
-    return 0;
-}
-
 static int rth_rec_raw(uint16_t op, uint16_t flags, int n, const int32_t *v) {
     int32_t *p = (int32_t *)rt_cmd_begin(op, flags, (uint32_t)n * 4u);
     if (!p) return 1; /* complete packet was rejected; never execute on producer */
@@ -13457,8 +13486,13 @@ static void rth_present_payload(uint16_t op, const uint8_t *p) {
         gl_renderer_present((const uint32_t *)q,cpu->w,cpu->h,cpu->linear,
             cpu->force_4_3,cpu->content_w,cpu->cycle,cpu->frame,cpu->epoch,
             cpu->generation,cpu->stream_lba,cpu->delivered_lba,cpu->serial);
-    } else
-        (void)gl_renderer_present_wide_fbo(a[0], a[1], a[2], a[3]);
+    } else if(!gl_renderer_present_wide_fbo(a[0], a[1], a[2], a[3])) {
+        GpuDisplayInfo display;
+        ctx_display_info(&display);
+        /* Same canonical image as the old missing-wide fallback, entirely
+         * on the graphics owner instead of GPU->CPU->GPU round-tripping. */
+        gl_renderer_present_vram(a[0],a[1],display.width,a[2],a[3],1);
+    }
     s_rth_ov.valid = 0;
 }
 
