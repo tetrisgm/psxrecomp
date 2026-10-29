@@ -58,13 +58,14 @@ static void reset(void) {
     ctx_on = ctx_off = 0;
 }
 
-static void run(int slots, long us, int expect_waits) {
+static void run(int slots, long us, int expect_refusals) {
     reset();
     present_us = us;
     PtConfig c = cfg(slots);
     check(pt_start(&c), "start");
     check(pt_current() == 0, "first slot is 0");
-    int bad_reuse = 0, bad_token = 0;
+    int bad_reuse = 0, bad_token = 0, accepted = 0;
+    uintptr_t expected[N_FRAMES];
     for (int f = 1; f <= N_FRAMES; f++) {
         const int cur = pt_current();
         if (atomic_load(&slot_busy[cur])) bad_reuse++;
@@ -74,6 +75,12 @@ static void run(int slots, long us, int expect_waits) {
         void *done = NULL;
         uint64_t w = 0;
         const int next = pt_submit((void *)(uintptr_t)f, &done, &w);
+        if (next == -2) {
+            check(!done && !w && pt_current() == cur, "refusal retains slot/token without waiting");
+            atomic_store(&slot_busy[cur], 0);
+            continue;
+        }
+        expected[accepted++] = (uintptr_t)f;
         if (next < 0 || next >= slots || next == cur || atomic_load(&slot_busy[next])) bad_reuse++;
         if ((uintptr_t)done != last_done[next]) bad_token++;
         /* this slot's next token is unknown until presented again */
@@ -82,18 +89,19 @@ static void run(int slots, long us, int expect_waits) {
         last_done[cur] = (((uintptr_t)f) << 8) | (uintptr_t)cur | 0x80u;
     }
     pt_drain();
-    check(atomic_load(&n_presented) == N_FRAMES, "every submitted slot presented");
+    check(atomic_load(&n_presented) == accepted, "every accepted slot presented");
     int ordered = 1;
-    for (int i = 0; i < N_FRAMES; i++) if (presented[i] != (uintptr_t)(i + 1)) ordered = 0;
+    for (int i = 0; i < accepted; i++) if (presented[i] != expected[i]) ordered = 0;
     check(ordered, "presented in submission order");
     check(!bad_reuse, "a slot is never composed while queued or presenting");
     check(!bad_token, "done token reaches the producer taking the slot");
     check(!atomic_load(&order_bad), "present sees only queued slots");
     PtStats st;
     pt_get_stats(&st);
-    check(st.submits == N_FRAMES && st.presents == N_FRAMES, "stats count");
+    check(st.submits == accepted && st.presents == accepted && st.refused == N_FRAMES - accepted, "stats count");
     check(st.queued_high <= slots, "bounded queue");
-    if (expect_waits > 0) check(st.waits > 0 && st.wait_ns > 0, "slow display blocks the producer");
+    check(!st.waits && !st.wait_ns, "slow display never blocks the producer");
+    if (expect_refusals > 0) check(st.refused > 0, "slow display drops optional presentation");
     /* stop with frames queued: they are presented, leftover tokens disposed */
     present_us = 2000;
     for (int f = 0; f < slots - 1; f++) {
@@ -102,7 +110,7 @@ static void run(int slots, long us, int expect_waits) {
         (void)pt_submit((void *)(uintptr_t)(N_FRAMES + 1 + f), &d, NULL);
     }
     pt_stop();
-    check(atomic_load(&n_presented) == N_FRAMES + slots - 1, "stop presents the queue");
+    check(atomic_load(&n_presented) == accepted + slots - 1, "stop presents the queue");
     check(atomic_load(&disposed) > 0, "stop disposes uncollected tokens");
     check(ctx_on == 1 && ctx_off == 1, "context taken and released once");
     check(!pt_running() && pt_submit(NULL, NULL, NULL) == -1, "stopped");
@@ -202,40 +210,22 @@ static void run_timed(void) {
           "already expired output refused at admission");
     pt_stop();
 
-    /* Admission wait: a full queue holds the producer until the next present
-     * frees a slot (bounded by the cap and the output's expiry). */
-    reset();
-    c.slots = 2;
-    c.admit_wait_ns = 2000000000ull;
-    check(pt_start(&c), "admission-wait presenter starts");
+    /* A future output occupies the only non-composing slot. Even a long
+     * expiry must never turn admission into a producer wait. */
+    reset(); c.slots = 2;
+    check(pt_start(&c), "nonblocking timed presenter starts");
     pt_set_epoch(5);
     begin = pt_clock_ns();
-    t = (PtTiming){5, begin + 100000000ull, begin + 2000000000ull};
-    check(pt_try_submit_at((void *)31, &t, &done) == 1, "first timed output queued");
-    t.not_before_ns = begin + 110000000ull;
-    uint64_t w0 = pt_clock_ns();
-    int got = pt_try_submit_at((void *)32, &t, &done);
-    uint64_t w = pt_clock_ns() - w0;
-    check(got == 0 && done == (void *)31,
-          "full queue waits for the present and takes the freed slot");
-    check(w >= 50000000ull && w < 1500000000ull, "waited for the present, not the cap");
-    pt_drain();
-    check(atomic_load(&n_presented) == 2 && presented[0] == 31 && presented[1] == 32,
-          "both outputs presented in order after the wait");
+    t = (PtTiming){5, begin + 1000000000ull, begin + 2000000000ull};
+    check(pt_try_submit_at((void *)31, &t, &done) == 1, "future output queued");
+    check(pt_try_submit_at((void *)32, &t, &done) == -2 && !done && pt_current() == 1,
+          "full timed queue retains composing slot and refuses immediately");
     pt_get_stats(&st);
-    check(st.timed_waited == 1 && st.timed_refused == 0 && st.timed_wait_ns >= 50000000ull,
-          "admission wait counted, no refusal");
-    /* An output that expires before a slot frees is still refused. */
-    t = (PtTiming){5, pt_clock_ns() + 300000000ull, pt_clock_ns() + 2000000000ull};
-    check(pt_try_submit_at((void *)33, &t, &done) >= 0, "late output queued");
-    t.not_before_ns = pt_clock_ns() + 10000000ull; t.expires_ns = pt_clock_ns() + 40000000ull;
-    w0 = pt_clock_ns();
-    check(pt_try_submit_at((void *)34, &t, &done) == -2, "output expiring before a slot frees is refused");
-    check(pt_clock_ns() - w0 < 250000000ull, "refusal at expiry, not at the cap");
-    pt_get_stats(&st);
-    check(st.timed_waited == 2 && st.timed_refused == 1, "expired wait counted as a refusal");
+    check(st.timed_refused == 1 && !st.timed_waited && !st.waits,
+          "timed admission never waits");
     pt_set_epoch(6);
     pt_stop();
+
 }
 
 int main(void) {

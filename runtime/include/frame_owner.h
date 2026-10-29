@@ -55,6 +55,7 @@ int frame_owner_control(FrameOwner *owner,uint64_t before_sequence,
 int frame_owner_current(const FrameOwner *owner,const FramePacketView *packet);
 uint64_t frame_owner_replaced(const FrameOwner *owner);
 uint64_t frame_owner_completed(const FrameOwner *owner);
+uint64_t frame_owner_idle_ns(const FrameOwner *owner);
 int frame_owner_is_thread(void);
 /* Consumer only; earliest request wins, including requests made by tick. */
 void frame_owner_tick_at(FrameOwner *owner,uint64_t deadline_ns);

@@ -489,6 +489,8 @@ static _Atomic int   s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) *
  * the native-wide fast-path latch, depth24) is captured when a call is
  * recorded and read back through the ctx_* accessors below during replay. */
 #include "render_thread.h"
+#include "frame_owner.h"
+#include "native_raster.h"
 static int       s_rth_on = 0;
 static uint16_t *s_rth_vram_pub = NULL;   /* lifecycle presentation backing   */
 static uint16_t *s_rth_vram_priv = NULL;  /* render thread's upload source     */
@@ -498,6 +500,7 @@ static int       s_rthx_tagged = 0, s_rthx_backdrop = 0;
 static int       s_rths_flat_bd = 0, s_rths_vp_w = 0, s_rths_bg_full = 0;
 static GpuDisplayInfo s_rths_display;
 static _Thread_local int s_rth_packet_replaying;
+static _Thread_local const FramePacketView *s_rth_packet_view;
 static inline int rth_replaying(void) {
     return s_rth_packet_replaying || (s_rth_on && rt_on_render_thread());
 }
@@ -647,28 +650,21 @@ typedef struct RthControl {
     double d[3];
     char text[1024];
 } RthControl;
+static void gl_rth_exec(void *user,const RtCmd *command,const void *payload);
+static void rth_control_execute(const void *payload) {
+    const RtCmd command={sizeof(RtCmd)+sizeof(RthControl),RTH_CONTROL,0,sizeof(RthControl),0};
+    gl_rth_exec(NULL,&command,payload);
+}
 static int rth_control(const RthControl *call) {
     if(!s_rth_on || rt_on_render_thread() || rt_held()) return 0;
-    rth_send_state();
-    if(!rth_group_flush()) abort();
-    void *p=rt_cmd_begin(RTH_CONTROL,0,sizeof *call);
-    if(!p) abort();
-    memcpy(p,call,sizeof *call);
-    rt_cmd_commit();
+    if(!rt_control(rth_control_execute,call,sizeof *call)) abort();
     return 1;
 }
 int gl_renderer_queue_diagnostic(void (*callback)(const void *),
                                  const void *request,uint32_t bytes) {
     if(!s_rth_on || rt_on_render_thread() || rt_held()) return 0;
     if(!callback || (bytes && !request) || bytes>UINT32_MAX-sizeof callback) abort();
-    rth_send_state();
-    if(!rth_group_flush()) abort();
-    uint8_t *p=rt_cmd_begin(RTH_DEBUG_CALL,0,(uint32_t)sizeof callback+bytes);
-    if(!p) abort();
-    memcpy(p,&callback,sizeof callback);
-    if(bytes) memcpy(p+sizeof callback,request,bytes);
-    rt_cmd_commit();
-    rt_flush(); /* also services a request while guest execution is paused */
+    if(!rt_request(callback,request,bytes)) abort();
     return 1;
 }
 #define RTH_CALL0(func) do { const RthControl c={.kind=RTH_CALL_0,.fn.v=(func)}; \
@@ -6031,8 +6027,7 @@ void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
             rt_cmd_commit();
             return;
         }
-        if (rt_batch_active()) return;
-        abort(); /* transport allocation failure, never permission to run GL here */
+        return; /* invalid complete packet is discarded at its boundary */
     }
     PSXProjectedVertex polygon[12];
     const double left=fmin(s_area_x1, -wide_dx())-1.0;
@@ -7563,7 +7558,7 @@ void gl_renderer_restage_vram_after_savestate(void) {
 }
 
 void gl_renderer_set_cpu_auth_dual(int on) {
-    GL_RT_SYNC("set_cpu_auth_dual");
+    RTH_CALLI(gl_renderer_set_cpu_auth_dual,on);
     s_cpu_auth_dual = on ? 1 : 0;
     if (s_cpu_auth_dual) {
         s_gpu_dirty = 0;
@@ -7572,8 +7567,7 @@ void gl_renderer_set_cpu_auth_dual(int on) {
 }
 
 void gl_renderer_set_hd_texture_mode(int on) {
-    /* Drain the GPU-authoritative stream before switching authority. */
-    GL_RT_SYNC("set_hd_texture_mode");
+    RTH_CALLI(gl_renderer_set_hd_texture_mode,on);
     on = on ? 1 : 0;
     s_hd_authority_pending = 0;
     if (on && !s_hd_native_authority && s_rth_a0_open && s_raster_ok) {
@@ -7591,8 +7585,8 @@ void gl_renderer_set_hd_texture_mode(int on) {
         }
     }
     s_hd_native_authority = on;
-    /* An A0 still streaming keeps its hold (s_rth_a0_open): the context was
-     * just taken above, and eligibility keeps it until the commit. */
+    /* A partial presentation upload defers the mode change until its commit.
+     * Native guest authority is independent of this cosmetic mode. */
     /* Smooth motion restarts its lists: their draws resolve textures under
      * the authority they were recorded in. */
     s_fg_broken = 1;
@@ -11620,18 +11614,7 @@ static int pt_begin(void) {
     SDL_GL_MakeCurrent(s_win, s_ctx);
     memset(s_pts_fbo, 0, sizeof s_pts_fbo);
     memset(s_ptp_fbo, 0, sizeof s_ptp_fbo);
-    PtConfig c = { slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL, 0 };
-    /* A timed output that finds every slot taken waits for the next present
-     * to free one (within its expiry) instead of being dropped. The wait is
-     * capped at PSX_PRESENT_ADMIT_WAIT_MS (default 25, 0 = refuse at once as
-     * before). */
-    {
-        const char *e = getenv("PSX_PRESENT_ADMIT_WAIT_MS");
-        double ms = e && *e ? atof(e) : 25.0;
-        if (ms < 0.0) ms = 0.0;
-        if (ms > 1000.0) ms = 1000.0;
-        c.admit_wait_ns = (uint64_t)(ms * 1e6);
-    }
+    PtConfig c = { slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL };
     if (!pt_start(&c)) {
         fprintf(stdout, "psxrecomp: present thread: start failed; swaps stay on the render thread\n");
         SDL_GL_DeleteContext(s_pt_ctx);
@@ -11687,7 +11670,10 @@ static void gl_present_swap(void) {
             return;
         }
     } else {
-        (void)pt_submit(ready, &done, NULL);
+        if (pt_submit(ready, &done, NULL) < 0) {
+            if (ready) p_glDeleteSync(ready);
+            return;
+        }
     }
     if (done) {
         rthf_gpu_gap(1);
@@ -11720,12 +11706,12 @@ int gl_renderer_present_thread_json(char *out, size_t cap) {
     pt_get_stats(&st);
     return snprintf(out, cap,
         "\"present_thread\":{\"active\":%d,\"slots\":%d,\"submits\":%llu,\"presents\":%llu,"
-        "\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
+        "\"refused\":%llu,\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
         "\"queued_high\":%d,\"timed_dropped\":%llu,\"timed_refused\":%llu,"
         "\"timed_waited\":%llu,\"timed_wait_ms\":%.3f,"
         "\"gap_ms_max\":%.3f,\"gaps_over_25ms\":%llu}",
         s_pt_on, st.slots, (unsigned long long)st.submits, (unsigned long long)st.presents,
-        (unsigned long long)st.waits, st.wait_ns / 1e6,
+        (unsigned long long)st.refused, (unsigned long long)st.waits, st.wait_ns / 1e6,
         st.presents ? (double)st.present_ns / (double)st.presents / 1e6 : 0.0,
         st.present_max_ns / 1e6, st.queued_high,
         (unsigned long long)st.timed_dropped, (unsigned long long)st.timed_refused,
@@ -11736,6 +11722,7 @@ static void gl_swap_now(int generated);
 static int  fg_keep_real(void);      /* frame generation */
 static void fg_note_swap(uint64_t ns);
 static void gl_swap_with_osd(void) {
+    if(s_rth_packet_view && !rt_packet_current(s_rth_packet_view)) return;
     openxr_present_native(); /* Copy guest content before host-only overlays. */
     s_native_surface_pending=0; /* Hold-last/resim cannot reuse a native source. */
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -12582,7 +12569,7 @@ static void dyn_context_ready(void) {
 }
 
 void gl_renderer_set_dynamic_resolution(int on) {
-    if (s_ctx) GL_RT_SYNC("set_dynamic_resolution");
+    RTH_CALLI(gl_renderer_set_dynamic_resolution,on);
     s_dyn_on = on ? 1 : 0;
     if (!s_ctx || !s_raster_ok) return;   /* dyn_context_ready decides */
     if (s_dyn_on) {
@@ -13077,6 +13064,18 @@ typedef struct RthFrameState {
     GpuDisplayInfo display;
     RthBank bank;
 } RthFrameState;
+typedef struct RthPacketSeed {
+    RthFrameState draw;
+    SwNativeTextureState cache;
+    uint16_t pixels[VRAM_W*VRAM_H];
+} RthPacketSeed;
+typedef struct RthPacketInputs {
+    NativeRasterInputs *draws;
+    GpuHdTextureTracking *tracking;
+} RthPacketInputs;
+static RthPacketInputs *s_rth_packet_build;
+static uint64_t s_rth_packet_last_sequence,s_rth_packet_last_epoch;
+static _Atomic uint64_t s_rth_packet_seed_ns,s_rth_packet_seal_ns,s_rth_packet_dispose_ns;
 static RthFrameState s_rth_frame_state={.area={0,0,VRAM_W-1,VRAM_H-1}};
 static RthFrameState s_rth_frame_saved;
 static int s_rth_frame_pass;
@@ -13202,7 +13201,7 @@ static int rth_mirror_wide_present_ok(int base_x) {
 
 static int rth_rec_raw(uint16_t op, uint16_t flags, int n, const int32_t *v) {
     int32_t *p = (int32_t *)rt_cmd_begin(op, flags, (uint32_t)n * 4u);
-    if (!p) return rt_batch_active();
+    if (!p) return 1; /* complete packet was rejected; never execute on producer */
     memcpy(p, v, (size_t)n * 4u);
     rt_cmd_commit();
     return 1;
@@ -13211,7 +13210,7 @@ static int rth_record_bank(const RthBank *bank) {
     s_rth_frame_state.bank=*bank;
     if(!rth_group_flush()) return 0;
     void* payload=rt_cmd_begin(RTH_BANK,0,sizeof *bank);
-    if(!payload) return 0;
+    if(!payload) return 1;
     memcpy(payload,bank,sizeof *bank);rt_cmd_commit();
     return 1;
 }
@@ -13304,11 +13303,7 @@ static uint16_t rth_prim_flags(void) {
 }
 
 static int gl_rth_eligible(void) {
-    extern int psx_netplay_active(void);
-    return s_raster_ok && s_ctx && !s_cpu_auth_dual &&
-           (!s_interp_enabled || pass_queued_presenter() || (s_rth_on ? s_pt_on : s_pt_want)) &&
-           (!s_pass_active || pass_queued_enabled()) &&
-           !psx_netplay_active() && !psx_openxr_session_active() &&
+    return s_raster_ok && s_ctx && gr_native_raster() &&
            gr_backend() == GR_BACKEND_OPENGL;
 }
 
@@ -13368,7 +13363,7 @@ static int rth_record_present_data(uint16_t op, int n, const int32_t *v,
     bytes+=pixel_bytes;
     if(!rth_group_flush()) return 0;
     uint8_t *p = (uint8_t *)rt_cmd_begin(op, 0, (uint32_t)bytes);
-    if (!p) return 0;
+    if (!p) return 1; /* failed whole packet; keep presentation off the guest */
     memcpy(p, &hd, sizeof hd);
     uint8_t *q = p + sizeof hd;
     for (int i = 0; i < 4; i++)
@@ -16253,12 +16248,10 @@ static void rtb_init(uint16_t *vram) {
     if (s_rth_on) s_rth_vram_pub = vram;
     s_rth_a0_open = 0;   /* a reset abandons an incomplete A0 */
     if(s_rth_on && !rt_on_render_thread() && !rt_held()) {
-        if(!rth_group_flush()) abort();
-        const size_t bytes=(size_t)VRAM_W*VRAM_H*sizeof(uint16_t);
-        void *p=rt_cmd_begin(RTH_INIT,0,(uint32_t)bytes);
-        if(!p) abort();
-        memcpy(p,vram,bytes);
-        rt_cmd_commit();
+        s_rth_group_n=0;
+        native_raster_inputs_enable(gr_native_raster(),1);
+        gl_renderer_pass_async_invalidate();
+        rt_invalidate();
     } else if(s_rth_on) {
         memcpy(s_rth_vram_priv,vram,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
         glb_init(s_rth_vram_priv);
@@ -16378,8 +16371,7 @@ static void rtb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) 
             rt_cmd_commit();
             return;
         }
-        if (rt_batch_active()) return;
-        abort(); /* allocation failure; uploads never migrate GL ownership */
+        return; /* invalid complete packet is discarded at its boundary */
     }
     glb_vram_transfer_in(x, y, w, h, d);
 }
@@ -16965,6 +16957,132 @@ static void gl_rth_ctx(void *user, int current) {
     }
 }
 
+static void rth_packet_dispose(void *data) {
+    RthPacketInputs *inputs=data;
+    if(!inputs) return;
+    uint64_t begin=pt_clock_ns();
+    native_raster_inputs_destroy(inputs->draws);
+    gpu_hd_textures_free_tracking(inputs->tracking);
+    free(inputs);
+    atomic_fetch_add(&s_rth_packet_dispose_ns,pt_clock_ns()-begin);
+}
+static int rth_packet_begin(void *user,FrameOwner *owner,uint64_t sequence) {
+    (void)user;
+    uint64_t begin=pt_clock_ns();
+    rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
+    RthPacketSeed *seed=NULL;
+    if(!frame_owner_reserve_initial(owner,sequence,sizeof *seed,(void **)&seed)) return 0;
+    NativeRaster *native=gr_native_raster();
+    if(!native) { frame_owner_cancel(owner);return 0; }
+    gr_flush_native_upload();
+    RthPacketInputs *inputs=calloc(1,sizeof *inputs);
+    if(!inputs) { frame_owner_cancel(owner);return 0; }
+    if(gpu_hd_textures_active()) {
+        inputs->tracking=gpu_hd_textures_capture_native(seed->pixels,&seed->cache);
+        if(!inputs->tracking) { free(inputs);frame_owner_cancel(owner);return 0; }
+    } else native_raster_checkpoint(native,seed->pixels,NULL,&seed->cache);
+    seed->draw=s_rth_frame_state;
+    seed->draw.stream[0]=gpu_ws_nw_flat_backdrop_enabled()?1:0;
+    seed->draw.stream[1]=gpu_ws_netplay_local_viewport_width();
+    seed->draw.stream[2]=gpu_ws_background_requires_full_composite()?1:0;
+    gpu_get_display_info(&seed->draw.display);
+    s_rth_packet_build=inputs;
+    /* First primitive must carry its source even if the previous packet
+     * ended on the same host-only source identity. */
+    s_rthe_native_source=UINT64_MAX;
+    atomic_fetch_add(&s_rth_packet_seed_ns,pt_clock_ns()-begin);
+    return 1;
+}
+static int rth_packet_seal(void *user,FrameOwner *owner) {
+    (void)user;
+    uint64_t begin=pt_clock_ns();
+    gr_flush_native_upload();
+    NativeRasterInputs *draws=native_raster_inputs_seal(gr_native_raster());
+    atomic_fetch_add(&s_rth_packet_seal_ns,pt_clock_ns()-begin);
+    RthPacketInputs *inputs=s_rth_packet_build;s_rth_packet_build=NULL;
+    if(!inputs || !native_raster_inputs_valid(draws)) {
+        native_raster_inputs_destroy(draws);rth_packet_dispose(inputs);return 0;
+    }
+    inputs->draws=draws;
+    size_t bytes=sizeof *inputs+native_raster_inputs_bytes(draws)+
+                 gpu_hd_textures_tracking_bytes(inputs->tracking);
+    if(!frame_owner_attach(owner,inputs,bytes,rth_packet_dispose)) {
+        rth_packet_dispose(inputs);return 0;
+    }
+    return 1;
+}
+/* Exact native pixels are for CPU-side texture keys/coherence. The enhanced
+ * surfaces and their render-to-texture pack remain presentation-owned; do
+ * not overwrite an enhanced render target with a native tile per primitive. */
+static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source) {
+    if(!source) return 1;
+    NativeRasterTile tiles[128];
+    int count=native_raster_inputs_get(inputs->draws,source,tiles,128);
+    if(count<0) return 0;
+    if(!count) return 1;
+    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+    for(int t=0;t<count;++t)
+        for(unsigned row=0;row<64;++row)
+            memcpy(s_rth_vram_priv+(tiles[t].y+row)*VRAM_W+tiles[t].x,
+                   tiles[t].pixels+row*64,64*sizeof(uint16_t));
+    const GpuHdTextureTracking *tracking=native_raster_inputs_metadata(inputs->draws,source);
+    return !tracking || gpu_hd_textures_apply_tracking(tracking);
+}
+static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,const void *payload) {
+    if(s_rth_packet_view && !rt_packet_current(s_rth_packet_view)) return 0;
+    if(command->op==RTH_GROUP) {
+        const int32_t *words=payload;
+        unsigned count=command->payload/4u,at=0;
+        while(at+2<=count) {
+            uint32_t id=(uint32_t)words[at],n=(uint32_t)words[at+1];
+            if(n>count-at-2 || (uint16_t)id==RTH_GROUP) return 0;
+            RtCmd inner={sizeof(RtCmd)+n*4u,(uint16_t)id,(uint16_t)(id>>16),n*4u,command->seq};
+            if(!rth_packet_record(inputs,&inner,words+at+2)) return 0;
+            at+=n+2;
+        }
+        return at==count;
+    }
+    if(command->op==RTH_NATIVE_SOURCE) {
+        uint64_t source;
+        if(command->payload!=sizeof source) return 0;
+        memcpy(&source,payload,sizeof source);
+        if(!rth_packet_native_input(inputs,source)) return 0;
+    }
+    gl_rth_exec(NULL,command,payload);return 1;
+}
+static void rth_packet_execute(void *user,const FramePacketView *packet) {
+    (void)user;
+    if(packet->initial_bytes!=sizeof(RthPacketSeed) || !packet->attachment) return;
+    const RthPacketSeed *seed=packet->initial;
+    const RthPacketInputs *inputs=packet->attachment;
+    s_rth_packet_replaying=1;s_rth_packet_view=packet;
+    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+    memcpy(s_rth_vram_priv,seed->pixels,sizeof seed->pixels);
+    rth_rebind_vram(s_rth_vram_priv);
+    sw_native_texture_load(&seed->cache);
+    if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
+    if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence!=s_rth_packet_last_sequence+1) {
+        gl_renderer_restage_vram_after_savestate();
+        fg_invalidate();
+    }
+    rth_frame_state_apply(&seed->draw);
+    const uint8_t *records=packet->records;
+    for(size_t at=0;at<packet->record_bytes;) {
+        const RtCmd *command=(const RtCmd *)(records+at);
+        if(!rt_packet_current(packet) || !rth_packet_record(inputs,command,command+1)) goto done;
+        at+=command->size;
+    }
+    s_rth_packet_last_epoch=packet->epoch;
+    s_rth_packet_last_sequence=packet->sequence;
+done:
+    s_rth_packet_view=NULL;s_rth_packet_replaying=0;
+}
+static void rth_packet_reset(void *user,uint64_t epoch) {
+    (void)user;(void)epoch;
+    fg_invalidate();gl_renderer_invalidate_present();
+    s_rth_packet_last_sequence=s_rth_packet_last_epoch=0;
+}
+
 /* ---- lifecycle / public ---------------------------------------------------- */
 extern void gr_refresh_backend(void);   /* gpu_render.c */
 
@@ -16988,13 +17106,19 @@ int gl_renderer_render_thread_start(int max_frames) {
     rth_rebind_vram(priv);
     rth_publish_diagnostics();
     s_rth_on = 1;
-    RtConfig cfg;
+    RtConfig cfg={0};
     cfg.ring_bytes = (size_t)32u << 20;
     cfg.max_frames = max_frames < 1 ? 1 : max_frames > 8 ? 8 : max_frames;
     cfg.exec = gl_rth_exec;
     cfg.ctx = gl_rth_ctx;
     cfg.user = NULL;
     cfg.tick = fg_tick;
+    cfg.initial_limit=(size_t)128<<20;
+    cfg.begin_frame=rth_packet_begin;
+    cfg.seal_frame=rth_packet_seal;
+    cfg.execute_frame=rth_packet_execute;
+    cfg.reset_frame=rth_packet_reset;
+    native_raster_inputs_enable(gr_native_raster(),1);
     fg_invalidate();
     (void)pt_begin();   /* [video] present_thread; falls back to direct swaps */
     if ((s_interp_enabled && !s_pt_on) || !rt_start(&cfg)) {
@@ -17004,6 +17128,7 @@ int gl_renderer_render_thread_start(int max_frames) {
         rth_rebind_vram(s_rth_vram_pub);
         free(priv);
         s_rth_vram_priv = NULL;
+        native_raster_inputs_enable(gr_native_raster(),0);
         return 0;
     }
     gr_refresh_backend();
@@ -17014,6 +17139,8 @@ void gl_renderer_render_thread_stop(void) {
     if (!s_rth_on) return;
     rth_group_flush();
     rt_stop();                       /* drains; the context is current here again */
+    native_raster_inputs_enable(gr_native_raster(),0);
+    rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
     pt_end();
     /* Preserve the presentation mirror across renderer shutdown/restart.
      * This is lifecycle storage, never guest VRAM publication. */
@@ -17036,11 +17163,6 @@ int gl_renderer_render_thread_active(void) { return s_rth_on; }
 void gl_renderer_render_thread_frame_boundary(void) {
     if (!s_rth_on) return;
     fg_note_guest_frame();
-    if (rt_held()) {
-        if (gl_rth_eligible()) gl_rth_release();
-    } else if (!gl_rth_eligible()) {
-        gl_rth_acquire("ineligible");
-    }
     /* The render thread's per-frame cost (dynamic resolution) ends here. */
     int need_frame=atomic_load_explicit(&s_rthf_want,memory_order_relaxed) || s_fg_on;
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -17082,6 +17204,12 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
                       i ? "," : "", (unsigned long long)ev[i].frame, ev[i].wait_ns / 1e3,
                       ev[i].reason);
     if (k > 0 && (size_t)k < cap) k += snprintf(out + k, cap - (size_t)k, "],");
+    if (k > 0 && (size_t)k < cap) k += snprintf(out+k,cap-(size_t)k,
+        "\"frames_replaced\":%llu,\"frames_rejected\":%llu,\"owner_delay_ms\":%u,"
+        "\"packet_seed_ms\":%.3f,\"packet_seal_ms\":%.3f,\"packet_dispose_ms\":%.3f,",
+        (unsigned long long)st.frames_replaced,(unsigned long long)st.frames_rejected,st.owner_delay_ms,
+        atomic_load(&s_rth_packet_seed_ns)*1e-6,atomic_load(&s_rth_packet_seal_ns)*1e-6,
+        atomic_load(&s_rth_packet_dispose_ns)*1e-6);
     if (k > 0 && (size_t)k < cap) k += gl_renderer_present_thread_json(out + k, cap - (size_t)k);
     return k;
 }

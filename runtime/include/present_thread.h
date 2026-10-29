@@ -1,8 +1,7 @@
 /* present_thread.h — opt-in present thread under the render thread
  * ([video] present_thread, docs/RENDER_THREAD.md "Present thread").
  *
- * The thread that composes frames (the render thread, or the emulation thread
- * while it holds the context at a sync point) draws each presented frame into
+ * The graphics owner composes each presented frame into
  * an offscreen slot instead of the window, then hands the slot over; the
  * present thread owns a second graphics context on the same window and does
  * the final copy and the swap. The swap's wait on the window compositor then
@@ -10,16 +9,15 @@
  *
  * This core is backend-neutral: a ring of `slots` numbered slots, each FREE,
  * COMPOSING (the producer's current slot, exactly one), QUEUED or PRESENTING.
- * Queued slots are presented in submission order. The producer blocks in
- * pt_submit() only while every other slot is queued or presenting (the
- * display is the bottleneck; that wait is the swap's wait, moved).
+ * Accepted slots are presented in order. With no free slot, submission is
+ * refused immediately and the producer retains its composing slot.
  *
  * Fences are opaque: `ready` travels with a submitted slot to present();
  * present() returns a `done` token (e.g. a fence after its copy) that the
  * producer receives when it next takes that slot, before drawing into it.
  *
  * Producer calls (pt_current / pt_submit) may come from different threads
- * over time, but never concurrently (the context hand-off orders them). */
+ * over time only across renderer shutdown/startup, never concurrently. */
 #ifndef PSX_PRESENT_THREAD_H
 #define PSX_PRESENT_THREAD_H
 
@@ -51,10 +49,6 @@ typedef struct PtConfig {
     PtPresentFn present;
     PtDisposeFn dispose;   /* optional */
     void       *user;
-    /* pt_try_submit_at: with every slot taken, wait up to this long (and
-     * never past the output's expiry) for one to free before refusing. 0
-     * refuses at once. */
-    uint64_t    admit_wait_ns;
 } PtConfig;
 
 /* Start the thread; returns once its ctx(1) has run. 1 on success (the
@@ -68,10 +62,9 @@ int  pt_running(void);
 
 /* Producer: the slot being composed. */
 int  pt_current(void);
-/* Producer: queue the current slot with `ready`, then take the next free slot
- * (blocking while none is). *next_done receives that slot's done token (NULL
- * if none); *wait_ns the time spent blocked. Returns the new current slot, or
- * -1 when not running. */
+/* Producer: queue only when another slot is free. On refusal (-2), retain the
+ * composing slot and ready token. On success next_done receives the next
+ * slot's done token. wait_ns is always zero; -1 means not running. */
 int  pt_submit(void *ready, void **next_done, uint64_t *wait_ns);
 /* Independent output scheduling. Times are monotonic nanoseconds from
  * pt_clock_ns(). Set a new nonzero epoch after a rate/session/clock reset.
@@ -84,8 +77,7 @@ typedef struct PtTiming {
 } PtTiming;
 uint64_t pt_clock_ns(void);
 void pt_set_epoch(uint64_t epoch);
-/* Producer: submit only if another slot is free (or frees within
- * cfg.admit_wait_ns, while the output has not expired), the epoch matches,
+/* Producer: submit only if another slot is free, the epoch matches,
  * and the output has not expired. Never waits for a deadline.
  * Returns new slot, -1 when stopped, -2 on refusal. On refusal the producer
  * keeps its current slot AND ready token; next_done is NULL. Accepted timed
@@ -99,11 +91,12 @@ int pt_present_timing(unsigned slot, PtTiming *out);
 void pt_drain(void);
 
 typedef struct PtStats {
+    uint64_t refused;
     uint64_t submits, presents, waits, wait_ns, present_ns, present_max_ns;
     uint64_t present_gap_max_ns, present_gaps_over_25ms;
     uint64_t timed_dropped, timed_refused;
     int      slots, queued_high;
-    /* Timed submissions that waited for a slot (admit_wait_ns), and how long. */
+    /* Retained diagnostic fields: admission never waits; always zero. */
     uint64_t timed_waited, timed_wait_ns;
 } PtStats;
 void pt_get_stats(PtStats *out);

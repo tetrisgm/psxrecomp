@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from gl_frame_owner_build import build_frame_owner, cxx_compiler
 
 MAC_FRAMEWORKS = ["Cocoa", "OpenGL", "IOKit", "CoreVideo", "CoreAudio", "AudioToolbox",
                   "Carbon", "ForceFeedback", "GameController", "Metal", "QuartzCore",
@@ -53,6 +54,7 @@ def parse(stdout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cc", default="cc")
+    ap.add_argument("--cxx")
     ap.add_argument("--sdl-include", required=True)
     ap.add_argument("--sdl-library", required=True)
     ap.add_argument("--output", required=True)
@@ -110,7 +112,12 @@ def main():
             return 2
         objs.append(o)
     probe = dest / ("probe.exe" if WINDOWS else "probe")
-    link = [args.cc, *objs, args.sdl_library, "-o", probe]
+    cxx = cxx_compiler(args.cc, args.cxx)
+    owner_objects = build_frame_owner(run, cxx, src, dest, ["-O1", *sections, *includes])
+    if owner_objects is None:
+        return 2
+    objs += owner_objects
+    link = [cxx, *objs, args.sdl_library, "-o", probe]
     if platform.system() == "Darwin":
         for f in MAC_FRAMEWORKS:
             link += ["-framework", f]

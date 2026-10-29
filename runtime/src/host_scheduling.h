@@ -1,6 +1,6 @@
 #ifndef PSX_HOST_SCHEDULING_H
 #define PSX_HOST_SCHEDULING_H
-enum class PsxHostThreadRole { Emulation, Audio, Render };
+enum class PsxHostThreadRole { Emulation, Audio, Render, NativeRaster };
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -36,7 +36,8 @@ public:
         using Name=HRESULT(WINAPI *)(HANDLE,PCWSTR);
         auto name=reinterpret_cast<Name>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),"SetThreadDescription"));
         if(name) name(GetCurrentThread(),audio?L"PSX audio":
-            role==PsxHostThreadRole::Render?L"PSX render":L"PSX emulation");
+            role==PsxHostThreadRole::Render?L"PSX render":
+            role==PsxHostThreadRole::NativeRaster?L"PSX native raster":L"PSX emulation");
     }
     ~PsxHostScheduling() {
         if(handle) leave(handle);

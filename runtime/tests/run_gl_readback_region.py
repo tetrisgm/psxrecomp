@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from gl_frame_owner_build import build_frame_owner
 
 
 def probe_result_ok(code, stdout, stderr, expect_unbounded=False):
@@ -88,7 +89,11 @@ def main():
     libraries = ["m", "kernel32", "user32", "gdi32", "winmm", "imm32", "ole32",
                  "oleaut32", "version", "uuid", "advapi32", "setupapi", "shell32",
                  "dinput8", "opengl32"]
-    if run([compiler / "g++.exe", "-O2", "-flto", *[dest / (name + ".o") for name, _ in sources],
+    owner_objects=build_frame_owner(run,compiler / "g++.exe",framework / "runtime/src",dest,
+                                    ["-O2","-flto",*includes])
+    if owner_objects is None:
+        return 2
+    if run([compiler / "g++.exe", "-O2", "-flto", *[dest / (name + ".o") for name, _ in sources],*owner_objects,
             sdl_library, *["-l" + name for name in libraries],
             "-o", dest / "probe.exe"]).returncode:
         return 2

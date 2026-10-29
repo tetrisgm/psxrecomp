@@ -356,6 +356,9 @@ static void present(int bx) {
     if (wide_mode) (void)gl_renderer_present_wide_fbo(bx, 0, FRAME_H, 0);
     else gl_renderer_present_vram(bx, 0, FRAME_W, FRAME_H, 0, 0);
     gl_renderer_render_thread_frame_boundary();
+    /* This fixture compares every real endpoint. Deliberate packet drops are
+     * covered separately by test_gl_frame_packet, so acknowledge this one. */
+    rt_drain();
 }
 
 static _Atomic int stats_writer_done;
@@ -454,6 +457,9 @@ int main(int argc, char **argv) {
         check(gl_renderer_pgxp_render_wanted() == (g_pgxp_depth || g_pgxp_color || g_pgxp_seam),
               "PGXP renderer features as asked");
     }
+    NativeRaster *native = native_raster_create(vram);
+    check(native != NULL, "native authority created");
+    gr_bind_native_raster(native, NULL);
     check(gl_renderer_render_thread_start(2) == 1, "render thread started");
     if (pt_mode) check(gl_renderer_present_thread_active(), "present thread started");
     const char *method = getenv("FG_METHOD");
@@ -495,7 +501,10 @@ int main(int argc, char **argv) {
         SDL_Delay(16);
     }
     SDL_Delay(60);
-    gl_renderer_render_thread_sync("test");   /* the render thread parks; we hold the context */
+    rt_drain();
+    /* Inspect endpoints after the graphics owner's lifecycle ends. Tests
+     * obey the same startup/shutdown-only context ownership as production. */
+    gl_renderer_render_thread_stop();
     if (fg) {
         char js[4096];
         gl_renderer_frame_gen_json(js, sizeof js);
@@ -722,6 +731,8 @@ int main(int argc, char **argv) {
         check(same, "the window shows every composed image, in order");
     }
     printf("checks=%d failures=%d\n", checks, failures);
+    gr_bind_native_raster(NULL, NULL);
+    native_raster_destroy(native);
     SDL_DestroyWindow(win);
     SDL_Quit();
     return failures ? 1 : 0;

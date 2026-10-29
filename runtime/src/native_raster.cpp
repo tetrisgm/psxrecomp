@@ -1,5 +1,6 @@
 #include "native_raster.h"
 #include "gpu_sw_renderer.h"
+#include "host_scheduling.h"
 
 #include <array>
 #include <atomic>
@@ -283,6 +284,7 @@ struct NativeRaster {
         available.notify_one();
     }
     void run() {
+        psx_host_schedule_thread(PsxHostThreadRole::NativeRaster);
         sw_context_bind(context);
         sw_renderer_init(vram.data());
         sw_set_faithful_authority(1);

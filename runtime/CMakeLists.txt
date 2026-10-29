@@ -423,7 +423,7 @@ if(BUILD_TESTING)
         add_test(NAME gl_frame_packet_test
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
-                --single --packet-owner
+                --single
                 --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_frame_packet.c"
                 --cc "${CMAKE_C_COMPILER}" --cxx "${CMAKE_CXX_COMPILER}"
                 --sdl-include "${_gl_scale_sdl_inc}"
@@ -1874,7 +1874,8 @@ if(BUILD_TESTING)
     # The fixture itself uses POSIX threads and nanosleep (MinGW has both;
     # the core takes its Win32 path there).
     if(NOT MSVC)
-        add_executable(render_thread_test tests/test_render_thread.c src/render_thread.c)
+        add_executable(render_thread_test tests/test_render_thread.c src/render_thread.c
+            src/frame_owner.cpp src/frame_packet.cpp)
         target_include_directories(render_thread_test PRIVATE include)
         find_package(Threads REQUIRED)
         target_link_libraries(render_thread_test PRIVATE Threads::Threads)

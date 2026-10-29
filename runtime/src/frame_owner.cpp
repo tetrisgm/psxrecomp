@@ -30,6 +30,7 @@ struct FrameOwner {
     uint64_t published=0; // wake generation, protected only by mutex
     bool stop=false;
     std::atomic<uint64_t> completed{0};
+    std::atomic<uint64_t> idle_ns{0};
     std::atomic<uint64_t> epoch{1};
     std::deque<Request> requests;
     std::deque<Request> controls;
@@ -62,16 +63,24 @@ struct FrameOwner {
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 while(!stop && published==seen) {
+                    const auto wait_begin=std::chrono::steady_clock::now();
                     if(deadline) {
                         const uint64_t now=config.clock_ns();
                         if(now>=deadline) break;
                         ready.wait_for(lock,std::chrono::nanoseconds(deadline-now));
                     } else ready.wait(lock);
+                    idle_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now()-wait_begin).count()),std::memory_order_relaxed);
                 }
                 seen=published;stopping=stop;
             }
             observe_epoch();
-            if(!stopping && deadline) {
+            FramePacketView packet{};
+            const bool has_packet=frame_packet_acquire(queue,&packet)!=0;
+            /* A waiting complete frame takes priority over interpolation
+             * of the previous one. Driver delay must not create a queue of
+             * obsolete generated images ahead of fresh guest output. */
+            if(!stopping && !has_packet && deadline) {
                 const uint64_t now=config.clock_ns();
                 if(now>=deadline) {
                     deadline=0;
@@ -79,8 +88,6 @@ struct FrameOwner {
                     if(next && (!deadline || next<deadline)) deadline=next;
                 }
             }
-            FramePacketView packet{};
-            const bool has_packet=frame_packet_acquire(queue,&packet)!=0;
             for(unsigned n=0;n<64;++n) {
                 observe_epoch();
                 Request request;
@@ -212,6 +219,7 @@ extern "C" int frame_owner_current(const FrameOwner *owner,const FramePacketView
 }
 extern "C" uint64_t frame_owner_replaced(const FrameOwner *owner) { return frame_packet_replaced(owner->queue); }
 extern "C" uint64_t frame_owner_completed(const FrameOwner *owner) { return owner->completed.load(std::memory_order_acquire); }
+extern "C" uint64_t frame_owner_idle_ns(const FrameOwner *owner) { return owner->idle_ns.load(std::memory_order_relaxed); }
 extern "C" int frame_owner_is_thread(void) { return current_owner!=nullptr; }
 extern "C" void frame_owner_tick_at(FrameOwner *owner,uint64_t deadline) {
     if(current_owner!=owner || !owner->config.tick) std::abort();

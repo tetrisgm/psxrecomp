@@ -28,6 +28,7 @@ struct OwnerTest {
     std::atomic<unsigned> controls{0};
     std::atomic<unsigned> resets{0};
     bool arm_old_tick=false;
+    uint64_t tick_after=0;
     FrameOwner *owner=nullptr;
 };
 static uint64_t owner_clock() {
@@ -37,6 +38,7 @@ static uint64_t owner_clock() {
 static uint64_t tick(void *user,uint64_t now) {
     auto &state=*static_cast<OwnerTest *>(user);
     assert(frame_owner_is_thread());
+    if(state.tick_after) assert(state.last.load(std::memory_order_acquire)>=state.tick_after);
     return ++state.ticks==1?now+1000000:0;
 }
 static void context(void *user,int current) {
@@ -203,6 +205,22 @@ int main() {
     /* The C renderer's owned packet carries its seed independently of all
      * skipped packets. Neither caller buffers nor later appends may mutate
      * the consumer's current packet. Overflow rejects a whole packet. */
+    {
+        OwnerTest priority;
+        priority.arm_old_tick=true;priority.tick_after=2;
+        const FrameOwnerConfig priority_config{8,4096,execute,context,&priority,tick,owner_clock};
+        priority.owner=frame_owner_start(&priority_config);assert(priority.owner);
+        uint64_t seq=1;
+        assert(frame_owner_begin(priority.owner,seq,&seq,sizeof seq));
+        assert(frame_owner_publish(priority.owner));
+        while(!priority.entered.load(std::memory_order_acquire)) std::this_thread::yield();
+        seq=2;
+        assert(frame_owner_begin(priority.owner,seq,&seq,sizeof seq));
+        assert(frame_owner_publish(priority.owner));
+        priority.unblock.store(true,std::memory_order_release);
+        while(priority.ticks.load(std::memory_order_acquire)<2) std::this_thread::yield();
+        frame_owner_stop(priority.owner);
+    }
     FramePacketQueue *queue=frame_packet_create(1024*1024,1024*1024);
     assert(queue);
     std::vector<uint16_t> native(1024*512,0x1234);

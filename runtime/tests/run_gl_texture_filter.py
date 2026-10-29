@@ -6,6 +6,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sys
+from gl_frame_owner_build import build_frame_owner, cxx_compiler
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -24,6 +25,7 @@ def main():
     parser.add_argument('--webp-decoder')
     parser.add_argument('--argument', action='append', default=[])
     args=parser.parse_args()
+    args.cxx=cxx_compiler(args.cc,args.cxx)
     fw=Path(__file__).resolve().parents[2]
     out=Path(args.output).resolve(); out.mkdir(parents=True,exist_ok=True)
     receipt=[]
@@ -57,13 +59,14 @@ def main():
         sources.append(("hov", fw/'runtime/src' / "host_overlay.c"))
     for name,source in sources:
         obj=out/(name+'.o'); run([args.cc,*flags,'-c',source,'-o',obj]); objects.append(obj)
+    objects += build_frame_owner(run,args.cxx,fw/'runtime/src',out,flags)
     if args.hd_pack:
         if not args.cxx: parser.error('--hd-pack requires --cxx')
         if not args.webp_include or not args.webp_decoder:
             parser.error('--hd-pack requires --webp-include and --webp-decoder')
         cppflags=[arg if arg!='-std=gnu11' else '-std=c++17' for arg in flags]
         cppflags+=['-I',args.webp_include]
-        for name in ('gpu_hd_textures','hd_texture_pack','duckstation_texture_pack','texture_image_decode','native_raster'):
+        for name in ('gpu_hd_textures','hd_texture_pack','duckstation_texture_pack','texture_image_decode'):
             obj=out/(name+'.o')
             run([args.cxx,*cppflags,'-c',fw/'runtime/src'/(name+'.cpp'),'-o',obj])
             objects.append(obj)
@@ -79,7 +82,7 @@ def main():
         libraries+=['-liconv','-Wl,-dead_strip']
     else: libraries+=['-lGL','-ldl','-lpthread']
     if platform.system()!='Darwin': libraries+=['-Wl,--gc-sections']
-    run([args.cxx if args.hd_pack else args.cc,*objects,args.sdl_library,'-o',exe,*libraries])
+    run([args.cxx,*objects,args.sdl_library,'-o',exe,*libraries])
     if not args.build_only:
         arguments=list(args.argument)
         if args.hd_pack:
