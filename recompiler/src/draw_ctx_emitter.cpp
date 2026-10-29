@@ -87,6 +87,9 @@ std::string draw_ctx_clone_text(const std::string& code,
     static const std::string kTick = " PSX_DCTX_TICK();";
     static const std::string kStorePc = "g_debug_last_store_pc = 0x";
     static const std::pair<const char*, const char*> kStores[] = {
+        {"psx_mem_write_word(cpu, ", "psx_dctx_sw(cpu, "},
+        {"psx_mem_write_half(cpu, ", "psx_dctx_sh(cpu, "},
+        {"psx_mem_write_byte(cpu, ", "psx_dctx_sb(cpu, "},
         {"cpu->write_word(", "psx_dctx_sw(cpu, "},
         {"cpu->write_half(", "psx_dctx_sh(cpu, "},
         {"cpu->write_byte(", "psx_dctx_sb(cpu, "},

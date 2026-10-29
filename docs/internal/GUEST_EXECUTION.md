@@ -62,7 +62,60 @@ samples, zero packet allocations, 37.381 ms maximum wall interval,
 matches all 120 reference frames exactly. G2's timing identity gate passes;
 the final CPU/tail-latency gate remains outstanding.
 
-G3 and G4 have not started. The final average <8 ms / heaviest <12 ms / wall
+G3 is implemented on fix/inline-memory; G4 follows on fix/inline-pgxp. The final average <8 ms / heaviest <12 ms / wall
 interval <20 ms target remains outstanding. Windows GetThreadTimes is quantized
 in this harness, so individual CPU intervals need a finer source before a
 sub-12-ms maximum can be claimed.
+
+## G3 inline compiled memory
+
+Generated stores and unaligned read/modify/write helpers use forced-inline
+psx_mem_read/write helpers. Ordinary RAM, scratchpad and BIOS use direct
+storage. Kernel dirty transitions and text-reference divergence bits are
+updated inline; watched/self-modifying code retains loader invalidation.
+Cache isolation, overlay callbacks, render passes, replay/capture and legacy
+vector-store compatibility preserve their existing slow paths. Disabled parity
+and card write observers are checked before calling their observer functions.
+Timed byte/half/word and LWC2 loads share direct RAM/scratch/ROM access with
+unchanged interlock, region wait, fraction and event ordering. Draw clones
+rewrite the new helpers to their private-memory operations.
+
+- Actual memory.c differential store fixture: identical bytes/counters and
+  observers across aliases, with zero memory callbacks for ordinary stores.
+  Also checks IsC, ROM, KSEG2, code dirty/evidence, kernel dirty transitions
+  and expanded RAM.
+- 30,000 randomized load cases against actual memory.c slow helpers: same
+  values, pipeline state, effective clock/fraction and device-service ordering.
+- Final LWC2 runtime and compact revision: all 120 grid frames bit-identical
+  to G1, no tolerance, zero dispatch/segment misses.
+- Project CTest 23/23, ten focused emitter/overlay checks, native fixtures and
+  40-step hidden smoke pass. OpenBIOS stamp current.
+- Correctness fixture migration now also updates the execution-source cookie:
+  cpu_state.h participates in the execution identity even though its serialized
+  layout is unchanged. Prior cookie 1a13ca4e verified against the retained G2
+  executable; RAM/mod layout bits and every guest payload byte remain intact.
+  Runtime production savestate validation is unchanged.
+
+First completed G3 candidate (guest-execution-G3-complete): 58.25 VBlanks/s,
+34,668 starved samples, 52.060 ms maximum wall interval, zero packet allocations,
+23046.875 / 1750 = 13.170 ms guest CPU/VBlank. This regresses G2's 10.050 ms;
+not accepted or merged. Executable grew from 44,210,176 to 77,652,480 bytes.
+Compiled RAM callbacks disappeared; remaining psx_read_word_raw samples are
+runtime consumers. This is not a claim that all memory activity is I/O.
+
+Compact revision shares exceptional store observers and lets the compiler
+share load timing independently of inline memory access. Executable 69,935,616
+bytes; randomized stores/loads, exact grid fingerprints and root CTest pass.
+Repeat smoke and completed-phase supervisor gate pending. G4 not started.
+
+Final compact G3 gate: 60.01 VBlanks/s (cadence 60.043), zero starved samples,
+zero packet allocations, 36.667 ms max wall, 21250 / 1802 = 11.792 ms average
+CPU. This is 17.3% above G2; final performance acceptance is NOT met.
+The compiled ordinary-memory callback gate is proven by differential tests;
+profile load/store CPU callback helpers disappear. Remaining raw memory reads
+(0.3% psx_read_word_raw, 0.2% psx_read_word) also serve actual runtime DMA/GPU
+consumers; they are not proof that every runtime memory access is I/O.
+Precise load timing remains shared (0.7%) independently of direct memory access.
+All 120 grid frames match G1, root CTest 23/23, native fixtures, ten focused
+emitter checks and repeated 40-step smoke (zero misses) pass. OpenBIOS restamped.
+Merge G3 as the compiled-memory phase; G4 owns the still-unmet final CPU budget.

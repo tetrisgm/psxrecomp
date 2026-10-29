@@ -2328,6 +2328,10 @@ if(BUILD_TESTING)
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_gp0_history_guard.py
                              --cc ${CMAKE_C_COMPILER})
+            add_test(NAME compiled_load_timing_test
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compiled_load_timing.py --cc ${CMAKE_C_COMPILER})
+            add_test(NAME compiled_memory_test
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_compiled_memory.py --cc ${CMAKE_C_COMPILER})
             add_test(NAME memory_debug_trace_guard_test
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_memory_debug_trace_guard.py
