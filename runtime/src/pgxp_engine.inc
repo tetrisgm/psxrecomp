@@ -48,6 +48,7 @@ PGXP_S void ck_wrapped(void);
 
 PGXP_API void pgxp_invalidate_all(void) {
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
+    s_stats.invalidations++;
     if (++s_gen == 0) {
         ck_wrapped();
         /* generation wrapped: physically clear so stale slots can't revive */
@@ -1752,7 +1753,12 @@ PGXP_S int pgxp_get_precise_vertex_impl(uint32_t addr, uint32_t packet_word,
             (int64_t)px - (int64_t)int_x * 65536 > 65536 ||
             (int64_t)py - (int64_t)int_y * 65536 < -65536 ||
             (int64_t)py - (int64_t)int_y * 65536 > 65536)
+        {
             s_stats.over_one_pixel++;
+            if(pflags & PGXP_F_UNCLAMPED) s_stats.over_one_unclamped++;
+            else if(pflags & (PGXP_F_DX|PGXP_F_DY)) s_stats.over_one_derived++;
+            else s_stats.over_one_projected++;
+        }
     }
     *x16 = px;
     *y16 = py;

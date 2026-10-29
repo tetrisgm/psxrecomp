@@ -594,6 +594,18 @@ int main(void) {
         pgxp_set_preserve_projection(0);
     }
 
+    /* The audit must distinguish a bad cache hit from precision that the
+     * integer GTE has already discarded. With IR1=0 and H/SZ close to two,
+     * preserving the MAC fraction moves an exact projection almost 2 pixels.
+     * A universal <=1-pixel gate would disable that precision recovery. */
+    {
+        int32_t x,y;
+        CHECK(pgxp_project_precise(4095,0,151*4096,12,0,0,151,300,
+                                  0,0,1,1,&x,&y)==1);
+        CHECK(x==(int32_t)std::floor((4095.0/4096.0)*300.0/151.0*65536.0));
+        CHECK(x>65536 && x<2*65536 && y==0);
+    }
+
     /* --- pgxp_project_precise: the exact projection and its qualifiers --- */
     {
         /* V = (100, -50, 1000) through the identity: MAC = V * 4096 (sf=1),
@@ -663,6 +675,8 @@ int main(void) {
         CHECK(pgxp_get_precise_vertex(0x80005000, packed, 323, -44, &px, &py, &z));
         pgxp_get_stats(&audit_after);
         CHECK(audit_after.over_one_pixel == audit_before.over_one_pixel + 1);
+        CHECK(audit_after.over_one_unclamped == audit_before.over_one_unclamped + 1);
+        CHECK(audit_after.over_one_projected == audit_before.over_one_projected);
         CHECK(px == x && py == y && z == 60000);
         CHECK(pgxp_get_unclamped_depth(0x80005000, packed) == 60000.0f);
         CHECK(!pgxp_get_precise_vertex(0x80005000, packed^1u, 322, -44, &px, &py, &z));

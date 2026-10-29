@@ -237,6 +237,8 @@ typedef struct PGXPStats {
     uint64_t tolerance_reject;
     uint64_t depth_only;         /* tolerance-clamped to native, depth kept   */
     uint64_t over_one_pixel;     /* accepted precise position >1 native px from integer */
+    uint64_t over_one_unclamped, over_one_derived, over_one_projected;
+    uint64_t invalidations;
     uint64_t w_valid;            /* lookups that also carried a usable depth */
     uint64_t produced;           /* RTPS/RTPT projections pushed into shadows */
     uint64_t swc2_stores;        /* GTE reg shadows copied to RAM shadows     */

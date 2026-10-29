@@ -199,6 +199,7 @@ typedef struct PGXPFrameAudit {
     uint64_t frame;
     uint64_t lookups, native, value_mismatch, trunc_reject;
     uint64_t tolerance_reject, depth_only, over_one_pixel;
+    uint64_t over_one_unclamped, over_one_derived, over_one_projected, invalidations;
     uint64_t word_lookups, word_hit, word_untracked, word_mismatch;
     uint64_t word_partial, word_no_z;
 } PGXPFrameAudit;
@@ -217,6 +218,10 @@ static void pgxp_frame_audit_capture(uint64_t frame) {
     PGXP_FRAME_DELTA(tolerance_reject);
     PGXP_FRAME_DELTA(depth_only);
     PGXP_FRAME_DELTA(over_one_pixel);
+    PGXP_FRAME_DELTA(over_one_unclamped);
+    PGXP_FRAME_DELTA(over_one_derived);
+    PGXP_FRAME_DELTA(over_one_projected);
+    PGXP_FRAME_DELTA(invalidations);
     PGXP_FRAME_DELTA(word_lookups);
     PGXP_FRAME_DELTA(word_hit);
     PGXP_FRAME_DELTA(word_untracked);
@@ -5874,6 +5879,10 @@ static void handle_pgxp_store_ring(int id, const char *json)
  * "position_fallback":0|1,"preserve_projection":0|1,"culling":0|1}. Fields
  * are optional; the reply echoes the resulting state (same shape as
  * geom_correction's "pgxp" object, flattened). */
+static void handle_pgxp_raster(int id,const char *json) {
+    char result[1024];gl_renderer_pgxp_raster_json(result,sizeof result,json_get_int(json,"depth_probe",-1));
+    send_fmt("{\"id\":%d,\"ok\":true,%s}",id,result);
+}
 static void handle_pgxp(int id, const char *json)
 {
     /* Live toggles for the one-toggle-at-a-time A/B protocol (docs/ENHANCEMENTS.md
@@ -5965,7 +5974,8 @@ static void handle_pgxp_frame(int id, const char *json)
              "\"lookups\":%llu,\"integer_fallback\":%llu,"
              "\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
              "\"tolerance_reject\":%llu,\"depth_only\":%llu,"
-             "\"over_one_pixel\":%llu,\"w\":{\"lookups\":%llu,"
+             "\"over_one_pixel\":%llu,\"over_one_unclamped\":%llu,\"over_one_derived\":%llu,"
+             "\"over_one_projected\":%llu,\"invalidations\":%llu,\"w\":{\"lookups\":%llu,"
              "\"valid\":%llu,\"untracked\":%llu,\"mismatch\":%llu,"
              "\"partial\":%llu,\"no_z\":%llu}}",
              id, (unsigned long long)frame,
@@ -5975,6 +5985,10 @@ static void handle_pgxp_frame(int id, const char *json)
              (unsigned long long)r->tolerance_reject,
              (unsigned long long)r->depth_only,
              (unsigned long long)r->over_one_pixel,
+             (unsigned long long)r->over_one_unclamped,
+             (unsigned long long)r->over_one_derived,
+             (unsigned long long)r->over_one_projected,
+             (unsigned long long)r->invalidations,
              (unsigned long long)r->word_lookups,
              (unsigned long long)r->word_hit,
              (unsigned long long)r->word_untracked,
@@ -16535,6 +16549,7 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "geom_correction",   handle_geom_correction },
     { "pgxp",              handle_pgxp },
+    { "pgxp_raster",       handle_pgxp_raster },
     { "pgxp_frame",        handle_pgxp_frame },
     { "pgxp_tri_ring",     handle_pgxp_tri_ring },
     { "pgxp_store_ring",   handle_pgxp_store_ring },
@@ -17617,7 +17632,8 @@ static int queue_render_debug_request(const char *json) {
     /* These handlers access only renderer-owned state, never guest memory or
      * the guest lockstep recorder. Other handlers still run at the CPU safe
      * point until their mixed inputs have an explicit immutable snapshot. */
-    if(!strcmp(name,"gl_coh_ring")) request.handler=handle_gl_coh_ring;
+    if(!strcmp(name,"pgxp_raster")) request.handler=handle_pgxp_raster;
+    else if(!strcmp(name,"gl_coh_ring")) request.handler=handle_gl_coh_ring;
     else if(!strcmp(name,"gl_present_ring")) request.handler=handle_gl_present_ring;
     else if(!strcmp(name,"post_aa")) request.handler=handle_post_aa;
     else if(!strcmp(name,"post_shader")) request.handler=handle_post_shader;
