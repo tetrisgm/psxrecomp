@@ -44,6 +44,14 @@ int main() {
         assert(packet_interpolation_sample(source,0.75,&result,1));
         assert(result.vertex[0].view[2]==50);
         assert(result.vertex[0].screen[0]==247);
+        PacketInterpolationVertex clipped[5];
+        result.vertex[0].view[2]=-10;
+        assert(packet_interpolation_clip(&result,1,clipped,5)==4);
+        for(unsigned i=0;i<4;++i) {
+            assert(clipped[i].view[2]>=1 && std::isfinite(clipped[i].screen[0]));
+        }
+        result.vertex[1].view[2]=result.vertex[2].view[2]=-10;
+        assert(packet_interpolation_clip(&result,1,clipped,5)==0);
         p.vertex[2].source={17,99};
         assert(packet_interpolation_pair(source,&a,&b,0));
         stats=packet_interpolation_stats(source);

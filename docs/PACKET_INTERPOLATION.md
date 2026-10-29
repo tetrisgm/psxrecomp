@@ -120,3 +120,38 @@ boot/navigation with zero dispatch/segment misses. The sampler tests include a
 minimum-cost case that defeats greedy nearest-neighbour selection. Assignment
 uses the smaller group as Hungarian rows to avoid cubic work for one-to-many
 birth/death groups. Frozen debug captures clear on timeline reset.
+
+
+## Vertex-source continuation (2026-10-29, not accepted)
+
+The main PGXP engine now observes resolved RTPS/RTPT provenance before guest
+culling. Optional audit packets own bounded transform-history attachments;
+private draw contexts do not publish. Snapshot copies survive mailbox replacement
+and producer advancement. Eight publication intervals are retained, with a
+262144-record hard bound; failure rejects a packet rather than publishing a
+partial table. PGXP timeline invalidation clears the producer history.
+
+The separate sampler accepts source tables and interpolates each matched
+vertex independently. RAM vertex origin, matrix origin, caller and transform
+occurrence are candidate keys; model coordinate values are not identity. Signed
+depth is accepted and homogeneous coordinates remain finite at zero depth. A
+separate clipping helper clips in view space before projection, retaining N's
+attributes and interpolating attributes only on newly clipped edges.
+
+This remains an audit, not production frame generation. The collector chooses
+transform groups referenced by submitted geometry from the packet-owned history,
+so an entirely culled invocation is not yet represented in the resolved previous
+table. Occurrence identity under changes to the set of visible instances remains
+unproven. A missing key is reported as `new_source`, not certified as a spawn.
+The runtime gate now rejects those unverified cases. Do not remove legacy redraw
+or claim a performance result from these counters.
+
+Fixtures cover invisible previous primitives with available source vertices,
+signed/zero depth, near-plane clipping, mutable mesh coordinates, OT submission
+across VBlanks, immutable attachments across twelve discarded publications, HUD
+attributes, cuts, and rational 60/90/120/144 output deadlines. Live validation
+before the final lifecycle/identity follow-up observed 45 driving pairs with
+zero unresolved/ambiguous vertices, but three pairs had 19/31/36 new-source
+vertices. That fails acceptance. Earlier zero-miss captures were paused and are
+only stationary repeatability evidence. Renderer cutover, effects interpolation,
+legacy deletion and 8K distinct-image measurements remain outstanding.

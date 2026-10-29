@@ -82,7 +82,9 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                 if(p.vertices<3 || p.vertices>4) {++c->stats.invalid;continue;}
                 for(unsigned j=0;j<p.vertices;++j) {
                     const auto& v=p.vertex[j];
-                    bool finite=true;for(double x:v.view) finite=finite&&std::isfinite(x);
+                    bool finite=std::isfinite(v.h)&&v.h>=0&&std::isfinite(v.ofx)&&
+                        std::isfinite(v.ofy)&&std::isfinite(v.x_scale)&&v.x_scale>0;
+                    for(double x:v.view) finite=finite&&std::isfinite(x);
                     if(!finite || (!v.source.object && !v.source.primitive)) {
                         ++c->stats.invalid;++c->stats.source_unmatched;continue;
                     }
@@ -254,6 +256,46 @@ extern "C" int packet_interpolation_sample(const PacketInterpolation *c,double t
         }
     }
     return 1;
+}
+extern "C" size_t packet_interpolation_clip(const PacketInterpolationPrimitive *p,
+    double near_depth,PacketInterpolationVertex *out,size_t capacity) {
+    if(!p || !out || p->vertices<3 || p->vertices>4 || capacity<p->vertices+2 ||
+       !std::isfinite(near_depth) || near_depth<=0) return 0;
+    for(unsigned i=0;i<p->vertices;++i) {
+        const auto& v=p->vertex[i];
+        for(double x:v.view) if(!std::isfinite(x)) return 0;
+        if(!std::isfinite(v.h) || !std::isfinite(v.x_scale) ||
+           !std::isfinite(v.ofx) || !std::isfinite(v.ofy)) return 0;
+    }
+    size_t count=0;
+    for(unsigned i=0;i<p->vertices;++i) {
+        const auto& a=p->vertex[(i+p->vertices-1)%p->vertices];
+        const auto& b=p->vertex[i];
+        bool ai=a.view[2]>=near_depth,bi=b.view[2]>=near_depth;
+        if(ai!=bi) {
+            double t=(near_depth-a.view[2])/(b.view[2]-a.view[2]);
+            auto v=b;v.source={};
+            for(unsigned d=0;d<3;++d) v.view[d]=a.view[d]+t*(b.view[d]-a.view[d]);
+            v.view[2]=near_depth;
+            v.h=a.h+t*(b.h-a.h);v.ofx=a.ofx+t*(b.ofx-a.ofx);
+            v.ofy=a.ofy+t*(b.ofy-a.ofy);v.x_scale=a.x_scale+t*(b.x_scale-a.x_scale);
+            for(unsigned d=0;d<2;++d) v.uv[d]=a.uv[d]+t*(b.uv[d]-a.uv[d]);
+            v.colour=0;
+            for(unsigned shift=0;shift<32;shift+=8) {
+                double ac=(a.colour>>shift)&255,bc=(b.colour>>shift)&255;
+                v.colour|=uint32_t(std::lround(ac+t*(bc-ac)))<<shift;
+            }
+            out[count++]=v;
+        }
+        if(bi) out[count++]=b;
+    }
+    for(size_t i=0;i<count;++i) {
+        auto& v=out[i];
+        v.homogeneous[0]=v.ofx*v.view[2]+v.h*v.x_scale*v.view[0];
+        v.homogeneous[1]=v.ofy*v.view[2]+v.h*v.view[1];v.homogeneous[2]=v.view[2];
+        v.screen[0]=v.homogeneous[0]/v.view[2];v.screen[1]=v.homogeneous[1]/v.view[2];
+    }
+    return count;
 }
 extern "C" PacketInterpolationStats packet_interpolation_stats(const PacketInterpolation *c) {
     return c?c->stats:PacketInterpolationStats{};

@@ -47,6 +47,9 @@ PGXP_S void ck_wrapped(void);
 #endif
 
 PGXP_API void pgxp_invalidate_all(void) {
+#ifdef PGXP_TRANSFORM_RECORD
+    PGXP_TRANSFORM_RECORD(nullptr);
+#endif
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
     s_stats.invalidations++;
     if (++s_gen == 0) {

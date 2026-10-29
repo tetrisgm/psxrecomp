@@ -33,7 +33,7 @@ struct Stream {
 std::mutex stats_mutex;
 PacketInterpolationStats published{};
 uint64_t published_sequence=0,published_missing=0,published_count=0;
-bool published_failed=false;
+bool published_failed=false,published_source_mode=false;
 std::atomic<bool> capture_requested{false};
 std::vector<PacketInterpolationPrimitive> captured[2];
 std::vector<PacketInterpolationSource> captured_sources[2];
@@ -46,7 +46,8 @@ uint64_t hash(uint64_t seed,uint32_t value) {
 FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
     uint64_t base=14695981039346656037ULL;
     base=hash(base,v.source_vertex);base=hash(base,v.source_matrix);base=hash(base,v.caller);
-    for(unsigned d=0;d<3;++d) base=hash(base,uint16_t(v.model[d]));
+    if(!v.source_vertex) return {};
+    if(!record && !stream.invocations.count(base)) return {};
     auto& instances=stream.invocations[base];
     auto at=std::find(instances.begin(),instances.end(),v.transform);
     if(at==instances.end()) {
@@ -57,7 +58,8 @@ FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
 }
 }
 extern "C" void packet_interpolation_transform(const PGXPProjection *p) {
-    if(!p || !p->interpolation_valid || producer_failed) return;
+    if(!p) {producer_transforms.clear();producer_generation=0;producer_failed=false;return;}
+    if(!p->interpolation_valid || producer_failed) return;
     try {
         if(producer_transforms.size()>=262144) {producer_failed=true;return;}
         producer_transforms.push_back({*p,producer_generation});
@@ -182,6 +184,7 @@ extern "C" void packet_interpolation_stream_end(void) {
     {
         std::lock_guard<std::mutex> lock(stats_mutex);
         published=stream.failed?PacketInterpolationStats{}:packet_interpolation_stats(stream.pair);
+        published_source_mode=stream.source_mode;
         published_sequence=stream.sequence;published_missing=stream.missing;
         published_count=stream.current.size();published_failed=stream.failed;
         if(capture_requested.exchange(false)) {
@@ -206,7 +209,7 @@ extern "C" void packet_interpolation_stream_reset(void) {
     stream.old_sources.clear();stream.sources.clear();
     stream.older.clear();stream.current.clear();stream.old_epoch=stream.old_sequence=0;
     std::lock_guard<std::mutex> lock(stats_mutex);
-    published={};published_sequence=published_missing=published_count=0;published_failed=false;
+    published_source_mode=false;published={};published_sequence=published_missing=published_count=0;published_failed=false;
     for(unsigned i=0;i<2;++i) {
         captured[i].clear();captured_sources[i].clear();captured_sequence[i]=0;
     }
@@ -215,9 +218,10 @@ extern "C" void packet_interpolation_stream_reset(void) {
 extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
     std::lock_guard<std::mutex> lock(stats_mutex);
     return std::snprintf(out,capacity,
-        "{\"status\":\"ok\",\"mode\":\"candidate_audit\",\"sequence\":%llu,\"primitives\":%llu,"
+        "{\"status\":\"ok\",\"mode\":\"%s\",\"sequence\":%llu,\"primitives\":%llu,"
         "\"matched\":%llu,\"unmatched\":%llu,\"disappeared\":%llu,\"ambiguous\":%llu,"
         "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"snapped\":%d,\"failed\":%s}",
+        published_source_mode?"vertex_source_audit":"candidate_audit",
         (unsigned long long)published_sequence,(unsigned long long)published_count,
         (unsigned long long)published.matched,(unsigned long long)published.unmatched,
         (unsigned long long)published.disappeared,(unsigned long long)published.ambiguous,

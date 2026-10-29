@@ -66,6 +66,7 @@ int main() {
             p.source_vertex=0x1000+i*8;p.source_matrix=0x2000;p.caller=0x3000;
             p.interpolation_valid=1;p.transform=frame;
             p.view[0]=float(frame*10+i);p.view[2]=100;p.h=290;p.x_scale=1;
+            p.model[0]=int16_t(frame*10+i); // mutable mesh values are not identity
             PacketInterpolationSource transform{};
             transform.transform_only=1;transform.projection[0]=p;
             packet_interpolation_stream_append(&transform);

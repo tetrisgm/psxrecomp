@@ -16283,7 +16283,8 @@ int gl_renderer_frame_generation_method(void) {
 }
 
 static void rth_packet_transform_record(const PGXPProjection *projection) {
-    if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
+    if(!projection) {packet_interpolation_transform(NULL);return;}
+    if(!s_rth_on || rt_on_render_thread() || rt_held() || !packet_interpolation_stream_enabled()) return;
     packet_interpolation_transform(projection);
 }
 static void rth_packet_interpolation_record(const PacketInterpolationSource *source) {

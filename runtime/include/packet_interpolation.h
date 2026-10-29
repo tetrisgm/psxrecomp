@@ -61,6 +61,11 @@ int packet_interpolation_pair(PacketInterpolation *context,
  * view-space positions. No allocations, GL calls, clocks or guest callbacks. */
 int packet_interpolation_sample(const PacketInterpolation *context,double t,
     PacketInterpolationPrimitive *output,size_t capacity);
+/* Clip a sampled triangle/quad against signed view depth before dividing.
+ * Output needs vertices+2 slots (six for a nonplanar quad); UV/colour are carried
+ * from the packet-N endpoints and interpolated only along clipped edges. */
+size_t packet_interpolation_clip(const PacketInterpolationPrimitive *primitive,
+    double near_depth, PacketInterpolationVertex *output, size_t capacity);
 PacketInterpolationStats packet_interpolation_stats(const PacketInterpolation *context);
 /* Absolute rational output cadence: no accumulated truncated-period drift.
  * index zero is the first output. Returns UINT64_MAX on invalid/overflow. */
