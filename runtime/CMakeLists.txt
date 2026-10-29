@@ -410,6 +410,17 @@ if(BUILD_TESTING)
         # bits, uploads, ring wraps and per-primitive widescreen tags. A host
         # with no window/GL 3.3 context (headless, Windows over SSH) exits 77:
         # reported as skipped.
+        set(PSX_PGXP_AUDIT_CC "${CMAKE_C_COMPILER}" CACHE FILEPATH "C compiler with LTO for PGXP GL audit fixture")
+        add_test(NAME pgxp_raster_origin_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
+                --single --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pgxp_raster_origin.c"
+                --cc "${PSX_PGXP_AUDIT_CC}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/pgxp-raster-results")
+        set_tests_properties(pgxp_raster_origin_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 300 SKIP_RETURN_CODE 77)
         add_test(NAME gl_render_thread_test
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
