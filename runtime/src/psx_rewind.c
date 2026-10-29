@@ -23,6 +23,7 @@
 /* Scheduler diagnostic, not a duration conversion: Windows documents these
  * as processor-dependent cycle units. Wall-clock maxima remain authoritative. */
 static uint64_t capture_thread_cycles(void) {
+    if(!g_psx_capture_timing)return 0;
 #ifdef _WIN32
     ULONG64 cycles=0;QueryThreadCycleTime(GetCurrentThread(),&cycles);return cycles;
 #else
@@ -62,7 +63,8 @@ static uint8_t *capture_image;
 static size_t capture_size,capture_capacity;
 static struct { size_t offset,size;const void *data; } patches[2];
 static unsigned patch_count;
-static int worker_ok;
+static int worker_ok,worker_timing;
+static uint64_t capture_now(void) {return g_psx_capture_timing?pt_clock_ns():0;}
 static double worker_cost;
 /* Only the emulation thread publishes these after the worker's acquire. */
 static uint32_t published_tick,published_count;
@@ -119,14 +121,14 @@ static int capture_write(void *unused,const void *data,size_t size) {
     capture_size+=size;return 1;
 }
 static void finish_delta(void *unused) {
-    (void)unused;uint64_t start=pt_clock_ns();worker_ok=1;
+    (void)unused;uint64_t start=worker_timing?pt_clock_ns():0;worker_ok=1;
     for(unsigned i=0;i<patch_count && worker_ok;i++) {
         if(patches[i].offset>capture_size || patches[i].size>capture_size-patches[i].offset)
             worker_ok=0;
         else memcpy(capture_image+patches[i].offset,patches[i].data,patches[i].size);
     }
     if(worker_ok)worker_ok=rw_push(&history,capture_image,capture_size,capture_tick,history.capacity);
-    worker_cost=(double)(pt_clock_ns()-start)/1e6;
+    worker_cost=worker_timing?(double)(pt_clock_ns()-start)/1e6:0;
 }
 static void publish_history(void) {
     published_tick=history.tick;published_count=history.size?history.count+1:0;
@@ -224,26 +226,27 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc) {
          * checkpoint needs no timed readiness probe at every block. Frame
          * and input requests bypass the bounded coalescing interval. */
         if(poll_wait && !due && !held && !debug_held){poll_wait--;return;}
-        uint64_t start=pt_clock_ns();
+        uint64_t start=capture_now();
         if(capturing==1) {
             patch_count=0;
             int result=boot_state_pending_finish(pending,defer_patch,NULL);
             if(!result) {
-                double ms=(double)(pt_clock_ns()-start)/1e6;
+                double ms=(double)(capture_now()-start)/1e6;
                 capture_cost+=ms;if(ms>stats.poll_max_ms)stats.poll_max_ms=ms;
                 poll_wait=63;return;
             }
+            worker_timing=g_psx_capture_timing;
             if(result<0 || !rewind_worker_submit(worker)) {
                 stats.failures++;capturing=0;return;
             }
             capturing=2;
         }
         if(!rewind_worker_ready(worker)) {
-            capture_cost+=(double)(pt_clock_ns()-start)/1e6;poll_wait=63;return;
+            capture_cost+=(double)(capture_now()-start)/1e6;poll_wait=63;return;
         }
         publish_history();
         if(worker_ok) {
-            double finish_ms=(double)(pt_clock_ns()-start)/1e6;
+            double finish_ms=(double)(capture_now()-start)/1e6;
             double ms=capture_cost+finish_ms;
             if(finish_ms>stats.finish_max_ms)stats.finish_max_ms=finish_ms;
             unsigned bin=ms>=10.0?10000:(unsigned)(ms*1000);capture_hist[bin]++;
@@ -259,14 +262,14 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc) {
     uint32_t pc=rewind_resolve_resume_pc(cpu,resume_pc);
     if(!resume_pc_ok(pc)||!psx_irq_resume_context_snapshot_safe_at(pc))return;
     if(due&&!blocked&&!psx_netplay_active()) {
-        uint64_t start=pt_clock_ns();
+        uint64_t start=capture_now();
         double prior_profile[6];boot_state_native_capture_profile(prior_profile);
         uint64_t thread_start=capture_thread_cycles();
         CPUState snap=*cpu;snap.pc=pc;
         capture_size=0;
         int saved=boot_state_begin_native(&snap,bios,entry,capture_write,NULL,pending);
         uint64_t thread_cycles=capture_thread_cycles()-thread_start;
-        capture_cost=(double)(pt_clock_ns()-start)/1e6;
+        capture_cost=(double)(capture_now()-start)/1e6;
         stats.begin_thread_cycles+=thread_cycles;
         if(thread_cycles>stats.max_begin_thread_cycles)stats.max_begin_thread_cycles=thread_cycles;
         if(capture_cost>stats.begin_max_ms) {

@@ -312,11 +312,13 @@ static uint32_t state_hash(void) {
 
 int main(int argc, char **argv) {
     unsigned loops = 1;
-    if (argc == 3 && argv[1][0] == '-' && argv[1][1] == '-' &&
+    if (argc >= 3 && argv[1][0] == '-' && argv[1][1] == '-' &&
         argv[1][2] == 'l') {
         loops = (unsigned)strtoul(argv[2], 0, 0);
         if (loops == 0) loops = 1;
     }
+    extern unsigned g_debug_write_hooks;
+    g_debug_write_hooks = argc > 3 ? 0 : 1;
     seed_memory();
     for (unsigned i = 0; i < loops; i++) do_six_writes(i);
     if (!check_written_bytes()) {
@@ -470,10 +472,11 @@ def parse(line: str) -> dict[str, str]:
     return dict(part.split("=", 1) for part in line.split())
 
 
-def run(exe: pathlib.Path, loops: int = 1) -> dict[str, str]:
+def run(exe: pathlib.Path, loops: int = 1, disabled: bool = False) -> dict[str, str]:
     cmd = [str(exe)]
     if loops != 1:
         cmd.extend(["--loops", str(loops)])
+    if disabled: cmd.append("disabled")
     proc = subprocess.run(cmd, cwd=exe.parent, check=True, text=True,
                           stdout=subprocess.PIPE)
     return parse(proc.stdout.strip())
@@ -492,6 +495,9 @@ def run_regression(cc: str) -> None:
                       tuple(), "trace_counting.c")
         prod_out = run(prod, 4)
         debug_out = run(debug, 4)
+        disabled_out = run(debug, 4, disabled=True)
+    if disabled_out["trace_calls"] != "0" or disabled_out["state"] != debug_out["state"]:
+        fail("disabled debug hooks must skip calls and preserve all guest writes")
     if prod_out["trace_calls"] != "0":
         fail("production memory.c still calls debug_server_trace_write_check")
     if debug_out["trace_calls"] != "24":

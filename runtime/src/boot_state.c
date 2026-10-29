@@ -452,17 +452,18 @@ static int write_vram_section_full(BsOut *o)
     return ok;
 }
 
+int g_psx_capture_timing;
 static double native_capture_profile[6];
 void boot_state_native_capture_profile(double out[6]) { memcpy(out,native_capture_profile,sizeof(native_capture_profile)); }
 static void native_capture_stamp(BsOut *o,double *time,unsigned index) {
-    if(o->sink) { double now=boot_state_mono_ms();native_capture_profile[index]+=now-*time;*time=now; }
+    if(o->sink && g_psx_capture_timing) { double now=boot_state_mono_ms();native_capture_profile[index]+=now-*time;*time=now; }
 }
 
 static int boot_state_save_to(BsOut* o, const CPUState* cpu,
                               uint32_t bios_checksum, uint32_t entry_pc) {
     BootStateHeader h;
     int ok;
-    double profile_time=o->sink?boot_state_mono_ms():0;
+    double profile_time=o->sink && g_psx_capture_timing?boot_state_mono_ms():0;
     memset(&h, 0, sizeof h);
     h.magic         = BOOT_STATE_MAGIC;
     h.version       = BOOT_STATE_VERSION;

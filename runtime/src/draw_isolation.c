@@ -1,5 +1,6 @@
 /* draw_isolation.c - private draw context for the draw-isolation gate.
  * See include/draw_isolation.h and docs/DRAW_ISOLATION.md. */
+extern unsigned g_debug_write_hooks;
 #include "draw_isolation.h"
 
 #include <stdlib.h>
@@ -220,6 +221,7 @@ int psx_draw_iso_begin(struct CPUState *cpu, uint32_t flags) {
     g_psx_exception_edge_observer = on_exception_edge;
     g_psx_mmio_observer = on_mmio;
     g_psx_ram_write_observer = on_ram_write;
+    g_debug_write_hooks |= 2u;
     return 1;
 }
 
@@ -230,6 +232,7 @@ void psx_draw_iso_end(void) {
     g_psx_exception_edge_observer = NULL;
     g_psx_mmio_observer = NULL;
     g_psx_ram_write_observer = NULL;
+    g_debug_write_hooks &= ~2u;
     /* Publish everything: the live machine becomes the merged image (the
      * main GTE context stays: the draw context's GTE is dropped). */
     for (uint32_t i = 0; i < PSX_DRAW_ISO_SEGS; i++) {

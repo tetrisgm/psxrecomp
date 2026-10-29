@@ -132,6 +132,11 @@ extern uint32_t g_debug_current_func_addr;
 /* Multi-range write-trace check.  Called from memory.c write paths.
  * Iterates up to 8 configurable address ranges; records matching
  * writes into the 1M-entry ring buffer with function + frame attribution. */
+/* Guest-owned flags: debug commands execute at guest safe points. Bit 1 is
+ * tracing, bit 2 is draw isolation. Disabled stores do not evaluate old data. */
+extern unsigned g_debug_write_hooks;
+
+
 void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                     uint32_t new_val, uint8_t width);
 

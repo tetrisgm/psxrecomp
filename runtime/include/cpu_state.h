@@ -13,6 +13,7 @@
 #define PSXRECOMP_CPU_STATE_H
 
 #include <stdint.h>
+#include "debug_hotpath.h"
 
 #ifdef __cplusplus
 extern "C" {
