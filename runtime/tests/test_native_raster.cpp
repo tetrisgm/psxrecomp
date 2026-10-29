@@ -11,8 +11,19 @@
 #include <vector>
 #include <memory>
 #include <new>
+#include <cstdlib>
 #include <cstring>
 #include "native_raster_oracle_fixtures.h"
+
+static thread_local bool count_allocations=false;
+static thread_local size_t allocations=0;
+void* operator new(size_t size) {
+    if(count_allocations) ++allocations;
+    if(void* p=std::malloc(size?size:1))return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p,size_t) noexcept { std::free(p); }
 
 /* Native contexts do not use title-specific wide presentation. */
 extern "C" {
@@ -188,6 +199,22 @@ static void provenance_observation() {
     assert(pixel(raster,0,0)==0 && owner.samples.size()==6);
     native_raster_destroy(raster);
 }
+static void allocation_free_submission() {
+    auto* r=native_raster_create(nullptr);assert(r);
+    std::array<uint16_t,1024> upload{};
+    NativeRasterCommand c{};c.op=NR_UPLOAD;c.args[2]=1024;c.args[3]=1;
+    NativeRasterState state{};state.right=1023;state.bottom=511;
+    const uint32_t packet[]={0x600000ff,0,0x00010001};
+    allocations=0;count_allocations=true;
+    for(unsigned frame=0;frame<100;++frame) {
+        for(unsigned n=0;n<1000;++n)assert(native_raster_gp0(r,&state,packet,3));
+        upload.fill(uint16_t(frame));
+        assert(native_raster_submit(r,&c,upload.data(),upload.size()));
+        uint16_t result=0;native_raster_read(r,0,0,1,1,&result);assert(result==frame);
+    }
+    count_allocations=false;assert(allocations==0);
+    native_raster_destroy(r);
+}
 static void bounded_queue_wrap() {
     struct State {
         std::atomic<bool> entered{false},release{false};
@@ -206,21 +233,22 @@ static void bounded_queue_wrap() {
         }
     },&state);
     std::thread producer([&] {
-        for(unsigned n=1;n<=10000;++n) {
+        for(unsigned n=1;n<=50000;++n) {
             send(raster,NR_WRITE,{0,0,int(n)});
             state.submitted.store(n);
         }
     });
-    while(!state.entered.load() || state.submitted.load()<4097) std::this_thread::yield();
-    /* One leased command plus all 4096 queue slots: submission is bounded,
+    while(!state.entered.load() || state.submitted.load()<16384) std::this_thread::yield();
+    /* All 16384 queue slots, including the executing command: submission is bounded,
      * but release must wake the producer and preserve order across wraps. */
-    assert(state.submitted.load()==4097);
+    assert(state.submitted.load()==16384);
     state.release.store(true);
     producer.join();
-    assert(pixel(raster,0,0)==10000 && state.seen==10000);
+    assert(pixel(raster,0,0)== (50000 & 65535) && state.seen==50000);
     native_raster_destroy(raster);
 }
 int main() {
+    allocation_free_submission();
     bounded_queue_wrap();
     immutable_texture_inputs();
     dropped_texture_input_packets();

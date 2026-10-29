@@ -8,7 +8,7 @@
 #include "worker_event.h"
 #include <condition_variable>
 #include <cstring>
-#include <future>
+#include <type_traits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -38,29 +38,28 @@ namespace {
 constexpr size_t vram_words = 1024 * 512;
 constexpr size_t queue_budget = 4 * 1024 * 1024;
 enum class Kind { Draw, Packet, Read, Snapshot, Restore, Observe, Visit };
+struct DrawPacket { NativeRasterState state; std::array<uint32_t,12> packet; };
 struct Job {
     uint64_t sequence=0;
     Kind kind = Kind::Draw;
-    NativeRasterCommand command{};
-    NativeRasterState state{};
-    std::array<uint32_t,12> packet{};
-    std::vector<uint16_t> upload;
+    union { NativeRasterCommand command{}; DrawPacket draw; };
+
     const uint16_t *borrowed_upload=nullptr;
     size_t borrowed_words=0;
-    const uint16_t *upload_data() const {return borrowed_upload?borrowed_upload:upload.data();}
-    size_t upload_size() const {return borrowed_upload?borrowed_words:upload.size();}
+    const uint16_t *upload_data() const {return borrowed_upload;}
+    size_t upload_size() const {return borrowed_words;}
     uint16_t *destination = nullptr;
     uint64_t *dirty = nullptr;
-    std::promise<void> *completion = nullptr;
+    WorkerEvent *completion = nullptr;
     std::atomic<bool> *checkpoint_done = nullptr;
     SwNativeTextureState *texture_destination = nullptr;
-    std::unique_ptr<SwNativeTextureState> texture_source;
+    const SwNativeTextureState *texture_source=nullptr;
+    uint64_t arena_end=0;
     NativeRasterObserver observer = nullptr;
     NativeRasterVisit visit = nullptr;
     void *user = nullptr;
     uint64_t source=0;
-    size_t bytes() const { return sizeof(Job) + upload_size() * sizeof(uint16_t)
-                                  +(texture_source?sizeof(SwNativeTextureState):0); }
+
 };
 int coordinate(uint32_t word) { return int(word&1023)-int(word&1024); }
 uint16_t color555(uint32_t rgb) {
@@ -78,8 +77,8 @@ size_t packet_size(unsigned op) {
     return 0;
 }
 void packet(const Job &job) {
-    const auto &s=job.state;
-    const auto *p=job.packet.data();
+    const auto &s=job.draw.state;
+    const auto *p=job.draw.packet.data();
     const unsigned op=p[0]>>24;
     sw_set_draw_area(s.left,s.top,s.right,s.bottom);
     sw_set_mask_bits(s.set_mask,s.check_mask);
@@ -194,17 +193,20 @@ void draw(const Job &j) {
 struct NativeRaster {
     std::array<uint16_t, vram_words> vram{};
     SwRendererContext *context = nullptr;
-    std::mutex mutex;
-
-    WorkerEvent available;
-    std::condition_variable space;
-    std::vector<Job> queue=std::vector<Job>(queue_budget/sizeof(Job));
-    size_t head=0,count=0;
+    static constexpr size_t slots=16384, arena_words=queue_budget/sizeof(uint16_t);
+    static_assert(std::is_trivially_copyable<Job>::value,"queue records must be POD");
+    WorkerEvent available, space, barrier;
+    std::array<Job,slots> queue;
+    std::array<uint16_t,arena_words> arena;
+    alignas(64) std::atomic<uint64_t> tail{0};
+    alignas(64) std::atomic<uint64_t> head{0};
+    std::atomic<uint64_t> arena_read{0};
+    uint64_t arena_write=0;
+    std::atomic<bool> parked{false}, producer_parked{false};
     uint64_t submitted=0,executed=0; /* producer / consumer owned */
     Job checkpoint;
     std::atomic<bool> checkpoint_pending{false};
-    size_t bytes = 0;
-    bool stop = false;
+    std::atomic<bool> stop{false};
 
     std::atomic<uint64_t> completed{0};
     std::thread thread;
@@ -225,11 +227,11 @@ struct NativeRaster {
 
     void capture_input(const Job& job) {
         if(!inputs_enabled || !inputs.valid || job.kind!=Kind::Packet) return;
-        const auto* p=job.packet.data();
+        const auto* p=job.draw.packet.data();
         const unsigned op=p[0]>>24;
         if(!(op&4) || !((op>=0x20 && op<0x40) || (op>=0x60 && op<0x80))) return;
         try {
-            unsigned page=job.state.page;
+            unsigned page=job.draw.state.page;
             if(op<0x40) page=(page&~511u)|((p[(op&16)?5:4]>>16)&511);
             const unsigned depth=(page>>7)&3,clut=p[2]>>16;
             std::array<bool,128> needed{};
@@ -286,22 +288,36 @@ struct NativeRaster {
             for(int x=bounds[0]/64;x<=bounds[2]/64;++x) input_tiles[y*16+x].reset();
     }
 
+    void wake() {
+        if(parked.load() && parked.exchange(false)) available.notify();
+    }
+    template<class Ready> void wait_space(Ready ready) {
+        if(ready()) return;
+        guest_wait_trace::Scope trace(guest_wait_trace::NativeSpace);
+        do {
+            producer_parked.store(true);
+            if(ready()) { producer_parked.store(false);break; }
+            wake();space.wait();
+        } while(!ready());
+    }
+    void copy_upload(Job& job,const uint16_t* pixels,size_t words) {
+        const uint64_t offset=arena_write%arena_words;
+        const uint64_t start=offset+words>arena_words?arena_write+arena_words-offset:arena_write;
+        const uint64_t end=start+words;
+        wait_space([&]{return end-arena_read.load(std::memory_order_acquire)<=arena_words;});
+        std::memcpy(arena.data()+start%arena_words,pixels,words*sizeof(uint16_t));
+        job.borrowed_upload=arena.data()+start%arena_words;job.borrowed_words=words;
+        job.arena_end=arena_write=end;
+    }
     void push(Job job) {
         if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore || job.borrowed_words)
             read_row_y=-1;
-        const size_t cost = job.bytes();
-
-        std::unique_lock<std::mutex> lock(mutex,std::defer_lock);
-        { guest_wait_trace::Scope trace(guest_wait_trace::NativeLock); lock.lock(); }
-        if(bytes + cost > queue_budget || count>=queue.size()) {
-            guest_wait_trace::Scope trace(guest_wait_trace::NativeSpace);
-            space.wait(lock, [&] { return bytes + cost <= queue_budget && count<queue.size(); });
-        }
+        const uint64_t write=tail.load(std::memory_order_relaxed);
+        wait_space([&]{return write-head.load(std::memory_order_acquire)<slots;});
         job.sequence=submitted++;
-        queue[(head+count)%queue.size()]=std::move(job);count++;
-        bytes += cost;
-        lock.unlock();
-        available.notify();
+        queue[write%slots]=job;
+        tail.store(write+1);
+        wake();
     }
     /* The one outstanding rewind checkpoint never contends for the draw
      * queue mutex/space. Its sequence is the boundary before the next draw.
@@ -314,7 +330,7 @@ struct NativeRaster {
         job.sequence=submitted;
         checkpoint=std::move(job);
         checkpoint_pending.store(true,std::memory_order_release);
-        available.notify();
+        wake();
     }
     void execute(Job &job) {
 
@@ -324,11 +340,11 @@ struct NativeRaster {
             if(mutation) sw_context_begin_write_observation(observer!=nullptr || inputs_enabled);
             NativeRasterEvent event{};
             if (observer && mutation) {
-                event.before=1;event.restore=job.kind==Kind::Restore || job.borrowed_words;
+                event.before=1;event.restore=job.kind==Kind::Restore || (job.kind==Kind::Snapshot && job.borrowed_words);
                 if(job.kind==Kind::Draw) event.command=&job.command;
                 if(job.kind==Kind::Packet) {
-                    event.state=&job.state;event.packet=job.packet.data();
-                    event.packet_words=packet_size(job.packet[0]>>24);
+                    event.state=&job.draw.state;event.packet=job.draw.packet.data();
+                    event.packet_words=packet_size(job.draw.packet[0]>>24);
                 }
                 event.upload=job.upload_data();event.upload_words=job.upload_size();
                 event.vram=vram.data();
@@ -346,9 +362,9 @@ struct NativeRaster {
                 if(job.texture_destination) sw_native_texture_save(job.texture_destination);
                 break;
             case Kind::Restore:
-                sw_vram_transfer_in(0,0,1024,512,job.upload.data());
+                sw_vram_transfer_in(0,0,1024,512,job.upload_data());
                 sw_native_cache_clear(1);
-                if(job.texture_source) sw_native_texture_load(job.texture_source.get());
+                if(job.texture_source) sw_native_texture_load(job.texture_source);
                 break;
             case Kind::Observe: observer=job.observer;observer_user=job.user;break;
             case Kind::Visit: job.visit(job.user,vram.data());break;
@@ -360,7 +376,7 @@ struct NativeRaster {
                 if(observer) observer(observer_user,&event);
             }
             completed.fetch_add(1, std::memory_order_release);
-            if (job.completion) job.completion->set_value();
+            if (job.completion) job.completion->notify();
         if (job.checkpoint_done) job.checkpoint_done->store(true,std::memory_order_release);
     }
     void service_checkpoint(uint64_t before) {
@@ -377,27 +393,25 @@ struct NativeRaster {
         sw_set_faithful_authority(1);
         for (;;) {
             service_checkpoint(executed);
-            Job job;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                if (!count) {
-                    if(stop && !checkpoint_pending.load(std::memory_order_acquire))break;
-                    lock.unlock();
-                    available.wait();
-                    continue;
+            const uint64_t read=head.load(std::memory_order_relaxed);
+            if(read==tail.load()) {
+                parked.store(true);
+                if(read!=tail.load() || checkpoint_pending.load(std::memory_order_acquire)) {
+                    parked.store(false);continue;
                 }
-                const size_t cost = queue[head].bytes();
-                job = std::move(queue[head]);
-                head=(head+1)%queue.size();count--;
-                bytes -= cost;
+                if(stop.load()) { parked.store(false);break; }
+                available.wait();continue;
             }
-            space.notify_one();
+            Job job=queue[read%slots];
 
             /* A checkpoint can be published between the loop's first check
              * and dequeuing this job; never execute a later sequence first. */
             service_checkpoint(job.sequence);
             execute(job);
             executed=job.sequence+1;
+            if(job.arena_end) arena_read.store(job.arena_end,std::memory_order_release);
+            head.store(read+1,std::memory_order_release);
+            if(producer_parked.exchange(false)) space.notify();
 
         }
         sw_context_bind(nullptr);
@@ -417,11 +431,8 @@ extern "C" NativeRaster *native_raster_create(const uint16_t *initial) {
 }
 extern "C" void native_raster_destroy(NativeRaster *r) {
     if (!r) return;
-    {
-        std::lock_guard<std::mutex> lock(r->mutex);
-        r->stop = true;
-    }
-    r->available.notify();
+    r->stop.store(true);
+    r->wake();
     r->thread.join();
     sw_context_destroy(r->context);
     delete r;
@@ -440,7 +451,7 @@ extern "C" int native_raster_submit(NativeRaster *r, const NativeRasterCommand *
     try {
         Job job;
         job.command = *c;
-        if (words) job.upload.assign(upload,upload+words);
+        if (words) r->copy_upload(job,upload,words);
         r->push(std::move(job));
         return 1;
     } catch (...) { return 0; }
@@ -450,9 +461,9 @@ extern "C" uint64_t native_raster_gp0_identified(NativeRaster *r,const NativeRas
     if(!r || !state || !words || !count || count!=packet_size(words[0]>>24)) return 0;
     try {
         Job job;
-        job.kind=Kind::Packet;job.state=*state;
+        job.kind=Kind::Packet;job.draw.state=*state;
         const uint64_t source=job.source=++r->next_source;
-        std::memcpy(job.packet.data(),words,count*sizeof(uint32_t));
+        std::memcpy(job.draw.packet.data(),words,count*sizeof(uint32_t));
         r->push(std::move(job));
         return source;
     } catch(...) { return 0; }
@@ -462,12 +473,10 @@ extern "C" int native_raster_gp0(NativeRaster *r,const NativeRasterState *state,
     return native_raster_gp0_identified(r,state,words,count)!=0;
 }
 static void sync_job(NativeRaster *r, Job job) {
-    std::promise<void> done;
-    auto result = done.get_future();
-    job.completion = &done;
+    job.completion = &r->barrier;
     r->push(std::move(job));
     guest_wait_trace::Scope trace(guest_wait_trace::NativeCompletion);
-    result.get();
+    r->barrier.wait();
 }
 extern "C" void native_raster_set_observer(NativeRaster *r,NativeRasterObserver observer,void *user) {
     Job job;job.kind=Kind::Observe;job.observer=observer;job.user=user;
@@ -553,7 +562,7 @@ extern "C" void native_raster_snapshot(NativeRaster *r,uint16_t *out,uint64_t di
 }
 extern "C" void native_raster_restore(NativeRaster *r,const uint16_t *source) {
     Job job;
-    job.kind=Kind::Restore; job.upload.assign(source,source+vram_words);
+    job.kind=Kind::Restore; job.borrowed_upload=source;job.borrowed_words=vram_words;
     sync_job(r,std::move(job));
 }
 extern "C" void native_raster_checkpoint(NativeRaster *r,uint16_t *vram,
@@ -566,8 +575,8 @@ extern "C" void native_raster_checkpoint(NativeRaster *r,uint16_t *vram,
 extern "C" void native_raster_restore_checkpoint(NativeRaster *r,const uint16_t *vram,
     const SwNativeTextureState *texture) {
     Job job;
-    job.kind=Kind::Restore;job.upload.assign(vram,vram+vram_words);
-    job.texture_source=std::make_unique<SwNativeTextureState>(*texture);
+    job.kind=Kind::Restore;job.borrowed_upload=vram;job.borrowed_words=vram_words;
+    job.texture_source=texture;
     sync_job(r,std::move(job));
 }
 extern "C" uint64_t native_raster_completed(NativeRaster *r) {
