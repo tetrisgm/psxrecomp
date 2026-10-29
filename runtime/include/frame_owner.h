@@ -1,0 +1,66 @@
+#ifndef PSX_FRAME_OWNER_H
+#define PSX_FRAME_OWNER_H
+#include "frame_packet.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Dedicated presentation owner. Context transfers happen at start/shutdown
+ * only. execute runs outside every transport lock; a stalled graphics driver
+ * cannot prevent the guest from replacing pending presentation packets. */
+typedef struct FrameOwner FrameOwner;
+typedef void (*FrameOwnerExecute)(void *user,const FramePacketView *packet);
+typedef struct FrameOwnerConfig {
+    size_t initial_limit,record_limit;
+    FrameOwnerExecute execute;
+    RtCtxFn context;
+    void *user;
+    RtTickFn tick;                 /* optional render-side timed work */
+    uint64_t (*clock_ns)(void);    /* same monotonic domain as tick deadlines */
+    /* Owner-side timeline reset, before any subsequent tick/frame/control.
+     * Discard retained interpolation images here. Producer invalidation does
+     * not wait for this callback or acquire the graphics context. */
+    void (*reset)(void *user,uint64_t epoch);
+} FrameOwnerConfig;
+FrameOwner *frame_owner_start(const FrameOwnerConfig *config);
+void frame_owner_stop(FrameOwner *owner);
+/* Producer-only recording API. Failed append invalidates this whole frame. */
+int frame_owner_begin(FrameOwner *owner,uint64_t sequence,const void *initial,size_t bytes);
+int frame_owner_reserve_initial(FrameOwner *owner,uint64_t sequence,size_t bytes,void **initial);
+int frame_owner_attach(FrameOwner *owner,void *attachment,size_t bytes,void (*dispose)(void*));
+void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags,uint32_t bytes);
+int frame_owner_append_records(FrameOwner *owner,const void *records,size_t bytes);
+void frame_owner_cancel(FrameOwner *owner);
+int frame_owner_publish(FrameOwner *owner);
+void frame_owner_invalidate(FrameOwner *owner);
+/* Durable asynchronous controls/diagnostics, separate from droppable frames.
+ * Copies payload on submission; callback runs on the owner outside all locks.
+ * after_sequence must name an already published frame (or zero). A newer
+ * frame satisfies the dependency. Timeline reset/shutdown invokes callback
+ * with stale=1, so a paused/reset guest cannot strand a diagnostic request.
+ * Returns zero on invalid input/allocation failure/full bounded queue; never
+ * waits for graphics. Caller must report busy, not execute GL itself.
+ * user must outlive completion; payload is borrowed only during callback. */
+typedef void (*FrameOwnerRequest)(void *user,const void *payload,size_t bytes,int stale);
+int frame_owner_request(FrameOwner *owner,uint64_t after_sequence,
+                        FrameOwnerRequest callback,void *user,const void *payload,size_t bytes);
+/* Durable configuration ordered BEFORE the named next frame, including when
+ * that frame is replaced by a newer one. If idle with no pending frame it
+ * applies immediately. Controls and diagnostics share the bounded capacity.
+ * This distinct ordering prevents a setting from landing one frame late. */
+int frame_owner_control(FrameOwner *owner,uint64_t before_sequence,
+                        FrameOwnerRequest callback,void *user,const void *payload,size_t bytes);
+/* Consumer check before presenting; producer invalidation never frees a
+ * consumer lease. Keep the image's epoch with any subsequent present job. */
+int frame_owner_current(const FrameOwner *owner,const FramePacketView *packet);
+uint64_t frame_owner_replaced(const FrameOwner *owner);
+int frame_owner_pending(const FrameOwner *owner);
+uint64_t frame_owner_completed(const FrameOwner *owner);
+uint64_t frame_owner_idle_ns(const FrameOwner *owner);
+int frame_owner_is_thread(void);
+/* Consumer only; earliest request wins, including requests made by tick. */
+void frame_owner_tick_at(FrameOwner *owner,uint64_t deadline_ns);
+#ifdef __cplusplus
+}
+#endif
+#endif

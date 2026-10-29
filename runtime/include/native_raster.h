@@ -45,10 +45,74 @@ typedef struct NativeRasterState {
     /* 0 draws every line; 1 skips even native rows, 2 skips odd rows. */
     uint32_t skip_field;
 } NativeRasterState;
+
+/* CPU-native provenance observation, ordered with the original writes. All
+ * pointers are borrowed only for the callback. before is 1 before the write,
+ * 0 after; restore marks a full machine restore. For GP0, state/packet are
+ * provided; otherwise command/upload describe the native operation. These
+ * callbacks run on the native worker, must not call GL or re-enter its queue,
+ * and cannot modify VRAM. Observer user storage must outlive registration. */
+typedef struct NativeRasterEvent {
+    int before, restore;
+    int has_writes, written_bounds[4]; /* post-write conservative native spans */
+    const NativeRasterCommand *command;
+    const NativeRasterState *state;
+    const uint32_t *packet;
+    size_t packet_words;
+    const uint16_t *upload;
+    size_t upload_words;
+    const uint16_t *vram;
+} NativeRasterEvent;
+typedef void (*NativeRasterObserver)(void *user,const NativeRasterEvent *event);
+typedef void (*NativeRasterVisit)(void *user,const uint16_t *vram);
+/* CPU-only barriers. Registration and visits occur after all preceding native
+ * work, without touching presentation. Visits configure/capture provenance
+ * on its owner, and may not retain the borrowed VRAM pointer after shutdown. */
+void native_raster_set_observer(NativeRaster *raster,NativeRasterObserver observer,void *user);
+void native_raster_visit(NativeRaster *raster,NativeRasterVisit visit,void *user);
 /* Complete fixed-length draw/fill/copy packets only. Environment and partial
  * transfers use the existing state/fragment operations. */
 int native_raster_gp0(NativeRaster *raster,const NativeRasterState *state,
                       const uint32_t *words,size_t count);
+/* Same submission, returning a monotonic source identity (zero on failure).
+ * All enhanced primitives derived from this GP0 share its texture input. */
+uint64_t native_raster_gp0_identified(NativeRaster *raster,const NativeRasterState *state,
+                                      const uint32_t *words,size_t count);
+
+/* Immutable native texture inputs captured BEFORE each textured GP0 executes.
+ * Only sampled pages/CLUTs are retained, in shared 64x64 native tiles. Writes
+ * invalidate future versions without changing any packet's held inputs.
+ * This is presentation data; native GPU cache/guest semantics are unchanged.
+ * Enable/seal are CPU-only ordered barriers. Seal starts the next collection.
+ * An over-budget/allocation-failed collection is invalid and the whole
+ * presentation packet must be dropped; native guest work is never dropped. */
+typedef struct NativeRasterInputs NativeRasterInputs;
+typedef struct NativeRasterInputMetadata {
+    void *data;
+    size_t bytes;
+    void (*release)(void*);
+} NativeRasterInputMetadata;
+/* Optional immutable provenance captured on the native worker with each
+ * sampled input. A successful callback transfers one retained reference.
+ * Failure invalidates presentation only. Registration is a CPU barrier. */
+typedef int (*NativeRasterMetadataCapture)(void *user,NativeRasterInputMetadata *out);
+void native_raster_inputs_metadata_provider(NativeRaster *raster,
+                                            NativeRasterMetadataCapture capture,void *user);
+typedef struct NativeRasterTile {
+    uint32_t x,y;
+    uint64_t version;
+    const uint16_t *pixels; /* 64x64, borrowed until inputs destruction */
+} NativeRasterTile;
+void native_raster_inputs_enable(NativeRaster *raster,int enabled);
+NativeRasterInputs *native_raster_inputs_seal(NativeRaster *raster);
+void native_raster_inputs_destroy(NativeRasterInputs *inputs);
+int native_raster_inputs_valid(const NativeRasterInputs *inputs);
+size_t native_raster_inputs_bytes(const NativeRasterInputs *inputs);
+/* Returns tile count, zero for a non-textured source, -1 for invalid inputs
+ * or insufficient output capacity. It never silently truncates a page. */
+int native_raster_inputs_get(const NativeRasterInputs *inputs,uint64_t source,
+                             NativeRasterTile *tiles,size_t capacity);
+const void *native_raster_inputs_metadata(const NativeRasterInputs *inputs,uint64_t source);
 
 NativeRaster *native_raster_create(const uint16_t *initial_vram);
 void native_raster_destroy(NativeRaster *raster);
@@ -56,8 +120,10 @@ void native_raster_destroy(NativeRaster *raster);
 int native_raster_submit(NativeRaster *raster,
                          const NativeRasterCommand *command,
                          const uint16_t *upload, size_t words);
-/* Reads fence only preceding native work. Snapshot also consumes this
- * instance's dirty-row mask, never the renderer's global dirty tracker. */
+/* Reads fence only preceding native work. With non-NULL dirty_rows, a snapshot
+ * consumes this instance's dirty-row mask, never the global tracker. NULL
+ * leaves dirty tracking intact (immutable presentation seeds are observers,
+ * not save/rewind checkpoints). */
 void native_raster_read(NativeRaster *raster, int x, int y, int w, int h,
                         uint16_t *destination);
 void native_raster_snapshot(NativeRaster *raster, uint16_t *destination,

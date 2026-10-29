@@ -420,6 +420,17 @@ if(BUILD_TESTING)
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-render-thread-results")
         set_tests_properties(gl_render_thread_test PROPERTIES
             LABELS "gpu;opengl;hardware" TIMEOUT 300 SKIP_RETURN_CODE 77)
+        add_test(NAME gl_frame_packet_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
+                --single
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_frame_packet.c"
+                --cc "${CMAKE_C_COMPILER}" --cxx "${CMAKE_CXX_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-frame-packet-results")
+        set_tests_properties(gl_frame_packet_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
         add_test(NAME gl_async_expire_test
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
@@ -465,6 +476,17 @@ if(BUILD_TESTING)
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-frame-gen-results")
         set_tests_properties(gl_frame_gen_test PROPERTIES
             LABELS "gpu;opengl;hardware" TIMEOUT 300 SKIP_RETURN_CODE 77)
+        add_test(NAME gl_frame_gen_bank_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_frame_gen.py"
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_frame_gen.c"
+                --cc "${CMAKE_C_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --bank-pgxp-only --scales 3
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-frame-gen-bank-results")
+        set_tests_properties(gl_frame_gen_bank_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
         # [video] texture_lod / anisotropic_filtering: off and untracked/
         # magnified prims are unchanged; minified world textures average
         # inside their UV bounds; render thread and PGXP depth agree.
@@ -872,6 +894,12 @@ if(BUILD_TESTING)
     target_link_libraries(duckstation_texture_pack_test PRIVATE Threads::Threads)
     target_link_libraries(duckstation_texture_pack_test PRIVATE psx_texture_image_decode)
     add_test(NAME duckstation_texture_pack_test COMMAND duckstation_texture_pack_test)
+    add_executable(gpu_hd_context_test tests/test_gpu_hd_context.cpp
+        src/gpu_hd_textures.cpp src/hd_texture_pack.cpp src/duckstation_texture_pack.cpp
+        src/native_raster.cpp src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
+    target_include_directories(gpu_hd_context_test PRIVATE include)
+    target_link_libraries(gpu_hd_context_test PRIVATE Threads::Threads psx_texture_image_decode)
+    add_test(NAME gpu_hd_context_test COMMAND gpu_hd_context_test)
     add_executable(texture_image_decode_test tests/test_texture_image_decode.cpp)
     target_link_libraries(texture_image_decode_test PRIVATE psx_texture_image_decode)
     add_test(NAME texture_image_decode_test COMMAND texture_image_decode_test
@@ -1813,7 +1841,7 @@ if(BUILD_TESTING)
     target_include_directories(stereo_shed_policy_test PRIVATE include)
     add_test(NAME stereo_shed_policy_test COMMAND stereo_shed_policy_test)
     add_executable(native_raster_test tests/test_native_raster.cpp
-                   src/native_raster.cpp src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
+                   src/native_raster.cpp src/frame_packet.cpp src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
     target_include_directories(native_raster_test PRIVATE include)
     target_compile_features(native_raster_test PRIVATE cxx_std_17)
     find_package(Threads REQUIRED)
@@ -1846,7 +1874,8 @@ if(BUILD_TESTING)
     # The fixture itself uses POSIX threads and nanosleep (MinGW has both;
     # the core takes its Win32 path there).
     if(NOT MSVC)
-        add_executable(render_thread_test tests/test_render_thread.c src/render_thread.c)
+        add_executable(render_thread_test tests/test_render_thread.c src/render_thread.c
+            src/frame_owner.cpp src/frame_packet.cpp)
         target_include_directories(render_thread_test PRIVATE include)
         find_package(Threads REQUIRED)
         target_link_libraries(render_thread_test PRIVATE Threads::Threads)
@@ -2559,6 +2588,17 @@ elseif(NOT MSVC)
 endif()
 if(BUILD_TESTING)
     add_executable(audio_catchup_test tests/test_audio_catchup.c)
+    add_executable(audio_transport_test tests/test_audio_transport.cpp)
+    add_executable(frame_mailbox_test tests/test_frame_mailbox.cpp src/frame_packet.cpp src/frame_owner.cpp)
+    target_compile_features(frame_mailbox_test PRIVATE cxx_std_17)
+    target_include_directories(frame_mailbox_test PRIVATE include)
+    target_link_libraries(frame_mailbox_test PRIVATE Threads::Threads)
+    add_test(NAME frame_mailbox_test COMMAND frame_mailbox_test)
+    target_compile_features(audio_transport_test PRIVATE cxx_std_17)
+    target_include_directories(audio_transport_test PRIVATE src)
+    target_link_libraries(audio_transport_test PRIVATE Threads::Threads)
+    add_test(NAME audio_transport_test COMMAND audio_transport_test)
+    set_tests_properties(frame_mailbox_test audio_transport_test PROPERTIES TIMEOUT 30)
     target_include_directories(audio_catchup_test PRIVATE include)
     add_test(NAME audio_catchup_test COMMAND audio_catchup_test)
     add_executable(audio_sink_resume_test tests/test_audio_sink_resume.c)

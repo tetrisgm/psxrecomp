@@ -231,6 +231,16 @@ int pt_submit(void *ready, void **next_done, uint64_t *wait_ns) {
     if (!P.running) return -1;
     mtx_lock(&P.mtx);
     const int cur = P.current;
+    int next = -1;
+    for (int k = 1; k < P.cfg.slots; k++) {
+        const int slot = (cur + k) % P.cfg.slots;
+        if (P.state[slot] == S_FREE) { next = slot; break; }
+    }
+    if (next < 0) {
+        P.st.refused++;
+        mtx_unlock(&P.mtx);
+        return -2; /* caller retains both the composing slot and ready token */
+    }
     memset(&P.timing[cur], 0, sizeof P.timing[cur]);
     P.ready[cur] = ready;
     P.state[cur] = S_QUEUED;
@@ -239,23 +249,6 @@ int pt_submit(void *ready, void **next_done, uint64_t *wait_ns) {
     P.st.submits++;
     if (P.q_len > P.st.queued_high) P.st.queued_high = P.q_len;
     cnd_bcast(&P.cv);
-    int next = -1;
-    uint64_t t0 = 0;
-    for (;;) {
-        /* Prefer the slot after the current one: the oldest free. */
-        for (int k = 1; k <= P.cfg.slots; k++) {
-            const int s = (cur + k) % P.cfg.slots;
-            if (P.state[s] == S_FREE) { next = s; break; }
-        }
-        if (next >= 0) break;
-        if (!t0) { t0 = now_ns(); P.st.waits++; }
-        cnd_wait(&P.cv, &P.mtx);
-    }
-    if (t0) {
-        const uint64_t w = now_ns() - t0;
-        P.st.wait_ns += w;
-        if (wait_ns) *wait_ns = w;
-    }
     P.state[next] = S_COMPOSING;
     P.current = next;
     if (next_done) *next_done = P.done[next];
@@ -280,29 +273,14 @@ int pt_try_submit_at(void *ready, const PtTiming *timing, void **next_done) {
     if (next_done) *next_done = NULL;
     if (!P.running) return -1;
     mtx_lock(&P.mtx);
-    uint64_t waited_from = 0;
-    if (timing && timing->epoch && timing->expires_ns > timing->not_before_ns) {
-        for (;;) {
-            const uint64_t now = now_ns();
-            if (P.stop || timing->epoch != P.epoch || now >= timing->expires_ns) break;
-            for (int k = 1; k < P.cfg.slots; ++k) {
-                const int slot = (P.current + k) % P.cfg.slots;
-                if (P.state[slot] == S_FREE) { next = slot; break; }
-            }
-            if (next >= 0 || !P.cfg.admit_wait_ns) break;
-            /* Every slot holds an output ahead of this one: the queue is
-             * full because the producer is early, so waiting for the next
-             * present to free a slot loses nothing, where refusing would
-             * drop a finished output. Bounded by the wait cap and the
-             * output's own expiry. */
-            if (!waited_from) { waited_from = now; P.st.timed_waited++; }
-            const uint64_t until = waited_from + P.cfg.admit_wait_ns < timing->expires_ns ?
-                                   waited_from + P.cfg.admit_wait_ns : timing->expires_ns;
-            if (now >= until) break;
-            cnd_wait_ns(&P.cv, &P.mtx, until - now);
+    const uint64_t now = now_ns();
+    if (timing && timing->epoch && timing->expires_ns > timing->not_before_ns &&
+        !P.stop && timing->epoch == P.epoch && now < timing->expires_ns) {
+        for (int k = 1; k < P.cfg.slots; ++k) {
+            const int slot = (P.current + k) % P.cfg.slots;
+            if (P.state[slot] == S_FREE) { next = slot; break; }
         }
     }
-    if (waited_from) P.st.timed_wait_ns += now_ns() - waited_from;
     if (next < 0) {
         P.st.timed_refused++;
         mtx_unlock(&P.mtx);

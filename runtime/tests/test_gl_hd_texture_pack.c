@@ -225,20 +225,27 @@ static void adv_hd_cases(const char* root) {
     check(!rt_held(),"ADV1: the commit releases the context");
     state(); gr_fill_rect(264,96,1,1,0x1111);
     gl_renderer_render_thread_frame_boundary();
-    gr_vram_transfer_out(256,96,4,1,(uint16_t[4]){0});
-    check(!memcmp(&vram[96*1024+256],done,sizeof(done)) && vram[96*1024+264]==0x1111,
-          "ADV1: committed upload stays in native VRAM");
+    uint16_t committed[4];
+    gr_vram_transfer_out(256,96,4,1,committed);
+    check(!memcmp(committed,done,sizeof(done)) && gr_vram_read(264,96)==0x1111,
+          "ADV1: renderer mirror retains committed upload and following draw");
     /* ADV2a: savestate loaded while an A0 is streaming and resumed mid-A0:
      * the full-VRAM section (a 1024x512 TRACK_UPLOAD) then gpu.c's GP0 state. */
     gl_renderer_render_thread_frame_boundary();
     state(); gr_fill_rect(256,100,4,1,0x2345);
     gr_vram_upload_begin(256,100,4,1);
     adv_payload_word(256,100,done[0]);
-    memcpy(adv_snapshot,vram,sizeof(adv_snapshot));   /* saved mid-A0 */
+    /* This renderer-only fixture has no gpu.c/native worker. Explicitly read
+     * its presentation mirror to construct the supplied restore image; the
+     * real machine saves CPU-native VRAM (native/parser fixtures cover that).
+     * A renderer read no longer publishes into the caller's vram array. */
+    gr_vram_transfer_out(0,0,1024,512,adv_snapshot);
+    adv_snapshot[100*1024+256]=done[0];
+    memcpy(vram,adv_snapshot,sizeof(vram));
     gr_vram_transfer_in(0,0,1024,512,adv_snapshot);
     gr_vram_upload_set_open(1);
     gl_renderer_render_thread_frame_boundary();
-    check(rt_held(),"ADV2: full-VRAM load mid-A0 keeps the context");
+    check(!rt_held(),"ADV2: full-VRAM load mid-A0 leaves the renderer running");
     adv_payload_word(257,100,done[1]);
     gl_renderer_render_thread_frame_boundary();
     gr_vram_transfer_out(259,100,1,1,&back);
@@ -253,14 +260,15 @@ static void adv_hd_cases(const char* root) {
     state(); gr_fill_rect(256,104,4,1,0x2345);
     gl_renderer_render_thread_frame_boundary();
     gl_renderer_render_thread_sync("adv-save");   /* a save syncs */
-    memcpy(adv_snapshot,vram,sizeof(adv_snapshot));
+    gr_vram_transfer_out(0,0,1024,512,adv_snapshot);
     adv_snapshot[104*1024+256]=done[0];
     gl_renderer_render_thread_frame_boundary();
     check(!rt_held(),"ADV2b: render thread runs before the load");
     gr_vram_upload_set_open(1);
+    memcpy(vram,adv_snapshot,sizeof(vram));
     gr_vram_transfer_in(0,0,1024,512,adv_snapshot);
     gl_renderer_render_thread_frame_boundary();
-    check(rt_held(),"ADV2b: a state restored mid-A0 keeps the context");
+    check(!rt_held(),"ADV2b: state restored mid-A0 leaves the renderer running");
     adv_payload_word(257,104,done[1]);
     gl_renderer_render_thread_frame_boundary();
     gr_vram_transfer_out(259,104,1,1,&back);
@@ -574,6 +582,9 @@ static void indexed_palette_scene(const char* root) {
 }
 
 int main(int argc,char** argv) {
+    gl_renderer_set_pgxp_depth(1);
+    gl_renderer_set_pgxp_color_perspective(1);
+    gl_renderer_set_pgxp_seam(2);
     if(argc==2 && !strcmp(argv[1],"--native-baseline")) {
         char* native_args[]={"hd-baseline","4","twin","1"};
         return scale_fixture_main(4,native_args);
@@ -730,17 +741,19 @@ int main(int argc,char** argv) {
     capture();
     check(sample(16,16)[0]>200 && sample(16,16)[1]<20,"render thread: replacement drawn from the upload recorded before it");
     check(sample(32,16)[2]>200 && sample(32,16)[0]<20,"render thread: later overwrite draws the new native source");
-    /* HD authority rasterizes native VRAM on the render thread's copy; a
-     * guest readback (a sync point) must see it in gpu.c's array. */
+    /* Explicit renderer diagnostics read its private presentation mirror.
+     * Guest reads now use a separate CPU-native worker and must not depend on
+     * publication of this mirror into gpu.c's array. */
     gl_renderer_render_thread_frame_boundary();   /* the capture held the context */
     check(!rt_held(),"render thread owns the context again");
+    const uint16_t public_before[2]={vram[96*1024+96],vram[96*1024+104]};
     state(); gr_fill_rect(96,96,4,4,0x1234);
     gr_draw_flat_rect(104,96,4,4,0x0421);
     gl_renderer_render_thread_frame_boundary();
     uint16_t back[2]={0,0};
     gr_vram_transfer_out(96,96,1,1,&back[0]); gr_vram_transfer_out(104,96,1,1,&back[1]);
-    check(back[0]==0x1234 && back[1]==0x0421 && vram[96*1024+96]==0x1234 && vram[96*1024+104]==0x0421,
-          "render thread: guest readback sees native draws under HD authority");
+    check(back[0]==0x1234 && back[1]==0x0421 && vram[96*1024+96]==public_before[0] && vram[96*1024+104]==public_before[1],
+          "render thread: diagnostic read sees draws without publishing guest VRAM");
     /* Review reproduction (#568): a pending A0 keeps only received payload
      * words, its mask check sees the prior native draw, and stop publishes
      * the final HD-authoritative draws. */
@@ -785,7 +798,7 @@ int main(int argc,char** argv) {
     gr_vram_upload_begin(128,96,4,1);
     vram[96*1024+128]=0x7c00; /* A partial GP0(A0) payload, as gpu.c writes it. */
     gl_renderer_render_thread_frame_boundary();   /* the payload spans a vblank */
-    check(rt_held(),"an open A0 keeps the context across a frame boundary");
+    check(!rt_held(),"an open A0 leaves the renderer running across a frame boundary");
     partial_read=0; gr_vram_transfer_out(129,96,1,1,&partial_read);
     check(vram[96*1024+128]==0x7c00 && partial_read==0x2345,
           "partial upload preserves payload and preceding native draws");

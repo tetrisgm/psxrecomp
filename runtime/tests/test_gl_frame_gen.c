@@ -194,6 +194,7 @@ static void fixture_present(int generated) {
 
 #define FRAME_W 320
 #define FRAME_H 240
+static int g_test_bank;
 
 static void textures(void) {
     static uint16_t page[64*64], clut[16];
@@ -203,6 +204,13 @@ static void textures(void) {
     for (int i = 0; i < 64*64; i++) vram[(i / 64) * 1024 + 896 + i % 64] = page[i];
     gr_vram_transfer_in(896, 0, 64, 64, page);
     gr_vram_transfer_in(512, 300, 16, 1, clut);
+    g_test_bank=getenv("FG_TEST_BANK")!=NULL;
+    if(g_test_bank) {
+        static uint16_t bank[1024*512];
+        for(int i=0;i<64*64;++i) bank[(i/64)*1024+896+i%64]=page[i]^0x5555;
+        memcpy(bank+300*1024+512,clut,sizeof clut);
+        check(psx_mod_define_texture_bank(12345,1024,512,bank),"immutable bank defined");
+    }
 }
 
 static int wide_mode;
@@ -326,6 +334,8 @@ static void game_frame_part(int g, int bx, int part) {
         int y = 12 + (i / 8) * 42 + (i == 5 ? g % 5 : 0);
         if (i == 0 && g % 5 == 0) { x = bx + 250 - (g * 37) % 200; y = 180; }
         fixture_sources(i, bx, x, y);
+        const int bank=g_test_bank && i%8<2;
+        if(bank) check(gl_renderer_select_texture_bank(12345),"queued bank selected");
         switch (i % 4) {
         case 0: gr_draw_shaded_textured_triangle(x, y, 0, 0, 0x808080, x + 30, y + 2, 63, 4, 0x6090b0,
                                                  x + 3, y + 32, 8, 63, 0xb09060, 512, 300, 0x000e, 0); break;
@@ -333,6 +343,7 @@ static void game_frame_part(int g, int bx, int part) {
         case 2: gr_draw_gouraud_triangle(x, y, 0x7c00, x + 26, y + 4, 0x03e0, x + 6, y + 30, 0x001f); break;
         default: gr_draw_flat_triangle(x, y, x + 24, y + 20, x - 4, y + 26, (uint16_t)(0x2108 * (i & 3) + 0x0421)); break;
         }
+        if(bank) check(gl_renderer_select_texture_bank(0),"queued bank deselected");
     }
     if (part == 0) return;
     if (g_occlude) occlude_quad(g, bx);
@@ -341,10 +352,19 @@ static void game_frame_part(int g, int bx, int part) {
     gr_copy_rect(bx + 10, 10, 900, 400, 16, 16);                  /* copy out of the display */
 }
 
+static _Atomic int live_scale_result;
+static void live_scale_complete(void *unused,int applied) {
+    (void)unused;
+    check(rt_on_render_thread(),"live allocation completion stays on graphics owner");
+    atomic_store(&live_scale_result,applied);
+}
 static void present(int bx) {
     if (wide_mode) (void)gl_renderer_present_wide_fbo(bx, 0, FRAME_H, 0);
     else gl_renderer_present_vram(bx, 0, FRAME_W, FRAME_H, 0, 0);
     gl_renderer_render_thread_frame_boundary();
+    /* This fixture compares every real endpoint. Deliberate packet drops are
+     * covered separately by test_gl_frame_packet, so acknowledge this one. */
+    rt_drain();
 }
 
 static _Atomic int stats_writer_done;
@@ -443,7 +463,18 @@ int main(int argc, char **argv) {
         check(gl_renderer_pgxp_render_wanted() == (g_pgxp_depth || g_pgxp_color || g_pgxp_seam),
               "PGXP renderer features as asked");
     }
+    NativeRaster *native = native_raster_create(vram);
+    check(native != NULL, "native authority created");
+    gr_bind_native_raster(native, NULL);
     check(gl_renderer_render_thread_start(2) == 1, "render thread started");
+    check(gl_renderer_request_internal_scale_complete(1,live_scale_complete,NULL),
+          "live allocation request accepted");
+    rt_drain();
+    check(atomic_load(&live_scale_result)==1,"live allocation completed");
+    check(gl_renderer_request_internal_scale_complete(scale,live_scale_complete,NULL),
+          "original scale request accepted");
+    rt_drain();
+    check(atomic_load(&live_scale_result)==scale,"original scale completed");
     if (pt_mode) check(gl_renderer_present_thread_active(), "present thread started");
     const char *method = getenv("FG_METHOD");
     const int rp = method && !strcmp(method, "reprojection");
@@ -457,9 +488,11 @@ int main(int argc, char **argv) {
         setenv("PSX_FRAME_GEN_FORCE", "1", 1);
 #endif
         if (rp) gl_renderer_set_frame_generation_method(GL_FG_METHOD_REPROJECTION);
+        rt_drain(); /* test observes application of queued owner controls */
         check(gl_renderer_frame_generation_method() ==
               (rp ? GL_FG_METHOD_REPROJECTION : GL_FG_METHOD_REDRAW), "generation method");
         gl_renderer_set_frame_generation(1);
+        rt_drain();
         check(gl_renderer_frame_generation() == 1, "frame generation on");
     }
     gl_renderer_frame_gen_configure(120.0, 59.94);
@@ -482,7 +515,10 @@ int main(int argc, char **argv) {
         SDL_Delay(16);
     }
     SDL_Delay(60);
-    gl_renderer_render_thread_sync("test");   /* the render thread parks; we hold the context */
+    rt_drain();
+    /* Inspect endpoints after the graphics owner's lifecycle ends. Tests
+     * obey the same startup/shutdown-only context ownership as production. */
+    gl_renderer_render_thread_stop();
     if (fg) {
         char js[4096];
         gl_renderer_frame_gen_json(js, sizeof js);
@@ -709,6 +745,8 @@ int main(int argc, char **argv) {
         check(same, "the window shows every composed image, in order");
     }
     printf("checks=%d failures=%d\n", checks, failures);
+    gr_bind_native_raster(NULL, NULL);
+    native_raster_destroy(native);
     SDL_DestroyWindow(win);
     SDL_Quit();
     return failures ? 1 : 0;

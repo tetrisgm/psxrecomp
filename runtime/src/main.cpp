@@ -61,6 +61,7 @@ extern "C" int g_psx_track_last_store;
 extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "gpu_hd_textures.h"
 #include "draw_distance.h"
 #include "mod_immediate.h"
 #include "display_scanout.h"
@@ -121,6 +122,8 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
  * trim to hold the ring near target -- no gaps. See recomp_audio_drc.h. */
 #define RECOMP_AUDIO_DRC_IMPL
 #include "recomp_audio_drc.h"
+#include "audio_transport.h"
+#include "host_scheduling.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include "host_sampler.h"
@@ -3017,24 +3020,11 @@ static int g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
-/* DRC bridge. Producer (sdl_audio_pump) runs on the main loop thread under
- * SDL_LockAudioDevice; consumer (sdl_drc_callback) runs on the SDL audio
- * thread. */
-static rab_bridge s_drc;
+/* The guest publishes PCM through a lock-free SPSC transport. The audio
+ * callback alone owns the resampler and its controller/history. */
+static PsxAudioTransport s_drc;
 static bool       s_drc_ready = false;
 
-/* Observability + A/B. PSXRECOMP_AUDIO_LEGACY=1 keeps the historical push model
- * (SDL_QueueAudio, no bridge) so the underrun baseline can be measured against
- * the bridge from a single build; default (unset) = bridge/pull model. Output
- * health is surfaced through the audio_stats TCP command (no stderr probe). */
-static bool audio_legacy_mode(void) {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("PSXRECOMP_AUDIO_LEGACY"); v = (e && *e && *e != '0') ? 1 : 0; }
-    return v != 0;
-}
-/* Legacy-mode underrun counter: incremented when the SDL queue is found empty
- * at pump time (the device was silence-filling = an audible gap). */
-static uint64_t g_legacy_underruns = 0;
 /* Set at unmute so the pump resyncs its bridge-underrun baseline past the
  * intentional mute-drain instead of reporting it as gaps. */
 int g_audio_unmute_resync = 0;
@@ -3045,9 +3035,10 @@ int g_audio_host_rate = 44100;
 }
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
+    psx_host_schedule_thread(PsxHostThreadRole::Audio);
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
     int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
-    rab_pull(&s_drc, reinterpret_cast<int16_t*>(stream), frames);
+    s_drc.pull(reinterpret_cast<int16_t*>(stream), frames);
     /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
      * This callback is the tap's single writer while the bridge is active. */
     audio_trace_pcm(AUDIO_TAP_HOST, reinterpret_cast<const int16_t*>(stream),
@@ -4390,7 +4381,7 @@ static void shutdown_runtime(void) {
         psx_sdl_audio_close(sdl_audio_device);   /* stops the pull callback */
         sdl_audio_device = 0;
     }
-    if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
+    if (s_drc_ready) { s_drc.free(); s_drc_ready = false; }
     close_controller();
     debug_server_shutdown();
 }
@@ -4407,7 +4398,7 @@ static void teardown_game_session_keep_lobby(void) {
         psx_sdl_audio_close(sdl_audio_device);
         sdl_audio_device = 0;
     }
-    if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
+    if (s_drc_ready) { s_drc.free(); s_drc_ready = false; }
     close_controller();
     if (g_vk_active) {
         vk_renderer_shutdown();
@@ -4469,39 +4460,20 @@ static void sdl_audio_pump(bool discard_output = false) {
     /* Guest-cycle SPU advance must not depend on host audio device/backpressure.
      * Win↔Linux rollback forked on aux/spu when one peer skipped spu_render
      * (queue full / !drc / no device) while the other kept advancing. */
-    const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
-    const bool legacy = audio_legacy_mode();
-    static int had_audio = 0;
-    uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
+    uint32_t queued = 0;   /* RENDER event b: host buffering in milliseconds */
     int host_queue_ok = 0;
 
     if (discard_output) {
         /* Host-only sink: skip all queue/bridge interaction, but continue to
          * the guest-cycle sample budget and spu_render below. */
-    } else if (sdl_audio_device && legacy) {
-        /* Historical push model + baseline measurement: a drained (==0) queue
-         * means the device was silence-filling since the last pump = a gap.
-         * Only meaningful after the first audio has been queued. */
-        const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
-        queued = psx_sdl_audio_queued_size(sdl_audio_device);
-        if (queued == 0 && had_audio) {
-            g_legacy_underruns++;
-            audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
-        }
-        if (queued > max_queue_bytes) {
-            audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
-            /* Still advance SPU below; only skip host enqueue. */
-        } else {
-            host_queue_ok = 1;
-        }
-    } else if (sdl_audio_device && !legacy && s_drc_ready) {
+    } else if (sdl_audio_device && s_drc_ready) {
         /* Surface bridge underruns (counted on the SDL audio thread) into the
          * event ring from this thread — the event ring is single-writer.
          * Across a turbo mute the ring intentionally runs dry (the pump stops
          * while the callback keeps pulling); those dry pulls are the mute,
          * not gaps — resync past them instead of reporting them. */
         rab_stats st;
-        rab_get_stats(&s_drc, &st);
+        s_drc.stats(&st);
         static uint64_t prev_underruns = 0;
         extern int g_audio_unmute_resync;
         if (g_audio_unmute_resync) {
@@ -4526,10 +4498,8 @@ static void sdl_audio_pump(bool discard_output = false) {
         /* Savestate/rewind load: queued output belongs to the old timeline. */
         spu_output_flush();
         g_audio_cycle_resync = 0;
-        if (legacy && sdl_audio_device)
-            psx_sdl_audio_clear(sdl_audio_device);
-        else
-            g_audio_unmute_resync = 1; /* skip mute-drain underrun reports */
+        if (s_drc_ready) s_drc.reset_timeline();
+        g_audio_unmute_resync = 1; /* skip mute-drain underrun reports */
         return;
     }
     int frames = (int)spu_output_available();
@@ -4575,28 +4545,16 @@ static void sdl_audio_pump(bool discard_output = false) {
             sdl_audio_gain_ramp(sdl_audio_buf, frames, g, g);
         }
     }
-    if (legacy) {
-        /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
-        audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
-        psx_sdl_audio_queue(sdl_audio_device, sdl_audio_buf, (uint32_t)frames * bytes_per_frame);
-        had_audio = 1;
-    } else {
-        /* Hand to the bridge (band-limited resample + DRC) instead of
-         * SDL_QueueAudio. Lock guards the SPSC ring against the pull callback.
-         * The T3 tap moves to sdl_drc_callback: what the device actually
-         * receives is the bridge's device-rate output, not this buffer. */
-        psx_sdl_audio_lock(sdl_audio_device);
-        rab_push(&s_drc, sdl_audio_buf, frames);
-        psx_sdl_audio_unlock(sdl_audio_device);
-    }
+    /* Publication never locks the device or resampler. T3 records the
+     * callback's device-rate output, after resampling. */
+    s_drc.push(sdl_audio_buf, frames);
 }
 
 /* Audio gating across turbo-loads transitions.
  *
- * The mute model stays: during turbo the guest runs at host speed, so
- * rendered SPU audio is time-compressed garble — we stop pumping, the queue
- * drains, voice positions freeze, and music resumes in place afterward.
- * What changes is the EDGES:
+ * During turbo the SPU continues at guest cadence. Host output is discarded
+ * while queued audio drains; the guest's voices and music keep advancing.
+ * The host output edges are faded:
  *   - entering turbo: render one short tail of the current voice state,
  *     ramp it to silence, and queue it — the drain ends in a fade instead
  *     of a hard cut;
@@ -4604,28 +4562,25 @@ static void sdl_audio_pump(bool discard_output = false) {
  *     re-trigger within a few frames; without the debounce the mute would
  *     flicker audibly), then resume pumping with a rising ramp applied
  *     across the first ~50 ms of samples (sdl_audio_pump above). */
-/* Bridge/legacy output health, surfaced through the audio_stats TCP command
+/* Host output health, surfaced through the audio_stats TCP command
  * (debug_server.c) — no stderr probe; rule 3. */
 extern "C" int psx_audio_out_stats(double *fill_ms, double *target_ms,
                                    uint64_t *underruns,
                                    uint64_t *overflow_drops, double *correction,
                                    int *legacy, int *host_rate)
 {
-    *legacy = audio_legacy_mode() ? 1 : 0;
+    *legacy = 0; /* retained wire field for existing audio_stats clients */
     *host_rate = g_audio_host_rate;
-    if (*legacy || !s_drc_ready) {
-        *fill_ms = sdl_audio_device
-                   ? (double)psx_sdl_audio_queued_size(sdl_audio_device)
-                     / (44100.0 * 4.0) * 1000.0
-                   : 0.0;
-        *target_ms = 0.0; /* push queue — no DRC fill target */
-        *underruns = g_legacy_underruns;
+    if (!s_drc_ready) {
+        *fill_ms = 0.0;
+        *target_ms = 0.0;
+        *underruns = 0;
         *overflow_drops = 0;
         *correction = 0.0;
-        return sdl_audio_device != 0;
+        return 0;
     }
     rab_stats st;
-    rab_get_stats(&s_drc, &st);
+    s_drc.stats(&st);
     *fill_ms = st.last_fill_ms;
     *target_ms = s_drc.cfg.target_ms;
     *underruns = st.underrun_events;
@@ -4919,6 +4874,10 @@ static uint64_t g_frame_report_wait_ticks = 0;   /* offline pacer waits */
 /* Host ticks the emulation thread has spent in the offline pacer: its idle
  * time (render_pass.c budgets queued passes from it). */
 extern "C" uint64_t psx_frame_pacer_wait_ticks(void) { return g_frame_report_wait_ticks; }
+extern "C" uint64_t psx_frame_pacer_spare_ticks(void) {
+    const uint64_t now = SDL_GetPerformanceCounter();
+    return s_frame_pacer.next_deadline > now ? s_frame_pacer.next_deadline - now : 0;
+}
 static uint64_t g_openxr_ready_execution_generation = 0;
 static PSXOpenXRReadyLoadRequest g_openxr_ready_load_request{};
 
@@ -5290,11 +5249,9 @@ static int sdl_audio_catchup_sink(int other_sink) {
         state = PsxAudioCatchup{};
         return 0;
     }
-    psx_sdl_audio_lock(sdl_audio_device);
-    rab_get_stats(&s_drc, &stats);
-    const double fill_ms = rab_fill_ms(&s_drc);
+    s_drc.stats(&stats);
+    const double fill_ms = s_drc.fill_ms();
     const double target_ms = s_drc.cfg.target_ms;
-    psx_sdl_audio_unlock(sdl_audio_device);
     const int active = psx_audio_catchup_update(&state,
         psx_audio_sync_enabled() && !psx_netplay_active() && present_should_wall_pace(),
         other_sink || (g_turbo_audio_sink_active && !state.active),
@@ -5331,13 +5288,8 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
             tail = (int)spu_output_pop(sdl_audio_buf, (uint32_t)tail);
             sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
             audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
-            if (sdl_audio_device && audio_legacy_mode()) {
-                audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
-                psx_sdl_audio_queue(sdl_audio_device, sdl_audio_buf, (uint32_t)tail * sizeof(int16_t) * 2u);
-            } else if (sdl_audio_device && s_drc_ready) {
-                psx_sdl_audio_lock(sdl_audio_device);
-                rab_push(&s_drc, sdl_audio_buf, tail);
-                psx_sdl_audio_unlock(sdl_audio_device);
+            if (sdl_audio_device && s_drc_ready) {
+                s_drc.push(sdl_audio_buf, tail);
             }
             muted = 1;
         }
@@ -5370,9 +5322,7 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
         sink_was_active = 0;
         /* Preserve queued PCM; re-prime only when the sink depleted the ring. */
         if (psx_audio_sync_enabled() && sdl_audio_device && s_drc_ready) {
-            psx_sdl_audio_lock(sdl_audio_device);
-            rab_resume_after_sink(&s_drc);
-            psx_sdl_audio_unlock(sdl_audio_device);
+            s_drc.resume_after_sink();
         }
         sdl_audio_fadein_left = sdl_audio_fade_samples;
         audio_trace_event(AUDIO_EV_UNMUTE,
@@ -10565,9 +10515,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 
 /* Render thread: start once, then close every frame (after its present,
  * before pacing, so the render thread draws while the guest waits). */
+static void video_res_service(void);
 static void render_thread_vblank(void) {
+    video_res_service();
 #ifndef PSX_SDL_NO_RENDER
-    if (!g_render_thread) return;
+    if (!g_gl_active || gr_backend()!=GR_BACKEND_OPENGL) return;
+    g_render_thread=1; /* GL presentation always has a permanent owner. */
     if (!s_render_thread_tried) {
         s_render_thread_tried = 1;
         gl_renderer_set_present_thread(g_present_thread, g_present_thread_slots);
@@ -10586,11 +10539,9 @@ static void render_thread_vblank(void) {
                              "from surplus only)\n");
             }
         } else {
-            std::fprintf(stdout, "psxrecomp: render thread requested but not started "
-                         "(needs the OpenGL backend without netplay, frame interpolation "
-                         "or a 24-bit display)\n");
-            if (g_frame_generation)
-                std::fprintf(stdout, "psxrecomp: Smooth motion (frame generation) needs the render thread; off\n");
+            std::fputs("psxrecomp: cannot start the permanent graphics owner\n",stdout);
+            std::fflush(stdout);
+            std::abort();
         }
         std::fflush(stdout);
     }
@@ -10691,6 +10642,9 @@ static int g_video_res_applied_ss = 1000;
 static std::mutex g_video_res_applied_mutex;
 static std::atomic<bool> g_video_res_live_failed{false};
 static std::atomic<bool> g_video_res_live_capable{false};
+static std::atomic<int> g_video_res_result{-1};
+static bool g_video_res_pending = false; // emulation thread only
+static int g_video_res_pending_ir = PSX_IR_UNSET, g_video_res_pending_ss = 1000;
 
 static void video_res_set_applied(int ir, int ss) {
     std::lock_guard<std::mutex> lock(g_video_res_applied_mutex);
@@ -10701,6 +10655,46 @@ static void video_res_set_applied(int ir, int ss) {
 static void video_res_refresh_capable(void) {
     g_video_res_live_capable.store(g_gl_active && g_video_scale_applies &&
                                    gl_renderer_internal_scale_live_capable() != 0);
+}
+
+/* Owner allocation completion never waits on the emulation thread. */
+static void video_res_complete(void*,int scale) {
+    g_video_res_result.store(scale,std::memory_order_release);
+}
+static void video_res_submit(void) {
+    if(g_video_res_pending) return;
+    video_res_refresh_capable();
+    if(!g_video_res_live_capable.load()) {
+        g_video_res_live_failed.store(true);
+        return;
+    }
+    const int previous_scale=g_video_scale;
+    apply_internal_resolution(match_display_px_h(sdl_window));
+    const int requested_scale=g_video_scale;
+    g_video_scale=previous_scale;
+    g_video_res_pending_ir=g_video_internal_res;
+    g_video_res_pending_ss=g_video_ss_milli;
+    g_video_res_result.store(-1);
+    g_video_res_pending=true;
+    g_video_res_live_failed.store(false);
+    if(!gl_renderer_request_internal_scale_complete(requested_scale,video_res_complete,nullptr)) {
+        g_video_res_pending=false;
+        g_video_res_live_failed.store(true);
+    }
+}
+static void video_res_service(void) {
+    if(!g_video_res_pending) return;
+    const int applied=g_video_res_result.exchange(-1,std::memory_order_acq_rel);
+    if(applied<0) return;
+    g_video_res_pending=false;
+    g_video_res_live_failed.store(applied==0);
+    if(applied) {
+        g_video_scale=applied;
+        video_res_set_applied(g_video_res_pending_ir,g_video_res_pending_ss);
+        dynres_setup();
+    }
+    if(g_video_internal_res!=g_video_res_pending_ir || g_video_ss_milli!=g_video_res_pending_ss)
+        video_res_submit();
 }
 
 /* Other restart-only settings still compare against boot. Resolution compares
@@ -10800,35 +10794,15 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
         else { dynres_setup(); if (!g_dynres.active && gl_renderer_dynamic_resolution_ceiling() >= 2) g_dynres.active = true; }
     }
     if (m & PSX_VIDEO_LIVE_RESOLUTION) {
-        /* The GL owner confirms allocation/application before this returns. */
         if (next->internal_resolution != PSX_IR_UNSET)
             g_video_internal_res = next->internal_resolution;
         if (next->supersample_milli >= PSX_SS_MILLI_MIN &&
             next->supersample_milli <= PSX_SS_MILLI_MAX)
             g_video_ss_milli = next->supersample_milli;
-        /* The request is kept (and saved) either way; the session's scale
-         * only moves when the backend takes it. Otherwise the change waits
-         * for a relaunch and the restart bits say so. */
-        const int prev_scale = g_video_scale;
-        video_res_refresh_capable();
-        int applied = 0;
-        if (g_video_res_live_capable.load()) {
-            apply_internal_resolution(match_display_px_h(sdl_window));
-            applied = gl_renderer_set_internal_scale_live(g_video_scale);
-        }
-        if (applied) {
-            std::fprintf(stdout, "psxrecomp: internal scale %dx (live)\n", applied);
-            g_video_scale = applied;
-            video_res_set_applied(g_video_internal_res, g_video_ss_milli);
-            g_video_res_live_failed.store(false);
-            dynres_setup();   /* the new scale is the controller's ceiling */
-        } else {
-            g_video_scale = prev_scale;
-            g_video_res_live_failed.store(true);
-            std::fprintf(stdout, "psxrecomp: internal resolution change needs a "
-                                 "relaunch (live change unavailable)\n");
-        }
+        /* Persist the request now, confirm application after owner completion. */
+        video_res_submit();
     }
+
     if ((m & PSX_VIDEO_LIVE_FRAME_GEN) && g_gl_active) {
         g_frame_generation = next->frame_generation ? 1 : 0;
         gl_renderer_set_frame_generation(g_frame_generation);
@@ -17877,6 +17851,7 @@ static void recomp_overlay_detach(void) {
 }
 
 static void host_pause_service(void) {
+    video_res_service();
     if (!g_ovl_on) return;
     mh_refresh_snapshot();
     if (const int disc = g_ovl_disc_req.exchange(0)) {
@@ -18053,6 +18028,7 @@ static void host_pause_service(void) {
 }
 
 int main(int argc, char** argv) {
+    psx_host_schedule_thread(PsxHostThreadRole::Emulation);
     g_main_argc = argc;
     g_main_argv = argv;
     /* Force line-buffered output so messages appear even if killed. */
@@ -20945,6 +20921,8 @@ session_reboot:
     video_res_set_applied(PSX_IR_UNSET, 1000);
     g_video_res_live_failed.store(false);
     g_video_res_live_capable.store(false);
+    g_video_res_pending=false;
+    g_video_res_result.store(-1);
     g_openxr_ready_execution_generation++;
     if (g_openxr_ready_execution_generation == 0)
         g_openxr_ready_execution_generation = 1;
@@ -21069,6 +21047,13 @@ session_reboot:
                      g_headless && g_video_renderer != 0 ? " (headless)" : "");
     }
     gpu_init();
+    {
+        char error[512]{};
+        if(!gpu_hd_textures_attach_native(gpu_native_owner(),error,sizeof error)) {
+            std::fprintf(stderr,"psxrecomp: native texture tracking: %s\n",error);
+            return 1;
+        }
+    }
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init.
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
@@ -21215,8 +21200,6 @@ session_reboot:
     g_render_thread_pref = g_render_thread;
     g_present_thread_pref = g_present_thread;
     g_frame_generation_pref = g_frame_generation;
-    if (const char* e = std::getenv("PSX_RENDER_THREAD"))
-        g_render_thread = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PRESENT_THREAD"))
         g_present_thread = (*e && *e != '0') ? 1 : 0;
     if (const char* e = std::getenv("PSX_PRESENT_THREAD_SLOTS"))
@@ -21650,19 +21633,17 @@ session_reboot:
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 1024;
-        const bool legacy = audio_legacy_mode();
-        want.allow_frequency_change = legacy ? 0 : 1;
-        if (!legacy)
-            want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
+        want.allow_frequency_change = 1;
+        want.callback = sdl_drc_callback;
         sdl_audio_device = psx_sdl_audio_open(&want, &have);
         if (sdl_audio_device) {
-            if (!legacy) {
+            {
                 rab_config cfg; rab_config_defaults(&cfg);
                 cfg.channels    = 2;
                 cfg.source_rate = 44100.0;            /* SPU render rate */
                 cfg.host_rate   = (double)have.freq;  /* actual device rate */
                 cfg.target_ms   = (double)resolved_audio_buffer_ms;
-                if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
+                if (s_drc.init(cfg) == 0) s_drc_ready = true;
             }
             g_audio_host_rate = have.freq;
             audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
@@ -22283,6 +22264,9 @@ session_reboot:
     /* Solo rollback resim self-check (PSX_RB_SELFCHECK=1, offline only). */
     psx_selfcheck_init(&cpu, memory_get_bios_checksum(), game_entry_pc);
 
+    /* Finish GL initialization before guest code starts. Every subsequent
+     * guest draw is a packet record, including the first BIOS/game frame. */
+    render_thread_vblank();
     /* Execute. */
     std::fprintf(stdout, "psxrecomp runtime: executing from PC=0x%08X\n", cpu.pc);
 

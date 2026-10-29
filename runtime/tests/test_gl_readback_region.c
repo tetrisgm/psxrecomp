@@ -31,6 +31,8 @@ int psx_netplay_active(void){return 0;}
  * these fixtures never start. */
 GrBackend gr_backend(void){return GR_BACKEND_OPENGL;}
 void gr_refresh_backend(void){}
+NativeRaster *gr_native_raster(void){return NULL;}
+void gr_flush_native_upload(void){}
 static int test_depth24;
 int gpu_display_is_depth24(void){return test_depth24;}
 void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));out->display_x=32;out->display_y=32;out->width=320;out->height=16;}

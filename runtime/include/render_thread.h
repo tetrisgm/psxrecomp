@@ -1,31 +1,9 @@
-/* render_thread.h — opt-in render thread core ([video] render_thread).
- *
- * The emulation thread records host draw work into a single-producer /
- * single-consumer command ring; the render thread owns the graphics context
- * and replays the ring in order. This header is backend-neutral: it knows
- * nothing about OpenGL. The OpenGL backend (gpu_gl_renderer.c) supplies the
- * command set (exec callback) and the context hand-off (ctx callback).
- *
- * Model (docs/RENDER_THREAD.md):
- *   - Records are appended with rt_cmd_begin()/rt_cmd_commit() and replayed in
- *     order by exec() on the render thread. A record never splits across the
- *     ring end; payloads are copied, so the producer may reuse its buffers.
- *   - rt_frame_end() closes a guest frame. At most max_frames closed frames may
- *     wait in the ring; past that the emulation thread blocks (backpressure).
- *     While replaying, rt_frames_ahead() counts the complete frames already
- *     recorded after the one being replayed, so the backend can skip
- *     presenting a frame it is far behind on.
- *   - rt_acquire() is the one sync point: it waits until every record has been
- *     executed, has the render thread release the context, and makes it
- *     current on the calling (emulation) thread. The emulation thread then
- *     holds the context ("held") until rt_release() hands it back. While held,
- *     the backend calls its functions directly, exactly as with no render
- *     thread at all.
- *   - No lock is held while exec() runs. Locks only guard sleeping/waking.
- *
- * Every function except the rt_on_render_thread() / rt_frames_ahead() /
- * rt_render_idle_ns()
- * queries is emulation-thread only. */
+/* Complete-frame presentation transport. One producer records owned commands
+ * and immutable native inputs; a permanent graphics owner consumes the newest
+ * complete packet. Pending packets may be replaced, never partial commands.
+ * No render-queue backpressure reaches the guest. Durable controls/diagnostics
+ * are independent of dropped packets. Context transfer occurs only at
+ * startup/shutdown. Producer methods are not concurrently callable. */
 #ifndef PSX_RENDER_THREAD_H
 #define PSX_RENDER_THREAD_H
 
@@ -54,42 +32,56 @@ typedef void (*RtExecFn)(void *user, const RtCmd *cmd, const void *payload);
 typedef void (*RtCtxFn)(void *user, int current);
 /* tick (optional): timed work on the render thread while it holds the
  * context (frame generation). Called with the current time before a record
- * is executed and while the ring is empty, once the deadline it last
+ * is executed and while no complete packet is pending, once the deadline it last
  * returned has passed; returns the next deadline (rt_now_ns clock), 0 for
  * none. An idle render thread sleeps no later than that deadline. */
 typedef uint64_t (*RtTickFn)(void *user, uint64_t now_ns);
+struct FrameOwner;
+struct FramePacketView;
 
 typedef struct RtConfig {
-    size_t   ring_bytes;   /* power of two; >= 1 MiB */
-    int      max_frames;   /* closed frames allowed in flight (>= 1) */
+    size_t   ring_bytes;   /* maximum record bytes per complete packet */
+    int      max_frames;   /* legacy configuration; mailbox has one pending slot */
     RtExecFn exec;
     RtCtxFn  ctx;
     void    *user;
     RtTickFn tick;         /* optional (NULL) */
+    /* Complete-frame transport. begin owns the initial seed before native
+     * work for this frame; seal attaches immutable native inputs. Neither
+     * callback may access GL. execute_frame runs only on the GL owner. */
+    size_t initial_limit;
+    int (*begin_frame)(void *user,struct FrameOwner *owner,uint64_t sequence);
+    int (*seal_frame)(void *user,struct FrameOwner *owner);
+    void (*execute_frame)(void *user,const struct FramePacketView *packet);
+    void (*reset_frame)(void *user,uint64_t epoch);
 } RtConfig;
+
+/* Copied diagnostic request outside the droppable draw stream. It observes
+ * the latest published frame (or its newer replacement), and works paused. */
+int rt_request(void (*callback)(const void *),const void *payload,uint32_t bytes);
+int rt_control(void (*callback)(const void *),const void *payload,uint32_t bytes);
+int rt_packet_current(const struct FramePacketView *packet);
+void rt_invalidate(void);
 
 /* Start: the context must be current on the calling thread; on success it is
  * released here and made current on the new render thread. Returns 1 on
  * success, 0 (nothing started, context still current) on failure. */
 int  rt_start(const RtConfig *cfg);
-/* Stop: drain every record, join the thread and make the context current on
+/* Stop: discard incomplete producer work, join and make the context current on
  * the calling thread again. Safe when not running. */
 void rt_stop(void);
 int  rt_running(void);
 int  rt_on_render_thread(void);
 
-/* Append a record with room for payload_bytes; returns a 16-byte aligned
- * payload or NULL on invalid input/allocation failure. Large records are
- * fragmented through the bounded ring and assembled by the consumer; exec
- * sees one intact immutable payload. Blocks while the ring is full. Must be
- * followed by rt_cmd_commit() before any other rt_* call. Ops 0 and UINT16_MAX
- * are reserved. Private batches still reject oversized records atomically. */
+/* Append to the producer-owned packet; returns aligned payload or NULL.
+ * Allocation/limit failure invalidates the complete packet, never permits
+ * executing GL on the producer. Optional batches reject atomically. */
 void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes);
 void  rt_cmd_commit(void);
-/* Publish committed work and wake the owner without waiting for execution. */
+/* Compatibility no-op: incomplete frames are never published. */
 void  rt_flush(void);
 /* Optional producer transaction. Records stay private until try_commit;
- * overflow or insufficient ring space drops the entire batch without waiting.
+ * overflow drops the entire optional batch without invalidating the frame.
  * No frame markers/context acquisition inside a batch. A NULL cmd_begin while
  * batching is a dropped record, never permission to execute it directly. */
 int rt_batch_begin(void);
@@ -97,15 +89,13 @@ int rt_batch_active(void);
 int rt_batch_try_commit(void);
 void rt_batch_discard(void);
 
-/* Close a guest frame: enqueue a frame marker, then block while more than
- * max_frames closed frames are unconsumed. */
+/* Seal/publish a complete frame and capture the next native seed. No GPU wait. */
 void rt_frame_end(void);
 
-/* Render-thread query while executing: how many complete frames are queued
- * after the frame whose record is being executed (0 = it is the newest). */
+/* Number of complete packets awaiting acquisition (zero or one). This is an
+ * advisory admission signal, never a reason to block guest publication. */
 int  rt_frames_ahead(void);
-/* Render-thread query: the consumer's running idle total (waiting for
- * records, or parked while the emulation thread holds the context). */
+/* Consumer running total of idle time awaiting packets or tick deadlines. */
 uint64_t rt_render_idle_ns(void);
 /* Monotonic nanoseconds (the clock tick deadlines use). */
 uint64_t rt_now_ns(void);
@@ -116,26 +106,26 @@ uint64_t rt_backpressure_events(void);
  * wins over the one tick last returned). */
 void rt_tick_at(uint64_t deadline_ns);
 
-/* Sync point. Drain, then move the context to the calling thread (held).
- * reason is a static string kept in the acquire ring. No-op when already held
- * or not running. */
+/* Legacy API migration guard: acquire aborts when called on the producer.
+ * Context borrowing is forbidden; release is a no-op and held is always 0. */
 void rt_acquire(const char *reason);
-/* Hand the context back to the render thread. No-op unless held. */
 void rt_release(void);
-int  rt_held(void);
-/* Wait until every committed record has executed (context stays where it
- * is). Used by tests and by rt_acquire. */
+int rt_held(void);
+/* Test-only complete-packet/control acknowledgement; never a runtime pacing
+ * primitive and never transfers the graphics context. */
 void rt_drain(void);
 
 /* Statistics (emulation thread). */
 typedef struct RtStats {
     uint64_t records, bytes, frames_produced, frames_consumed;
+    uint64_t frames_replaced,frames_rejected;
     uint64_t acquires, releases, oversize;
     uint64_t backpressure_waits, ring_full_waits;
     uint64_t backpressure_ns, ring_full_ns, acquire_ns;
     uint64_t render_busy_ns, render_idle_ns;
     uint64_t ring_high_water;
     int      max_frames, running, held;
+    unsigned owner_delay_ms; /* debug-only stalled-consumer experiment */
 } RtStats;
 void rt_get_stats(RtStats *out);
 

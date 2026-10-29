@@ -1,695 +1,235 @@
-/* render_thread.c — render thread core. See render_thread.h and
- * docs/RENDER_THREAD.md.
- *
- * One producer (the emulation thread), one consumer (the render thread).
- * Positions are monotonic 64-bit byte counters; the ring index is pos & mask.
- * The consumer frees a record only after exec() returns, so a payload stays
- * valid for the whole replay. Locks only guard sleeping: the sleeper raises
- * its *_sleeping flag under the lock BEFORE re-checking its condition, and the
- * waker publishes its position (seq_cst) BEFORE reading that flag, so a wake
- * can never fall between a check and a wait. */
-
+﻿/* Complete-frame presentation transport. Native work is never queued here.
+ * The producer publishes owned packets; the graphics owner consumes the
+ * newest complete packet without applying backpressure to guest execution. */
 #include "render_thread.h"
-
+#include "frame_owner.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <stdio.h>
 #ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-typedef SRWLOCK            rt_mutex;
-typedef CONDITION_VARIABLE rt_cond;
-static void mtx_init(rt_mutex *m) { InitializeSRWLock(m); }
-static void mtx_lock(rt_mutex *m) { AcquireSRWLockExclusive(m); }
-static void mtx_unlock(rt_mutex *m) { ReleaseSRWLockExclusive(m); }
-static void cnd_init(rt_cond *c) { InitializeConditionVariable(c); }
-static void cnd_wait(rt_cond *c, rt_mutex *m) { SleepConditionVariableSRW(c, m, INFINITE, 0); }
-static void cnd_wait_ns(rt_cond *c, rt_mutex *m, uint64_t ns) {
-    DWORD ms = (DWORD)((ns + 999999u) / 1000000u);
-    SleepConditionVariableSRW(c, m, ms ? ms : 1, 0);
-}
-static void cnd_bcast(rt_cond *c) { WakeAllConditionVariable(c); }
-static uint64_t now_ns(void) {
-    LARGE_INTEGER f, t;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&t);
-    return (uint64_t)((double)t.QuadPart * 1e9 / (double)f.QuadPart);
-}
-static void cpu_relax(void) { YieldProcessor(); }
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #else
-#  include <pthread.h>
-#  include <sched.h>
-#  if defined(__APPLE__)
-#    include <pthread/qos.h>
-#  endif
-#  include <time.h>
-typedef pthread_mutex_t rt_mutex;
-typedef pthread_cond_t  rt_cond;
-static void mtx_init(rt_mutex *m) { pthread_mutex_init(m, NULL); }
-static void mtx_lock(rt_mutex *m) { pthread_mutex_lock(m); }
-static void mtx_unlock(rt_mutex *m) { pthread_mutex_unlock(m); }
-static void cnd_init(rt_cond *c) { pthread_cond_init(c, NULL); }
-static void cnd_wait(rt_cond *c, rt_mutex *m) { pthread_cond_wait(c, m); }
-static void cnd_wait_ns(rt_cond *c, rt_mutex *m, uint64_t ns) {
-#  if defined(__APPLE__)
-    struct timespec rel = { (time_t)(ns / 1000000000u), (long)(ns % 1000000000u) };
-    pthread_cond_timedwait_relative_np(c, m, &rel);
-#  else
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t t = (uint64_t)ts.tv_nsec + ns % 1000000000u;
-    ts.tv_sec += (time_t)(ns / 1000000000u + t / 1000000000u);
-    ts.tv_nsec = (long)(t % 1000000000u);
-    pthread_cond_timedwait(c, m, &ts);
-#  endif
-}
-static void cnd_bcast(rt_cond *c) { pthread_cond_broadcast(c); }
-static uint64_t now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-static void cpu_relax(void) {
-#  if defined(__aarch64__)
-    __asm__ __volatile__("yield");
-#  elif defined(__x86_64__) || defined(__i386__)
-    __asm__ __volatile__("pause");
-#  endif
-}
+#include <time.h>
+#include <sched.h>
 #endif
 
-#define OP_PAD   0u      /* filler to the ring end; consumer skips it  */
-#define F_FRAME  0x8000u /* op 0 with this flag: frame marker          */
-#define OP_CHUNK UINT16_MAX /* transport-only fragment of one large record */
-typedef struct RtChunk { RtCmd command; uint32_t offset; } RtChunk;
+static FrameOwner *owner;
+static RtConfig config;
+static FramePacketQueue *batch;
+static int batching;
+static uint64_t sequence;
+static _Atomic uint64_t published,completed,records,bytes,produced,consumed,busy_ns,high_water,oversize;
+static _Atomic uint64_t rejected;
+static size_t frame_bytes;
+static unsigned owner_delay_ms;
 
-/* Producer-side wake batching: a sleeping render thread is woken once this
- * much unread work is queued (frame ends, drains and acquires always wake). */
-#define WAKE_BYTES   (128u * 1024u)
-#define WAKE_RECORDS 256u
-#define SPIN_LOOPS   4096   /* consumer polls this long before sleeping */
-/* Producer-side publish batching: committed records become visible to the
- * render thread (one release store of wpos) every this many records / bytes,
- * and always before the producer waits, at a frame end, drain or sync point.
- * One store per record made the emulation thread and the render thread trade
- * the position cache line ~12,000 times a frame on R4's race. */
-#define PUBLISH_BYTES   (16u * 1024u)
-#define PUBLISH_RECORDS 32u   /* PSX_RENDER_THREAD_PUBLISH=N overrides; 1 = every record */
-/* Consumer: busy time is published once per this many records (and when it
- * goes idle), not timed per record. */
-#define BUSY_RECORDS    64u
-
-/* The two sides write different cache lines: wpos and the producer's own
- * state on one set, rpos and the consumer's counters on another. */
-#define RT_LINE _Alignas(64)
-
-#define ACQ_RING 64
-
-static struct {
-    /* configuration */
-    uint8_t *ring;
-    uint64_t cap, mask;
-    int      max_frames;
-    RtExecFn exec;
-    RtCtxFn  ctx;
-    void    *user;
-    RtTickFn tick;
-    uint64_t tick_at;          /* consumer: next tick deadline (0 = none) */
-
-    /* shared positions / counters, grouped by the side that writes them */
-    RT_LINE _Atomic uint64_t wpos;       /* producer: published write position */
-    _Atomic uint64_t frames_produced;    /* producer */
-    RT_LINE _Atomic uint64_t rpos;       /* consumer */
-    _Atomic uint64_t frames_consumed;    /* consumer */
-    _Atomic uint64_t busy_ns, idle_ns;   /* consumer */
-    RT_LINE _Atomic int render_sleeping; /* consumer */
-    RT_LINE _Atomic int emu_sleeping;    /* producer */
-    _Atomic int      running;
-
-    /* hand-off + lifecycle, guarded by mtx */
-    rt_mutex mtx;
-    rt_cond  cv_work, cv_emu;
-    int      release_req, stop;
-    _Atomic int released;      /* read unlocked by emu_wait's first check */
-
-    /* producer-only */
-    RT_LINE uint64_t wlocal;   /* committed write position, published or not */
-    uint64_t rcache;           /* the producer's last read of rpos (<= rpos) */
-    uint64_t unpub_bytes, unpub_records;
-    uint64_t publish_records;  /* PUBLISH_RECORDS or PSX_RENDER_THREAD_PUBLISH */
-    uint64_t pend_start, pend_size, pend_payload_off;
-    uint16_t pend_op, pend_flags;
-    uint32_t pend_payload;
-    int      pending;
-    RtCmd   *large_pending;   /* producer owns until commit fragments it */
-    uint8_t *batch;
-    uint64_t batch_used, batch_records;
-    int batch_active, batch_failed;
-    uint64_t unwoken_bytes, unwoken_records;
-    uint32_t seq;
-    int      held;
-
-    /* stats (producer unless noted) */
-    uint64_t records, bytes, acquires, releases, oversize;
-    uint64_t bp_waits, full_waits, bp_ns, full_ns, acq_ns, high_water;
-    _Atomic uint64_t bp_events;          /* producer writes, any thread reads */
-    RtAcquireEvent acq_ring[ACQ_RING];
-    uint64_t acq_n;
-
+uint64_t rt_now_ns(void) {
 #ifdef _WIN32
-    HANDLE thread;
+    LARGE_INTEGER frequency,counter;
+    QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&counter);
+    return (uint64_t)((double)counter.QuadPart*1e9/(double)frequency.QuadPart);
 #else
-    pthread_t thread;
+    struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
+    return (uint64_t)now.tv_sec*1000000000ull+(uint64_t)now.tv_nsec;
 #endif
-} R;
-
-#if defined(_MSC_VER)
-static __declspec(thread) int t_render;
-#else
-static __thread int t_render;
-#endif
-
-int rt_running(void)          { return atomic_load(&R.running); }
-int rt_on_render_thread(void) { return t_render; }
-int rt_held(void)             { return R.held; }
-uint64_t rt_render_idle_ns(void) { return atomic_load(&R.idle_ns); }
-uint64_t rt_now_ns(void) { return now_ns(); }
-uint64_t rt_backpressure_events(void) { return atomic_load(&R.bp_events); }
-void rt_tick_at(uint64_t deadline_ns) {
-    if (!t_render || !deadline_ns) return;
-    if (!R.tick_at || deadline_ns < R.tick_at) R.tick_at = deadline_ns;
 }
-
-/* Consumer: run tick when its deadline has passed. */
-static void run_tick(void) {
-    if (!R.tick || !R.tick_at) return;
-    uint64_t now = now_ns();
-    if (now < R.tick_at) return;
-    R.tick_at = 0;
-    uint64_t next = R.tick(R.user, now);
-    if (next && (!R.tick_at || next < R.tick_at)) R.tick_at = next;
-    atomic_fetch_add(&R.busy_ns, now_ns() - now);
-}
-
-static inline uint64_t align_up(uint64_t n) {
-    return (n + (RT_ALIGN - 1)) & ~(uint64_t)(RT_ALIGN - 1);
-}
-
-/* ---- consumer ------------------------------------------------------------ */
-
-static void wake_emu(void) {
-    if (atomic_load(&R.emu_sleeping)) {
-        mtx_lock(&R.mtx);
-        cnd_bcast(&R.cv_emu);
-        mtx_unlock(&R.mtx);
-    }
-}
-
-/* Called with mtx held when the ring is empty: hand the context over while
- * the emulation thread asks for it. Returns with mtx held. */
-static void serve_release_locked(void) {
-    if (!R.release_req) return;
-    mtx_unlock(&R.mtx);
-    R.ctx(R.user, 0);
-    mtx_lock(&R.mtx);
-    atomic_store(&R.released, 1);
-    cnd_bcast(&R.cv_emu);
-    while (R.release_req && !R.stop) cnd_wait(&R.cv_work, &R.mtx);
-    atomic_store(&R.released, 0);
-    cnd_bcast(&R.cv_emu);
-    if (R.stop) return;              /* the stopper owns the context now */
-    mtx_unlock(&R.mtx);
-    R.ctx(R.user, 1);
-    mtx_lock(&R.mtx);
-}
-
+static void execute_packet(void *unused,const FramePacketView *packet) {
+    (void)unused;
+    const uint64_t begin=rt_now_ns();
+#ifndef PSX_NO_DEBUG_TOOLS
+    if(owner_delay_ms) {
 #ifdef _WIN32
-static DWORD WINAPI render_main(LPVOID arg)
+        Sleep(owner_delay_ms);
 #else
-static void *render_main(void *arg)
+        struct timespec delay={owner_delay_ms/1000,(long)(owner_delay_ms%1000)*1000000};
+        nanosleep(&delay,NULL);
 #endif
-{
-    (void)arg;
-    t_render = 1;
-    R.ctx(R.user, 1);
-    uint64_t r = atomic_load(&R.rpos);
-    int have_ctx = 1;
-    uint64_t burst_t0 = 0, burst_n = 0;   /* busy time of the current burst */
-    RtCmd *large = NULL;
-    uint32_t large_received = 0;
-    for (;;) {
-        run_tick();
-        uint64_t w = atomic_load_explicit(&R.wpos, memory_order_acquire);
-        if (r == w) {
-            if (burst_n) {
-                atomic_fetch_add(&R.busy_ns, now_ns() - burst_t0);
-                burst_n = 0;
-            }
-            int spun = 0;
-            while (spun < SPIN_LOOPS &&
-                   atomic_load_explicit(&R.wpos, memory_order_acquire) == r) {
-                cpu_relax();
-                spun++;
-            }
-            if (atomic_load_explicit(&R.wpos, memory_order_acquire) != r) continue;
-            uint64_t t0 = now_ns();
-            mtx_lock(&R.mtx);
-            atomic_store(&R.render_sleeping, 1);
-            while (atomic_load(&R.wpos) == r && !R.stop && !R.release_req) {
-                if (R.tick_at) {   /* timed work due: sleep no later than it */
-                    uint64_t now = now_ns();
-                    if (now >= R.tick_at) break;
-                    cnd_wait_ns(&R.cv_work, &R.mtx, R.tick_at - now);
-                } else {
-                    cnd_wait(&R.cv_work, &R.mtx);
-                }
-            }
-            atomic_store(&R.render_sleeping, 0);
-            if (R.release_req && atomic_load(&R.wpos) == r) {
-                serve_release_locked();
-                if (R.stop) have_ctx = 0;
-            }
-            int done = R.stop && atomic_load(&R.wpos) == r;
-            mtx_unlock(&R.mtx);
-            atomic_fetch_add(&R.idle_ns, now_ns() - t0);
-            if (done) break;
-            continue;
-        }
-        if (!burst_n) burst_t0 = now_ns();
-        const RtCmd *c = (const RtCmd *)(R.ring + (r & R.mask));
-        if (c->op == OP_PAD) {
-            if (c->flags & F_FRAME)
-                atomic_fetch_add(&R.frames_consumed, 1);
-        } else if (c->op == OP_CHUNK) {
-            RtChunk chunk;
-            if(c->payload < sizeof chunk) abort();
-            memcpy(&chunk,(const uint8_t *)c+sizeof *c,sizeof chunk);
-            const uint32_t bytes=c->payload-sizeof chunk;
-            if(!chunk.offset) {
-                if(large || chunk.command.op==OP_PAD || chunk.command.op==OP_CHUNK ||
-                   (uint64_t)chunk.command.payload+sizeof(RtCmd)>chunk.command.size) abort();
-                large=malloc(chunk.command.size);
-                if(!large) abort();
-                *large=chunk.command; large_received=0;
-            }
-            if(!large || chunk.offset!=large_received ||
-               memcmp(large,&chunk.command,sizeof *large) ||
-               bytes>large->payload-large_received) abort();
-            memcpy((uint8_t *)(large+1)+large_received,
-                   (const uint8_t *)(c+1)+sizeof chunk,bytes);
-            large_received+=bytes;
-            if(large_received==large->payload) {
-                R.exec(R.user,large,large+1);
-                free(large); large=NULL;
-            }
-        } else {
-            if(large) abort(); /* fragments must be contiguous in the stream */
-            R.exec(R.user, c, (const uint8_t *)c + sizeof(RtCmd));
-        }
-        r += c->size;
-        atomic_store(&R.rpos, r);   /* seq_cst: pairs with wake_emu's load */
-        if (++burst_n >= BUSY_RECORDS) {
-            const uint64_t t1 = now_ns();
-            atomic_fetch_add(&R.busy_ns, t1 - burst_t0);
-            burst_t0 = t1;
-            burst_n = 1;
-        }
-        wake_emu();
     }
-    if (have_ctx) R.ctx(R.user, 0);
-    t_render = 0;
-#ifdef _WIN32
-    return 0;
-#else
-    return NULL;
 #endif
-}
-
-/* ---- producer ------------------------------------------------------------ */
-
-/* Make every committed record visible to the render thread. */
-static void publish(void) {
-    if (!R.unpub_records && !R.unpub_bytes) return;
-    /* seq_cst, not release: with wake_render's load of render_sleeping it
-     * is the store-then-load pair the sleep handshake relies on. */
-    atomic_store(&R.wpos, R.wlocal);
-    R.unpub_bytes = R.unpub_records = 0;
-}
-
-static void wake_render(int force) {
-    if (force) publish();
-    if (!force && R.unwoken_bytes < WAKE_BYTES && R.unwoken_records < WAKE_RECORDS)
-        return;
-    R.unwoken_bytes = R.unwoken_records = 0;
-    if (atomic_load(&R.render_sleeping)) {
-        mtx_lock(&R.mtx);
-        cnd_bcast(&R.cv_work);
-        mtx_unlock(&R.mtx);
-    }
-}
-
-void rt_flush(void) { if(rt_running()) wake_render(1); }
-
-/* Block until pred() holds; the render thread wakes us after every record. */
-typedef int (*Pred)(uint64_t arg);
-static void emu_wait(Pred pred, uint64_t arg) {
-    if (pred(arg)) return;
-    wake_render(1);
-    mtx_lock(&R.mtx);
-    atomic_store(&R.emu_sleeping, 1);
-    while (!pred(arg)) cnd_wait(&R.cv_emu, &R.mtx);
-    atomic_store(&R.emu_sleeping, 0);
-    mtx_unlock(&R.mtx);
-}
-
-static int pred_space(uint64_t need_end) {   /* need_end: wpos after the write */
-    if (need_end - R.rcache <= R.cap) return 1;
-    R.rcache = atomic_load_explicit(&R.rpos, memory_order_acquire);
-    return need_end - R.rcache <= R.cap;
-}
-static int pred_drained(uint64_t w) { return atomic_load(&R.rpos) == w; }
-static int pred_frames(uint64_t limit) {
-    return atomic_load(&R.frames_produced) - atomic_load(&R.frames_consumed) <= limit;
-}
-static int pred_released(uint64_t unused) { (void)unused; return atomic_load(&R.released); }
-
-void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes) {
-    if (!rt_running() || R.pending || op == OP_PAD) return NULL;
-    uint64_t size = align_up(sizeof(RtCmd) + (uint64_t)payload_bytes);
-    if (size > R.cap / 2) {
-        R.oversize++;
-        if(R.batch_active) { R.batch_failed=1; return NULL; }
-        if(size>UINT32_MAX) return NULL;
-        R.large_pending=malloc((size_t)size);
-        if(!R.large_pending) return NULL;
-        *R.large_pending=(RtCmd){(uint32_t)size,op,flags,payload_bytes,R.seq++};
-        R.pending=1;
-        return R.large_pending+1;
-    }
-    if (R.batch_active) {
-        if (R.batch_failed || size > R.cap / 2 - R.batch_used) {
-            R.batch_failed = 1; return NULL;
+    if(config.execute_frame) config.execute_frame(config.user,packet);
+    else {
+        const unsigned char *data=packet->records;
+        for(size_t at=0;at<packet->record_bytes;) {
+            const RtCmd *command=(const RtCmd *)(data+at);
+            config.exec(config.user,command,command+1);
+            at+=command->size;
         }
-        RtCmd *c = (RtCmd *)(R.batch + R.batch_used);
-        c->size = (uint32_t)size; c->op = op; c->flags = flags;
-        c->payload = payload_bytes; c->seq = R.seq++;
-        R.pend_size = size; R.pending = 1;
-        return (uint8_t *)c + sizeof(*c);
     }
-    uint64_t w = R.wlocal;
-    uint64_t off = w & R.mask;
-    uint64_t pad = (off + size > R.cap) ? R.cap - off : 0;
-    if (!pred_space(w + pad + size)) {
-        uint64_t t0 = now_ns();
-        R.full_waits++;
-        emu_wait(pred_space, w + pad + size);
-        R.full_ns += now_ns() - t0;
-        atomic_fetch_add(&R.bp_events, 1);
-    }
-    if (pad) {
-        RtCmd *p = (RtCmd *)(R.ring + off);
-        p->size = (uint32_t)pad; p->op = OP_PAD; p->flags = 0; p->payload = 0; p->seq = 0;
-        w += pad;
-        off = 0;
-    }
-    RtCmd *c = (RtCmd *)(R.ring + off);
-    c->size = (uint32_t)size;
-    c->op = op;
-    c->flags = flags;
-    c->payload = payload_bytes;
-    c->seq = R.seq++;
-    R.pend_start = w;
-    R.pend_size = size;
-    R.pending = 1;
-    return (uint8_t *)c + sizeof(RtCmd);
+    atomic_fetch_add(&busy_ns,rt_now_ns()-begin);
+    atomic_fetch_add(&consumed,1);
+    atomic_store(&completed,packet->sequence);
 }
-
-void rt_cmd_commit(void) {
-    if (!R.pending) return;
-    R.pending = 0;
-    if(R.large_pending) {
-        RtCmd *large=R.large_pending;
-        R.large_pending=NULL;
-        /* Only one producer staging allocation and one consumer assembly may
-         * exist here. Fragments use the bounded ring, preserve ordering, and
-         * never transfer the graphics context to the producer. */
-        const uint32_t max=(uint32_t)(R.cap/2)-sizeof(RtCmd)-sizeof(RtChunk)-RT_ALIGN;
-        for(uint32_t at=0;at<large->payload;) {
-            uint32_t bytes=large->payload-at;
-            if(bytes>max) bytes=max;
-            RtChunk chunk={*large,at};
-            uint8_t *p=rt_cmd_begin(OP_CHUNK,0,sizeof chunk+bytes);
-            if(!p) abort();
-            memcpy(p,&chunk,sizeof chunk);
-            memcpy(p+sizeof chunk,(const uint8_t *)(large+1)+at,bytes);
-            rt_cmd_commit();
-            at+=bytes;
+static void context(void *unused,int current) { (void)unused;config.ctx(config.user,current); }
+static uint64_t tick(void *unused,uint64_t now) {
+    (void)unused;
+    uint64_t begin=rt_now_ns(),next=config.tick(config.user,now);
+    atomic_fetch_add(&busy_ns,rt_now_ns()-begin);
+    return next;
+}
+static void reset(void *unused,uint64_t epoch) {
+    (void)unused;
+    if(config.reset_frame) config.reset_frame(config.user,epoch);
+}
+static void begin_frame(void) {
+    ++sequence;frame_bytes=0;
+    if(config.begin_frame) (void)config.begin_frame(config.user,owner,sequence);
+    else (void)frame_owner_begin(owner,sequence,NULL,0);
+}
+int rt_start(const RtConfig *cfg) {
+    if(owner) return 1;
+    if(!cfg || !cfg->ctx || (!cfg->exec && !cfg->execute_frame)) return 0;
+    config=*cfg;
+    owner_delay_ms=0;
+#ifndef PSX_NO_DEBUG_TOOLS
+    const char *delay=getenv("PSX_RENDER_OWNER_DELAY_MS");
+    if(delay) {
+        long value=strtol(delay,NULL,10);
+        if(value>0) owner_delay_ms=(unsigned)(value>1000?1000:value);
+    }
+#endif
+    if(!config.ring_bytes) config.ring_bytes=(size_t)32<<20;
+    FrameOwnerConfig settings={0};
+    settings.initial_limit=config.initial_limit;settings.record_limit=config.ring_bytes;
+    settings.execute=execute_packet;settings.context=context;
+    settings.clock_ns=rt_now_ns;settings.tick=config.tick?tick:NULL;settings.reset=reset;
+    batch=frame_packet_create(0,config.ring_bytes);
+    if(!batch) return 0;
+    owner=frame_owner_start(&settings);
+    if(!owner) { frame_packet_destroy(batch);batch=NULL;return 0; }
+    sequence=0;batching=0;
+    atomic_store(&published,0);atomic_store(&completed,0);
+    atomic_store(&records,0);atomic_store(&bytes,0);atomic_store(&produced,0);
+    atomic_store(&consumed,0);atomic_store(&busy_ns,0);atomic_store(&high_water,0);
+    atomic_store(&oversize,0);
+    atomic_store(&rejected,0);
+    begin_frame();return 1;
+}
+void rt_stop(void) {
+    if(!owner) return;
+    rt_batch_discard();frame_owner_cancel(owner);
+    frame_owner_stop(owner);owner=NULL;
+    frame_packet_destroy(batch);batch=NULL;
+}
+int rt_running(void) { return owner!=NULL; }
+int rt_on_render_thread(void) { return frame_owner_is_thread(); }
+int rt_held(void) { return 0; }
+void *rt_cmd_begin(uint16_t op,uint16_t flags,uint32_t payload) {
+    if(!owner || frame_owner_is_thread()) return NULL;
+    void *result=batching?frame_packet_append(batch,op,flags,payload):
+                         frame_owner_append(owner,op,flags,payload);
+    if(result) {
+        uint64_t size=((uint64_t)sizeof(RtCmd)+payload+RT_ALIGN-1)&~(uint64_t)(RT_ALIGN-1);
+        atomic_fetch_add(&records,1);atomic_fetch_add(&bytes,size);
+        if(!batching) {
+            frame_bytes+=(size_t)size;
+            if(frame_bytes>atomic_load(&high_water)) atomic_store(&high_water,frame_bytes);
         }
-        free(large);
-        return;
-    }
-    if (R.batch_active) { R.batch_used += R.pend_size; R.batch_records++; return; }
-    uint64_t end = R.pend_start + R.pend_size;
-    R.unpub_bytes += end - R.wlocal;   /* includes a pad record before it */
-    R.unpub_records++;
-    R.wlocal = end;
-    R.records++;
-    R.bytes += R.pend_size;
-    /* Against the producer's last view of rpos: an upper bound. */
-    uint64_t depth = end - R.rcache;
-    if (depth > R.high_water) R.high_water = depth;
-    R.unwoken_bytes += R.pend_size;
-    R.unwoken_records++;
-    if (R.unpub_records >= R.publish_records || R.unpub_bytes >= PUBLISH_BYTES)
-        publish();
-    wake_render(0);
+    } else atomic_fetch_add(&oversize,1);
+    return result;
 }
-
-int rt_batch_active(void) { return R.batch_active; }
+void rt_cmd_commit(void) {}
+/* An incomplete guest frame is never published merely to wake diagnostics. */
+void rt_flush(void) {}
 int rt_batch_begin(void) {
-    if (!rt_running() || R.held || R.pending || R.batch_active) return 0;
-    if (!R.batch) R.batch = malloc((size_t)R.cap / 2);
-    if (!R.batch) return 0;
-    R.batch_used = R.batch_records = 0; R.batch_failed = 0; R.batch_active = 1;
-    return 1;
+    if(!owner || batching) return 0;
+    batching=frame_packet_begin(batch,0,NULL,0);return batching;
+}
+int rt_batch_active(void) { return batching; }
+int rt_batch_try_commit(void) {
+    if(!batching) return 0;
+    batching=0;
+    if(!frame_packet_publish(batch)) return 0;
+    FramePacketView view;
+    if(!frame_packet_acquire(batch,&view)) return 0;
+    int ok=frame_owner_append_records(owner,view.records,view.record_bytes);
+    if(ok) frame_bytes+=view.record_bytes;
+    frame_packet_release(batch);return ok;
 }
 void rt_batch_discard(void) {
-    if (!R.batch_active) return;
-    R.pending = 0; R.batch_active = 0; R.batch_used = R.batch_records = 0;
+    if(!batching) return;
+    frame_packet_cancel(batch);batching=0;
 }
-int rt_batch_try_commit(void) {
-    if (!R.batch_active || R.pending) return 0;
-    uint64_t w = R.wlocal, off = w & R.mask, size = R.batch_used;
-    uint64_t pad = off + size > R.cap ? R.cap - off : 0;
-    if (R.batch_failed || !pred_space(w + pad + size)) { rt_batch_discard(); return 0; }
-    if (pad) {
-        RtCmd *c = (RtCmd *)(R.ring + off);
-        *c = (RtCmd){.size=(uint32_t)pad,.op=OP_PAD}; off = 0;
-    }
-    memcpy(R.ring + off, R.batch, (size_t)size);
-    R.wlocal += pad + size;
-    R.unpub_bytes += pad + size; R.unpub_records += R.batch_records;
-    R.records += R.batch_records; R.bytes += size;
-    R.unwoken_bytes += size; R.unwoken_records += R.batch_records;
-    uint64_t depth = R.wlocal - R.rcache;
-    if (depth > R.high_water) R.high_water = depth;
-    rt_batch_discard(); publish(); wake_render(1);
-    return 1;
-}
-
-static void commit_marker(uint16_t flags) {
-    uint64_t w = R.wlocal;
-    uint64_t off = w & R.mask;
-    uint64_t size = sizeof(RtCmd);
-    if (!pred_space(w + size)) emu_wait(pred_space, w + size);
-    RtCmd *c = (RtCmd *)(R.ring + off);   /* 16 bytes always fit before the end */
-    c->size = (uint32_t)size; c->op = OP_PAD; c->flags = flags; c->payload = 0; c->seq = R.seq++;
-    R.wlocal = w + size;
-    R.unpub_bytes += size;
-    R.unpub_records++;
-    publish();
-}
-
 void rt_frame_end(void) {
-    if (!rt_running()) return;
-    if (R.held) {
-        /* Nothing is queued while the context is held; count the frame as
-         * produced and consumed so the in-flight bound stays meaningful. */
-        atomic_fetch_add(&R.frames_produced, 1);
-        atomic_fetch_add(&R.frames_consumed, 1);
-        return;
-    }
-    atomic_fetch_add(&R.frames_produced, 1);
-    commit_marker(F_FRAME);
-    wake_render(1);
-    if (!pred_frames((uint64_t)R.max_frames)) {
-        uint64_t t0 = now_ns();
-        R.bp_waits++;
-        emu_wait(pred_frames, (uint64_t)R.max_frames);
-        R.bp_ns += now_ns() - t0;
-        atomic_fetch_add(&R.bp_events, 1);
-    }
+    if(!owner) return;
+    if(batching) abort();
+    if(config.seal_frame && !config.seal_frame(config.user,owner)) frame_owner_cancel(owner);
+    if(frame_owner_publish(owner)) {
+        atomic_store(&published,sequence);atomic_fetch_add(&produced,1);
+    } else atomic_fetch_add(&rejected,1);
+    begin_frame();
 }
-
-int rt_frames_ahead(void) {
-    int64_t d = (int64_t)(atomic_load(&R.frames_produced) -
-                          atomic_load(&R.frames_consumed)) - 1;
-    return d < 0 ? 0 : (int)d;
+void rt_invalidate(void) {
+    if(!owner) return;
+    rt_batch_discard();frame_owner_invalidate(owner);
+    atomic_store(&published,0);begin_frame();
 }
-
-void rt_drain(void) {
-    if (!rt_running() || R.held) return;
-    publish();
-    uint64_t w = R.wlocal;
-    emu_wait(pred_drained, w);
-}
-
+int rt_frames_ahead(void) { return owner?frame_owner_pending(owner):0; }
+uint64_t rt_backpressure_events(void) { return 0; }
+uint64_t rt_render_idle_ns(void) { return owner?frame_owner_idle_ns(owner):0; }
+void rt_tick_at(uint64_t deadline) { if(owner) frame_owner_tick_at(owner,deadline); }
+/* Runtime context borrowing has been removed. Callers must queue owner work. */
 void rt_acquire(const char *reason) {
-    if (!rt_running() || R.held) return;
-    uint64_t t0 = now_ns();
-    rt_drain();
-    mtx_lock(&R.mtx);
-    R.release_req = 1;
-    cnd_bcast(&R.cv_work);
-    mtx_unlock(&R.mtx);
-    emu_wait(pred_released, 0);
-    R.ctx(R.user, 1);
-    R.held = 1;
-    uint64_t dt = now_ns() - t0;
-    R.acquires++;
-    R.acq_ns += dt;
-    RtAcquireEvent *e = &R.acq_ring[R.acq_n++ % ACQ_RING];
-    e->frame = atomic_load(&R.frames_produced);
-    e->wait_ns = dt;
-    e->reason = reason ? reason : "?";
+    if(!owner || frame_owner_is_thread()) return;
+    fprintf(stderr,"presentation owner violation: synchronous %s\n",reason?reason:"GL access");
+    abort();
 }
-
-void rt_release(void) {
-    if (!rt_running() || !R.held) return;
-    R.ctx(R.user, 0);
-    mtx_lock(&R.mtx);
-    R.release_req = 0;
-    cnd_bcast(&R.cv_work);
-    /* A following acquire must not consume the preceding release's ack.
-     * Wait only for the CPU ownership handshake, not graphics completion. */
-    while(atomic_load(&R.released)) cnd_wait(&R.cv_emu,&R.mtx);
-    mtx_unlock(&R.mtx);
-    R.held = 0;
-    R.releases++;
+void rt_release(void) {}
+/* Test-only completion barrier. Runtime source must not call this; unlike
+ * acquisition it never transfers the context. Tests close their synthetic
+ * frame here before inspecting it through an owner-side request. */
+static void drain_complete(const void *payload) {
+    _Atomic int *done;memcpy(&done,payload,sizeof done);atomic_store(done,1);
 }
-
-/* ---- lifecycle ----------------------------------------------------------- */
-
-int rt_start(const RtConfig *cfg) {
-    if (rt_running() || !cfg || !cfg->exec || !cfg->ctx) return 0;
-    size_t cap = cfg->ring_bytes;
-    if (cap < (1u << 20) || (cap & (cap - 1))) return 0;
-    uint8_t *ring = (uint8_t *)malloc(cap);
-    if (!ring) return 0;
-    memset(&R, 0, sizeof(R));
-    R.ring = ring;
-    R.cap = cap;
-    R.mask = cap - 1;
-    R.max_frames = cfg->max_frames < 1 ? 1 : cfg->max_frames;
-    R.exec = cfg->exec;
-    R.ctx = cfg->ctx;
-    R.user = cfg->user;
-    R.tick = cfg->tick;
-    R.tick_at = 0;
-    R.publish_records = PUBLISH_RECORDS;
-    {
-        const char *e = getenv("PSX_RENDER_THREAD_PUBLISH");
-        const long n = (e && *e) ? strtol(e, NULL, 10) : 0;
-        if (n >= 1 && n <= 4096) R.publish_records = (uint64_t)n;
-    }
-    mtx_init(&R.mtx);
-    cnd_init(&R.cv_work);
-    cnd_init(&R.cv_emu);
-    /* The context leaves this thread before the render thread takes it. */
-    R.ctx(R.user, 0);
-    atomic_store(&R.running, 1);
+void rt_drain(void) {
+    if(!owner || frame_owner_is_thread()) return;
+    if(frame_bytes) rt_frame_end();
+    _Atomic int done=0;_Atomic int *pointer=&done;
+    if(!rt_request(drain_complete,&pointer,sizeof pointer)) abort();
+    while(!atomic_load(&done)) {
 #ifdef _WIN32
-    R.thread = CreateThread(NULL, 0, render_main, NULL, 0, NULL);
-    int ok = R.thread != NULL;
-    /* GL command replay is on the frame deadline. Match the present thread's
-     * priority under host CPU load; retain a diagnostic off switch. */
-    if (ok) {
-        const char *priority = getenv("PSX_RENDER_THREAD_PRIORITY");
-        if (!priority || *priority != '0')
-            SetThreadPriority(R.thread, THREAD_PRIORITY_ABOVE_NORMAL);
-    }
+        Sleep(0);
 #else
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-#  if defined(__APPLE__)
-    /* A plain pthread gets the default QoS and, on a busy host, efficiency
-     * cores. The render thread is on the frame's critical path, like the
-     * emulation (main) thread, so it asks for the same class. */
-    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
-#  endif
-    int ok = pthread_create(&R.thread, &attr, render_main, NULL) == 0;
-    pthread_attr_destroy(&attr);
+        sched_yield();
 #endif
-    if (!ok) {
-        atomic_store(&R.running, 0);
-        R.ctx(R.user, 1);
-        free(R.batch); R.batch = NULL;
-    free(R.ring);
-        R.ring = NULL;
-        return 0;
     }
-    return 1;
 }
-
-void rt_stop(void) {
-    if (!rt_running()) return;
-    int was_held = R.held;
-    if (!was_held) rt_drain();
-    mtx_lock(&R.mtx);
-    R.stop = 1;
-    R.release_req = 0;
-    cnd_bcast(&R.cv_work);
-    mtx_unlock(&R.mtx);
-#ifdef _WIN32
-    WaitForSingleObject(R.thread, INFINITE);
-    CloseHandle(R.thread);
-#else
-    pthread_join(R.thread, NULL);
-#endif
-    atomic_store(&R.running, 0);
-    R.held = 0;
-    if (!was_held) R.ctx(R.user, 1);
-    free(R.batch); R.batch = NULL;
-    free(R.ring);
-    R.ring = NULL;
+typedef struct Request { void (*callback)(const void *); unsigned char payload[]; } Request;
+static void execute_request(void *unused,const void *payload,size_t count,int stale) {
+    (void)unused;(void)count;(void)stale;
+    const Request *request=payload;
+    request->callback(request->payload);
 }
-
-void rt_get_stats(RtStats *o) {
-    memset(o, 0, sizeof(*o));
-    o->records = R.records;
-    o->bytes = R.bytes;
-    o->frames_produced = atomic_load(&R.frames_produced);
-    o->frames_consumed = atomic_load(&R.frames_consumed);
-    o->acquires = R.acquires;
-    o->releases = R.releases;
-    o->oversize = R.oversize;
-    o->backpressure_waits = R.bp_waits;
-    o->ring_full_waits = R.full_waits;
-    o->backpressure_ns = R.bp_ns;
-    o->ring_full_ns = R.full_ns;
-    o->acquire_ns = R.acq_ns;
-    o->render_busy_ns = atomic_load(&R.busy_ns);
-    o->render_idle_ns = atomic_load(&R.idle_ns);
-    o->ring_high_water = R.high_water;
-    o->max_frames = R.max_frames;
-    o->running = rt_running();
-    o->held = R.held;
+static int request_work(void (*callback)(const void *),const void *payload,uint32_t count,int control) {
+    if(!owner || !callback || (count && !payload) || count>1024*1024-sizeof(Request)) return 0;
+    Request *request=malloc(sizeof(Request)+count);
+    if(!request) return 0;
+    request->callback=callback;if(count) memcpy(request->payload,payload,count);
+    int ok=control?frame_owner_control(owner,sequence,execute_request,NULL,request,sizeof(Request)+count):
+                   frame_owner_request(owner,atomic_load(&published),execute_request,NULL,request,sizeof(Request)+count);
+    free(request);return ok;
 }
-
-int rt_acquire_events(RtAcquireEvent *out, int cap) {
-    int n = 0;
-    for (uint64_t i = 0; i < R.acq_n && i < ACQ_RING && n < cap; i++)
-        out[n++] = R.acq_ring[(R.acq_n - 1 - i) % ACQ_RING];
-    return n;
+int rt_request(void (*callback)(const void *),const void *payload,uint32_t count) {
+    return request_work(callback,payload,count,0);
 }
+int rt_control(void (*callback)(const void *),const void *payload,uint32_t count) {
+    return request_work(callback,payload,count,1);
+}
+int rt_packet_current(const FramePacketView *packet) {
+    return owner && frame_owner_current(owner,packet);
+}
+void rt_get_stats(RtStats *out) {
+    if(!out) return;
+    memset(out,0,sizeof *out);
+    out->running=owner!=NULL;out->max_frames=2;
+    out->owner_delay_ms=owner_delay_ms;
+    out->records=atomic_load(&records);out->bytes=atomic_load(&bytes);
+    out->frames_produced=atomic_load(&produced);out->frames_consumed=atomic_load(&consumed);
+    out->frames_replaced=owner?frame_owner_replaced(owner):0;
+    out->frames_rejected=atomic_load(&rejected);
+    out->render_busy_ns=atomic_load(&busy_ns);out->ring_high_water=atomic_load(&high_water);
+    out->render_idle_ns=rt_render_idle_ns();
+    out->oversize=atomic_load(&oversize);
+}
+int rt_acquire_events(RtAcquireEvent *out,int cap) { (void)out;(void)cap;return 0; }

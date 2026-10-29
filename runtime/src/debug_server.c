@@ -77,6 +77,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -10406,7 +10407,8 @@ static int      s_capture_frozen = 0;
 static uint64_t s_capture_mark_frame = 0;
 static uint64_t s_capture_mark_count = 0;
 static char     s_capture_wide_path[512];
-static int      s_capture_wide_ok = 0;
+static _Atomic uint64_t s_capture_completion = 0;
+static _Atomic uint64_t s_capture_generation = 0;
 static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 
 static void disp_ring_capture(void)
@@ -10571,10 +10573,17 @@ static void handle_screenshot_file(int id, const char *json)
  * so what lands in the PNG is what the player sees. Falls back to the native
  * resolve when no hi-res surface exists (supersampling 1 / software), so the
  * command always answers with something truthful about the actual output. */
+typedef struct DebugWideSnapshot {
+    GpuDisplayInfo display;
+    int extra,local_width,base_x;
+} DebugWideSnapshot;
+static _Thread_local const DebugWideSnapshot *s_debug_wide_snapshot;
+static const char *write_wide_png(const char *path, int *out_w, int *out_h);
 static void handle_screenshot_hires(int id, const char *json)
 {
     GpuDisplayInfo di;
-    gpu_get_display_info(&di);
+    if(s_debug_wide_snapshot) di=s_debug_wide_snapshot->display;
+    else gpu_get_display_info(&di);
     if (di.disabled || di.width == 0 || di.height == 0) {
         send_err(id, "display disabled"); return;
     }
@@ -10884,50 +10893,22 @@ static void handle_video_info(int id, const char *json)
  * checked without an 8K monitor. */
 static void handle_screenshot_wide_hires(int id, const char *json)
 {
-    extern int gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
-    GpuDisplayInfo di;
-    gpu_get_display_info(&di);
-    if (di.disabled || di.height == 0) { send_err(id, "display disabled"); return; }
-    int S = gr_scale();
-    if (S < 1) S = 1;
-    int base_x = json_get_int(json, "base_x", (int)di.display_x);
     char path[512];
-    if (!json_get_str(json, "path", path, sizeof(path)))
-        strncpy(path, "psx_screenshot_wide_hires.png", sizeof(path) - 1);
-    path[sizeof(path) - 1] = '\0';
-    /* The dump reads rows from the top of the surface: size it to reach the
-     * end of the displayed band (at 8K the lower double-buffer band ends at
-     * row 8640, past a fixed 8192x8192 budget for a 21:9 or wider surface). */
-    long long need = (long long)ws_nw_present_width() * S *
-                     (((long long)di.display_y + di.height) * S);
-    int cap = need > 8192LL * 8192 && need < (1LL << 28) ? (int)need : 8192 * 8192;
-    uint32_t *buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
-    if (!buf) { send_err(id, "alloc failed"); return; }
-    int W = 0, H = 0;
-    int n = gr_wide_dump_full(buf, cap, &W, &H, base_x);
-    if (n <= 0) { free(buf); send_err(id, "no wide surface (native-wide not engaged?)"); return; }
-    int y0 = (int)di.display_y * S, oh = (int)di.height * S;
-    if (y0 < 0) y0 = 0;
-    if (y0 + oh > H) oh = H - y0;
-    if (oh <= 0) { free(buf); send_err(id, "display band outside the surface"); return; }
-    uint8_t *rgb = (uint8_t *)malloc((size_t)W * oh * 3);
-    if (!rgb) { free(buf); send_err(id, "alloc failed"); return; }
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < W; x++) {
-            uint32_t px = buf[(size_t)(y0 + y) * W + x];
-            uint8_t *p = rgb + ((size_t)y * W + x) * 3;
-            p[0] = (uint8_t)((px >> 16) & 0xFF);
-            p[1] = (uint8_t)((px >> 8) & 0xFF);
-            p[2] = (uint8_t)(px & 0xFF);
-        }
-    free(buf);
-    FILE *f = fopen(path, "wb");
-    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
-    int ok = png_write_rgb(f, rgb, (uint32_t)W, (uint32_t)oh);
-    free(rgb); fclose(f);
-    if (!ok) { send_err(id, "png encode failed"); return; }
-    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d,"
-             "\"scale\":%d}", id, path, W, oh, S);
+    if (!json_get_str(json,"path",path,sizeof path))
+        snprintf(path,sizeof path,"psx_screenshot_wide_hires.png");
+    int width=0,height=0;
+    DebugWideSnapshot snapshot;
+    const DebugWideSnapshot *previous=s_debug_wide_snapshot;
+    if(previous) {
+        snapshot=*previous;
+        snapshot.base_x=json_get_int(json,"base_x",snapshot.base_x);
+        s_debug_wide_snapshot=&snapshot;
+    }
+    const char *error=write_wide_png(path,&width,&height);
+    s_debug_wide_snapshot=previous;
+    if(error) { send_err(id,error);return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d,\"scale\":%d}",
+             id,path,width,height,gr_scale());
 }
 
 /* present_shot — PNG of the COMPOSED renderer output: the frame after SDL fits
@@ -11060,24 +11041,31 @@ static const char *write_wide_png(const char *path, int *out_w, int *out_h)
                                       int disp_y, int disp_h);
 
     if (!gr_wide_supported()) return "active backend has no wide compositor";
-    int extra = ws_nw_extra();
+    int extra = s_debug_wide_snapshot ? s_debug_wide_snapshot->extra : ws_nw_extra();
     if (extra <= 0) return "native-wide not engaged (extra=0; need a wide game frame)";
 
     GpuDisplayInfo di;
-    gpu_get_display_info(&di);
+    if(s_debug_wide_snapshot) di=s_debug_wide_snapshot->display;
+    else gpu_get_display_info(&di);
     if (di.disabled || di.width == 0 || di.height == 0) return "display disabled";
 
     int scale = gr_scale(); if (scale < 1) scale = 1;
-    int local_width = gpu_ws_netplay_local_viewport_width();
-    int base_x = local_width > 0 ? gpu_ws_netplay_local_viewport_base_x() : (int)di.display_x;
+    int local_width = s_debug_wide_snapshot ? s_debug_wide_snapshot->local_width : gpu_ws_netplay_local_viewport_width();
+    int base_x = s_debug_wide_snapshot ? s_debug_wide_snapshot->base_x :
+        local_width > 0 ? gpu_ws_netplay_local_viewport_base_x() : (int)di.display_x;
     int present_w = local_width > 0 ? local_width : (int)di.width + extra;
     int W = present_w * scale, H = (int)di.height * scale;
 
-    uint32_t *buf = (uint32_t *)malloc((size_t)W * H * sizeof(uint32_t));
-    if (!buf) return "alloc failed";
-    int n = gr_render_wide_display(buf, W * (int)sizeof(uint32_t),
-                                   base_x, (int)di.display_y, (int)di.height);
-    if (n <= 0) { free(buf); return "no wide surface for displayed buffer"; }
+    uint32_t *buf = NULL;
+    if(s_debug_wide_snapshot) {
+        if(!gl_renderer_capture_wide_display(base_x,di.display_y,di.height,&buf,&W,&H))
+            return "no wide surface for displayed buffer";
+    } else {
+        buf = (uint32_t *)malloc((size_t)W * H * sizeof(uint32_t));
+        if (!buf) return "alloc failed";
+        int n = gr_render_wide_display(buf,W*sizeof(uint32_t),base_x,di.display_y,di.height);
+        if(n<=0) { free(buf);return "no wide surface for displayed buffer"; }
+    }
 
     /* ARGB8888 (0xAARRGGBB) -> RGB, written in the buffer's row order (so the
      * PNG shows exactly the present orientation — the point of this probe). */
@@ -11116,11 +11104,21 @@ static void handle_wide_shot(int id, const char *json)
              id, path, W, H);
 }
 
-/* Operator capture mark. Runs on the present thread (hotkey handler), where
- * the renderer's context is current. Freezes the display and GP0 rings so the
- * frames and draw lists leading up to the mark survive until read, and saves
- * the presented native-wide frame (the only record of the compositor output).
- * A second mark while frozen is ignored; release with capture_mark op=release. */
+/* Freeze guest-owned rings at the CPU safe point. The immutable display
+ * request is rendered/read back separately; status reports its completion. */
+typedef struct CaptureMarkRequest {
+    DebugWideSnapshot display;
+    uint64_t generation;
+    char path[512];
+} CaptureMarkRequest;
+static void capture_mark_image(const void *payload) {
+    const CaptureMarkRequest *request=payload;
+    const DebugWideSnapshot *previous=s_debug_wide_snapshot;
+    s_debug_wide_snapshot=&request->display;
+    const int ok=write_wide_png(request->path,NULL,NULL)==NULL;
+    s_debug_wide_snapshot=previous;
+    atomic_store(&s_capture_completion,(request->generation<<1)|(unsigned)ok);
+}
 void debug_server_capture_mark(void)
 {
     if (s_capture_frozen) return;
@@ -11128,11 +11126,24 @@ void debug_server_capture_mark(void)
     s_capture_mark_count++;
     snprintf(s_capture_wide_path, sizeof s_capture_wide_path,
              "capture_mark_%llu_wide.png", (unsigned long long)s_frame_count);
-    s_capture_wide_ok = write_wide_png(s_capture_wide_path, NULL, NULL) == NULL;
     s_capture_frozen = 1;
     gpu_gp0_ring_set_frozen(1);
     present_image_ring_set_frozen(1);
     gpu_timeline_set_frozen(1);
+    CaptureMarkRequest request={0};
+    gpu_get_display_info(&request.display.display);
+    request.display.extra=ws_nw_extra();
+    request.display.local_width=gpu_ws_netplay_local_viewport_width();
+    request.display.base_x=request.display.local_width>0?
+        gpu_ws_netplay_local_viewport_base_x():request.display.display.display_x;
+    request.generation=s_capture_mark_count;
+    snprintf(request.path,sizeof request.path,"%s",s_capture_wide_path);
+    atomic_store(&s_capture_generation,request.generation);
+    if(!gl_renderer_queue_diagnostic(capture_mark_image,&request,sizeof request)) {
+        /* Software/no render owner: the CPU backend can resolve locally. */
+        const int ok=write_wide_png(request.path,NULL,NULL)==NULL;
+        atomic_store(&s_capture_completion,(request.generation<<1)|(unsigned)ok);
+    }
 }
 
 /* Render thread ([video] render_thread, docs/RENDER_THREAD.md):
@@ -11211,6 +11222,7 @@ static void handle_capture_mark(int id, const char *json)
     if (!strcmp(op, "mark")) debug_server_capture_mark();
     else if (!strcmp(op, "release")) {
         s_capture_frozen = 0;
+        atomic_store(&s_capture_generation,0);
         gpu_gp0_ring_set_frozen(0);
         present_image_ring_set_frozen(0);
         gpu_timeline_set_frozen(0);
@@ -11224,12 +11236,16 @@ static void handle_capture_mark(int id, const char *json)
         if (s_disp_ring[i].frame > d_new) d_new = s_disp_ring[i].frame;
     }
     if (d_old == UINT32_MAX) d_old = 0;
+    const uint64_t generation=atomic_load(&s_capture_generation);
+    const uint64_t completion=atomic_load(&s_capture_completion);
+    const int pending=generation && (completion>>1)!=generation;
+    const int wide_ok=generation && !pending && (completion&1);
     send_fmt("{\"id\":%d,\"ok\":true,\"frozen\":%d,\"mark_frame\":%llu,"
-             "\"count\":%llu,\"wide_path\":\"%s\",\"wide_ok\":%d,"
+             "\"count\":%llu,\"wide_path\":\"%s\",\"wide_ok\":%d,\"wide_pending\":%d,"
              "\"display_ring\":[%u,%u],\"gp0_ring\":[%u,%u],\"frame\":%llu}",
              id, s_capture_frozen, (unsigned long long)s_capture_mark_frame,
              (unsigned long long)s_capture_mark_count, s_capture_wide_path,
-             s_capture_wide_ok, d_old, d_new, oldest, newest,
+             wide_ok, pending, d_old, d_new, oldest, newest,
              (unsigned long long)s_frame_count);
 }
 
@@ -11268,10 +11284,15 @@ static void handle_wide_full(int id, const char *json)
     path[sizeof(path) - 1] = '\0';
 
     int cap = 1024 * 1024 * 4;  /* up to 4 Mpix (e.g. 426*512*S^2) */
-    uint32_t *buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
-    if (!buf) { send_err(id, "alloc failed"); return; }
-    int W = 0, H = 0;
-    int n = gr_wide_dump_full(buf, cap, &W, &H, base_x);
+    uint32_t *buf = NULL;
+    int W = 0, H = 0, n = 0;
+    if(gr_backend()==GR_BACKEND_OPENGL) {
+        if(gl_renderer_capture_wide_display(base_x,0,512,&buf,&W,&H)) n=W*H;
+    } else {
+        buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
+        if (!buf) { send_err(id, "alloc failed"); return; }
+        n = gr_wide_dump_full(buf, cap, &W, &H, base_x);
+    }
     if (n <= 0) { free(buf); send_err(id, "no wide surface (SW backend? native-wide engaged?)"); return; }
 
     uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
@@ -17519,6 +17540,8 @@ static void complete_debug_response(void) {
     SDL_UnlockMutex(s_io_mutex);
 }
 typedef struct RenderDebugRequest {
+    int wide;
+    DebugWideSnapshot wide_snapshot;
     void (*handler)(int,const char *);
     int id;
     char json[RECV_BUF_SIZE];
@@ -17526,7 +17549,9 @@ typedef struct RenderDebugRequest {
 static void execute_render_debug_request(const void *data) {
     const RenderDebugRequest *request=data;
     s_in_command=1;
+    s_debug_wide_snapshot=request->wide?&request->wide_snapshot:NULL;
     request->handler(request->id,request->json);
+    s_debug_wide_snapshot=NULL;
     s_in_command=0;
     complete_debug_response();
 }
@@ -17547,6 +17572,19 @@ static int queue_render_debug_request(const char *json) {
     else if(!strcmp(name,"gl_ws_ablate")) request.handler=handle_gl_ws_ablate;
       else if(!strcmp(name,"gl_fbo_peek")) request.handler=handle_gl_fbo_peek;
       else if(!strcmp(name,"gl_vram_diff")) request.handler=handle_gl_vram_diff;
+    else if(!strcmp(name,"wide_full")) request.handler=handle_wide_full;
+    else if(!strcmp(name,"screenshot_hires") || !strcmp(name,"screenshot_wide_hires") ||
+            !strcmp(name,"wide_shot") || (!strcmp(name,"screenshot") &&
+            gr_wide_supported() && ws_nw_extra()>0)) {
+        request.handler=!strcmp(name,"screenshot_hires")?handle_screenshot_hires:
+            !strcmp(name,"screenshot_wide_hires")?handle_screenshot_wide_hires:handle_wide_shot;
+        request.wide=1;
+        gpu_get_display_info(&request.wide_snapshot.display);
+        request.wide_snapshot.extra=ws_nw_extra();
+        request.wide_snapshot.local_width=gpu_ws_netplay_local_viewport_width();
+        request.wide_snapshot.base_x=request.wide_snapshot.local_width>0?
+            gpu_ws_netplay_local_viewport_base_x():request.wide_snapshot.display.display_x;
+    }
     else return 0;
     request.id=json_get_int(json,"id",0);
     snprintf(request.json,sizeof request.json,"%s",json);
