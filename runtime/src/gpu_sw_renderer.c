@@ -120,9 +120,9 @@ static void sw_dirty_row(uint32_t y) {
     s_sw->dirty_rows[y >> 6] |= UINT64_C(1) << (y & 63);
 }
 static void sw_dirty_rect(int x, int y, int w, int h) {
+    if (!s_sw->private_dirty) { gpu_vram_dirty_mark_rect(x, y, w, h); return; }
     if (w <= 0 || h <= 0) return;
     for (int i = 0; i < h && i < 512; ++i) sw_dirty_row((uint32_t)(y+i));
-    (void)x;
 }
 static void sw_dirty_all(void) { sw_dirty_rect(0, 0, 1024, 512); }
 #define g_vram (s_sw->g_vram)
