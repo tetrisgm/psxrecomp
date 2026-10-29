@@ -93,6 +93,7 @@ assert "        psx_rewind_set_title_blocked(0);\n" in MAIN
 assert "if (!direct_shortcut_active(i)) continue;" in MAIN
 assert "const int direct = direct_shortcut_active(shortcut);" in MAIN
 assert "psx_rewind_title_blocked());" in MAIN
-assert "    if (!psx_rewind_enabled() || s_open || psx_netplay_active() ||\n        s_title_blocked)\n        return;" in REW
-assert "!psx_netplay_active() && !s_title_blocked)\n        (void)do_capture" in REW
-assert 'host_osd_push("Rewind is off in this mode", 1500);' in REW
+assert "(held||debug_held)&&!blocked&&!psx_netplay_active()" in REW
+assert "!active&&!blocked&&!psx_netplay_active()" in REW
+assert "psx_rewind_set_held(down);" in MAIN
+assert "rewind_host_pause_loop" not in MAIN

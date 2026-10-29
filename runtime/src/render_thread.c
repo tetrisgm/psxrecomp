@@ -24,6 +24,11 @@ static _Atomic uint64_t published,completed,records,bytes,produced,consumed,busy
 static _Atomic uint64_t rejected;
 static size_t frame_bytes;
 static unsigned owner_delay_ms;
+static size_t history_depth,history_budget;
+static int history_reversing;
+static struct { uint64_t tick,sequence; } history_marks[3602];
+static uint64_t replay_count,replay_misses;
+
 
 uint64_t rt_now_ns(void) {
 #ifdef _WIN32
@@ -98,6 +103,7 @@ int rt_start(const RtConfig *cfg) {
     if(!batch) return 0;
     owner=frame_owner_start(&settings);
     if(!owner) { frame_packet_destroy(batch);batch=NULL;return 0; }
+    frame_owner_history_configure(owner,history_depth,history_budget);
     sequence=0;batching=0;
     atomic_store(&published,0);atomic_store(&completed,0);
     atomic_store(&records,0);atomic_store(&bytes,0);atomic_store(&produced,0);
@@ -155,6 +161,7 @@ void rt_frame_end(void) {
     if(!owner) return;
     if(batching) abort();
     if(config.seal_frame && !config.seal_frame(config.user,owner)) frame_owner_cancel(owner);
+    if(history_reversing) { frame_owner_cancel(owner);begin_frame();return; }
     if(frame_owner_publish(owner)) {
         atomic_store(&published,sequence);atomic_fetch_add(&produced,1);
     } else atomic_fetch_add(&rejected,1);
@@ -233,3 +240,46 @@ void rt_get_stats(RtStats *out) {
     out->oversize=atomic_load(&oversize);
 }
 int rt_acquire_events(RtAcquireEvent *out,int cap) { (void)out;(void)cap;return 0; }
+
+void rt_history_configure(size_t depth,size_t budget) {
+    history_depth=depth;history_budget=budget;
+    memset(history_marks,0,sizeof history_marks);
+    if(owner)frame_owner_history_configure(owner,depth,budget);
+}
+void rt_history_mark(uint64_t tick) {
+    const size_t slot=tick%3602;
+    history_marks[slot].tick=tick;
+    history_marks[slot].sequence=atomic_load(&published);
+}
+static uint64_t history_sequence(uint64_t tick) {
+    size_t slot=tick%3602;
+    return history_marks[slot].tick==tick?history_marks[slot].sequence:0;
+}
+int rt_history_present(uint64_t tick) {
+    uint64_t saved=history_sequence(tick);
+    if(!owner || !saved || !frame_owner_history_has(owner,saved)) { replay_misses++;return 0; }
+    rt_batch_discard();frame_owner_invalidate(owner);
+    ++sequence;
+    int ok=frame_owner_history_replay(owner,saved,sequence);
+    if(ok) { atomic_store(&published,sequence);replay_count++; }
+    else replay_misses++;
+    /* Restores can append state changes before the next replay. They stay
+     * private and are discarded; forward resume explicitly reseeds. */
+    frame_owner_begin(owner,++sequence,NULL,0);frame_bytes=0;
+    return ok;
+}
+void rt_history_branch(uint64_t tick) {
+    if(owner)frame_owner_history_branch(owner,history_sequence(tick));
+    for(size_t i=0;i<3602;i++) if(history_marks[i].tick>tick)history_marks[i].sequence=0;
+    rt_invalidate();
+}
+size_t rt_history_bytes(void) { return owner?frame_owner_history_bytes(owner):0; }
+uint64_t rt_history_replays(void) { return replay_count; }
+uint64_t rt_history_misses(void) { return replay_misses; }
+
+void rt_history_reverse(int active) { history_reversing=active!=0; }
+
+int rt_history_ready(void) { return !owner || atomic_load(&completed)>=atomic_load(&published); }
+int rt_history_available(uint64_t tick) {
+    return !owner || frame_owner_history_has(owner,history_sequence(tick));
+}

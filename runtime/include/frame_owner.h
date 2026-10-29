@@ -60,6 +60,12 @@ uint64_t frame_owner_idle_ns(const FrameOwner *owner);
 int frame_owner_is_thread(void);
 /* Consumer only; earliest request wins, including requests made by tick. */
 void frame_owner_tick_at(FrameOwner *owner,uint64_t deadline_ns);
+void frame_owner_history_configure(FrameOwner *,size_t depth,size_t bytes);
+size_t frame_owner_history_bytes(const FrameOwner *);
+int frame_owner_history_has(const FrameOwner *,uint64_t sequence);
+int frame_owner_history_replay(FrameOwner *,uint64_t saved,uint64_t sequence);
+void frame_owner_history_branch(FrameOwner *,uint64_t sequence);
+
 #ifdef __cplusplus
 }
 #endif

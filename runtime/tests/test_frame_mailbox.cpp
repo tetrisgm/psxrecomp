@@ -140,7 +140,44 @@ static void test_optional_batches() {
     frame_packet_release(queue);frame_packet_destroy(queue);
 }
 
+static void rewind_packets() {
+    auto *q=frame_packet_create(1024,1024);assert(q);
+    frame_packet_history_configure(q,3,8192);
+    int disposed=0;
+    struct Attachment { int *disposed;int value; };
+    auto dispose=[](void *v) { auto *a=static_cast<Attachment*>(v);++*a->disposed;delete a; };
+    for(unsigned i=1;i<=5;i++) {
+        assert(frame_packet_begin(q,i,&i,sizeof i));
+        assert(frame_packet_attach(q,new Attachment{&disposed,int(i)},sizeof(Attachment),dispose));
+        auto *value=static_cast<unsigned*>(frame_packet_append(q,1,0,sizeof i));assert(value);*value=i*10;
+        assert(frame_packet_publish(q));
+    }
+    assert(!frame_packet_history_has(q,2) && frame_packet_history_has(q,3));
+    FramePacketView held{};assert(frame_packet_acquire(q,&held));
+    const auto *held_attachment=static_cast<const Attachment*>(held.attachment);
+    frame_packet_invalidate(q);
+    assert(!frame_packet_current(q,&held) && held_attachment->value==5);
+    assert(frame_packet_history_replay(q,3,6));
+    frame_packet_history_branch(q,3);
+    assert(!frame_packet_history_has(q,4) && held_attachment->value==5);
+    frame_packet_release(q);
+    FramePacketView reverse{};assert(frame_packet_acquire(q,&reverse));
+    assert(reverse.sequence==6 && frame_packet_current(q,&reverse));
+    assert(*static_cast<const unsigned*>(reverse.initial)==3);
+    assert(static_cast<const Attachment*>(reverse.attachment)->value==3);
+    auto *record=static_cast<const RtCmd*>(reverse.records);
+    assert(*reinterpret_cast<const unsigned*>(record+1)==30);
+    frame_packet_history_configure(q,1,1); // byte overflow never publishes a partial packet
+    assert(!frame_packet_history_has(q,3));
+    assert(static_cast<const Attachment*>(reverse.attachment)->value==3);
+    frame_packet_release(q);
+    assert(frame_packet_begin(q,7,nullptr,0));assert(frame_packet_publish(q));
+    assert(frame_packet_history_bytes(q)==0 && !frame_packet_history_has(q,7));
+    frame_packet_destroy(q);assert(disposed==5);
+}
+
 int main() {
+    rewind_packets();
     test_attachments();
     test_optional_batches();
     OwnerTest state;

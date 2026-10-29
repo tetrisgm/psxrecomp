@@ -1,3 +1,4 @@
+#include "psx_rewind.h"
 /* savestate.c — user save states. The runtime UI opens from the save-state menu.
  * See savestate.h.
  *
@@ -1105,6 +1106,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
             s_status_generation++;
             /* Restage FBO/present latch so the restored frame is visible
              * immediately (avoids disabled-display blank latch + stale smooth). */
+            psx_rewind_discard_history();
             psx_frontend_on_savestate_loaded();
             if (path[0]) savestate_read_hd_residency(slot);
             t_after_frontend = savestate_mono_ms();

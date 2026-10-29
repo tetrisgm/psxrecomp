@@ -76,6 +76,17 @@ void psx_mod_memory_snapshot_write(uint8_t* out) {
     memcpy(out + 16u + mod_memory_used, mod_gpu_dma_memory, mod_gpu_dma_memory_used);
 }
 
+int psx_mod_memory_snapshot_visit(int (*sink)(void*,const void*,size_t),void *context) {
+    if(!sink)return 0;
+    if(!psx_mod_memory_snapshot_bytes())return 1;
+    uint8_t header[16];PstW w;pst_w_init(&w,header,sizeof header);
+    pst_w_u32(&w,1u);pst_w_u32(&w,PSX_MOD_GPU_DMA_APERTURE_BASE);
+    pst_w_u32(&w,mod_memory_used);pst_w_u32(&w,mod_gpu_dma_memory_used);
+    return sink(context,header,sizeof header) &&
+        sink(context,mod_memory,mod_memory_used) &&
+        sink(context,mod_gpu_dma_memory,mod_gpu_dma_memory_used);
+}
+
 /* Non-mutating pre-check for boot_state's two-pass load; the reader runs it. */
 int psx_mod_memory_snapshot_validate(const uint8_t* data, uint32_t size) {
     PstR r;

@@ -60,6 +60,15 @@ int frame_packet_pending(const FramePacketQueue *queue);
 void frame_packet_invalidate(FramePacketQueue *queue);
 int frame_packet_current(const FramePacketQueue *queue,const FramePacketView *view);
 
+/* Optional bounded CPU packet history, producer only. Leased storage survives
+ * eviction. Limits include allocated vector capacities and attachment bytes.
+ * Replays are not inserted into history; caller invalidates the epoch first. */
+void frame_packet_history_configure(FramePacketQueue *,size_t depth,size_t bytes);
+size_t frame_packet_history_bytes(const FramePacketQueue *);
+int frame_packet_history_has(const FramePacketQueue *,uint64_t sequence);
+int frame_packet_history_replay(FramePacketQueue *,uint64_t saved,uint64_t sequence);
+void frame_packet_history_branch(FramePacketQueue *,uint64_t sequence);
+
 #ifdef __cplusplus
 }
 #endif

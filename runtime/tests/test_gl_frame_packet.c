@@ -7,7 +7,7 @@
 #include "frame_owner.h"
 #include "native_raster.h"
 
-typedef struct PacketSeed { RthFrameState state; uint16_t pixels[1024*512]; } PacketSeed;
+typedef struct PacketSeed { uint64_t tick; RthFrameState state; uint16_t pixels[1024*512]; } PacketSeed;
 static _Atomic int packet_entered,packet_unblock,packet_acquires,packet_releases;
 static uint16_t packet_private[1024*512];
 static FrameOwner *packet_owner;
@@ -73,7 +73,7 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
         /* Inspect the GPU on its owner. The backend's native read accessor
          * deliberately never reads GL during replay; it returns the seed. */
         glReadPixels(16+draw*16,16,4,4,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,pixels);
-        uint16_t expected=(uint16_t)(1+(packet->sequence+draw)%30);
+        uint16_t expected=(uint16_t)(1+(seed->tick+draw)%30);
         if(pixels[0]!=expected) fprintf(stderr,"packet=%llu draw=%u got=%04x expected=%04x bank_failed=%d depth24=%d\n",
             (unsigned long long)packet->sequence,draw,pixels[0],expected,s_selected_bank_failed,ctx_depth24());
         for(unsigned i=0;i<16;++i) check(pixels[i]==expected,"packet pre-draw texture version");
@@ -82,6 +82,32 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
     check(glGetError()==GL_NO_ERROR,"packet owner GL error");
     s_rth_packet_replaying=0;
 }
+static void restored_wide_composite(void) {
+    /* Native and enhanced HUDs are different images. Restage must revoke
+     * the fast center-splice proof without disabling PGXP. */
+    gr_wide_configure(426,53);gr_wide_set_target(0);
+    for(unsigned i=0;i<1024*512;i++)vram[i]=0x001f;
+    glb_vram_transfer_in(0,0,1024,512,vram);flush_cpu_upload();
+    glb_wide_clear(0,0,512,0x7c00);
+    GLuint fbo=wide_fbo_for(0);
+    s_wide_native_seeded=0;s_wide_fast=1;s_rths_bg_full=0;
+    wide_blit_center(fbo,0,0,240);
+    uint8_t before[4],after[4];
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+    glReadPixels(100*3,10*3,1,1,GL_RGBA,GL_UNSIGNED_BYTE,before);
+    glb_wide_clear(0,0,512,0x7c00);s_pb_valid=1;
+    gl_renderer_restage_vram_after_savestate();
+    check(!s_pb_valid && !wide_fast_center_valid(),"native restore invalidates backup and center splice");
+    check(s_pgxp_depth && s_pgxp_cpersp && s_pgxp_seam,"restore keeps PGXP enabled");
+    wide_blit_center(fbo,0,0,240);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+    glReadPixels(100*3,10*3,1,1,GL_RGBA,GL_UNSIGNED_BYTE,after);
+    check(before[0]>240 && before[2]<10,"reference fast splice copied native red HUD");
+    check(after[2]>240 && after[0]<10,"restored composite preserves enhanced blue HUD");
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,0);
+    gr_wide_configure(0,0);
+}
+
 int main(void) {
 #ifdef _WIN32
     _putenv_s("PSX_GL_ASYNC_GPU_TIMER","1");
@@ -109,6 +135,7 @@ int main(void) {
     gl_renderer_set_pgxp_seam(2);
     gl_renderer_set_swap_interval(0);
     if(!gl_renderer_init_context(win)) return 2;
+    restored_wide_composite();
     NativeRaster *native=native_raster_create(vram);
     if(!native) abort();
     native_raster_inputs_enable(native,1);
@@ -117,12 +144,13 @@ int main(void) {
     config.execute=packet_execute;config.context=packet_context;
     packet_owner=frame_owner_start(&config);
     if(!packet_owner) abort();
+    frame_owner_history_configure(packet_owner,8,32u*1024u*1024u);
     NativeRasterState state={0,0,1023,511,0,0,0x108,0,0,0,0};
     uint16_t upload[64*64];
     for(uint64_t sequence=1;sequence<=64;++sequence) {
         void *seed=NULL;
         if(!frame_owner_reserve_initial(packet_owner,sequence,sizeof(PacketSeed),&seed)) abort();
-        PacketSeed *initial=seed;
+        PacketSeed *initial=seed;initial->tick=sequence;
         memset(&initial->state,0,sizeof initial->state);
         initial->state.area[2]=1023;initial->state.area[3]=511;
         initial->state.mod[0]=initial->state.mod[1]=initial->state.mod[2]=128;
@@ -161,6 +189,11 @@ int main(void) {
     native_raster_destroy(native);
     atomic_store(&packet_unblock,1);
     while(frame_owner_completed(packet_owner)<2) SDL_Delay(1);
+    frame_owner_invalidate(packet_owner);
+    check(frame_owner_history_replay(packet_owner,60,100),"replay historical enhanced texture inputs");
+    frame_owner_history_branch(packet_owner,60);
+    check(!frame_owner_history_has(packet_owner,61),"future packets removed on branch");
+    while(frame_owner_completed(packet_owner)<3) SDL_Delay(1);
     frame_owner_stop(packet_owner);
     check(atomic_load(&packet_acquires)==2 && atomic_load(&packet_releases)==2,
           "context transfers only at lifecycle boundaries");

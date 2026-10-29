@@ -1,4 +1,4 @@
-/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
+﻿/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
  *
  * Implements:
  *   - GPUSTAT register with correct bit semantics
@@ -8344,6 +8344,51 @@ void gpu_snapshot_write(uint8_t *p) {
     pst_w_pod(&w,texture.palette,sizeof texture.palette,2);
     pst_w_u32(&w,texture.palette_key);pst_w_u32(&w,texture.page);
 }
+struct GpuNativeCapture {
+    NativeRasterCheckpoint *job;
+    uint16_t upload_pixels[1024];
+    uint16_t vram[1024*512];
+    uint64_t rows[8];
+    SwNativeTextureState texture;
+    uint8_t *wire;
+    uint32_t size;
+};
+GpuNativeCapture *gpu_native_capture_create(void) {
+    GpuNativeCapture *c=(GpuNativeCapture*)calloc(1,sizeof(*c));
+    if(!c)return NULL;
+    c->size=gpu_snapshot_bytes();c->wire=(uint8_t*)malloc(c->size);
+    c->job=native_raster_checkpoint_create();
+    if(!c->wire || !c->job) { native_raster_checkpoint_release(c->job);free(c->wire);free(c);return NULL; }return c;
+}
+void gpu_native_capture_destroy(GpuNativeCapture *c) {
+    if(!c)return;
+    native_raster_checkpoint_release(c->job);free(c->wire);free(c);
+}
+int gpu_native_capture_begin(GpuNativeCapture *c) {
+    if(!native_raster_checkpoint_ready(c->job))return 0;
+    const size_t upload_words=s_native_upload_count;
+    if(upload_words)memcpy(c->upload_pixels,s_native_upload_pixels,upload_words*sizeof(uint16_t));
+    PstW w;pst_w_init(&w,c->wire,c->size);(void)gpu_snap_emit(&w);
+    pst_w_u32(&w,native_polyline_color);pst_w_u32(&w,native_polyline_previous);
+    pst_w_u32(&w,native_sprite_flip);
+    int ok=native_raster_checkpoint_submit_upload(c->job,s_native_raster,c->vram,c->rows,&c->texture,
+        &s_native_upload,c->upload_pixels,upload_words);
+    if(ok)s_native_upload_count=0;
+    return ok;
+}
+int gpu_native_capture_ready(GpuNativeCapture *c) { return native_raster_checkpoint_ready(c->job); }
+void gpu_native_capture_result(GpuNativeCapture *c,const uint8_t **gpu,
+    uint32_t *size,const uint16_t **vram) {
+    PstW w;uint32_t offset=c->size-NATIVE_GPU_WIRE_BYTES+12;
+    pst_w_init(&w,c->wire+offset,c->size-offset);
+    pst_w_pod(&w,c->texture.tags,sizeof c->texture.tags,4);
+    pst_w_pod(&w,c->texture.words,sizeof c->texture.words,2);
+    pst_w_pod(&w,c->texture.palette,sizeof c->texture.palette,2);
+    pst_w_u32(&w,c->texture.palette_key);pst_w_u32(&w,c->texture.page);
+    for(unsigned y=0;y<512;y++) if(c->rows[y/64]&(UINT64_C(1)<<(y%64))) gpu_vram_dirty_mark_row(y);
+    *gpu=c->wire;*size=c->size;*vram=c->vram;
+}
+const uint16_t *gpu_snapshot_native_vram(void) { return s_native_readback; }
 uint32_t gpu_cosim_snapshot_bytes(void) { return gpu_snapshot_bytes(); }
 void gpu_cosim_snapshot_write(uint8_t *p) { gpu_snapshot_write(p); }
 void gpu_cosim_dump(char *out, int cap) {
@@ -8411,6 +8456,7 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     ws_reset_scene_history();
     ws_scene_hold_reset(&s_ws_scene_hold);
     ws_world_scale_reset(&ws_world_scale, (uint32_t)s_frame_count);
+    ws_ui_prepass_invalidate_stale();
     ws_hud_anchor_clear(ws_hud_anchor_tags, WS_HUD_ANCHOR_TABLE_SIZE);
     ws_hud_anchor_clear(ws_background_tags, WS_HUD_ANCHOR_TABLE_SIZE);
     ws_background_tags_used = 0;
@@ -8421,6 +8467,9 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     ws_repeat_rect_tag_clear(ws_feedback_rect_tags);
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
      * on a stale draw area after savestate load. */
+    gr_set_texture_window(texture_window_value);
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
+    gr_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
     /* GP0(E1h) bit 9 is restored with the registers; the renderer only
