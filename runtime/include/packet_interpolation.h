@@ -43,7 +43,7 @@ typedef struct PacketInterpolationStats {
     uint64_t matched, unmatched, disappeared, ambiguous, invalid;
     uint64_t duplicate_equal;
     uint64_t resolved_occurrence, resolved_assignment, appeared_candidates;
-    uint64_t source_matched, new_source, source_unmatched, source_ambiguous;
+    uint64_t source_matched, new_source, source_unmatched, source_ambiguous, source_moving;
     int snapped;
 } PacketInterpolationStats;
 typedef struct PacketInterpolation PacketInterpolation;

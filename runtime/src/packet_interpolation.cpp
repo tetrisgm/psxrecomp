@@ -100,6 +100,7 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                     }
                     if(!finite) {++c->stats.invalid;++c->stats.source_unmatched;continue;}
                     c->source_masks[i]|=1u<<j;++c->stats.source_matched;
+                    if(distance>1e-12) ++c->stats.source_moving;
                     if(max_motion>0 && std::sqrt(distance)>max_motion*std::max(1.0,std::abs(v.view[2]))) c->stats.snapped=1;
                 }
                 if(c->source_masks[i]==(1u<<p.vertices)-1) ++c->stats.matched;

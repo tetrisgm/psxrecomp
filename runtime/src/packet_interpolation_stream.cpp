@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <unordered_set>
+#include <array>
 
 struct PacketTransformTable { std::vector<PGXPProjection> values; };
 namespace {
@@ -25,6 +26,7 @@ struct Stream {
     struct Raw { PGXPProjection projection; uint64_t sequence; };
     std::vector<Raw> history;
     std::unordered_map<uint64_t,std::vector<uint64_t>> invocations;
+    std::unordered_map<uint64_t,std::unordered_map<uint64_t,std::vector<std::array<int16_t,3>>>> ordinals;
     bool source_mode=false;
     uint64_t missing=0;
     bool failed=false;
@@ -54,7 +56,17 @@ FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
         if(!record) return {};
         instances.push_back(v.transform);at=instances.end()-1;
     }
-    return {base,uint64_t(at-instances.begin())+1};
+    // Some games stream multiple vertices through one RAM staging address.
+    // Their ordinal is transformation order within the invocation, not their
+    // changing model coordinate value and not visible primitive order.
+    auto& vertices=stream.ordinals[base][v.transform];
+    const std::array<int16_t,3> model{v.model[0],v.model[1],v.model[2]};
+    auto vertex=std::find(vertices.begin(),vertices.end(),model);
+    if(vertex==vertices.end()) {
+        if(!record) return {};
+        vertices.push_back(model);vertex=vertices.end()-1;
+    }
+    return {base,((uint64_t(at-instances.begin())+1)<<32)|(uint64_t(vertex-vertices.begin())+1)};
 }
 }
 extern "C" void packet_interpolation_transform(const PGXPProjection *p) {
@@ -149,7 +161,7 @@ extern "C" void packet_interpolation_stream_append(const PacketInterpolationSour
     try { stream.current.push_back(p);stream.sources.push_back(*s); }
     catch(...) { stream.failed=true;stream.current.clear(); }
 }
-extern "C" void packet_interpolation_stream_end(void) {
+static void stream_end_impl(void) {
     /* A VBlank packet without polygon records is not a new geometry sample.
      * R4's 30 Hz draw produces these between draws. Keep the previous sample
      * for the audit; this is not a policy for presenting blank/cleared frames. */
@@ -161,7 +173,7 @@ extern "C" void packet_interpolation_stream_end(void) {
         std::unordered_set<uint64_t> groups;
         for(const auto& source:stream.sources) for(const auto& p:source.projection)
             if(p.interpolation_valid) groups.insert(p.transform);
-        stream.transforms.clear();stream.invocations.clear();
+        stream.transforms.clear();stream.invocations.clear();stream.ordinals.clear();
         for(const auto& raw:stream.history) if(groups.count(raw.projection.transform)) {
             const auto& v=raw.projection;
             PacketInterpolationTransform transform{};
@@ -200,12 +212,20 @@ extern "C" void packet_interpolation_stream_end(void) {
         }
     }
     stream.old_transforms.swap(stream.transforms);
-    stream.transforms.clear();stream.invocations.clear();stream.source_mode=false;
+    stream.transforms.clear();stream.invocations.clear();stream.ordinals.clear();stream.source_mode=false;
     stream.older.swap(stream.current);stream.old_sources.swap(stream.sources);
     stream.old_epoch=stream.epoch;stream.old_sequence=stream.sequence;
 }
+extern "C" void packet_interpolation_stream_end(void) {
+    try {stream_end_impl();}
+    catch(...) {
+        packet_interpolation_stream_reset();
+        std::lock_guard<std::mutex> lock(stats_mutex);
+        published_failed=true;
+    }
+}
 extern "C" void packet_interpolation_stream_reset(void) {
-    stream.transforms.clear();stream.old_transforms.clear();stream.invocations.clear();stream.history.clear();
+    stream.transforms.clear();stream.old_transforms.clear();stream.invocations.clear();stream.ordinals.clear();stream.history.clear();
     stream.old_sources.clear();stream.sources.clear();
     stream.older.clear();stream.current.clear();stream.old_epoch=stream.old_sequence=0;
     std::lock_guard<std::mutex> lock(stats_mutex);
@@ -220,7 +240,7 @@ extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
     return std::snprintf(out,capacity,
         "{\"status\":\"ok\",\"mode\":\"%s\",\"sequence\":%llu,\"primitives\":%llu,"
         "\"matched\":%llu,\"unmatched\":%llu,\"disappeared\":%llu,\"ambiguous\":%llu,"
-        "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"snapped\":%d,\"failed\":%s}",
+        "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"source_moving\":%llu,\"snapped\":%d,\"failed\":%s}",
         published_source_mode?"vertex_source_audit":"candidate_audit",
         (unsigned long long)published_sequence,(unsigned long long)published_count,
         (unsigned long long)published.matched,(unsigned long long)published.unmatched,
@@ -229,7 +249,7 @@ extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
         (unsigned long long)published.appeared_candidates,(unsigned long long)published.invalid,(unsigned long long)published_missing,
         (unsigned long long)published.duplicate_equal,
         (unsigned long long)published.source_matched,(unsigned long long)published.new_source,
-        (unsigned long long)published.source_unmatched,(unsigned long long)published.source_ambiguous,published.snapped,published_failed?"true":"false");
+        (unsigned long long)published.source_unmatched,(unsigned long long)published.source_ambiguous,(unsigned long long)published.source_moving,published.snapped,published_failed?"true":"false");
 }
 
 extern "C" void packet_interpolation_capture_request(void) {

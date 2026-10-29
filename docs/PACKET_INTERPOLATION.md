@@ -155,3 +155,15 @@ zero unresolved/ambiguous vertices, but three pairs had 19/31/36 new-source
 vertices. That fails acceptance. Earlier zero-miss captures were paused and are
 only stationary repeatability evidence. Renderer cutover, effects interpolation,
 legacy deletion and 8K distinct-image measurements remain outstanding.
+
+
+The ordinal follow-up distinguishes vertices streamed through a shared RAM
+staging address by their pre-cull first-transform ordinal. Its fixture changes
+model coordinates while preserving transform order. A broader steering census
+(`analysis/interp-ordinal45.json` in R4) rejected 27/45 pairs: up to 617 unverified
+new-source uses, 2394 matched uses, zero source-unmatched/ambiguous/invalid.
+This is not acceptance: ordinal stability and entirely culled invocations still
+need proof. That run predates the final diagnostic-only `source_moving` counter;
+its gate used `--stationary` to disable motion-counter enforcement, despite
+steering input. No motion/no-pop acceptance should be inferred from that option.
+The final gate explicitly rejects stationary samples unless requested.
