@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <thread>
 #include <vector>
+#include "native_raster_oracle_fixtures.h"
 
 /* Native contexts do not use title-specific wide presentation. */
 extern "C" {
@@ -109,6 +110,43 @@ int main() {
         assert(pixel(r,104+x,104+y)==(c|(c<<5)|(c<<10)));
     }
 
+    // Sprite modulation preserves all eight source bits: 31*127/128 = 30,
+    // whereas quantizing 127 to five bits before modulation gives 29.
+    send(r,NR_MASK,{0,0});
+    send(r,NR_WRITE,{700,400,31});
+    send(r,NR_NATIVE_RECT,{300,300,1,1,127,60,144,0,0,0x11a,1});
+    assert(pixel(r,300,300)==30);
+    // Horizontal flip starts at the odd member of the supplied texel pair.
+    send(r,NR_WRITE,{699,400,4});
+    send(r,NR_WRITE,{701,400,7});
+    send(r,NR_NATIVE_RECT,{302,300,2,1,0,60,144,0,0,0x11a,19});
+    assert(pixel(r,302,300)==7 && pixel(r,303,300)==31);
+    // The line endpoint is included and RGB888 rounds at the pixel, not
+    // before interpolation. Reversing the endpoints preserves coverage.
+    send(r,NR_NATIVE_LINE,{400,300,0,432,300,31,4});
+    assert(pixel(r,416,300)==2 && pixel(r,432,300)==3);
+    send(r,NR_NATIVE_LINE,{432,301,31,400,301,0,4});
+    assert(pixel(r,416,301)==2 && pixel(r,432,301)==3);
+    send(r,NR_NATIVE_LINE,{440,300,0x7f7f7f,443,300,0x7f7f7f,8});
+    for(int x=0;x<4;++x) {
+        const int c=(127+dither[0][x])/8;
+        assert(pixel(r,440+x,300)==(c|(c<<5)|(c<<10)));
+    }
+
+    // Raw GP0 packets retain RGB888 and the captured guest offset/area.
+    NativeRasterState state{0,0,1023,511,10,20,0,0,0,0};
+    uint32_t triangle[]={0x30000000,0x001e01f4,31,0x001e0214,0,0x003e01f4};
+    assert(native_raster_gp0(r,&state,triangle,6));
+    triangle[2]=255; // queue owns the original packet
+    state.offset_x=100;
+    assert(pixel(r,526,51)==2);
+    uint32_t rect[]={0x600000ff,0x006401f4,0x00020003};
+    assert(native_raster_gp0(r,&state,rect,3));
+    assert(pixel(r,600,120)==31 && pixel(r,602,121)==31);
+    assert(!native_raster_gp0(r,&state,rect,2));
+    uint32_t environment=0xe1000000;
+    assert(!native_raster_gp0(r,&state,&environment,1));
+
     // Independent contexts race on different threads while the default
     // renderer remains usable. No graphics/context owner participates.
     std::vector<uint16_t> legacy(1024*512);
@@ -129,6 +167,54 @@ int main() {
     assert(native_raster_completed(r)>60000);
     upload.args[2]=1025;
     assert(!native_raster_submit(r,&upload,data.data(),data.size()));
+    // Copy reads a 128-halfword chunk before writing it. A rightward
+    // overlap can therefore feed the next chunk, unlike a whole-row copy.
+    send(r,NR_MASK,{0,0});
+    std::array<uint16_t,256> ramp{};
+    for(unsigned i=0;i<ramp.size();++i) ramp[i]=uint16_t(i+1);
+    NativeRasterCommand ramp_upload{};
+    ramp_upload.op=NR_UPLOAD;
+    ramp_upload.args[0]=0;ramp_upload.args[1]=450;
+    ramp_upload.args[2]=256;ramp_upload.args[3]=1;
+    assert(native_raster_submit(r,&ramp_upload,ramp.data(),ramp.size()));
+    send(r,NR_COPY,{0,450,1,450,255,1});
+    assert(pixel(r,128,450)==128 && pixel(r,129,450)==128);
+
+    // The palette cache may intentionally differ from VRAM. A machine
+    // checkpoint must preserve both; clearing it on load changes pixels.
+    native_raster_restore(r,saved.data());
+    send(r,NR_AREA,{0,0,1023,511});
+    send(r,NR_SEMI,{0,0});
+    send(r,NR_WRITE,{0,400,1});
+    send(r,NR_WRITE,{17,480,31});
+    send(r,NR_NATIVE_RECT,{500,400,1,1,0,0,144,16,480,16,3});
+    assert(pixel(r,500,400)==31);
+    send(r,NR_WRITE,{17,480,992});
+    SwNativeTextureState texture{};
+    native_raster_checkpoint(r,saved.data(),dirty,&texture);
+    native_raster_restore(r,saved.data());
+    send(r,NR_NATIVE_RECT,{500,400,1,1,0,0,144,16,480,16,3});
+    assert(pixel(r,500,400)==992);
+    native_raster_restore_checkpoint(r,saved.data(),&texture);
+    send(r,NR_NATIVE_RECT,{500,400,1,1,0,0,144,16,480,16,3});
+    assert(pixel(r,500,400)==31);
+
+    // Full-VRAM oracle digests include masked pixels, texture feedback,
+    // shading, clipping, sprite flips and palette/texture fetches.
+    for(size_t i=0;i<saved.size();++i)
+        saved[i]=uint16_t((i*173+(i>>10)*31)^0x5317);
+    for(const auto &fixture:native_oracle_fixtures) {
+        native_raster_restore(r,saved.data());
+        assert(native_raster_gp0(r,&fixture.state,fixture.words,fixture.count));
+        native_raster_read(r,0,0,1024,512,restored.data());
+        uint64_t digest=UINT64_C(14695981039346656037);
+        for(auto value:restored) {
+            digest=(digest^(value&255))*UINT64_C(1099511628211);
+            digest=(digest^(value>>8))*UINT64_C(1099511628211);
+        }
+        assert(digest==fixture.digest);
+    }
     native_raster_destroy(other);
     native_raster_destroy(r);
 }
+

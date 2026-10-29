@@ -78,6 +78,9 @@ struct SwRendererContext {
     int g_uv_lim[4];
     int private_dirty;
     uint64_t dirty_rows[8];
+    struct { uint32_t tag; uint16_t words[4]; } native_texture[256];
+    uint16_t native_palette[256];
+    uint32_t native_palette_key, native_page;
 };
 static SwRendererContext s_default = {
     .g_scale = 1, .g_hr_w = VRAM_WIDTH, .g_hr_h = VRAM_HEIGHT,
@@ -96,6 +99,8 @@ SwRendererContext *sw_context_create(void) {
     c->g_uv_lim[2] = c->g_uv_lim[3] = 255;
     c->private_dirty = 1;
     memset(c->dirty_rows, 0xff, sizeof c->dirty_rows);
+    for(int i=0;i<256;++i) c->native_texture[i].tag=UINT32_MAX;
+    c->native_palette_key=c->native_page=UINT32_MAX;
     return c;
 }
 SwRendererContext *sw_context_bind(SwRendererContext *c) {
@@ -452,6 +457,80 @@ static uint16_t texel_fetch(int u, int v, uint16_t texpage,
  * (texel_fetch applies the window instead, which wraps by design). */
 
 
+void sw_native_cache_clear(int palette) {
+    for(int i=0;i<256;++i) s_sw->native_texture[i].tag=UINT32_MAX;
+    if(palette) s_sw->native_palette_key=UINT32_MAX;
+}
+void sw_native_texture_save(SwNativeTextureState *state) {
+    for(int i=0;i<256;++i) {
+        state->tags[i]=s_sw->native_texture[i].tag;
+        memcpy(state->words[i],s_sw->native_texture[i].words,8);
+    }
+    memcpy(state->palette,s_sw->native_palette,sizeof state->palette);
+    state->palette_key=s_sw->native_palette_key;
+    state->page=s_sw->native_page;
+}
+void sw_native_texture_load(const SwNativeTextureState *state) {
+    for(int i=0;i<256;++i) {
+        s_sw->native_texture[i].tag=state->tags[i];
+        memcpy(s_sw->native_texture[i].words,state->words[i],8);
+    }
+    memcpy(s_sw->native_palette,state->palette,sizeof state->palette);
+    s_sw->native_palette_key=state->palette_key;
+    s_sw->native_page=state->page;
+}
+void sw_native_copy(int sx,int sy,int dx,int dy,int w,int h) {
+    sw_native_cache_clear(0);
+    for(int row=0;row<h;++row) {
+        int target_y=(dy+row)&511;
+        for(int block=0;block<w;block+=128) {
+            uint16_t pixels[128];
+            int count=min_i(128,w-block);
+            for(int i=0;i<count;++i) pixels[i]=vram_get(sx+block+i,sy+row);
+            for(int i=0;i<count;++i) {
+                uint16_t *dst=g_vram+target_y*1024+((dx+block+i)&1023);
+                if(!g_mask_check_bit || !(*dst&0x8000))
+                    *dst=pixels[i]|(g_mask_set_bit?0x8000:0);
+            }
+        }
+        sw_dirty_row((uint32_t)target_y);
+    }
+}
+static void native_texture_begin(uint16_t page,uint16_t cx,uint16_t cy) {
+    unsigned mode=(page>>7)&3;
+    uint32_t key=(page&31)|((mode!=0)?32:0);
+    if(key!=s_sw->native_page) {
+        sw_native_cache_clear(0);
+        s_sw->native_page=key;
+    }
+    if(mode<2) {
+        key=(cx/16)|(cy<<6)|(mode<<16);
+        if(key!=s_sw->native_palette_key) {
+            for(unsigned i=0;i<(mode?256u:16u);++i)
+                s_sw->native_palette[i]=vram_get(cx+i,cy);
+            s_sw->native_palette_key=key;
+        }
+    }
+}
+static uint16_t native_texel(int u,int v,uint16_t page) {
+    unsigned mode=(page>>7)&3;
+    if(mode>2) mode=2;
+    u=(u&255&~(g_tw_mask_x*8))|((g_tw_off_x&g_tw_mask_x)*8);
+    v=(v&255&~(g_tw_mask_y*8))|((g_tw_off_y&g_tw_mask_y)*8);
+    unsigned x=(((page&15)*64)+(unsigned)(u>>(2-mode)))&1023;
+    unsigned y=(((page>>4)&1)*256+(unsigned)v)&511;
+    unsigned address=y*1024+x,line=address&~3u;
+    unsigned slot=mode?((x/4)&7)|((y&31)<<3):((x/4)&3)|((y&63)<<2);
+    if(s_sw->native_texture[slot].tag!=line) {
+        memcpy(s_sw->native_texture[slot].words,g_vram+line,8);
+        s_sw->native_texture[slot].tag=line;
+    }
+    uint16_t word=s_sw->native_texture[slot].words[x&3];
+    if(mode==2) return word;
+    unsigned index=mode?((word>>((u&1)*8))&255):((word>>((u&3)*4))&15);
+    return s_sw->native_palette[index];
+}
+
 /* Native attribute planes use 12-bit truncated derivatives with a half-unit
  * seed, accumulated modulo 32 bits at 24 fractional bits. This preserves
  * RGB888 until pixel quantization; the presentation raster remains separate.
@@ -505,34 +584,50 @@ void sw_draw_native_triangle(const SwNativeVertex input[3],uint16_t cx,uint16_t 
         plane[channel]=native_plane(v,value,core,area);
     }
     // Sorting is solely for coverage; planes retain the original core seed.
+    int order[3]={0,1,2};
     for(int i=1;i<3;++i) {
-        SwNativeVertex current=v[i]; int j=i;
-        while(j>0 && v[j-1].y>current.y) { v[j]=v[j-1]; --j; }
+        SwNativeVertex current=v[i]; int original=order[i],j=i;
+        while(j>0 && v[j-1].y>current.y) { v[j]=v[j-1];order[j]=order[j-1]; --j; }
         v[j]=current;
+        order[j]=original;
     }
+    int sorted_core=0;
+    while(order[sorted_core]!=core) ++sorted_core;
     static const int8_t matrix[4][4]={
         {-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},{3,-1,2,-2}
     };
     const int textured=(flags&1)!=0, raw=(flags&2)!=0;
+    if(textured) native_texture_begin(page,cx,cy);
     const int dither=(flags&8) && (textured?!raw:(flags&4)!=0);
-    const int top=max_i(max_i(v[0].y,g_clip_y1),0);
-    const int bottom=min_i(min_i(v[2].y,g_clip_y2+1),512);
-    for(int y=top;y<bottom;++y) {
+    const int top=v[0].y,bottom=v[2].y;
+    /* Feedback observes traversal order: start at the core's half, moving
+     * away from its Y. Each horizontal span still runs left to right. */
+    for(int part=0;part<2;++part) {
+      int lower=sorted_core?(part==0):(part==1);
+      int lo=max_i(top,lower?v[1].y:v[0].y);
+      int hi=min_i(bottom,lower?v[2].y:v[1].y);
+      int descending=lower?(sorted_core==2):(sorted_core!=0);
+      for(int row=0;row<hi-lo;++row) {
+        int y=descending?hi-1-row:lo+row;
+        const int py=(y&1023)-(y&1024);
+        if(py<0 || py>=512 || py<g_clip_y1 || py>g_clip_y2) continue;
         int a,b;
         psx_triangle_edges_at_y(v[0].x,v[0].y,v[1].x,v[1].y,v[2].x,v[2].y,y,&a,&b);
-        int left=max_i(max_i(min_i(a,b),g_clip_x1),0);
-        int right=min_i(min_i(max_i(a,b),g_clip_x2+1),1024);
+        const int start=min_i(a,b),wrapped=(start&1023)-(start&1024);
+        const int translation=start-wrapped;
+        int left=max_i(max_i(wrapped,g_clip_x1),0);
+        int right=min_i(min_i(wrapped+abs(a-b),g_clip_x2+1),1024);
         int wrote=0;
-        for(int x=left;x<right;++x) {
-            uint16_t *dst=g_vram+y*1024+x;
-            if(g_mask_check_bit && (*dst&0x8000)) continue;
+        for(int px=left;px<right;++px) {
+            const int x=px+translation;
+            uint16_t *dst=g_vram+py*1024+px;
             int r=(int)native_plane_at(plane[0],x,y);
             int g=(int)native_plane_at(plane[1],x,y);
             int bcol=(int)native_plane_at(plane[2],x,y);
             uint16_t color,stp=0;
             if(textured) {
-                uint16_t texel=texel_fetch((int)native_plane_at(plane[3],x,y),
-                                           (int)native_plane_at(plane[4],x,y),page,cx,cy);
+                uint16_t texel=native_texel((int)native_plane_at(plane[3],x,y),
+                                            (int)native_plane_at(plane[4],x,y),page);
                 if(!texel) continue;
                 stp=texel&0x8000;
                 if(raw) color=texel&0x7fff;
@@ -543,12 +638,87 @@ void sw_draw_native_triangle(const SwNativeVertex input[3],uint16_t cx,uint16_t 
                     color=native_quantize(r,g,bcol,dither?matrix[y&3][x&3]:0);
                 }
             } else color=native_quantize(r,g,bcol,dither?matrix[y&3][x&3]:0);
+            if(g_mask_check_bit && (*dst&0x8000)) continue;
             if(g_semi_trans_enabled && (!textured || stp))
                 color=blend_pixels(*dst,color,g_semi_trans_mode);
             *dst=color|stp|(g_mask_set_bit?0x8000:0);
             wrote=1;
         }
-        if(wrote) sw_dirty_row((uint32_t)y);
+        if(wrote) sw_dirty_row((uint32_t)py);
+      }
+    }
+}
+
+/* Native line coordinates use a dominant-axis DDA, not Bresenham. Keep
+ * colour at 12 fractional bits until quantization, including flat dithering.
+ * The endpoint is inclusive; the subpixel bias resolves half-pixel ties. */
+void sw_draw_native_line(const SwNativeVertex input[2],unsigned flags) {
+    SwNativeVertex a=input[0],b=input[1];
+    int dx=abs(b.x-a.x),dy=abs(b.y-a.y),steps=max_i(dx,dy);
+    if(dx>=1024 || dy>=512) return;
+    if(a.x>b.x) { SwNativeVertex swap=a;a=b;b=swap; }
+    int64_t sx=(int64_t)(b.x-a.x)*INT64_C(4294967296);
+    int64_t sy=(int64_t)(b.y-a.y)*INT64_C(4294967296);
+    if(steps) {
+        sx=(sx+(sx>0?steps-1:sx<0?1-steps:0))/steps;
+        sy=(sy+(sy>0?steps-1:sy<0?1-steps:0))/steps;
+    }
+    int64_t x=(int64_t)a.x*INT64_C(4294967296)+INT64_C(2147483648)-1024;
+    int64_t y=(int64_t)a.y*INT64_C(4294967296)+INT64_C(2147483648)-(sy<0?1024:0);
+    int color[3],delta[3];
+    for(int c=0;c<3;++c) {
+        int first=(int)((a.rgb>>(8*c))&255);
+        int last=(int)((b.rgb>>(8*c))&255);
+        color[c]=first*4096+2048;
+        delta[c]=(steps && (flags&4))?(last-first)*4096/steps:0;
+    }
+    static const int8_t matrix[4][4]={{-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},{3,-1,2,-2}};
+    for(int i=0;i<=steps;++i,x+=sx,y+=sy) {
+        int px=(int)(((uint64_t)x>>32)&2047),py=(int)(((uint64_t)y>>32)&2047);
+        if(px>=g_clip_x1 && px<=g_clip_x2 && px<1024 &&
+           py>=g_clip_y1 && py<=g_clip_y2 && py<512) {
+            uint16_t *dst=g_vram+py*1024+px;
+            if(!g_mask_check_bit || !(*dst&0x8000)) {
+                uint16_t value=native_quantize(color[0]/4096,color[1]/4096,color[2]/4096,
+                                               (flags&8)?matrix[py&3][px&3]:0);
+                if(g_semi_trans_enabled) value=blend_pixels(*dst,value,g_semi_trans_mode);
+                *dst=value|(g_mask_set_bit?0x8000:0);
+                sw_dirty_row((uint32_t)py);
+            }
+        }
+        for(int c=0;c<3;++c) color[c]+=delta[c];
+    }
+}
+
+void sw_draw_native_rect(int x,int y,int w,int h,uint32_t rgb,int u,int v,
+                         uint16_t cx,uint16_t cy,uint16_t page,unsigned flags) {
+    /* Horizontal sprite reversal starts on the odd texel of its pair. */
+    if(flags&16) u|=1;
+    if(flags&1) native_texture_begin(page,cx,cy);
+    const int left=max_i(max_i(x,g_clip_x1),0),top=max_i(max_i(y,g_clip_y1),0);
+    const int right=min_i(min_i(x+w,g_clip_x2+1),1024);
+    const int bottom=min_i(min_i(y+h,g_clip_y2+1),512);
+    for(int py=top;py<bottom;++py) {
+        int wrote=0;
+        for(int px=left;px<right;++px) {
+            uint16_t *dst=g_vram+py*1024+px,stp=0,color;
+            int r=rgb&255,g=(rgb>>8)&255,b=(rgb>>16)&255;
+            if(flags&1) {
+                uint16_t texel=native_texel(u+((flags&16)?x-px:px-x),
+                                           v+((flags&32)?y-py:py-y),page);
+                if(!texel) continue;
+                stp=texel&0x8000;
+                if(flags&2) color=texel&0x7fff;
+                else color=native_quantize(((texel&31)*r)>>4,
+                    (((texel>>5)&31)*g)>>4,(((texel>>10)&31)*b)>>4,0);
+            } else color=native_quantize(r,g,b,0);
+            if(g_mask_check_bit && (*dst&0x8000)) continue;
+            if(g_semi_trans_enabled && (!(flags&1) || stp))
+                color=blend_pixels(*dst,color,g_semi_trans_mode);
+            *dst=color|stp|(g_mask_set_bit?0x8000:0);
+            wrote=1;
+        }
+        if(wrote) sw_dirty_row((uint32_t)py);
     }
 }
 

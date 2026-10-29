@@ -2053,3 +2053,15 @@ Guest-frame lookup merged multiple extra presentations and could not verify
 HUD stability. Added duplicate-frame/freeze/eviction regression coverage and
 retained legacy frame lookup. Six focused framework checks and all 21 title
 checks pass on Windows and Linux, and both runtime builds link successfully.
+
+### 2026-10-28 — Native GP0 parity work (frame architecture phase 1, incomplete)
+
+Added immutable original-GP0 packet/state decoding on the CPU raster worker,
+RGB888 sprite/line rasterization, integer coordinate wrapping, texture and
+palette cache semantics, feedback traversal order, 128-halfword copy chunks,
+and cache-preserving native checkpoint APIs. Separate pinned Beetle GPU oracle
+with PGXP enabled matches 10000 mixed draw cases and 10000 coordinate-stress
+cases; retained 16 full-VRAM digests and native checkpoint regressions pass.
+Manifest/proof: runtime/tests/NATIVE_RASTER_ORACLE.md and
+runtime/tests/native_raster_oracle_fixtures.h. Production capture/read routing
+is not yet switched; no frame-architecture phase is accepted or merged.

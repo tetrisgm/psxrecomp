@@ -24,6 +24,19 @@ typedef struct SwNativeVertex { int x, y; uint32_t rgb; int u, v; } SwNativeVert
 void sw_draw_native_triangle(const SwNativeVertex vertices[3],
                              uint16_t clut_x, uint16_t clut_y,
                              uint16_t texpage, unsigned flags);
+void sw_draw_native_line(const SwNativeVertex vertices[2], unsigned flags);
+void sw_native_cache_clear(int palette);
+void sw_native_copy(int sx,int sy,int dx,int dy,int w,int h);
+/* Guest-observable cache contents: serialize fields explicitly, not padding. */
+typedef struct SwNativeTextureState {
+    uint32_t tags[256];
+    uint16_t words[256][4],palette[256];
+    uint32_t palette_key,page;
+} SwNativeTextureState;
+void sw_native_texture_save(SwNativeTextureState *state);
+void sw_native_texture_load(const SwNativeTextureState *state);
+void sw_draw_native_rect(int x,int y,int w,int h,uint32_t rgb,int u,int v,
+                         uint16_t clut_x,uint16_t clut_y,uint16_t page,unsigned flags);
 
 /* Maximum internal-resolution supersampling factor (linear, per axis). */
 #define SW_MAX_INTERNAL_SCALE 4
