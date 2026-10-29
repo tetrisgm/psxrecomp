@@ -2159,3 +2159,28 @@ smoke frame 8767 has zero dispatch/segment misses. Same-save 18x/all-on15s:
 53.075 VBlanks/s, max67.360ms,79173starved,53.16swap completions/s;
 scene/presentGPU3.670/12.813ms,zero acquisitions. Render queue backpressure still
 exists; neither real-time nor distinct-image acceptance is claimed.
+
+2026-10-28 frame architecture phase 2 WIP: callback-owned resampler behind a
+lock-free SPSC transport, Games/Pro Audio MMCSS, old push-audio diagnostic path
+removed, and callback-side timeline reset preserving subsequent PCM. Focused
+parity/concurrency/reset tests pass. Three-slot immutable frame-packet transport
+passes replacement/ownership/epoch/overflow tests and exact native replay after
+dropped packets; native seed observation does not consume rewind dirty rows.
+This transport is not yet connected to GL; the old render ring still applies
+backpressure. R4 dev build and 32 tests pass. No phase-2 acceptance or merge.
+Phase-2 continuation: dedicated frame owner passes blocked-consumer publication
+(10000 packets), startup/shutdown-only context ownership, and idle timed-work
+tests. GL has a producer draw-state mirror with extra-pass restore, including
+async discard. Six hidden GL modes match pixels, dev build/32 R4 tests pass,
+and hidden boot-to-race smoke plus live/paused diagnostics pass with zero
+misses/context acquisitions. New owner remains unconnected to GL; incremental
+ring backpressure remains. No phase-2 acceptance, merge or performance claim.
+2026-10-29 phase 2 WIP: native HD contexts call no GL; immutable Duck/Beetle provenance and bounded packet attachments pass ownership/pending-copy tests. Hidden HD fixture 231/217 checks passes after replacing stale publication/context-hold assumptions (same seven failures reproduced on previous HD implementation). Dev build, R4 32/32 and hidden smoke/diagnostics pass, zero misses/acquisitions. Native HD contexts and packet attachments remain unconnected to production raster/GL; no phase acceptance.
+
+2026-10-29 frame phase 2 WIP: native provenance observers follow original GP0, partial masked uploads and copies; sampling marks Duck sources used independently of dropped presentation. Production native HD binding and owned/shared tracking snapshots pass focused tests, hidden HD GL, R4 32/32 and hidden smoke (zero misses; PID 46044 stopped). Durable presentation-owner requests pass stalled-consumer/reset tests. GL still uses the incremental ring; exact per-draw native inputs and packet integration remain, no phase acceptance or promotion.
+
+2026-10-29 phase 2 WIP continuation: immutable per-GP0 native texture page/CLUT tiles and shared HD provenance are captured before draws, with bounded overflow and held-packet/drop tests. GP0 source IDs are carried through the presentation facade. Texture-bank CPU resolution stays on the producer; GL creation/selection is queued, including generated-list state capture/replay. Six hidden GL parity modes, full-PGXP bank replay endpoints and parser/native tests pass. Durable owner controls are ordered before frames, diagnostics after them; stalled/replaced/idle ordering tests pass. The collector is not yet enabled in production publication and GL still uses the old blocking ring; phase 2 is not accepted.
+
+2026-10-29 phase 2 WIP continuation: packet optional batches reject malformed/over-budget input atomically; cancelled open packets preserve the last complete pending packet. Native producer binding supplies an upload-flush boundary without a graphics context. The owner cancels old-timeline timed work and runs reset handling before subsequent work; stalled/reset/idle ordering passed 20 repeated concurrent runs. New hidden real-GL packet fixture replays actual RTH records with full draw-state seeds and retained per-draw native texture inputs: 62 pending packets replaced while GL is stalled, native worker destroyed before consumption, 71 checks passed, context transfers only at startup/shutdown. Receipt: analysis/perf-20261028/phase2-packet-replay-gl-final/rth-grkmih5g in R4. Production GL still uses the incremental ring; phase 2 is not accepted or promoted.
+
+2026-10-29 frame-architecture phase 2 WIP: production transport now publishes complete immutable native-seeded packets without guest ring/context waits. Native/MMCSS and durable controls/diagnostics integrated. Complete-packet GL (71), mailbox/owner, and full-PGXP bank endpoint parity fixtures pass. Present-slot admission is now nonblocking, with token ownership tests passing. Slowed-owner 18x gate still fails (57.653 VBlanks/s, 11869 starved); not accepted or promoted. Remaining legacy host GL ownership APIs and fixtures are being migrated; no faithful timing or generated-code changes.

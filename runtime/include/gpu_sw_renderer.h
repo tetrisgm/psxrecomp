@@ -15,6 +15,11 @@ SwRendererContext *sw_context_create(void);
 SwRendererContext *sw_context_bind(SwRendererContext *context);
 void sw_context_destroy(SwRendererContext *context);
 void sw_context_take_dirty(uint64_t rows[8]);
+/* Independent per-operation write bounds for native provenance/packet inputs;
+ * observing them does not consume save/rewind dirty rows. Bounds are inclusive
+ * and conservatively cover written spans (including masked holes). */
+void sw_context_begin_write_observation(int enabled);
+int sw_context_written_bounds(int bounds[4]);
 
 /* Guest-native polygon input, before presentation transforms or RGB555
  * truncation. x/y already include the guest drawing offset. Flags select

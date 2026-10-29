@@ -113,6 +113,8 @@ int psx_netplay_active(void){return 0;}
 #ifndef PSX_TEST_HD_TEXTURE_PACK
 GrBackend gr_backend(void){return GR_BACKEND_OPENGL;}
 void gr_refresh_backend(void){}
+NativeRaster *gr_native_raster(void){return NULL;}
+void gr_flush_native_upload(void){}
 /* No HD texture pack (gpu_hd_textures.cpp) in these fixtures. */
 int gpu_hd_textures_active(void){return 0;}
 #endif

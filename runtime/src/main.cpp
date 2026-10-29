@@ -61,6 +61,7 @@ extern "C" int g_psx_track_last_store;
 extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
 #include "overlay_backend.h"
 #include "gpu.h"
+#include "gpu_hd_textures.h"
 #include "draw_distance.h"
 #include "mod_immediate.h"
 #include "display_scanout.h"
@@ -121,6 +122,8 @@ extern "C" uint32_t g_guest_last_store_addr, g_guest_last_store_val;
  * trim to hold the ring near target -- no gaps. See recomp_audio_drc.h. */
 #define RECOMP_AUDIO_DRC_IMPL
 #include "recomp_audio_drc.h"
+#include "audio_transport.h"
+#include "host_scheduling.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include "host_sampler.h"
@@ -3017,24 +3020,11 @@ static int g_turbo_load_release_frames = TURBO_LOADS_RELEASE_FRAMES;
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
-/* DRC bridge. Producer (sdl_audio_pump) runs on the main loop thread under
- * SDL_LockAudioDevice; consumer (sdl_drc_callback) runs on the SDL audio
- * thread. */
-static rab_bridge s_drc;
+/* The guest publishes PCM through a lock-free SPSC transport. The audio
+ * callback alone owns the resampler and its controller/history. */
+static PsxAudioTransport s_drc;
 static bool       s_drc_ready = false;
 
-/* Observability + A/B. PSXRECOMP_AUDIO_LEGACY=1 keeps the historical push model
- * (SDL_QueueAudio, no bridge) so the underrun baseline can be measured against
- * the bridge from a single build; default (unset) = bridge/pull model. Output
- * health is surfaced through the audio_stats TCP command (no stderr probe). */
-static bool audio_legacy_mode(void) {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("PSXRECOMP_AUDIO_LEGACY"); v = (e && *e && *e != '0') ? 1 : 0; }
-    return v != 0;
-}
-/* Legacy-mode underrun counter: incremented when the SDL queue is found empty
- * at pump time (the device was silence-filling = an audible gap). */
-static uint64_t g_legacy_underruns = 0;
 /* Set at unmute so the pump resyncs its bridge-underrun baseline past the
  * intentional mute-drain instead of reporting it as gaps. */
 int g_audio_unmute_resync = 0;
@@ -3045,9 +3035,10 @@ int g_audio_host_rate = 44100;
 }
 
 static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
+    psx_host_schedule_thread(PsxHostThreadRole::Audio);
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
     int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
-    rab_pull(&s_drc, reinterpret_cast<int16_t*>(stream), frames);
+    s_drc.pull(reinterpret_cast<int16_t*>(stream), frames);
     /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
      * This callback is the tap's single writer while the bridge is active. */
     audio_trace_pcm(AUDIO_TAP_HOST, reinterpret_cast<const int16_t*>(stream),
@@ -4390,7 +4381,7 @@ static void shutdown_runtime(void) {
         psx_sdl_audio_close(sdl_audio_device);   /* stops the pull callback */
         sdl_audio_device = 0;
     }
-    if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
+    if (s_drc_ready) { s_drc.free(); s_drc_ready = false; }
     close_controller();
     debug_server_shutdown();
 }
@@ -4407,7 +4398,7 @@ static void teardown_game_session_keep_lobby(void) {
         psx_sdl_audio_close(sdl_audio_device);
         sdl_audio_device = 0;
     }
-    if (s_drc_ready) { rab_free(&s_drc); s_drc_ready = false; }
+    if (s_drc_ready) { s_drc.free(); s_drc_ready = false; }
     close_controller();
     if (g_vk_active) {
         vk_renderer_shutdown();
@@ -4469,39 +4460,20 @@ static void sdl_audio_pump(bool discard_output = false) {
     /* Guest-cycle SPU advance must not depend on host audio device/backpressure.
      * Win↔Linux rollback forked on aux/spu when one peer skipped spu_render
      * (queue full / !drc / no device) while the other kept advancing. */
-    const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
-    const bool legacy = audio_legacy_mode();
-    static int had_audio = 0;
-    uint32_t queued = 0;   /* RENDER event b: bytes (legacy) / fill ms (bridge) */
+    uint32_t queued = 0;   /* RENDER event b: host buffering in milliseconds */
     int host_queue_ok = 0;
 
     if (discard_output) {
         /* Host-only sink: skip all queue/bridge interaction, but continue to
          * the guest-cycle sample budget and spu_render below. */
-    } else if (sdl_audio_device && legacy) {
-        /* Historical push model + baseline measurement: a drained (==0) queue
-         * means the device was silence-filling since the last pump = a gap.
-         * Only meaningful after the first audio has been queued. */
-        const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
-        queued = psx_sdl_audio_queued_size(sdl_audio_device);
-        if (queued == 0 && had_audio) {
-            g_legacy_underruns++;
-            audio_trace_event(AUDIO_EV_UNDERRUN, 0, 0);
-        }
-        if (queued > max_queue_bytes) {
-            audio_trace_event(AUDIO_EV_PUMP_SKIP, queued, 0);
-            /* Still advance SPU below; only skip host enqueue. */
-        } else {
-            host_queue_ok = 1;
-        }
-    } else if (sdl_audio_device && !legacy && s_drc_ready) {
+    } else if (sdl_audio_device && s_drc_ready) {
         /* Surface bridge underruns (counted on the SDL audio thread) into the
          * event ring from this thread — the event ring is single-writer.
          * Across a turbo mute the ring intentionally runs dry (the pump stops
          * while the callback keeps pulling); those dry pulls are the mute,
          * not gaps — resync past them instead of reporting them. */
         rab_stats st;
-        rab_get_stats(&s_drc, &st);
+        s_drc.stats(&st);
         static uint64_t prev_underruns = 0;
         extern int g_audio_unmute_resync;
         if (g_audio_unmute_resync) {
@@ -4526,10 +4498,8 @@ static void sdl_audio_pump(bool discard_output = false) {
         /* Savestate/rewind load: queued output belongs to the old timeline. */
         spu_output_flush();
         g_audio_cycle_resync = 0;
-        if (legacy && sdl_audio_device)
-            psx_sdl_audio_clear(sdl_audio_device);
-        else
-            g_audio_unmute_resync = 1; /* skip mute-drain underrun reports */
+        if (s_drc_ready) s_drc.reset_timeline();
+        g_audio_unmute_resync = 1; /* skip mute-drain underrun reports */
         return;
     }
     int frames = (int)spu_output_available();
@@ -4575,28 +4545,16 @@ static void sdl_audio_pump(bool discard_output = false) {
             sdl_audio_gain_ramp(sdl_audio_buf, frames, g, g);
         }
     }
-    if (legacy) {
-        /* T3 tap: the exact post-fade bytes handed to the host audio queue. */
-        audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, frames);
-        psx_sdl_audio_queue(sdl_audio_device, sdl_audio_buf, (uint32_t)frames * bytes_per_frame);
-        had_audio = 1;
-    } else {
-        /* Hand to the bridge (band-limited resample + DRC) instead of
-         * SDL_QueueAudio. Lock guards the SPSC ring against the pull callback.
-         * The T3 tap moves to sdl_drc_callback: what the device actually
-         * receives is the bridge's device-rate output, not this buffer. */
-        psx_sdl_audio_lock(sdl_audio_device);
-        rab_push(&s_drc, sdl_audio_buf, frames);
-        psx_sdl_audio_unlock(sdl_audio_device);
-    }
+    /* Publication never locks the device or resampler. T3 records the
+     * callback's device-rate output, after resampling. */
+    s_drc.push(sdl_audio_buf, frames);
 }
 
 /* Audio gating across turbo-loads transitions.
  *
- * The mute model stays: during turbo the guest runs at host speed, so
- * rendered SPU audio is time-compressed garble — we stop pumping, the queue
- * drains, voice positions freeze, and music resumes in place afterward.
- * What changes is the EDGES:
+ * During turbo the SPU continues at guest cadence. Host output is discarded
+ * while queued audio drains; the guest's voices and music keep advancing.
+ * The host output edges are faded:
  *   - entering turbo: render one short tail of the current voice state,
  *     ramp it to silence, and queue it — the drain ends in a fade instead
  *     of a hard cut;
@@ -4604,28 +4562,25 @@ static void sdl_audio_pump(bool discard_output = false) {
  *     re-trigger within a few frames; without the debounce the mute would
  *     flicker audibly), then resume pumping with a rising ramp applied
  *     across the first ~50 ms of samples (sdl_audio_pump above). */
-/* Bridge/legacy output health, surfaced through the audio_stats TCP command
+/* Host output health, surfaced through the audio_stats TCP command
  * (debug_server.c) — no stderr probe; rule 3. */
 extern "C" int psx_audio_out_stats(double *fill_ms, double *target_ms,
                                    uint64_t *underruns,
                                    uint64_t *overflow_drops, double *correction,
                                    int *legacy, int *host_rate)
 {
-    *legacy = audio_legacy_mode() ? 1 : 0;
+    *legacy = 0; /* retained wire field for existing audio_stats clients */
     *host_rate = g_audio_host_rate;
-    if (*legacy || !s_drc_ready) {
-        *fill_ms = sdl_audio_device
-                   ? (double)psx_sdl_audio_queued_size(sdl_audio_device)
-                     / (44100.0 * 4.0) * 1000.0
-                   : 0.0;
-        *target_ms = 0.0; /* push queue — no DRC fill target */
-        *underruns = g_legacy_underruns;
+    if (!s_drc_ready) {
+        *fill_ms = 0.0;
+        *target_ms = 0.0;
+        *underruns = 0;
         *overflow_drops = 0;
         *correction = 0.0;
-        return sdl_audio_device != 0;
+        return 0;
     }
     rab_stats st;
-    rab_get_stats(&s_drc, &st);
+    s_drc.stats(&st);
     *fill_ms = st.last_fill_ms;
     *target_ms = s_drc.cfg.target_ms;
     *underruns = st.underrun_events;
@@ -5290,11 +5245,9 @@ static int sdl_audio_catchup_sink(int other_sink) {
         state = PsxAudioCatchup{};
         return 0;
     }
-    psx_sdl_audio_lock(sdl_audio_device);
-    rab_get_stats(&s_drc, &stats);
-    const double fill_ms = rab_fill_ms(&s_drc);
+    s_drc.stats(&stats);
+    const double fill_ms = s_drc.fill_ms();
     const double target_ms = s_drc.cfg.target_ms;
-    psx_sdl_audio_unlock(sdl_audio_device);
     const int active = psx_audio_catchup_update(&state,
         psx_audio_sync_enabled() && !psx_netplay_active() && present_should_wall_pace(),
         other_sink || (g_turbo_audio_sink_active && !state.active),
@@ -5331,13 +5284,8 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
             tail = (int)spu_output_pop(sdl_audio_buf, (uint32_t)tail);
             sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
             audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
-            if (sdl_audio_device && audio_legacy_mode()) {
-                audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
-                psx_sdl_audio_queue(sdl_audio_device, sdl_audio_buf, (uint32_t)tail * sizeof(int16_t) * 2u);
-            } else if (sdl_audio_device && s_drc_ready) {
-                psx_sdl_audio_lock(sdl_audio_device);
-                rab_push(&s_drc, sdl_audio_buf, tail);
-                psx_sdl_audio_unlock(sdl_audio_device);
+            if (sdl_audio_device && s_drc_ready) {
+                s_drc.push(sdl_audio_buf, tail);
             }
             muted = 1;
         }
@@ -5370,9 +5318,7 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
         sink_was_active = 0;
         /* Preserve queued PCM; re-prime only when the sink depleted the ring. */
         if (psx_audio_sync_enabled() && sdl_audio_device && s_drc_ready) {
-            psx_sdl_audio_lock(sdl_audio_device);
-            rab_resume_after_sink(&s_drc);
-            psx_sdl_audio_unlock(sdl_audio_device);
+            s_drc.resume_after_sink();
         }
         sdl_audio_fadein_left = sdl_audio_fade_samples;
         audio_trace_event(AUDIO_EV_UNMUTE,
@@ -18009,6 +17955,7 @@ static void host_pause_service(void) {
 }
 
 int main(int argc, char** argv) {
+    psx_host_schedule_thread(PsxHostThreadRole::Emulation);
     g_main_argc = argc;
     g_main_argv = argv;
     /* Force line-buffered output so messages appear even if killed. */
@@ -21025,6 +20972,13 @@ session_reboot:
                      g_headless && g_video_renderer != 0 ? " (headless)" : "");
     }
     gpu_init();
+    {
+        char error[512]{};
+        if(!gpu_hd_textures_attach_native(gpu_native_owner(),error,sizeof error)) {
+            std::fprintf(stderr,"psxrecomp: native texture tracking: %s\n",error);
+            return 1;
+        }
+    }
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init.
      * Dual-raster: gr_set_scale(N) arms GL hr FBO @ N× while glb_set_scale
      * keeps SW at 1×. SW-only netplay: force scale 1. Offline: full SSAA. */
@@ -21606,19 +21560,17 @@ session_reboot:
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 1024;
-        const bool legacy = audio_legacy_mode();
-        want.allow_frequency_change = legacy ? 0 : 1;
-        if (!legacy)
-            want.callback = sdl_drc_callback;  /* pull model: bridge resamples + DRC */
+        want.allow_frequency_change = 1;
+        want.callback = sdl_drc_callback;
         sdl_audio_device = psx_sdl_audio_open(&want, &have);
         if (sdl_audio_device) {
-            if (!legacy) {
+            {
                 rab_config cfg; rab_config_defaults(&cfg);
                 cfg.channels    = 2;
                 cfg.source_rate = 44100.0;            /* SPU render rate */
                 cfg.host_rate   = (double)have.freq;  /* actual device rate */
                 cfg.target_ms   = (double)resolved_audio_buffer_ms;
-                if (rab_init(&s_drc, &cfg) == 0) s_drc_ready = true;
+                if (s_drc.init(cfg) == 0) s_drc_ready = true;
             }
             g_audio_host_rate = have.freq;
             audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);

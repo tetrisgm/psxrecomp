@@ -489,6 +489,8 @@ static _Atomic int   s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) *
  * the native-wide fast-path latch, depth24) is captured when a call is
  * recorded and read back through the ctx_* accessors below during replay. */
 #include "render_thread.h"
+#include "frame_owner.h"
+#include "native_raster.h"
 static int       s_rth_on = 0;
 static uint16_t *s_rth_vram_pub = NULL;   /* lifecycle presentation backing   */
 static uint16_t *s_rth_vram_priv = NULL;  /* render thread's upload source     */
@@ -497,7 +499,11 @@ static int       s_rthx_prim = 0;         /* current record carries prim tags  *
 static int       s_rthx_tagged = 0, s_rthx_backdrop = 0;
 static int       s_rths_flat_bd = 0, s_rths_vp_w = 0, s_rths_bg_full = 0;
 static GpuDisplayInfo s_rths_display;
-static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread(); }
+static _Thread_local int s_rth_packet_replaying;
+static _Thread_local const FramePacketView *s_rth_packet_view;
+static inline int rth_replaying(void) {
+    return s_rth_packet_replaying || (s_rth_on && rt_on_render_thread());
+}
 /* Frame generation (defined with the render-thread code near the end). */
 static _Atomic int s_fg_on;
 static int       s_fg_drawing, s_fg_presenting, s_fg_broken, s_fg_capture_real;
@@ -547,8 +553,17 @@ enum {
     RTH_PRESENT_WIDE, RTH_STATE, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
     RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_INIT,
-    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_DEBUG_CALL, RTH_GROUP
+    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_DEBUG_CALL, RTH_BANK, RTH_NATIVE_SOURCE, RTH_GROUP
 };
+/* Bank definitions are immutable process-lifetime CPU assets. Resolve them
+ * on the producer; the graphics owner never invokes a title resolver. */
+typedef struct RthBank {
+    uint16_t id,live_clut;
+    uint32_t width,height;
+    const uint16_t *pixels;
+} RthBank;
+static RthBank s_bank_selected_definition;
+static int rth_record_bank(const RthBank *bank);
 /* Producer-side geometry publication for an optional seam-prepared pass.
  * Collection never reads the render owner's mutable snap index. */
 static PgxpRthSeamStream s_async_seam_stream;
@@ -603,6 +618,8 @@ static void rth_rebind_vram(uint16_t *vram) {
     gpu_hd_textures_bind_vram(vram);
 }
 static int rth_group_flush(void);
+static void rth_frame_state_push(void);
+static void rth_frame_state_pop(void);
 static void rth_send_state(void);
 static int  rth_rec_ints(uint16_t op, uint16_t flags, int n, const int32_t *v);
 static uint16_t rth_prim_flags(void);
@@ -633,28 +650,21 @@ typedef struct RthControl {
     double d[3];
     char text[1024];
 } RthControl;
+static void gl_rth_exec(void *user,const RtCmd *command,const void *payload);
+static void rth_control_execute(const void *payload) {
+    const RtCmd command={sizeof(RtCmd)+sizeof(RthControl),RTH_CONTROL,0,sizeof(RthControl),0};
+    gl_rth_exec(NULL,&command,payload);
+}
 static int rth_control(const RthControl *call) {
     if(!s_rth_on || rt_on_render_thread() || rt_held()) return 0;
-    rth_send_state();
-    if(!rth_group_flush()) abort();
-    void *p=rt_cmd_begin(RTH_CONTROL,0,sizeof *call);
-    if(!p) abort();
-    memcpy(p,call,sizeof *call);
-    rt_cmd_commit();
+    if(!rt_control(rth_control_execute,call,sizeof *call)) abort();
     return 1;
 }
 int gl_renderer_queue_diagnostic(void (*callback)(const void *),
                                  const void *request,uint32_t bytes) {
     if(!s_rth_on || rt_on_render_thread() || rt_held()) return 0;
     if(!callback || (bytes && !request) || bytes>UINT32_MAX-sizeof callback) abort();
-    rth_send_state();
-    if(!rth_group_flush()) abort();
-    uint8_t *p=rt_cmd_begin(RTH_DEBUG_CALL,0,(uint32_t)sizeof callback+bytes);
-    if(!p) abort();
-    memcpy(p,&callback,sizeof callback);
-    if(bytes) memcpy(p+sizeof callback,request,bytes);
-    rt_cmd_commit();
-    rt_flush(); /* also services a request while guest execution is paused */
+    if(!rt_request(callback,request,bytes)) abort();
     return 1;
 }
 #define RTH_CALL0(func) do { const RthControl c={.kind=RTH_CALL_0,.fn.v=(func)}; \
@@ -932,6 +942,7 @@ static int           s_raster_ok = 0;      /* full GPU pipeline available */
 static GLuint s_bank_tex[65536];
 static GLuint s_selected_bank_tex;
 static int s_selected_bank_live_clut, s_tb_bank_live_clut;
+static int s_selected_bank_failed;
 
 /* Authoritative VRAM: hr color texture + stencil (mask bit) FBO. */
 static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
@@ -6016,8 +6027,7 @@ void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
             rt_cmd_commit();
             return;
         }
-        if (rt_batch_active()) return;
-        abort(); /* transport allocation failure, never permission to run GL here */
+        return; /* invalid complete packet is discarded at its boundary */
     }
     PSXProjectedVertex polygon[12];
     const double left=fmin(s_area_x1, -wide_dx())-1.0;
@@ -7079,16 +7089,17 @@ int gl_renderer_read_display_hires(int x, int y, int w, int h, uint32_t *out,
                                 cap_px, ow, oh);
 }
 
-int gl_renderer_select_texture_bank(uint16_t id) {
-    GL_RT_SYNC("select_texture_bank");
-    uint32_t width, height;
-    const uint16_t* pixels;
+static int select_texture_bank_now(const RthBank *bank) {
+    s_bank_selected_definition=*bank;
+    const uint16_t id=bank->id;
+    const uint32_t width=bank->width,height=bank->height;
+    const uint16_t *pixels=bank->pixels;
     GLint alignment, row_length;
-    s_selected_bank_live_clut = 0;
+    s_selected_bank_live_clut = bank->live_clut;
+    s_selected_bank_failed=0;
     if (!id) { s_selected_bank_tex = 0; return 1; }
     if (!gl_renderer_texture_banks_supported()) return 0;
     if (!s_bank_tex[id]) {
-        pixels = mod_texture_bank_pixels(id, &width, &height);
         if (!pixels) return 0;
         glGenTextures(1, &s_bank_tex[id]);
         p_glActiveTexture(PSXGL_TEXTURE0);
@@ -7114,12 +7125,18 @@ int gl_renderer_select_texture_bank(uint16_t id) {
     return 1;
 }
 
-int gl_renderer_select_texture_bank_live_clut(uint16_t id) {
-    GL_RT_SYNC("select_texture_bank_live_clut");
-    if (!gl_renderer_select_texture_bank(id)) return 0;
-    s_selected_bank_live_clut = id != 0;
-    return 1;
+static int select_texture_bank(uint16_t id,int live_clut) {
+    RthBank bank={.id=id,.live_clut=id && live_clut};
+    if(id) {
+        if(!gl_renderer_texture_banks_supported()) return 0;
+        bank.pixels=mod_texture_bank_pixels(id,&bank.width,&bank.height);
+        if(!bank.pixels) return 0;
+    }
+    if(rth_record_mode()) return rth_record_bank(&bank);
+    return select_texture_bank_now(&bank);
 }
+int gl_renderer_select_texture_bank(uint16_t id) { return select_texture_bank(id,0); }
+int gl_renderer_select_texture_bank_live_clut(uint16_t id) { return select_texture_bank(id,1); }
 
 int gl_renderer_init_context(SDL_Window *win) {
     s_win = win;
@@ -7265,6 +7282,8 @@ void gl_renderer_shutdown(void) {
         gl_renderer_set_bezel(NULL, 0, 0);
     }
     memset(s_bank_tex, 0, sizeof s_bank_tex);
+    memset(&s_bank_selected_definition,0,sizeof s_bank_selected_definition);
+    s_selected_bank_failed=0;
     s_selected_bank_tex = s_tb_bank_tex = 0;
     s_selected_bank_live_clut = s_tb_bank_live_clut = 0;
     if (s_ctx) {
@@ -7539,7 +7558,7 @@ void gl_renderer_restage_vram_after_savestate(void) {
 }
 
 void gl_renderer_set_cpu_auth_dual(int on) {
-    GL_RT_SYNC("set_cpu_auth_dual");
+    RTH_CALLI(gl_renderer_set_cpu_auth_dual,on);
     s_cpu_auth_dual = on ? 1 : 0;
     if (s_cpu_auth_dual) {
         s_gpu_dirty = 0;
@@ -7548,8 +7567,7 @@ void gl_renderer_set_cpu_auth_dual(int on) {
 }
 
 void gl_renderer_set_hd_texture_mode(int on) {
-    /* Drain the GPU-authoritative stream before switching authority. */
-    GL_RT_SYNC("set_hd_texture_mode");
+    RTH_CALLI(gl_renderer_set_hd_texture_mode,on);
     on = on ? 1 : 0;
     s_hd_authority_pending = 0;
     if (on && !s_hd_native_authority && s_rth_a0_open && s_raster_ok) {
@@ -7567,8 +7585,8 @@ void gl_renderer_set_hd_texture_mode(int on) {
         }
     }
     s_hd_native_authority = on;
-    /* An A0 still streaming keeps its hold (s_rth_a0_open): the context was
-     * just taken above, and eligibility keeps it until the commit. */
+    /* A partial presentation upload defers the mode change until its commit.
+     * Native guest authority is independent of this cosmetic mode. */
     /* Smooth motion restarts its lists: their draws resolve textures under
      * the authority they were recorded in. */
     s_fg_broken = 1;
@@ -10229,10 +10247,12 @@ int gl_renderer_pass_async_begin(const GLRenderAsyncToken *token) {
         pgxp_rth_seam_stream_release(&s_async_seam_stream);
         rth_group_flush(); rt_batch_discard(); return 0;
     }
+    rth_frame_state_push();
     return 1;
 }
 int gl_renderer_pass_async_end(const GLRenderAsyncToken *token,int keep) {
     if (!rt_batch_active()) return 0;
+    rth_frame_state_pop();
     s_async_seam_collecting = 0;
     if (!token || token->output.epoch!=s_async_recording.output.epoch ||
         token->output.generation!=s_async_recording.output.generation ||
@@ -11594,18 +11614,7 @@ static int pt_begin(void) {
     SDL_GL_MakeCurrent(s_win, s_ctx);
     memset(s_pts_fbo, 0, sizeof s_pts_fbo);
     memset(s_ptp_fbo, 0, sizeof s_ptp_fbo);
-    PtConfig c = { slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL, 0 };
-    /* A timed output that finds every slot taken waits for the next present
-     * to free one (within its expiry) instead of being dropped. The wait is
-     * capped at PSX_PRESENT_ADMIT_WAIT_MS (default 25, 0 = refuse at once as
-     * before). */
-    {
-        const char *e = getenv("PSX_PRESENT_ADMIT_WAIT_MS");
-        double ms = e && *e ? atof(e) : 25.0;
-        if (ms < 0.0) ms = 0.0;
-        if (ms > 1000.0) ms = 1000.0;
-        c.admit_wait_ns = (uint64_t)(ms * 1e6);
-    }
+    PtConfig c = { slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL };
     if (!pt_start(&c)) {
         fprintf(stdout, "psxrecomp: present thread: start failed; swaps stay on the render thread\n");
         SDL_GL_DeleteContext(s_pt_ctx);
@@ -11661,7 +11670,10 @@ static void gl_present_swap(void) {
             return;
         }
     } else {
-        (void)pt_submit(ready, &done, NULL);
+        if (pt_submit(ready, &done, NULL) < 0) {
+            if (ready) p_glDeleteSync(ready);
+            return;
+        }
     }
     if (done) {
         rthf_gpu_gap(1);
@@ -11694,12 +11706,12 @@ int gl_renderer_present_thread_json(char *out, size_t cap) {
     pt_get_stats(&st);
     return snprintf(out, cap,
         "\"present_thread\":{\"active\":%d,\"slots\":%d,\"submits\":%llu,\"presents\":%llu,"
-        "\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
+        "\"refused\":%llu,\"waits\":%llu,\"wait_ms\":%.3f,\"swap_ms_avg\":%.3f,\"swap_ms_max\":%.3f,"
         "\"queued_high\":%d,\"timed_dropped\":%llu,\"timed_refused\":%llu,"
         "\"timed_waited\":%llu,\"timed_wait_ms\":%.3f,"
         "\"gap_ms_max\":%.3f,\"gaps_over_25ms\":%llu}",
         s_pt_on, st.slots, (unsigned long long)st.submits, (unsigned long long)st.presents,
-        (unsigned long long)st.waits, st.wait_ns / 1e6,
+        (unsigned long long)st.refused, (unsigned long long)st.waits, st.wait_ns / 1e6,
         st.presents ? (double)st.present_ns / (double)st.presents / 1e6 : 0.0,
         st.present_max_ns / 1e6, st.queued_high,
         (unsigned long long)st.timed_dropped, (unsigned long long)st.timed_refused,
@@ -11710,6 +11722,7 @@ static void gl_swap_now(int generated);
 static int  fg_keep_real(void);      /* frame generation */
 static void fg_note_swap(uint64_t ns);
 static void gl_swap_with_osd(void) {
+    if(s_rth_packet_view && !rt_packet_current(s_rth_packet_view)) return;
     openxr_present_native(); /* Copy guest content before host-only overlays. */
     s_native_surface_pending=0; /* Hold-last/resim cannot reuse a native source. */
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -12556,7 +12569,7 @@ static void dyn_context_ready(void) {
 }
 
 void gl_renderer_set_dynamic_resolution(int on) {
-    if (s_ctx) GL_RT_SYNC("set_dynamic_resolution");
+    RTH_CALLI(gl_renderer_set_dynamic_resolution,on);
     s_dyn_on = on ? 1 : 0;
     if (!s_ctx || !s_raster_ok) return;   /* dyn_context_ready decides */
     if (s_dyn_on) {
@@ -13041,10 +13054,46 @@ static const GpuRenderBackend GL_BACKEND = {
  * thread holds the context (rth_mirror_resync). */
 static int s_rthm_wide_w = 0, s_rthm_wide_off = 0;
 static int s_rthm_base[WIDE_MAX_SURF];
-static int s_rthm_area[4] = { 0, 0, VRAM_W - 1, VRAM_H - 1 };
+/* Persistent draw environment on the producer. A frame seed must
+ * not sample the render owner's current state: it may be several frames
+ * behind. Precision overrides are per primitive and remain in its records. */
+typedef struct RthFrameState {
+    int semi[2],mask[2],window,mod[4],dither;
+    int area[4],offset[2],wide[2],view[4],target,target_on;
+    int stream[3];
+    GpuDisplayInfo display;
+    RthBank bank;
+} RthFrameState;
+typedef struct RthPacketSeed {
+    RthFrameState draw;
+    SwNativeTextureState cache;
+    uint16_t pixels[VRAM_W*VRAM_H];
+} RthPacketSeed;
+typedef struct RthPacketInputs {
+    NativeRasterInputs *draws;
+    GpuHdTextureTracking *tracking;
+} RthPacketInputs;
+static RthPacketInputs *s_rth_packet_build;
+static uint64_t s_rth_packet_last_sequence,s_rth_packet_last_epoch;
+static _Atomic uint64_t s_rth_packet_seed_ns,s_rth_packet_seal_ns,s_rth_packet_dispose_ns;
+static RthFrameState s_rth_frame_state={.area={0,0,VRAM_W-1,VRAM_H-1}};
+static RthFrameState s_rth_frame_saved;
+static int s_rth_frame_pass;
+static void rth_frame_state_push(void) {
+    if(s_rth_frame_pass) abort();
+    s_rth_frame_saved=s_rth_frame_state;s_rth_frame_pass=1;
+}
+static void rth_frame_state_pop(void) {
+    if(!s_rth_frame_pass) return;
+    s_rth_frame_state=s_rth_frame_saved;s_rth_frame_pass=0;
+    s_rthm_wide_w=s_rth_frame_state.wide[0];
+    s_rthm_wide_off=s_rth_frame_state.wide[1];
+    s_rthm_cur=s_rth_frame_state.target_on;
+}
 /* Last stream state sent (RTH_STATE); -1 forces the first send. */
 static int s_rthe_flat_bd = -1, s_rthe_vp_w = -1, s_rthe_bg_full = -1;
 static GpuDisplayInfo s_rthe_display;
+static uint64_t s_rthe_native_source,s_rths_native_source;
 static uint64_t s_rth_presents = 0, s_rth_presents_stale = 0;
 
 #define RTHF_PRIM      0x0001u
@@ -13052,14 +13101,81 @@ static uint64_t s_rth_presents = 0, s_rth_presents_stale = 0;
 #define RTHF_BD_SHIFT  2          /* bits 2-3: psx_ws_prim_in_backdrop() 0..3 */
 
 static void rth_mirror_resync(void) {
+    s_rthe_native_source=s_rths_native_source=gr_native_source();
     s_rthm_scale = s_out_scale;
     s_rthm_wide_w = g_wide_w;
     s_rthm_wide_off = g_wide_off;
     s_rthm_cur = g_wide_cur != 0;
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         s_rthm_base[i] = s_wide_fbo[i] ? s_wide_base[i] : -1;
-    s_rthm_area[0] = s_area_x1; s_rthm_area[1] = s_area_y1;
-    s_rthm_area[2] = s_area_x2; s_rthm_area[3] = s_area_y2;
+    RthFrameState *st=&s_rth_frame_state;
+    st->bank=s_bank_selected_definition;
+    st->area[0]=s_area_x1;st->area[1]=s_area_y1;
+    st->area[2]=s_area_x2;st->area[3]=s_area_y2;
+    st->offset[0]=s_off_x;st->offset[1]=s_off_y;
+    st->semi[0]=s_semi_en;st->semi[1]=s_semi_mode;
+    st->mask[0]=s_mask_set;st->mask[1]=s_mask_check;
+    st->window=s_tw_mask_x|(s_tw_mask_y<<5)|(s_tw_off_x<<10)|(s_tw_off_y<<15);
+    st->mod[0]=s_mod_r;st->mod[1]=s_mod_g;st->mod[2]=s_mod_b;st->mod[3]=s_mod_raw;
+    st->dither=s_dither_bit;
+    st->wide[0]=g_wide_w;st->wide[1]=g_wide_off;
+    st->view[0]=view_enabled;st->view[1]=view_shift;
+    st->view[2]=view_pad_left;st->view[3]=view_pad_right;
+    st->target=g_wide_cur_base;st->target_on=g_wide_cur!=0;
+    st->stream[0]=gpu_ws_nw_flat_backdrop_enabled()?1:0;
+    st->stream[1]=gpu_ws_netplay_local_viewport_width();
+    st->stream[2]=gpu_ws_background_requires_full_composite()?1:0;
+    gpu_get_display_info(&st->display);
+    s_rth_frame_pass=0;
+}
+
+static void rth_frame_state_record(uint16_t op,const int32_t *v) {
+    RthFrameState *st=&s_rth_frame_state;
+    switch(op) {
+    case RTH_SEMI: memcpy(st->semi,v,sizeof st->semi);break;
+    case RTH_MASK: memcpy(st->mask,v,sizeof st->mask);break;
+    case RTH_TWIN: st->window=v[0];break;
+    case RTH_MOD: memcpy(st->mod,v,sizeof st->mod);break;
+    case RTH_DITHER: st->dither=v[0];break;
+    case RTH_AREA: memcpy(st->area,v,sizeof st->area);break;
+    case RTH_OFFSET: memcpy(st->offset,v,sizeof st->offset);break;
+    case RTH_WIDE_CONFIGURE:
+        if(v[0]<=0 || st->wide[0]!=v[0]) st->target_on=0;
+        memcpy(st->wide,v,sizeof st->wide);break;
+    case RTH_WIDE_VIEW: memcpy(st->view,v,sizeof st->view);break;
+    case RTH_WIDE_TARGET: st->target=v[0];st->target_on=1;break;
+    case RTH_WIDE_DISABLE: st->target_on=0;break;
+    case RTH_STATE:
+        memcpy(st->stream,v,sizeof st->stream);
+        memcpy(&st->display,v+3,sizeof st->display);break;
+    case RTH_PASS_BEGIN: rth_frame_state_push();break;
+    case RTH_PASS_END: rth_frame_state_pop();break;
+    }
+}
+
+/* A complete packet starts from its producer's draw environment, not the
+ * last packet the renderer happened to consume. Precision/depth overrides
+ * belong to individual primitive records and cannot leak across packets. */
+static void rth_frame_state_apply(const RthFrameState *st) {
+    flush_flat_batch();flush_tex_batch();
+    s_rths_flat_bd=st->stream[0];s_rths_vp_w=st->stream[1];s_rths_bg_full=st->stream[2];
+    s_rths_display=st->display;
+    s_rths_native_source=0;
+    glb_set_precise_triangle(0,0,0,0,0,0,0);
+    glb_set_perspective_triangle(0,0,0,0);
+    glb_set_depth_triangle(0,0,0,0);
+    glb_set_draw_area(st->area[0],st->area[1],st->area[2],st->area[3]);
+    glb_set_draw_offset(st->offset[0],st->offset[1]);
+    glb_set_semi_transparency(st->semi[0],st->semi[1]);
+    glb_set_mask_bits(st->mask[0],st->mask[1]);
+    glb_set_texture_window((uint32_t)st->window);
+    glb_set_color_modulation(st->mod[0],st->mod[1],st->mod[2],st->mod[3]);
+    glb_set_dither(st->dither);
+    glb_wide_configure(st->wide[0],st->wide[1]);
+    glb_wide_set_view(st->view[0],st->view[1],st->view[2],st->view[3]);
+    if(st->target_on) glb_wide_set_target(st->target);
+    else glb_wide_disable_target();
+    s_selected_bank_failed=!select_texture_bank_now(&st->bank);
 }
 
 /* wide_fbo_for() as it will run on the render thread: the same lookup, limit
@@ -13085,9 +13201,17 @@ static int rth_mirror_wide_present_ok(int base_x) {
 
 static int rth_rec_raw(uint16_t op, uint16_t flags, int n, const int32_t *v) {
     int32_t *p = (int32_t *)rt_cmd_begin(op, flags, (uint32_t)n * 4u);
-    if (!p) return rt_batch_active();
+    if (!p) return 1; /* complete packet was rejected; never execute on producer */
     memcpy(p, v, (size_t)n * 4u);
     rt_cmd_commit();
+    return 1;
+}
+static int rth_record_bank(const RthBank *bank) {
+    s_rth_frame_state.bank=*bank;
+    if(!rth_group_flush()) return 0;
+    void* payload=rt_cmd_begin(RTH_BANK,0,sizeof *bank);
+    if(!payload) return 1;
+    memcpy(payload,bank,sizeof *bank);rt_cmd_commit();
     return 1;
 }
 
@@ -13111,6 +13235,7 @@ static int rth_group_flush(void) {
     return rth_rec_raw(RTH_GROUP,0,(int)n,s_rth_group);
 }
 static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
+    rth_frame_state_record(op,v);
     if (s_async_seam_collecting) {
         if (op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI || op==RTH_TEX_TRI ||
             op==RTH_SHADED_TEX_TRI)
@@ -13124,7 +13249,7 @@ static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
         }
     }
     int setup=op==RTH_SEMI || op==RTH_MASK || op==RTH_TWIN || op==RTH_MOD ||
-        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC;
+        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC || op==RTH_NATIVE_SOURCE;
     int triangle=op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI ||
         op==RTH_TEX_TRI || op==RTH_SHADED_TEX_TRI;
     if(!rth_group_on() || (!setup && !triangle) || n<0 || n>508) {
@@ -13144,6 +13269,12 @@ static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
  * and the backdrop gate; sent whenever it changes, before the call that would
  * first observe the change. */
 static void rth_send_state(void) {
+    const uint64_t source=gr_native_source();
+    if(source!=s_rthe_native_source) {
+        int32_t words[2];memcpy(words,&source,sizeof source);
+        rth_rec_ints(RTH_NATIVE_SOURCE,0,2,words);
+        s_rthe_native_source=source;
+    }
     int flat = gpu_ws_nw_flat_backdrop_enabled() ? 1 : 0;
     int vp = gpu_ws_netplay_local_viewport_width();
     int bg = gpu_ws_background_requires_full_composite() ? 1 : 0;
@@ -13172,11 +13303,7 @@ static uint16_t rth_prim_flags(void) {
 }
 
 static int gl_rth_eligible(void) {
-    extern int psx_netplay_active(void);
-    return s_raster_ok && s_ctx && !s_cpu_auth_dual &&
-           (!s_interp_enabled || pass_queued_presenter() || (s_rth_on ? s_pt_on : s_pt_want)) &&
-           (!s_pass_active || pass_queued_enabled()) &&
-           !psx_netplay_active() && !psx_openxr_session_active() &&
+    return s_raster_ok && s_ctx && gr_native_raster() &&
            gr_backend() == GR_BACKEND_OPENGL;
 }
 
@@ -13236,7 +13363,7 @@ static int rth_record_present_data(uint16_t op, int n, const int32_t *v,
     bytes+=pixel_bytes;
     if(!rth_group_flush()) return 0;
     uint8_t *p = (uint8_t *)rt_cmd_begin(op, 0, (uint32_t)bytes);
-    if (!p) return 0;
+    if (!p) return 1; /* failed whole packet; keep presentation off the guest */
     memcpy(p, &hd, sizeof hd);
     uint8_t *q = p + sizeof hd;
     for (int i = 0; i < 4; i++)
@@ -13549,6 +13676,10 @@ typedef struct {
     int semi_en, semi_mode, mask_set, mask_check, tw[4], mod[4];
     int area[4], off[2], wide_on, wide_base, view[4], rths[3];
     GpuDisplayInfo display;
+    RthBank bank;
+    GLuint bank_tex;
+    int bank_live_clut,bank_failed;
+    uint64_t native_source;
 } FgState;
 typedef struct {
     uint8_t  *buf; size_t len, cap;
@@ -13725,6 +13856,9 @@ static void fg_state_capture(FgState *st) {
     st->view[2] = view_pad_left; st->view[3] = view_pad_right;
     st->rths[0] = s_rths_flat_bd; st->rths[1] = s_rths_vp_w; st->rths[2] = s_rths_bg_full;
     st->display=s_rths_display;
+    st->bank=s_bank_selected_definition;st->bank_tex=s_selected_bank_tex;
+    st->bank_live_clut=s_selected_bank_live_clut;st->bank_failed=s_selected_bank_failed;
+    st->native_source=s_rths_native_source;
 }
 
 /* Restore draw state without the setters' side effects (stencil rebuilds,
@@ -13741,6 +13875,9 @@ static void fg_state_apply(const FgState *st, GLuint wide_cur) {
     view_pad_left = st->view[2]; view_pad_right = st->view[3];
     s_rths_flat_bd = st->rths[0]; s_rths_vp_w = st->rths[1]; s_rths_bg_full = st->rths[2];
     s_rths_display=st->display;
+    s_bank_selected_definition=st->bank;s_selected_bank_tex=st->bank_tex;
+    s_selected_bank_live_clut=st->bank_live_clut;s_selected_bank_failed=st->bank_failed;
+    s_rths_native_source=st->native_source;
     s_pc_valid = 0; s_pq_valid = 0; s_projected_uv_valid = 0; s_pz_valid = 0;
 }
 
@@ -13788,6 +13925,7 @@ static int fg_op_kept(uint16_t op) {
     case RTH_TEX_RECT_SCALED: case RTH_LINE: case RTH_SHADED_LINE: case RTH_AREA:
     case RTH_OFFSET: case RTH_WIDE_VIEW: case RTH_WIDE_TARGET: case RTH_WIDE_DISABLE:
     case RTH_WIDE_CLEAR: case RTH_WIDE_CLEAR_MARGINS: case RTH_PROJ_TRI: case RTH_STATE:
+    case RTH_BANK: case RTH_NATIVE_SOURCE:
         return 1;
     default:
         return 0;
@@ -14262,7 +14400,14 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         s_rthx_backdrop = (h.flags >> RTHF_BD_SHIFT) & 3;
         const int area[4] = { s_area_x1, s_area_y1, s_area_x2, s_area_y2 };
         const int in = !s_fg_replay_objects_only && fg_area_meets(area, disp);
+        if(s_selected_bank_failed && (h.op==RTH_TEX_TRI || h.op==RTH_SHADED_TEX_TRI ||
+           h.op==RTH_TEX_RECT || h.op==RTH_TEX_RECT_SCALED)) continue;
         switch (h.op) {
+        case RTH_NATIVE_SOURCE: memcpy(&s_rths_native_source,v,sizeof s_rths_native_source);break;
+        case RTH_BANK: {
+            RthBank bank;if(h.bytes!=sizeof bank) abort();memcpy(&bank,pl,sizeof bank);
+            s_selected_bank_failed=!select_texture_bank_now(&bank);break;
+        }
         case RTH_SEMI:    glb_set_semi_transparency(v[0], v[1]); break;
         case RTH_DITHER:  glb_set_dither(v[0]); break;
         case RTH_MASK:    glb_set_mask_bits(v[0], v[1]); break;
@@ -16103,12 +16248,10 @@ static void rtb_init(uint16_t *vram) {
     if (s_rth_on) s_rth_vram_pub = vram;
     s_rth_a0_open = 0;   /* a reset abandons an incomplete A0 */
     if(s_rth_on && !rt_on_render_thread() && !rt_held()) {
-        if(!rth_group_flush()) abort();
-        const size_t bytes=(size_t)VRAM_W*VRAM_H*sizeof(uint16_t);
-        void *p=rt_cmd_begin(RTH_INIT,0,(uint32_t)bytes);
-        if(!p) abort();
-        memcpy(p,vram,bytes);
-        rt_cmd_commit();
+        s_rth_group_n=0;
+        native_raster_inputs_enable(gr_native_raster(),1);
+        gl_renderer_pass_async_invalidate();
+        rt_invalidate();
     } else if(s_rth_on) {
         memcpy(s_rth_vram_priv,vram,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
         glb_init(s_rth_vram_priv);
@@ -16228,8 +16371,7 @@ static void rtb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d) 
             rt_cmd_commit();
             return;
         }
-        if (rt_batch_active()) return;
-        abort(); /* allocation failure; uploads never migrate GL ownership */
+        return; /* invalid complete packet is discarded at its boundary */
     }
     glb_vram_transfer_in(x, y, w, h, d);
 }
@@ -16278,7 +16420,6 @@ static void rtb_vram_transfer_out(int x, int y, int w, int h, uint16_t *d) {
     GL_RT_SYNC("vram_transfer_out"); glb_vram_transfer_out(x, y, w, h, d); }
 static void rtb_set_draw_area(int x1, int y1, int x2, int y2) {
     if (rth_record_mode()) {
-        s_rthm_area[0] = x1; s_rthm_area[1] = y1; s_rthm_area[2] = x2; s_rthm_area[3] = y2;
         RTH_REC(RTH_AREA, 0, x1, y1, x2, y2);
         return;
     }
@@ -16286,7 +16427,8 @@ static void rtb_set_draw_area(int x1, int y1, int x2, int y2) {
 }
 static void rtb_get_draw_area(int *x1, int *y1, int *x2, int *y2) {
     if (s_rth_on && !rt_on_render_thread() && !rt_held()) {
-        *x1 = s_rthm_area[0]; *y1 = s_rthm_area[1]; *x2 = s_rthm_area[2]; *y2 = s_rthm_area[3];
+        *x1=s_rth_frame_state.area[0];*y1=s_rth_frame_state.area[1];
+        *x2=s_rth_frame_state.area[2];*y2=s_rth_frame_state.area[3];
         return;
     }
     glb_get_draw_area(x1, y1, x2, y2);
@@ -16516,6 +16658,17 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         rth_publish_diagnostics();
         return;
     }
+    if(c->op==RTH_BANK) {
+        if(c->payload!=sizeof(RthBank)) abort();
+        if(s_fg_on) fg_capture(c,payload);
+        RthBank bank;memcpy(&bank,payload,sizeof bank);
+        s_selected_bank_failed=!select_texture_bank_now(&bank);
+        return;
+    }
+    /* Match a refused synchronous bank allocation: its textured primitive
+     * is not drawn using some unrelated previously selected texture. */
+    if(s_selected_bank_failed && (c->op==RTH_TEX_TRI || c->op==RTH_SHADED_TEX_TRI ||
+       c->op==RTH_TEX_RECT || c->op==RTH_TEX_RECT_SCALED)) return;
     if (s_pass_dead && c->op != RTH_PASS_END && c->op != RTH_FRAME &&
         c->op != RTH_PRESENT_VRAM && c->op != RTH_PRESENT_WIDE &&
         c->op != RTH_PRESENT_CPU && c->op != RTH_PRESENT_BLANK && c->op != RTH_PRESENT_HOLD) {
@@ -16539,6 +16692,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
     if (agpu_op_open) agpu_op_begin(c->op);
     switch (c->op) {
     case RTH_SEMI:      glb_set_semi_transparency(v[0], v[1]); break;
+    case RTH_NATIVE_SOURCE: memcpy(&s_rths_native_source,v,sizeof s_rths_native_source);break;
     case RTH_DITHER:    glb_set_dither(v[0]); break;
     case RTH_MASK:      glb_set_mask_bits(v[0], v[1]); break;
     case RTH_TWIN:      glb_set_texture_window((uint32_t)v[0]); break;
@@ -16803,6 +16957,132 @@ static void gl_rth_ctx(void *user, int current) {
     }
 }
 
+static void rth_packet_dispose(void *data) {
+    RthPacketInputs *inputs=data;
+    if(!inputs) return;
+    uint64_t begin=pt_clock_ns();
+    native_raster_inputs_destroy(inputs->draws);
+    gpu_hd_textures_free_tracking(inputs->tracking);
+    free(inputs);
+    atomic_fetch_add(&s_rth_packet_dispose_ns,pt_clock_ns()-begin);
+}
+static int rth_packet_begin(void *user,FrameOwner *owner,uint64_t sequence) {
+    (void)user;
+    uint64_t begin=pt_clock_ns();
+    rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
+    RthPacketSeed *seed=NULL;
+    if(!frame_owner_reserve_initial(owner,sequence,sizeof *seed,(void **)&seed)) return 0;
+    NativeRaster *native=gr_native_raster();
+    if(!native) { frame_owner_cancel(owner);return 0; }
+    gr_flush_native_upload();
+    RthPacketInputs *inputs=calloc(1,sizeof *inputs);
+    if(!inputs) { frame_owner_cancel(owner);return 0; }
+    if(gpu_hd_textures_active()) {
+        inputs->tracking=gpu_hd_textures_capture_native(seed->pixels,&seed->cache);
+        if(!inputs->tracking) { free(inputs);frame_owner_cancel(owner);return 0; }
+    } else native_raster_checkpoint(native,seed->pixels,NULL,&seed->cache);
+    seed->draw=s_rth_frame_state;
+    seed->draw.stream[0]=gpu_ws_nw_flat_backdrop_enabled()?1:0;
+    seed->draw.stream[1]=gpu_ws_netplay_local_viewport_width();
+    seed->draw.stream[2]=gpu_ws_background_requires_full_composite()?1:0;
+    gpu_get_display_info(&seed->draw.display);
+    s_rth_packet_build=inputs;
+    /* First primitive must carry its source even if the previous packet
+     * ended on the same host-only source identity. */
+    s_rthe_native_source=UINT64_MAX;
+    atomic_fetch_add(&s_rth_packet_seed_ns,pt_clock_ns()-begin);
+    return 1;
+}
+static int rth_packet_seal(void *user,FrameOwner *owner) {
+    (void)user;
+    uint64_t begin=pt_clock_ns();
+    gr_flush_native_upload();
+    NativeRasterInputs *draws=native_raster_inputs_seal(gr_native_raster());
+    atomic_fetch_add(&s_rth_packet_seal_ns,pt_clock_ns()-begin);
+    RthPacketInputs *inputs=s_rth_packet_build;s_rth_packet_build=NULL;
+    if(!inputs || !native_raster_inputs_valid(draws)) {
+        native_raster_inputs_destroy(draws);rth_packet_dispose(inputs);return 0;
+    }
+    inputs->draws=draws;
+    size_t bytes=sizeof *inputs+native_raster_inputs_bytes(draws)+
+                 gpu_hd_textures_tracking_bytes(inputs->tracking);
+    if(!frame_owner_attach(owner,inputs,bytes,rth_packet_dispose)) {
+        rth_packet_dispose(inputs);return 0;
+    }
+    return 1;
+}
+/* Exact native pixels are for CPU-side texture keys/coherence. The enhanced
+ * surfaces and their render-to-texture pack remain presentation-owned; do
+ * not overwrite an enhanced render target with a native tile per primitive. */
+static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source) {
+    if(!source) return 1;
+    NativeRasterTile tiles[128];
+    int count=native_raster_inputs_get(inputs->draws,source,tiles,128);
+    if(count<0) return 0;
+    if(!count) return 1;
+    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+    for(int t=0;t<count;++t)
+        for(unsigned row=0;row<64;++row)
+            memcpy(s_rth_vram_priv+(tiles[t].y+row)*VRAM_W+tiles[t].x,
+                   tiles[t].pixels+row*64,64*sizeof(uint16_t));
+    const GpuHdTextureTracking *tracking=native_raster_inputs_metadata(inputs->draws,source);
+    return !tracking || gpu_hd_textures_apply_tracking(tracking);
+}
+static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,const void *payload) {
+    if(s_rth_packet_view && !rt_packet_current(s_rth_packet_view)) return 0;
+    if(command->op==RTH_GROUP) {
+        const int32_t *words=payload;
+        unsigned count=command->payload/4u,at=0;
+        while(at+2<=count) {
+            uint32_t id=(uint32_t)words[at],n=(uint32_t)words[at+1];
+            if(n>count-at-2 || (uint16_t)id==RTH_GROUP) return 0;
+            RtCmd inner={sizeof(RtCmd)+n*4u,(uint16_t)id,(uint16_t)(id>>16),n*4u,command->seq};
+            if(!rth_packet_record(inputs,&inner,words+at+2)) return 0;
+            at+=n+2;
+        }
+        return at==count;
+    }
+    if(command->op==RTH_NATIVE_SOURCE) {
+        uint64_t source;
+        if(command->payload!=sizeof source) return 0;
+        memcpy(&source,payload,sizeof source);
+        if(!rth_packet_native_input(inputs,source)) return 0;
+    }
+    gl_rth_exec(NULL,command,payload);return 1;
+}
+static void rth_packet_execute(void *user,const FramePacketView *packet) {
+    (void)user;
+    if(packet->initial_bytes!=sizeof(RthPacketSeed) || !packet->attachment) return;
+    const RthPacketSeed *seed=packet->initial;
+    const RthPacketInputs *inputs=packet->attachment;
+    s_rth_packet_replaying=1;s_rth_packet_view=packet;
+    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+    memcpy(s_rth_vram_priv,seed->pixels,sizeof seed->pixels);
+    rth_rebind_vram(s_rth_vram_priv);
+    sw_native_texture_load(&seed->cache);
+    if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
+    if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence!=s_rth_packet_last_sequence+1) {
+        gl_renderer_restage_vram_after_savestate();
+        fg_invalidate();
+    }
+    rth_frame_state_apply(&seed->draw);
+    const uint8_t *records=packet->records;
+    for(size_t at=0;at<packet->record_bytes;) {
+        const RtCmd *command=(const RtCmd *)(records+at);
+        if(!rt_packet_current(packet) || !rth_packet_record(inputs,command,command+1)) goto done;
+        at+=command->size;
+    }
+    s_rth_packet_last_epoch=packet->epoch;
+    s_rth_packet_last_sequence=packet->sequence;
+done:
+    s_rth_packet_view=NULL;s_rth_packet_replaying=0;
+}
+static void rth_packet_reset(void *user,uint64_t epoch) {
+    (void)user;(void)epoch;
+    fg_invalidate();gl_renderer_invalidate_present();
+    s_rth_packet_last_sequence=s_rth_packet_last_epoch=0;
+}
+
 /* ---- lifecycle / public ---------------------------------------------------- */
 extern void gr_refresh_backend(void);   /* gpu_render.c */
 
@@ -16826,13 +17106,19 @@ int gl_renderer_render_thread_start(int max_frames) {
     rth_rebind_vram(priv);
     rth_publish_diagnostics();
     s_rth_on = 1;
-    RtConfig cfg;
+    RtConfig cfg={0};
     cfg.ring_bytes = (size_t)32u << 20;
     cfg.max_frames = max_frames < 1 ? 1 : max_frames > 8 ? 8 : max_frames;
     cfg.exec = gl_rth_exec;
     cfg.ctx = gl_rth_ctx;
     cfg.user = NULL;
     cfg.tick = fg_tick;
+    cfg.initial_limit=(size_t)128<<20;
+    cfg.begin_frame=rth_packet_begin;
+    cfg.seal_frame=rth_packet_seal;
+    cfg.execute_frame=rth_packet_execute;
+    cfg.reset_frame=rth_packet_reset;
+    native_raster_inputs_enable(gr_native_raster(),1);
     fg_invalidate();
     (void)pt_begin();   /* [video] present_thread; falls back to direct swaps */
     if ((s_interp_enabled && !s_pt_on) || !rt_start(&cfg)) {
@@ -16842,6 +17128,7 @@ int gl_renderer_render_thread_start(int max_frames) {
         rth_rebind_vram(s_rth_vram_pub);
         free(priv);
         s_rth_vram_priv = NULL;
+        native_raster_inputs_enable(gr_native_raster(),0);
         return 0;
     }
     gr_refresh_backend();
@@ -16852,6 +17139,8 @@ void gl_renderer_render_thread_stop(void) {
     if (!s_rth_on) return;
     rth_group_flush();
     rt_stop();                       /* drains; the context is current here again */
+    native_raster_inputs_enable(gr_native_raster(),0);
+    rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
     pt_end();
     /* Preserve the presentation mirror across renderer shutdown/restart.
      * This is lifecycle storage, never guest VRAM publication. */
@@ -16874,11 +17163,6 @@ int gl_renderer_render_thread_active(void) { return s_rth_on; }
 void gl_renderer_render_thread_frame_boundary(void) {
     if (!s_rth_on) return;
     fg_note_guest_frame();
-    if (rt_held()) {
-        if (gl_rth_eligible()) gl_rth_release();
-    } else if (!gl_rth_eligible()) {
-        gl_rth_acquire("ineligible");
-    }
     /* The render thread's per-frame cost (dynamic resolution) ends here. */
     int need_frame=atomic_load_explicit(&s_rthf_want,memory_order_relaxed) || s_fg_on;
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -16920,6 +17204,12 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
                       i ? "," : "", (unsigned long long)ev[i].frame, ev[i].wait_ns / 1e3,
                       ev[i].reason);
     if (k > 0 && (size_t)k < cap) k += snprintf(out + k, cap - (size_t)k, "],");
+    if (k > 0 && (size_t)k < cap) k += snprintf(out+k,cap-(size_t)k,
+        "\"frames_replaced\":%llu,\"frames_rejected\":%llu,\"owner_delay_ms\":%u,"
+        "\"packet_seed_ms\":%.3f,\"packet_seal_ms\":%.3f,\"packet_dispose_ms\":%.3f,",
+        (unsigned long long)st.frames_replaced,(unsigned long long)st.frames_rejected,st.owner_delay_ms,
+        atomic_load(&s_rth_packet_seed_ns)*1e-6,atomic_load(&s_rth_packet_seal_ns)*1e-6,
+        atomic_load(&s_rth_packet_dispose_ns)*1e-6);
     if (k > 0 && (size_t)k < cap) k += gl_renderer_present_thread_json(out + k, cap - (size_t)k);
     return k;
 }

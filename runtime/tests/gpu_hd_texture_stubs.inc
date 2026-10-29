@@ -5,6 +5,12 @@ static int test_title_profile_active, test_title_profile_banks;
 int psx_mod_netplay_is_active(void) { return test_title_profile_active; }
 int psx_mod_netplay_requires_texture_banks(void) { return test_title_profile_banks; }
 #ifndef PSX_TEST_HD_TEXTURE_PACK
+GpuHdTextureTracking *gpu_hd_textures_capture_native(uint16_t *vram,SwNativeTextureState *cache) {
+    (void)vram;(void)cache;return NULL;
+}
+void gpu_hd_textures_free_tracking(GpuHdTextureTracking *tracking) { (void)tracking; }
+size_t gpu_hd_textures_tracking_bytes(const GpuHdTextureTracking *tracking) { (void)tracking;return 0; }
+int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking *tracking) { return tracking==NULL; }
 #ifndef PSX_TEST_HD_TRACKING
 uint64_t gpu_hd_textures_tracking_generation(void) { return 0; }
 int gpu_hd_textures_invalidation_changes(int x,int y,int w,int h) {

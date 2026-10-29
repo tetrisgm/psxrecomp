@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from gl_frame_owner_build import build_frame_owner, cxx_compiler
 
 MAC_FRAMEWORKS = ["Cocoa", "OpenGL", "IOKit", "CoreVideo", "CoreAudio", "AudioToolbox",
                   "Carbon", "ForceFeedback", "GameController", "Metal", "QuartzCore",
@@ -53,12 +54,15 @@ def parse(stdout):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cc", default="cc")
+    ap.add_argument("--cxx")
     ap.add_argument("--sdl-include", required=True)
     ap.add_argument("--sdl-library", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--fixture", type=pathlib.Path)
     ap.add_argument("--scales", default="1,3")
     ap.add_argument("--frames", default="24")
+    ap.add_argument("--bank-pgxp-only", action="store_true",
+                    help="immutable-bank replay endpoints with depth, colour and seams enabled")
     args = ap.parse_args()
     sdl_includes = [str(pathlib.Path(d).resolve()) for d in args.sdl_include.split(";") if d]
     args.sdl_library = str(pathlib.Path(args.sdl_library).resolve())
@@ -70,12 +74,13 @@ def main():
     print("Evidence directory:", dest)
     receipt = []
 
-    def run(command):
+    def run(command, env=None):
         command = [str(c) for c in command]
         r = subprocess.run(command, cwd=dest, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", env=env)
         receipt.append({"cmd": command, "exit": r.returncode,
-                        "stdout": r.stdout, "stderr": r.stderr[-4000:]})
+                        "stdout": r.stdout, "stderr": r.stderr[-4000:],
+                        "env": {k: v for k, v in (env or {}).items() if k.startswith("FG_")}})
         (dest / "receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
         return r
 
@@ -107,7 +112,12 @@ def main():
             return 2
         objs.append(o)
     probe = dest / ("probe.exe" if WINDOWS else "probe")
-    link = [args.cc, *objs, args.sdl_library, "-o", probe]
+    cxx = cxx_compiler(args.cc, args.cxx)
+    owner_objects = build_frame_owner(run, cxx, src, dest, ["-O1", *sections, *includes])
+    if owner_objects is None:
+        return 2
+    objs += owner_objects
+    link = [cxx, *objs, args.sdl_library, "-o", probe]
     if platform.system() == "Darwin":
         for f in MAC_FRAMEWORKS:
             link += ["-framework", f]
@@ -123,6 +133,27 @@ def main():
         return 2
 
     ok = True
+    if args.bank_pgxp_only:
+        env = dict(os.environ, FG_TEST_BANK="1", FG_PGXP="depth,color,seam", FG_RP_DEPTH="1")
+        for scale in [int(v) for v in args.scales.split(",") if v]:
+            for path in ("vram", "wide"):
+                results = []
+                for fg in (0, 1):
+                    r = run([probe, scale, fg, path, args.frames, "flip"], env)
+                    if r.returncode == SKIP_EXIT:
+                        return SKIP_EXIT
+                    parsed = parse(r.stdout)
+                    print(f"bank PGXP scale={scale} path={path} generation={fg} exit={r.returncode}",
+                          r.stdout.strip().splitlines()[-5:], r.stderr[-1000:])
+                    generated = re.search(r"^presents=(\d+) generated=(\d+)$", r.stdout, re.M)
+                    if (r.returncode or parsed["failures"] != 0 or parsed["real"] is None or
+                        not generated or (fg and int(generated[2]) == 0)):
+                        ok = False
+                    results.append(parsed["real"])
+                if results[0] != results[1]:
+                    print("FAIL: bank replay changed real images", results)
+                    ok = False
+        return 0 if ok else 1
     first = True
     for s in [int(v) for v in args.scales.split(",") if v]:
         for path, timing in (("vram", "flip"), ("wide", "flip"), ("vram", "late"), ("wide", "late")):
