@@ -1363,6 +1363,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
         int64_t cy16 = sy16 < -kLim ? -kLim : (sy16 > kLim - 1 ? kLim - 1 : sy16);
         int32_t px16 = (int32_t)cx16, py16 = (int32_t)cy16;
         bool unclamped_projection = false;
+        bool exact_projection = false;
         /* Preserve projection precision (G1.11): shadow the exact projection
          * instead when the vertex qualifies and it lies inside the GPU's
          * truncation-agreement window; outside it the IR path's shadow is
@@ -1377,12 +1378,19 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
                                      gte->OFX, gte->OFY, x_num, x_den, &ex16, &ey16);
             if (precise == 2 || (precise == 1 &&
                 GTE_PGXP(gte, ppp_accept, ex16, ey16, (uint32_t)gte->SXY[2]))) {
+                exact_projection = true;
                 unclamped_projection = precise == 2;
                 px16 = ex16;
                 py16 = ey16;
             }
         }
         GTE_PGXP(gte, gte_push_sxy, px16, py16, gte->SZ[3], (uint32_t)gte->SXY[2]);
+        uint32_t audit = exact_projection ? PGXP_AUDIT_EXACT : 0u;
+        if ((mac1 >> shift) != gte->IR1 || (mac2 >> shift) != gte->IR2) audit |= PGXP_AUDIT_IR;
+        if ((mac3 >> 12) != gte->SZ[3]) audit |= PGXP_AUDIT_SZ;
+        if (gte_h_scaled(gte) >= 2u * gte->SZ[3]) audit |= PGXP_AUDIT_DIVIDE;
+        if (sx < -1024 || sx > 1023 || sy < -1024 || sy > 1023) audit |= PGXP_AUDIT_SXY;
+        GTE_PGXP(gte, gte_mark_audit, audit);
         if (unclamped_projection) GTE_PGXP(gte, gte_mark_unclamped, (uint32_t)(mac3 >> 12));
         if (!proj_override && GTE_PGXP0(gte, projection_tracking) && shift == 12 && !lm) {
             const double z = (double)(mac3 >> 12);

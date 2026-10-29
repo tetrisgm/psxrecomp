@@ -96,10 +96,26 @@ image in each burst, native images, and nonempty normalized PGXP streams.
 Transient load notifications must expire before capture. The R4
 `--require-effects` gate also requires the Car Effects draw counter to advance.
 
-The R4 harness also accepts `--particle-car 0` as a negative pause test. The
-current title effect advances forced particles while paused, outside the generic
-PGXP renderer; this produces image changes with identical native/PGXP streams.
-That failure must not be suppressed by changing precision or holding the image.
+The R4 harness accepts `--particle-car 0` to inject a visible forced burst
+and require it to freeze during pause, with zero simulation updates. The title
+mod now passes this gate, including deterministic replay and accepted rewind.
+
+### Explained accuracy exclusions
+
+`pgxp_frame` retains raw `over_one_pixel` and adds mutually exclusive producer-
+provenance classes: `over_one_ir_sz`, `over_one_ir`, `over_one_sz`,
+`over_one_fraction`, `over_one_divide`, `over_one_sxy`, `over_one_unexplained`.
+Only the first four, tagged as qualified exact projections at RTPS/RTPT, are
+excluded from the one-pixel integer comparison. Recovering IR/SZ saturation and
+MAC fractions is the purpose of exact projection; its analytical error relative
+to the truncated integer path is not bounded by one pixel. For example,
+MAC1=4095, MAC3=151*4096, H=300 gives precise X=1.98627 vs integer X=0.
+Unknown/derived provenance, divide overflow, and screen-clamp differences fail.
+Partial writes and mismatches clear diagnostic provenance alongside projection
+provenance. Tags are diagnostic only and never alter acceptance or rendering.
+R4's matched scene is 324 IR-saturation recoveries + 518 fractional projections;
+all other >1-pixel classes are zero. Regressions cover actual GTE production,
+classification, intact propagation, and noninheritance by a later untagged push.
 
 An additional `PGXP_AUDIT_SCALE=18` fixture run covers the 8K internal scale.
 The Windows test runner prepends the selected compiler's directory to PATH so

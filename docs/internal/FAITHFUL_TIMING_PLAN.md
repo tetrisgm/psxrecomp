@@ -213,6 +213,12 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- 2026-10-29: Phase-3b continuation adds diagnostic-only GTE projection
+  provenance and per-frame accuracy classes. Matched R4 scene: 324 IR saturation
+  recoveries, 518 exact fractional projections, zero unexplained. Guest timing,
+  integer results and presentation scheduling unchanged; focused GTE/PGXP suites
+  pass. See `docs/PGXP_AUDIT.md`.
+
 - **2026-10-28 (`feat/frame-arch-1-native-authority`, in progress):** Separate
   software-raster contexts and an independent CPU native queue now have fixture
   coverage for ownership isolation, masks/CLUTs/wrapping, queue ordering,

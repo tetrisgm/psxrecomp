@@ -168,6 +168,13 @@ void pgxp_suppress_end(void);
  * sees. Shifts the shadow FIFO exactly like push_sxy (regs 12..15). */
 /* Tag only immediately after push_sxy of a qualified unclamped projection. */
 void pgxp_gte_mark_unclamped(uint32_t depth);
+/* Diagnostic provenance, attached only to an intact GTE-produced word. */
+enum {
+    PGXP_AUDIT_EXACT = 1u << 7, PGXP_AUDIT_IR = 1u << 8,
+    PGXP_AUDIT_SZ = 1u << 9, PGXP_AUDIT_DIVIDE = 1u << 10,
+    PGXP_AUDIT_SXY = 1u << 11, PGXP_AUDIT_MASK = 0xF80u
+};
+void pgxp_gte_mark_audit(uint32_t reasons);
 /* Full positive MAC3 depth of an intact, validated exact-projection word;
  * zero when unavailable. The legacy SZ APIs keep their hardware u16 value. */
 float pgxp_get_unclamped_depth(uint32_t addr, uint32_t word);
@@ -238,6 +245,8 @@ typedef struct PGXPStats {
     uint64_t depth_only;         /* tolerance-clamped to native, depth kept   */
     uint64_t over_one_pixel;     /* accepted precise position >1 native px from integer */
     uint64_t over_one_unclamped, over_one_derived, over_one_projected;
+    uint64_t over_one_ir_sz, over_one_ir, over_one_sz, over_one_fraction;
+    uint64_t over_one_divide, over_one_sxy, over_one_unexplained;
     uint64_t invalidations;
     uint64_t w_valid;            /* lookups that also carried a usable depth */
     uint64_t produced;           /* RTPS/RTPT projections pushed into shadows */

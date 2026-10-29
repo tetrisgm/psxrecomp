@@ -200,6 +200,7 @@ typedef struct PGXPFrameAudit {
     uint64_t lookups, native, value_mismatch, trunc_reject;
     uint64_t tolerance_reject, depth_only, over_one_pixel;
     uint64_t over_one_unclamped, over_one_derived, over_one_projected, invalidations;
+    uint64_t over_one_ir_sz, over_one_ir, over_one_sz, over_one_fraction, over_one_divide, over_one_sxy, over_one_unexplained;
     uint64_t word_lookups, word_hit, word_untracked, word_mismatch;
     uint64_t word_partial, word_no_z;
 } PGXPFrameAudit;
@@ -221,6 +222,14 @@ static void pgxp_frame_audit_capture(uint64_t frame) {
     PGXP_FRAME_DELTA(over_one_unclamped);
     PGXP_FRAME_DELTA(over_one_derived);
     PGXP_FRAME_DELTA(over_one_projected);
+    PGXP_FRAME_DELTA(over_one_ir_sz);
+    PGXP_FRAME_DELTA(over_one_ir);
+    PGXP_FRAME_DELTA(over_one_sz);
+    PGXP_FRAME_DELTA(over_one_fraction);
+    PGXP_FRAME_DELTA(over_one_divide);
+    PGXP_FRAME_DELTA(over_one_sxy);
+    PGXP_FRAME_DELTA(over_one_unexplained);
+
     PGXP_FRAME_DELTA(invalidations);
     PGXP_FRAME_DELTA(word_lookups);
     PGXP_FRAME_DELTA(word_hit);
@@ -5975,6 +5984,7 @@ static void handle_pgxp_frame(int id, const char *json)
              "\"value_mismatch\":%llu,\"trunc_reject\":%llu,"
              "\"tolerance_reject\":%llu,\"depth_only\":%llu,"
              "\"over_one_pixel\":%llu,\"over_one_unclamped\":%llu,\"over_one_derived\":%llu,"
+             "\"over_one_ir_sz\":%llu,\"over_one_ir\":%llu,\"over_one_sz\":%llu,\"over_one_fraction\":%llu,\"over_one_divide\":%llu,\"over_one_sxy\":%llu,\"over_one_unexplained\":%llu,"
              "\"over_one_projected\":%llu,\"invalidations\":%llu,\"w\":{\"lookups\":%llu,"
              "\"valid\":%llu,\"untracked\":%llu,\"mismatch\":%llu,"
              "\"partial\":%llu,\"no_z\":%llu}}",
@@ -5987,6 +5997,13 @@ static void handle_pgxp_frame(int id, const char *json)
              (unsigned long long)r->over_one_pixel,
              (unsigned long long)r->over_one_unclamped,
              (unsigned long long)r->over_one_derived,
+             (unsigned long long)r->over_one_ir_sz,
+             (unsigned long long)r->over_one_ir,
+             (unsigned long long)r->over_one_sz,
+             (unsigned long long)r->over_one_fraction,
+             (unsigned long long)r->over_one_divide,
+             (unsigned long long)r->over_one_sxy,
+             (unsigned long long)r->over_one_unexplained,
              (unsigned long long)r->over_one_projected,
              (unsigned long long)r->invalidations,
              (unsigned long long)r->word_lookups,

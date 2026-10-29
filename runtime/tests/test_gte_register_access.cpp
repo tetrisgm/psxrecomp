@@ -1322,6 +1322,32 @@ int test_preserve_projection_is_shadow_only() {
     return 0;
 }
 
+int test_projection_audit_provenance() {
+    gte_precision_tracking_set(1);
+    pgxp_set_enabled(1);
+    pgxp_set_preserve_projection(1);
+    pgxp_set_tolerance(-1.0f);
+    /* Analytic MAC fraction: 4095/4096 * 300/151 = 1.98627, integer IR=0. */
+    CPUState cpu{};
+    cpu.gte_ctrl[0] = 4095;
+    cpu.gte_ctrl[7] = 151;
+    cpu.gte_ctrl[26] = 300;
+    cpu.gte_data[0] = 1;
+    gte_execute(&cpu, 0x80001);
+    const uint32_t word = cpu.gte_data[14];
+    CHECK(word == 0);
+    pgxp_store_gte_reg(0x80005000, 14);
+    PGXPStats a{}, b{};
+    pgxp_get_stats(&a);
+    int32_t x,y; uint16_t z;
+    CHECK(pgxp_get_precise_vertex(0x80005000,word,0,0,&x,&y,&z));
+    pgxp_get_stats(&b);
+    CHECK(b.over_one_fraction == a.over_one_fraction + 1);
+    CHECK(b.over_one_unexplained == a.over_one_unexplained);
+    CHECK(x > 65536 && x < 2*65536);
+    return 0;
+}
+
 int test_projection_scale() {
     double value = 2;
     for (const char* bad : {"", "nan", "inf", "9", "0", "-1", "2junk", "1e999", "1e-999"}) {
@@ -1560,6 +1586,7 @@ int main() {
     if (int rc = test_precision_speculative_transaction()) return rc;
     if (int rc = test_pgxp_probe_does_not_count_geometry_lookup()) return rc;
     if (int rc = test_preserve_projection_is_shadow_only()) return rc;
+    if (int rc = test_projection_audit_provenance()) return rc;
     if (int rc = test_pgxp_culling()) return rc;
     if (int rc = test_render_view_parallax()) return rc;
     if (int rc = test_render_pose()) return rc;

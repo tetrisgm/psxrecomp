@@ -76,6 +76,7 @@ int  pgxp_ctx_project_precise(PgxpCtxEngine *e, int64_t mac1, int64_t mac2, int6
                               int64_t x_den, int32_t *x16, int32_t *y16);
 int  pgxp_ctx_ppp_accept(PgxpCtxEngine *e, int32_t x16, int32_t y16, uint32_t packed);
 void pgxp_ctx_gte_push_sxy(PgxpCtxEngine *e, int32_t x16, int32_t y16, uint16_t sz3, uint32_t packed);
+void pgxp_ctx_gte_mark_audit(PgxpCtxEngine *e, uint32_t reasons);
 void pgxp_ctx_gte_mark_unclamped(PgxpCtxEngine *e, uint32_t depth);
 void pgxp_ctx_gte_set_projection(PgxpCtxEngine *e, const PGXPProjection *projection);
 int  pgxp_ctx_get_gte_sxy_checked(PgxpCtxEngine *e, uint32_t index, uint32_t expect,

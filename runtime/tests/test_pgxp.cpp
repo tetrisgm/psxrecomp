@@ -604,6 +604,31 @@ int main(void) {
                                   0,0,1,1,&x,&y)==1);
         CHECK(x==(int32_t)std::floor((4095.0/4096.0)*300.0/151.0*65536.0));
         CHECK(x>65536 && x<2*65536 && y==0);
+        const int saved_preserve = pgxp_preserve_projection();
+        const float saved_tolerance = pgxp_tolerance();
+        pgxp_set_preserve_projection(1);
+        pgxp_set_tolerance(-1.0f);
+        /* Produce a qualified exact projection and attach its provenance. */
+        CHECK(pgxp_project_precise(4095,0,151*4096,12,0,0,151,300,
+                                  0,0,1,1,&x,&y)==1);
+        CHECK(pgxp_ppp_accept(x,y,0));
+        pgxp_gte_push_sxy(x,y,151,0);
+        pgxp_gte_mark_audit(PGXP_AUDIT_EXACT);
+        pgxp_store_gte_reg(0x80005000,14);
+        PGXPStats a{}, b{};
+        pgxp_get_stats(&a);
+        int32_t px,py; uint16_t z;
+        CHECK(pgxp_get_precise_vertex(0x80005000,0,0,0,&px,&py,&z));
+        pgxp_get_stats(&b);
+        CHECK(b.over_one_fraction==a.over_one_fraction+1);
+        /* An untagged next push must not inherit the preceding classification. */
+        pgxp_gte_push_sxy(x,y,151,0);
+        pgxp_store_gte_reg(0x80005000,14);
+        CHECK(pgxp_get_precise_vertex(0x80005000,0,0,0,&px,&py,&z));
+        pgxp_get_stats(&a);
+        CHECK(a.over_one_unexplained==b.over_one_unexplained+1);
+        pgxp_set_preserve_projection(saved_preserve);
+        pgxp_set_tolerance(saved_tolerance);
     }
 
     /* --- pgxp_project_precise: the exact projection and its qualifiers --- */
@@ -1071,6 +1096,35 @@ int main(void) {
         CHECK(pgxp_debug_shadow(0, TBL + 0x60, &lv, &value, &flags, &sx, &sy, &sz));
         CHECK((flags & 1u) == 0);
         pgxp_set_tolerance(-1.0f);
+    }
+
+    /* Diagnostic exclusions require intact producer provenance. Unknown,
+     * derived and partially overwritten words cannot be silently excluded. */
+    {
+        pgxp_set_preserve_projection(1);
+        pgxp_set_tolerance(-1.0f);
+        const uint32_t reasons[] = {PGXP_AUDIT_EXACT,
+            PGXP_AUDIT_EXACT | PGXP_AUDIT_IR,
+            PGXP_AUDIT_EXACT | PGXP_AUDIT_SZ,
+            PGXP_AUDIT_EXACT | PGXP_AUDIT_IR | PGXP_AUDIT_SZ,
+            PGXP_AUDIT_DIVIDE, PGXP_AUDIT_SXY, 0};
+        PGXPStats before{}, after{};
+        pgxp_get_stats(&before);
+        for (uint32_t reason : reasons) {
+            pgxp_gte_push_sxy(2 * 65536, 0, 151, 0);
+            pgxp_gte_mark_audit(reason);
+            pgxp_store_gte_reg(0x80005000, 14);
+            int32_t x, y; uint16_t z;
+            CHECK(pgxp_get_precise_vertex(0x80005000, 0, 0, 0, &x, &y, &z));
+        }
+        pgxp_get_stats(&after);
+        CHECK(after.over_one_fraction == before.over_one_fraction + 1);
+        CHECK(after.over_one_ir == before.over_one_ir + 1);
+        CHECK(after.over_one_sz == before.over_one_sz + 1);
+        CHECK(after.over_one_ir_sz == before.over_one_ir_sz + 1);
+        CHECK(after.over_one_divide == before.over_one_divide + 1);
+        CHECK(after.over_one_sxy == before.over_one_sxy + 1);
+        CHECK(after.over_one_unexplained == before.over_one_unexplained + 1);
     }
 
     /* --- stats sanity: dataflow hits were counted --- */
