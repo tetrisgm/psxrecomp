@@ -20,6 +20,7 @@ typedef struct FramePacketView {
     size_t initial_bytes;
     const void *records;
     size_t record_bytes;
+    const void *attachment;
 } FramePacketView;
 
 /* Limits are per slot, with three slots total (writing, pending, reading).
@@ -29,6 +30,12 @@ FramePacketQueue *frame_packet_create(size_t initial_limit,size_t record_limit);
 void frame_packet_destroy(FramePacketQueue *queue); /* stopped owners only */
 int frame_packet_begin(FramePacketQueue *queue,uint64_t sequence,
                        const void *initial,size_t bytes);
+/* Takes ownership only on success. One immutable CPU-only attachment per
+ * packet, accounted against initial_limit along with the seed. Its disposer
+ * runs on slot reuse/destruction, never while the consumer holds that slot;
+ * it must not call GL, wait for another owner, or reference live guest data. */
+int frame_packet_attach(FramePacketQueue *queue,void *attachment,size_t bytes,
+                        void (*dispose)(void*));
 void *frame_packet_append(FramePacketQueue *queue,uint16_t op,uint16_t flags,
                           uint32_t bytes);
 int frame_packet_publish(FramePacketQueue *queue);

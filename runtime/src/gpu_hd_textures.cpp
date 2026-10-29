@@ -63,10 +63,34 @@ struct Lease {
     std::shared_ptr<Composition> composition;
     ~Lease() { hd_texture_pixels_release(&beetle); duck_texture_pixels_release(&duck); }
 };
-std::unique_ptr<Session> session;
-const uint16_t* native_vram = nullptr;
-uint64_t generation = 1;
-uint64_t composition_serial = 0;
+} // namespace
+
+struct GpuHdTextureContext {
+    std::unique_ptr<Session> session;
+    const uint16_t* native_vram = nullptr;
+    uint64_t generation = 1, composition_serial = 0;
+    uint64_t token = 1, last_config = 0, last_beetle = 0, last_duck = 0;
+    bool dumps_suppressed = false;
+    bool presentation = false;
+};
+
+struct GpuHdTextureTracking {
+    std::string root;
+    bool configured = false, replacements = false, dump = false, copy_pending = false;
+    uint32_t beetle_identity = 0;
+    std::vector<uint8_t> beetle;
+    std::vector<std::array<uint16_t, 4>> learned;
+    DuckTextureTrackingSnapshot* duck = nullptr;
+    ~GpuHdTextureTracking() { duck_texture_pack_free_tracking(duck); }
+};
+
+namespace {
+GpuHdTextureContext presentation_context;
+struct PresentationContextInit {
+    PresentationContextInit() { presentation_context.presentation = true; }
+} presentation_context_init;
+thread_local GpuHdTextureContext* context = &presentation_context;
+
 
 struct DecodedParts {
     std::array<DuckTexturePixels, kMaxParts> pixels{};
@@ -90,7 +114,7 @@ int window_coord(int value, int mask, int offset) {
 }
 bool make_query(uint16_t texpage, uint16_t cx, uint16_t cy, const int limits[4],
                 uint32_t window, HdTextureDrawQuery& query) {
-    if (!native_vram || !limits || ((texpage >> 7) & 3u) == 3u) return false;
+    if (!context->native_vram || !limits || ((texpage >> 7) & 3u) == 3u) return false;
     if (limits[0] < 0 || limits[1] < 0 || limits[2] > 255 || limits[3] > 255 ||
         limits[0] > limits[2] || limits[1] > limits[3]) return false;
     int first[2] = {255,255}, last[2] = {0,0};
@@ -112,7 +136,7 @@ bool make_query(uint16_t texpage, uint16_t cx, uint16_t cy, const int limits[4],
     query.v_first = static_cast<uint8_t>(first[1]);
     query.v_last = static_cast<uint8_t>(last[1]);
     query.clut_x = cx; query.clut_y = cy;
-    query.vram = native_vram; query.vram_word_count = kVramWords;
+    query.vram = context->native_vram; query.vram_word_count = kVramWords;
     return true;
 }
 uint8_t replacement_class(const uint8_t* pixel, bool semi) {
@@ -175,7 +199,7 @@ std::vector<uint64_t> composition_signature(const HdTextureDrawQuery& query,
         duck_texture_hash_rect(query.vram, query.vram_word_count, query.page_x + first_word,
             query.page_y + query.v_first, last_word - first_word + 1, native_height),
         duck_texture_hash_words_le(palette.data(), palette_size)};
-    signature.push_back(duck_texture_pack_linear_filter(session->duck) != 0);
+    signature.push_back(duck_texture_pack_linear_filter(context->session->duck) != 0);
     for (size_t i = 0; i < count; ++i) {
         const auto& match = matches[i];
         signature.insert(signature.end(), {match.entry_id, static_cast<uint32_t>(match.origin_u),
@@ -186,10 +210,10 @@ std::vector<uint64_t> composition_signature(const HdTextureDrawQuery& query,
     return signature;
 }
 std::shared_ptr<Composition> find_composition(const std::vector<uint64_t>& signature, uint64_t ready_mask) {
-    for (auto& cached : session->compositions)
+    for (auto& cached : context->session->compositions)
         if (cached->ready_mask == ready_mask && cached->signature == signature) {
-            ++session->diag.composition_hits;
-            cached->last_use = ++session->composition_clock; return cached;
+            ++context->session->diag.composition_hits;
+            cached->last_use = ++context->session->composition_clock; return cached;
         }
     return {};
 }
@@ -200,7 +224,7 @@ std::shared_ptr<Composition> compose(const HdTextureDrawQuery& query,
     if (query.page_x + query.u_last / per_word >= 1024 || query.page_y + query.v_last >= 512) return {};
     const uint32_t native_width = query.u_last - query.u_first + 1;
     const uint32_t native_height = query.v_last - query.v_first + 1;
-    const bool linear = duck_texture_pack_linear_filter(session->duck) != 0;
+    const bool linear = duck_texture_pack_linear_filter(context->session->duck) != 0;
     double scale_x = 1, scale_y = 1;
     uint64_t ready_mask = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -217,15 +241,15 @@ std::shared_ptr<Composition> compose(const HdTextureDrawQuery& query,
     const uint32_t width = static_cast<uint32_t>(wanted_width), height = static_cast<uint32_t>(wanted_height);
     const size_t bytes = static_cast<size_t>(width) * height * 4u;
     if (bytes > kCompositionBudget) return {};
-    while (!session->compositions.empty() && (session->compositions.size() >= kCompositionCount ||
-           session->composition_bytes + bytes > kCompositionBudget)) {
-        auto oldest = std::min_element(session->compositions.begin(), session->compositions.end(),
+    while (!context->session->compositions.empty() && (context->session->compositions.size() >= kCompositionCount ||
+           context->session->composition_bytes + bytes > kCompositionBudget)) {
+        auto oldest = std::min_element(context->session->compositions.begin(), context->session->compositions.end(),
             [](const auto& a, const auto& b) { return a->last_use < b->last_use; });
-        session->composition_bytes -= (*oldest)->rgba.size(); session->compositions.erase(oldest);
+        context->session->composition_bytes -= (*oldest)->rgba.size(); context->session->compositions.erase(oldest);
     }
     auto result = std::make_shared<Composition>();
-    ++session->diag.composition_builds;
-    session->diag.composition_pixels += static_cast<uint64_t>(width) * height;
+    ++context->session->diag.composition_builds;
+    context->session->diag.composition_pixels += static_cast<uint64_t>(width) * height;
     result->signature = std::move(signature); result->width = width; result->height = height;
     result->ready_mask = ready_mask;
     result->rgba.resize(bytes);
@@ -251,25 +275,82 @@ std::shared_ptr<Composition> compose(const HdTextureDrawQuery& query,
                 result->rgba.data() + (static_cast<size_t>(y) * width + x) * 4);
         }
     }
-    result->cache_key = (UINT64_C(1) << 63) | ++composition_serial;
-    result->last_use = ++session->composition_clock;
-    session->compositions.push_back(result); session->composition_bytes += bytes;
+    result->cache_key = (UINT64_C(1) << 63) | ++context->composition_serial;
+    result->last_use = ++context->session->composition_clock;
+    context->session->compositions.push_back(result); context->session->composition_bytes += bytes;
     return result;
 }
-bool dumps_suppressed = false;
+
 void dump_query(const HdTextureDrawQuery& query, int semi) {
-    if (!session->dump || session->dump_failed || dumps_suppressed) return;
+    if (!context->session->dump || context->session->dump_failed || context->dumps_suppressed) return;
     char error[256]{};
-    const int status = duck_texture_pack_dump_draw(session->duck, &query, semi, error, sizeof(error));
-    if (status == HD_TEXTURE_LOOKUP_FOUND) ++session->diag.dumped_textures;
+    const int status = duck_texture_pack_dump_draw(context->session->duck, &query, semi, error, sizeof(error));
+    if (status == HD_TEXTURE_LOOKUP_FOUND) ++context->session->diag.dumped_textures;
     if (status < 0) {
         /* Keep the configured raster authority until a safe session boundary.
          * Tearing it down inside a pre-draw query would lose command order. */
-        session->dump_failed = true;
-        session->dump_error = error;
+        context->session->dump_failed = true;
+        context->session->dump_error = error;
     }
 }
 }
+
+extern "C" GpuHdTextureContext* gpu_hd_textures_create_native_context(void) {
+    return new (std::nothrow) GpuHdTextureContext;
+}
+extern "C" GpuHdTextureContext* gpu_hd_textures_select_context(GpuHdTextureContext* next) {
+    auto* previous = context;
+    context = next ? next : &presentation_context;
+    return previous;
+}
+extern "C" void gpu_hd_textures_destroy_context(GpuHdTextureContext* value) {
+    if (value != &presentation_context) delete value;
+}
+
+extern "C" GpuHdTextureTracking* gpu_hd_textures_capture_tracking(void) {
+    try {
+        auto result = std::make_unique<GpuHdTextureTracking>();
+        if (!context->session) return result.release();
+        const auto& source = *context->session;
+        result->configured = true;
+        result->root = source.root;
+        result->replacements = source.replacements;
+        result->dump = source.dump;
+        result->copy_pending = source.copy_pending;
+        result->learned = source.learned;
+        result->duck = duck_texture_pack_capture_tracking(source.duck);
+        if (!result->duck) return nullptr;
+        if (source.beetle) {
+            uint8_t* bytes = nullptr; size_t count = 0;
+            if (!hd_texture_pack_tracking_state_save(source.beetle, &bytes, &count)) return nullptr;
+            std::unique_ptr<uint8_t, decltype(&std::free)> owned(bytes, &std::free);
+            result->beetle.assign(bytes, bytes + count);
+            result->beetle_identity = hd_texture_pack_identity(source.beetle);
+        }
+        return result.release();
+    } catch (...) { return nullptr; }
+}
+extern "C" int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracking) {
+    if (!tracking) return 0;
+    if (!tracking->configured) return !context->session;
+    if (!context->session) return 0;
+    auto& destination = *context->session;
+    if (destination.root != tracking->root || destination.replacements != tracking->replacements ||
+        destination.dump != tracking->dump || bool(destination.beetle) != !tracking->beetle.empty()) return 0;
+    if (destination.beetle &&
+        (hd_texture_pack_identity(destination.beetle) != tracking->beetle_identity ||
+         !hd_texture_pack_tracking_state_check(tracking->beetle.data(), tracking->beetle.size()))) return 0;
+    try {
+        auto learned = tracking->learned;
+        if (!duck_texture_pack_apply_tracking(destination.duck, tracking->duck)) return 0;
+        if (destination.beetle && !hd_texture_pack_tracking_state_load(destination.beetle,
+                tracking->beetle.data(), tracking->beetle.size())) return 0;
+        destination.learned.swap(learned);
+        destination.copy_pending = tracking->copy_pending;
+        return 1;
+    } catch (...) { return 0; }
+}
+extern "C" void gpu_hd_textures_free_tracking(GpuHdTextureTracking* tracking) { delete tracking; }
 
 extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
                                           int dump, char* error, size_t capacity) {
@@ -295,7 +376,7 @@ extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
             std::filesystem::create_directories(directory / "dumps");
         }
         if (!duck_texture_pack_create(root, &next->duck, error, capacity)) return 0;
-        if (next->replacements) {
+        if (context->presentation && next->replacements) {
             /* Replacements decoded and resident before the game draws, within
              * kPreloadMaxBytes; the rest stays on the budgeted async path. */
             const auto t0 = std::chrono::steady_clock::now();
@@ -324,21 +405,21 @@ extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
         /* Quiesce renderer users (GL render thread: dump_draw appends to the
          * old session's sources) before flushing its dumps or reading its
          * residency; the cache is rebuilt from the new session. */
-        if (session) gl_renderer_clear_hd_texture_cache();
-        if (session) {
+        if (context->session && context->presentation) gl_renderer_clear_hd_texture_cache();
+        if (context->session) {
             char dump_error[256]{};
-            if (duck_texture_pack_flush_dumps(session->duck, dump_error, sizeof(dump_error)) < 0) {
-                session->dump_error = dump_error;
+            if (duck_texture_pack_flush_dumps(context->session->duck, dump_error, sizeof(dump_error)) < 0) {
+                context->session->dump_error = dump_error;
                 fail(error, capacity, dump_error); return 0;
             }
         }
-        if (session && (session->replacements || session->dump) && session->root == next->root) {
-            if (!duck_texture_pack_copy_tracking(next->duck, session->duck)) {
+        if (context->session && (context->session->replacements || context->session->dump) && context->session->root == next->root) {
+            if (!duck_texture_pack_copy_tracking(next->duck, context->session->duck)) {
                 fail(error, capacity, "Could not preserve texture-upload tracking during reload."); return 0;
             }
-            if (session->beetle && next->beetle) {
+            if (context->session->beetle && next->beetle) {
                 uint8_t* saved = nullptr; size_t saved_size = 0;
-                if (!hd_texture_pack_tracking_state_save(session->beetle, &saved, &saved_size)) {
+                if (!hd_texture_pack_tracking_state_save(context->session->beetle, &saved, &saved_size)) {
                     fail(error, capacity, "Could not save Beetle texture-upload tracking during reload."); return 0;
                 }
                 const int restored = hd_texture_pack_tracking_state_load(next->beetle, saved, saved_size);
@@ -347,26 +428,26 @@ extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
                 /* Restage after rewind/load rehashes these bounded upload
                  * rectangles against restored VRAM. A same-pack reload must
                  * preserve that knowledge as well as current residency. */
-                next->learned = session->learned;
+                next->learned = context->session->learned;
             }
         }
         /* This also flushes all queued users before old replacement textures
          * and pixel leases may be destroyed. */
-        gl_renderer_set_hd_texture_mode(next->replacements || next->dump);
-        gl_renderer_clear_hd_texture_cache();
-        session = std::move(next); ++generation;
+        if (context->presentation) gl_renderer_set_hd_texture_mode(next->replacements || next->dump);
+        if (context->presentation) gl_renderer_clear_hd_texture_cache();
+        context->session = std::move(next); ++context->generation;
         DuckTexturePackInfo info{};
-        duck_texture_pack_get_info(session->duck, &info);
+        duck_texture_pack_get_info(context->session->duck, &info);
         size_t replacements_found = info.replacement_count;
         size_t ambiguous = info.ambiguous_count;
-        if (session->beetle) {
+        if (context->session->beetle) {
             HdTexturePackInfo beetle_info{};
-            hd_texture_pack_get_info(session->beetle, &beetle_info);
+            hd_texture_pack_get_info(context->session->beetle, &beetle_info);
             replacements_found = beetle_info.unique_key_count;
             ambiguous = beetle_info.ambiguous_key_count;
         }
         std::fprintf(stdout, "psxrecomp: texture pack '%s': %zu replacements, %zu ambiguous, %zu ignored\n",
-                     session->root.c_str(), replacements_found, ambiguous, info.ignored_count);
+                     context->session->root.c_str(), replacements_found, ambiguous, info.ignored_count);
         if (info.diagnostic && info.diagnostic[0])
             std::fprintf(stderr, "psxrecomp: texture pack: %s\n", info.diagnostic);
         return 1;
@@ -375,99 +456,102 @@ extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
     }
 }
 extern "C" void gpu_hd_textures_shutdown(void) {
-    gl_renderer_set_hd_texture_mode(0);
-    gl_renderer_clear_hd_texture_cache();
-    session.reset(); ++generation;
+    if (context->presentation) gl_renderer_set_hd_texture_mode(0);
+    if (context->presentation) gl_renderer_clear_hd_texture_cache();
+    context->session.reset(); ++context->generation;
 }
 extern "C" int gpu_hd_textures_reload(char* error, size_t capacity) {
-    if (!session) { fail(error, capacity, "No texture-pack session is active."); return 0; }
-    const std::string root = session->root;
-    return gpu_hd_textures_configure(root.c_str(), session->replacements, session->dump, error, capacity);
+    if (!context->session) { fail(error, capacity, "No texture-pack session is active."); return 0; }
+    const std::string root = context->session->root;
+    return gpu_hd_textures_configure(root.c_str(), context->session->replacements, context->session->dump, error, capacity);
 }
 extern "C" void gpu_hd_textures_set_dump_enabled(int enabled) {
-    if (!session || session->dump == (enabled != 0)) return;
+    if (!context->session || context->session->dump == (enabled != 0)) return;
     /* The render thread may be dumping (dump_draw) or tracking residency. */
-    gl_renderer_render_thread_sync("hd_set_dump");
-    if (enabled && !session->replacements) gpu_hd_textures_reset_tracking();
+    if (context->presentation) gl_renderer_render_thread_sync("hd_set_dump");
+    if (enabled && !context->session->replacements) gpu_hd_textures_reset_tracking();
     if (!enabled) {
         char error[256]{};
-        if (duck_texture_pack_flush_dumps(session->duck, error, sizeof(error)) < 0) {
-            session->dump_error = error; session->dump_failed = true; return;
+        if (duck_texture_pack_flush_dumps(context->session->duck, error, sizeof(error)) < 0) {
+            context->session->dump_error = error; context->session->dump_failed = true; return;
         }
     }
-    gl_renderer_set_hd_texture_mode(session->replacements || enabled);
-    session->dump = enabled != 0;
-    session->dump_failed = false;
+    if (context->presentation) gl_renderer_set_hd_texture_mode(context->session->replacements || enabled);
+    context->session->dump = enabled != 0;
+    context->session->dump_failed = false;
 }
-extern "C" int gpu_hd_textures_replacements_enabled(void) { return session && session->replacements; }
-extern "C" int gpu_hd_textures_dump_enabled(void) { return session && session->dump; }
+extern "C" int gpu_hd_textures_replacements_enabled(void) { return context->session && context->session->replacements; }
+extern "C" int gpu_hd_textures_dump_enabled(void) { return context->session && context->session->dump; }
 extern "C" uint64_t gpu_hd_textures_tracking_generation(void) {
-    static uint64_t token=1, last_config=0, last_beetle=0, last_duck=0;
-    uint64_t beetle=session?hd_texture_pack_tracking_generation(session->beetle):0;
-    uint64_t duck=session?duck_texture_pack_tracking_generation(session->duck):0;
-    if (generation!=last_config || beetle!=last_beetle || duck!=last_duck) {
-        ++token; last_config=generation; last_beetle=beetle; last_duck=duck;
+    auto& token = context->token;
+    auto& last_config = context->last_config;
+    auto& last_beetle = context->last_beetle;
+    auto& last_duck = context->last_duck;
+    uint64_t beetle=context->session?hd_texture_pack_tracking_generation(context->session->beetle):0;
+    uint64_t duck=context->session?duck_texture_pack_tracking_generation(context->session->duck):0;
+    if (context->generation!=last_config || beetle!=last_beetle || duck!=last_duck) {
+        ++token; last_config=context->generation; last_beetle=beetle; last_duck=duck;
     }
     return token;
 }
 extern "C" int gpu_hd_textures_invalidation_changes(int x,int y,int w,int h) {
-    if (!session || w<1 || h<1) return 0;
+    if (!context->session || w<1 || h<1) return 0;
     if (w>1024 || h>512) return 1;
-    return hd_texture_pack_invalidation_changes(session->beetle,x&1023,y&511,w,h) ||
-           duck_texture_pack_invalidation_changes(session->duck,x&1023,y&511,w,h);
+    return hd_texture_pack_invalidation_changes(context->session->beetle,x&1023,y&511,w,h) ||
+           duck_texture_pack_invalidation_changes(context->session->duck,x&1023,y&511,w,h);
 }
-extern "C" int gpu_hd_textures_active(void) { return session && (session->replacements || session->dump); }
+extern "C" int gpu_hd_textures_active(void) { return context->session && (context->session->replacements || context->session->dump); }
 extern "C" void gpu_hd_textures_get_diag(GpuHdTextureDiag* out) {
     if (!out) return;
     *out = {};
-    if (!session) { out->root = ""; out->diagnostic = ""; return; }
+    if (!context->session) { out->root = ""; out->diagnostic = ""; return; }
     /* Counters and dump queues are written by the GL render thread. */
-    gl_renderer_render_thread_sync("hd_diag");
-    *out = session->diag;
-    out->root = session->root.c_str(); out->active = gpu_hd_textures_active();
-    out->replacements = session->replacements; out->dump = session->dump && !session->dump_failed;
-    out->format = session->beetle ? 1 : 2;
-    DuckTexturePackInfo info{}; duck_texture_pack_get_info(session->duck, &info);
+    if (context->presentation) gl_renderer_render_thread_sync("hd_diag");
+    *out = context->session->diag;
+    out->root = context->session->root.c_str(); out->active = gpu_hd_textures_active();
+    out->replacements = context->session->replacements; out->dump = context->session->dump && !context->session->dump_failed;
+    out->format = context->session->beetle ? 1 : 2;
+    DuckTexturePackInfo info{}; duck_texture_pack_get_info(context->session->duck, &info);
     out->decoded_images = info.decoded_images;
     out->decode_evictions = info.decode_evictions;
     out->decoded_bytes = info.decoded_bytes;
     out->dumped_textures = info.queued_dump_count; out->pending_dump_sources = info.pending_dump_sources;
-    if (session->beetle) { HdTexturePackInfo beetle_info{}; hd_texture_pack_get_info(session->beetle, &beetle_info); out->replacement_count = beetle_info.unique_key_count; }
+    if (context->session->beetle) { HdTexturePackInfo beetle_info{}; hd_texture_pack_get_info(context->session->beetle, &beetle_info); out->replacement_count = beetle_info.unique_key_count; }
     else out->replacement_count = info.replacement_count;
     std::string diagnostic = info.diagnostic ? info.diagnostic : "";
-    if (!session->dump_error.empty()) {
+    if (!context->session->dump_error.empty()) {
         if (!diagnostic.empty()) diagnostic += "; ";
-        diagnostic += session->dump_error;
+        diagnostic += context->session->dump_error;
     }
-    if (session->diagnostics.empty() || session->diagnostics.back() != diagnostic)
-        session->diagnostics.push_back(std::move(diagnostic));
-    out->diagnostic = session->diagnostics.back().c_str();
+    if (context->session->diagnostics.empty() || context->session->diagnostics.back() != diagnostic)
+        context->session->diagnostics.push_back(std::move(diagnostic));
+    out->diagnostic = context->session->diagnostics.back().c_str();
 }
 extern "C" int gpu_hd_textures_debug_uploads_at(int x, int y, char* out, size_t cap) {
     if (out && cap) out[0] = '\0';
-    return session ? hd_texture_pack_debug_uploads_at(session->beetle, (unsigned)x, (unsigned)y, out, cap) : 0;
+    return context->session ? hd_texture_pack_debug_uploads_at(context->session->beetle, (unsigned)x, (unsigned)y, out, cap) : 0;
 }
-extern "C" void gpu_hd_textures_note_applied(void) { if (session) ++session->diag.applied_draws; }
+extern "C" void gpu_hd_textures_note_applied(void) { if (context->session) ++context->session->diag.applied_draws; }
 extern "C" void gpu_hd_textures_note_gl_cache(int eviction) {
-    if (session) {
-        if (eviction) ++session->diag.gl_evictions;
-        else ++session->diag.gl_uploads;
+    if (context->session) {
+        if (eviction) ++context->session->diag.gl_evictions;
+        else ++context->session->diag.gl_uploads;
     }
 }
 extern "C" void gpu_hd_textures_bind_vram(const uint16_t* vram) {
-    native_vram = vram;
+    context->native_vram = vram;
     /* Private replay buffers reuse an address with different contents. */
-    if (session) duck_texture_pack_clear_lookup_cache(session->duck);
+    if (context->session) duck_texture_pack_clear_lookup_cache(context->session->duck);
 }
-extern "C" void gpu_hd_textures_suppress_dumps(int on) { dumps_suppressed = on != 0; }
-extern "C" void gpu_hd_textures_set_vram(const uint16_t* vram) { native_vram = vram; gpu_hd_textures_reset_tracking(); }
+extern "C" void gpu_hd_textures_suppress_dumps(int on) { context->dumps_suppressed = on != 0; }
+extern "C" void gpu_hd_textures_set_vram(const uint16_t* vram) { context->native_vram = vram; gpu_hd_textures_reset_tracking(); }
 extern "C" void gpu_hd_textures_reset_tracking(void) {
-    if (!session) return;
-    gl_renderer_clear_hd_texture_cache();
-    session->compositions.clear(); session->composition_bytes = 0;
-    session->copy_pending = false;
-    hd_texture_pack_reset_tracking(session->beetle);
-    duck_texture_pack_reset_tracking(session->duck);
+    if (!context->session) return;
+    if (context->presentation) gl_renderer_clear_hd_texture_cache();
+    context->session->compositions.clear(); context->session->composition_bytes = 0;
+    context->session->copy_pending = false;
+    hd_texture_pack_reset_tracking(context->session->beetle);
+    duck_texture_pack_reset_tracking(context->session->duck);
 }
 extern "C" void gpu_hd_textures_begin_upload(int x, int y, int width, int height) {
     /* The GP0 header arrives before native payload writes. Complete uploads
@@ -475,19 +559,19 @@ extern "C" void gpu_hd_textures_begin_upload(int x, int y, int width, int height
     gpu_hd_textures_invalidate(x, y, width, height);
 }
 extern "C" void gpu_hd_textures_begin_copy(int sx, int sy, int dx, int dy, int width, int height) {
-    if (!session || !native_vram) return;
-    session->copy_pending = false;
+    if (!context->session || !context->native_vram) return;
+    context->session->copy_pending = false;
     if (width < 1 || width > 1024 || height < 1 || height > 512) { gpu_hd_textures_reset_tracking(); return; }
-    hd_texture_pack_invalidate(session->beetle, dx & 1023, dy & 511, width, height);
-    session->copy_pending = duck_texture_pack_begin_copy(session->duck, sx & 1023, sy & 511,
-        dx & 1023, dy & 511, width, height, native_vram, kVramWords) > 0;
-    if (!session->copy_pending)
-        duck_texture_pack_invalidate(session->duck, dx & 1023, dy & 511, width, height);
+    hd_texture_pack_invalidate(context->session->beetle, dx & 1023, dy & 511, width, height);
+    context->session->copy_pending = duck_texture_pack_begin_copy(context->session->duck, sx & 1023, sy & 511,
+        dx & 1023, dy & 511, width, height, context->native_vram, kVramWords) > 0;
+    if (!context->session->copy_pending)
+        duck_texture_pack_invalidate(context->session->duck, dx & 1023, dy & 511, width, height);
 }
 extern "C" void gpu_hd_textures_end_copy(void) {
-    if (!session || !session->copy_pending) return;
-    session->copy_pending = false;
-    if (duck_texture_pack_end_copy(session->duck, native_vram, kVramWords) < 0)
+    if (!context->session || !context->session->copy_pending) return;
+    context->session->copy_pending = false;
+    if (duck_texture_pack_end_copy(context->session->duck, context->native_vram, kVramWords) < 0)
         gpu_hd_textures_reset_tracking();
 }
 namespace {
@@ -500,39 +584,39 @@ uint32_t get32(const uint8_t* at) { uint32_t v = 0; for (int i = 0; i < 4; ++i) 
 extern "C" int gpu_hd_textures_residency_save(uint8_t** data, size_t* size) {
     if (data) *data = nullptr;
     if (size) *size = 0;
-    if (!data || !size || !session || !session->beetle || !native_vram) return 0;
+    if (!data || !size || !context->session || !context->session->beetle || !context->native_vram) return 0;
     uint8_t* tracking = nullptr; size_t tracking_size = 0;
-    if (!hd_texture_pack_tracking_state_save(session->beetle, &tracking, &tracking_size)) return 0;
+    if (!hd_texture_pack_tracking_state_save(context->session->beetle, &tracking, &tracking_size)) return 0;
     uint8_t* out = static_cast<uint8_t*>(std::malloc(kResidencyHeader + tracking_size));
     if (!out) { std::free(tracking); return 0; }
     put32(out, kResidencyMagic); put32(out + 4, kResidencyVersion);
-    put32(out + 8, hd_texture_crc32_words_le(native_vram, kVramWords));
-    put32(out + 12, hd_texture_pack_identity(session->beetle));
+    put32(out + 8, hd_texture_crc32_words_le(context->native_vram, kVramWords));
+    put32(out + 12, hd_texture_pack_identity(context->session->beetle));
     if (tracking_size) std::memcpy(out + kResidencyHeader, tracking, tracking_size);
     std::free(tracking);
     *data = out; *size = kResidencyHeader + tracking_size;
     return 1;
 }
 extern "C" int gpu_hd_textures_residency_load(const uint8_t* data, size_t size) {
-    if (!data || size < kResidencyHeader || !session || !session->beetle || !native_vram) return 0;
+    if (!data || size < kResidencyHeader || !context->session || !context->session->beetle || !context->native_vram) return 0;
     if (get32(data) != kResidencyMagic || get32(data + 4) != kResidencyVersion) return 0;
     /* Saved with another pack: its residency names other uploads. */
-    if (get32(data + 12) != hd_texture_pack_identity(session->beetle)) return 0;
-    if (get32(data + 8) != hd_texture_crc32_words_le(native_vram, kVramWords)) return 0;
+    if (get32(data + 12) != hd_texture_pack_identity(context->session->beetle)) return 0;
+    if (get32(data + 8) != hd_texture_crc32_words_le(context->native_vram, kVramWords)) return 0;
     if (!hd_texture_pack_tracking_state_check(data + kResidencyHeader, size - kResidencyHeader)) return 0;
-    return hd_texture_pack_tracking_state_load(session->beetle, data + kResidencyHeader,
+    return hd_texture_pack_tracking_state_load(context->session->beetle, data + kResidencyHeader,
                                                size - kResidencyHeader);
 }
 extern "C" void gpu_hd_textures_invalidate(int x, int y, int width, int height) {
-    if (!session || width < 1 || height < 1) return;
+    if (!context->session || width < 1 || height < 1) return;
     if (width > 1024 || height > 512) { gpu_hd_textures_reset_tracking(); return; }
-    hd_texture_pack_invalidate(session->beetle, x & 1023, y & 511, width, height);
-    duck_texture_pack_invalidate(session->duck, x & 1023, y & 511, width, height);
+    hd_texture_pack_invalidate(context->session->beetle, x & 1023, y & 511, width, height);
+    duck_texture_pack_invalidate(context->session->duck, x & 1023, y & 511, width, height);
 }
 extern "C" void gpu_hd_textures_track_upload(int x, int y, int width, int height,
                                              const uint16_t* words) {
     (void)words;
-    if (!session || !native_vram || width < 1 || width > 1024 || height < 1 || height > 512) return;
+    if (!context->session || !context->native_vram || width < 1 || width > 1024 || height < 1 || height > 512) return;
     if (width == 1024 && height == 512) { gpu_hd_textures_reset_tracking(); return; }
     /* gpu.c's A0 staging already contains post-mask words. Read the canonical
      * mirror here also for host-initiated transfers which use raw input. */
@@ -542,46 +626,46 @@ extern "C" void gpu_hd_textures_track_upload(int x, int y, int width, int height
     for (int row = 0; row < height; ++row)
         for (int col = 0; col < width; ++col)
             applied[static_cast<size_t>(row) * width + col] =
-                native_vram[((y + row) & 511) * 1024 + ((x + col) & 1023)];
+                context->native_vram[((y + row) & 511) * 1024 + ((x + col) & 1023)];
     uint32_t hash = 0;
-    hd_texture_pack_track_upload(session->beetle, x & 1023, y & 511, width, height,
+    hd_texture_pack_track_upload(context->session->beetle, x & 1023, y & 511, width, height,
                                  applied.get(), count, &hash);
-    duck_texture_pack_track_upload(session->duck, x & 1023, y & 511, width, height,
-                                   native_vram, kVramWords);
-    if (session->beetle && hd_texture_pack_has_texture(session->beetle, hash)) {
+    duck_texture_pack_track_upload(context->session->duck, x & 1023, y & 511, width, height,
+                                   context->native_vram, kVramWords);
+    if (context->session->beetle && hd_texture_pack_has_texture(context->session->beetle, hash)) {
         const std::array<uint16_t, 4> rect{uint16_t(x & 1023), uint16_t(y & 511),
                                            uint16_t(width), uint16_t(height)};
-        if (std::find(session->learned.begin(), session->learned.end(), rect) == session->learned.end()) {
+        if (std::find(context->session->learned.begin(), context->session->learned.end(), rect) == context->session->learned.end()) {
             /* Bounded by count and by area: a restage re-hashes at most one
              * VRAM's worth of words (~1 MiB of CRC), however large or many
              * the learned uploads (oldest dropped first). */
-            session->learned.push_back(rect);
+            context->session->learned.push_back(rect);
             size_t area = 0;
-            for (const auto& r : session->learned) area += size_t(r[2]) * r[3];
-            while (session->learned.size() > 1 &&
-                   (session->learned.size() > 256 || area > kVramWords)) {
-                const auto& r = session->learned.front();
+            for (const auto& r : context->session->learned) area += size_t(r[2]) * r[3];
+            while (context->session->learned.size() > 1 &&
+                   (context->session->learned.size() > 256 || area > kVramWords)) {
+                const auto& r = context->session->learned.front();
                 area -= size_t(r[2]) * r[3];
-                session->learned.erase(session->learned.begin());
+                context->session->learned.erase(context->session->learned.begin());
             }
         }
     }
 }
 extern "C" void gpu_hd_textures_restage(void) {
     gpu_hd_textures_reset_tracking();
-    if (!session || !session->beetle || !native_vram) return;
+    if (!context->session || !context->session->beetle || !context->native_vram) return;
     /* Only a rectangle whose restored words still hash to a replacement key
      * becomes resident again: the same words at the same place as an upload
      * this session saw, so no identity is invented. */
     std::vector<uint16_t> words;
-    for (const auto& r : session->learned) {
+    for (const auto& r : context->session->learned) {
         const size_t count = size_t(r[2]) * r[3];
         words.resize(count);
         for (unsigned row = 0; row < r[3]; ++row)
             for (unsigned col = 0; col < r[2]; ++col)
-                words[size_t(row) * r[2] + col] = native_vram[((r[1] + row) & 511) * 1024 + ((r[0] + col) & 1023)];
-        if (hd_texture_pack_has_texture(session->beetle, hd_texture_crc32_words_le(words.data(), count)))
-            hd_texture_pack_track_upload(session->beetle, r[0], r[1], r[2], r[3], words.data(), count, nullptr);
+                words[size_t(row) * r[2] + col] = context->native_vram[((r[1] + row) & 511) * 1024 + ((r[0] + col) & 1023)];
+        if (hd_texture_pack_has_texture(context->session->beetle, hd_texture_crc32_words_le(words.data(), count)))
+            hd_texture_pack_track_upload(context->session->beetle, r[0], r[1], r[2], r[3], words.data(), count, nullptr);
     }
 }
 static int acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
@@ -589,23 +673,23 @@ static int acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
                                             int semi, GpuHdTextureImage* image, bool allow_gl_cache) {
     if (!image) return 0;
     *image = {};
-    if (!session) return 0;
-    ++session->diag.draw_queries;
+    if (!context->session) return 0;
+    ++context->session->diag.draw_queries;
     HdTextureDrawQuery query{};
     if (!make_query(tp, cx, cy, limits, window, query)) return 0;
     dump_query(query, semi);
-    if (!session->replacements) return 0;
+    if (!context->session->replacements) return 0;
     /* The lease is made only for a draw that matched: most textured draws
      * (world geometry) miss, thousands per frame on the render thread. */
     std::unique_ptr<Lease> lease;
-    if (session->beetle) {
+    if (context->session->beetle) {
         HdTextureMatch match{};
-        if (hd_texture_pack_match(session->beetle, &query, &match) != HD_TEXTURE_LOOKUP_FOUND) return 0;
+        if (hd_texture_pack_match(context->session->beetle, &query, &match) != HD_TEXTURE_LOOKUP_FOUND) return 0;
         lease.reset(new (std::nothrow) Lease);
         if (!lease) return 0;
-        ++session->diag.matched_draws;
-        hd_texture_pack_request_decode(session->beetle, match.entry.texture_hash, match.entry.palette_hash);
-        if (hd_texture_pack_acquire_decoded(session->beetle, match.entry.texture_hash,
+        ++context->session->diag.matched_draws;
+        hd_texture_pack_request_decode(context->session->beetle, match.entry.texture_hash, match.entry.palette_hash);
+        if (hd_texture_pack_acquire_decoded(context->session->beetle, match.entry.texture_hash,
                                           match.entry.palette_hash, &lease->beetle) != HD_TEXTURE_LOOKUP_FOUND) return 0;
         const unsigned pixels_per_word = 4u >> query.depth;
         image->rgba = lease->beetle.rgba; image->width = lease->beetle.width;
@@ -619,21 +703,21 @@ static int acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
     } else {
         try {
             std::array<DuckTextureMatch,kMaxParts> matches{}; size_t count = 0;
-            if (duck_texture_pack_match_parts(session->duck, &query, semi, matches.data(), matches.size(), &count) != HD_TEXTURE_LOOKUP_FOUND || !count) return 0;
+            if (duck_texture_pack_match_parts(context->session->duck, &query, semi, matches.data(), matches.size(), &count) != HD_TEXTURE_LOOKUP_FOUND || !count) return 0;
             lease.reset(new (std::nothrow) Lease);
             if (!lease) return 0;
-            ++session->diag.matched_draws;
+            ++context->session->diag.matched_draws;
             const auto& match = matches[0];
             if (count == 1 && match.clip_u <= query.u_first && match.clip_v <= query.v_first &&
                 match.clip_u + match.clip_width > query.u_last && match.clip_v + match.clip_height > query.v_last) {
                 /* The GPU copy outlives the decoder's smaller CPU LRU. A draw
                  * using that copy must not queue another PNG decode. */
-                if (allow_gl_cache && gl_renderer_hd_texture_cached(match.entry_id, generation,
+                if (context->presentation && allow_gl_cache && gl_renderer_hd_texture_cached(match.entry_id, context->generation,
                         &image->width, &image->height)) {
                     image->stride = image->width * 4u;
                 } else {
-                    duck_texture_pack_request_decode(session->duck, match.entry_id);
-                    if (duck_texture_pack_acquire_decoded(session->duck, match.entry_id, &lease->duck) != HD_TEXTURE_LOOKUP_FOUND) return 0;
+                    duck_texture_pack_request_decode(context->session->duck, match.entry_id);
+                    if (duck_texture_pack_acquire_decoded(context->session->duck, match.entry_id, &lease->duck) != HD_TEXTURE_LOOKUP_FOUND) return 0;
                     image->rgba = lease->duck.rgba; image->width = lease->duck.width;
                     image->height = lease->duck.height; image->stride = lease->duck.stride;
                 }
@@ -652,8 +736,8 @@ static int acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
                 if (!lease->composition) {
                     DecodedParts decoded; size_t ready = 0;
                     for (size_t i = 0; i < count; ++i) {
-                        duck_texture_pack_request_decode(session->duck, matches[i].entry_id);
-                        if (duck_texture_pack_acquire_decoded(session->duck, matches[i].entry_id, &decoded.pixels[i]) == HD_TEXTURE_LOOKUP_FOUND) ++ready;
+                        duck_texture_pack_request_decode(context->session->duck, matches[i].entry_id);
+                        if (duck_texture_pack_acquire_decoded(context->session->duck, matches[i].entry_id, &decoded.pixels[i]) == HD_TEXTURE_LOOKUP_FOUND) ++ready;
                     }
                     if (!ready) return 0;
                     lease->composition = compose(query, matches, decoded, count, std::move(signature), palette);
@@ -669,8 +753,8 @@ static int acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
             }
         } catch (const std::exception&) { return 0; }
     }
-    image->generation = generation; image->lease = lease.release();
-    ++session->diag.ready_draws;
+    image->generation = context->generation; image->lease = lease.release();
+    ++context->session->diag.ready_draws;
     return 1;
 }
 extern "C" int gpu_hd_textures_acquire_draw(uint16_t tp, uint16_t cx, uint16_t cy,
@@ -687,9 +771,9 @@ extern "C" void gpu_hd_textures_release_image(GpuHdTextureImage* image) {
 }
 extern "C" void gpu_hd_textures_observe_draw(uint16_t tp, uint16_t cx, uint16_t cy,
     const int limits[4], uint32_t window, int semi) {
-    if (!session || !session->dump || session->dump_failed) return;
+    if (!context->session || !context->session->dump || context->session->dump_failed) return;
     HdTextureDrawQuery query{};
     if (make_query(tp, cx, cy, limits, window, query)) {
-        ++session->diag.draw_queries; dump_query(query, semi);
+        ++context->session->diag.draw_queries; dump_query(query, semi);
     }
 }

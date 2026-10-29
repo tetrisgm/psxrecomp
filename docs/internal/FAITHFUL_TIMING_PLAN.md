@@ -2145,3 +2145,4 @@ async discard. Six hidden GL modes match pixels, dev build/32 R4 tests pass,
 and hidden boot-to-race smoke plus live/paused diagnostics pass with zero
 misses/context acquisitions. New owner remains unconnected to GL; incremental
 ring backpressure remains. No phase-2 acceptance, merge or performance claim.
+2026-10-29 phase 2 WIP: native HD contexts call no GL; immutable Duck/Beetle provenance and bounded packet attachments pass ownership/pending-copy tests. Hidden HD fixture 231/217 checks passes after replacing stale publication/context-hold assumptions (same seven failures reproduced on previous HD implementation). Dev build, R4 32/32 and hidden smoke/diagnostics pass, zero misses/acquisitions. Native HD contexts and packet attachments remain unconnected to production raster/GL; no phase acceptance.

@@ -372,6 +372,72 @@ struct DuckTexturePack {
     Worker worker;
 };
 
+struct DuckTextureTrackingSnapshot {
+    std::vector<Upload> uploads;
+    std::vector<PageSource> pages;
+    std::deque<std::shared_ptr<Source>> sources;
+    std::vector<CopyUpdate> copy_updates;
+    Rect copy_destination{};
+    bool copy_pending = false;
+    size_t bytes = 0, records = 0;
+};
+
+namespace {
+template<class Tracking>
+DuckTextureTrackingSnapshot clone_tracking(const Tracking& source, DuckTexturePack* owner) {
+    DuckTextureTrackingSnapshot result;
+    result.uploads = source.uploads;
+    result.pages = source.pages;
+    result.copy_updates = source.copy_updates;
+    result.copy_destination = source.copy_destination;
+    result.copy_pending = source.copy_pending;
+    std::unordered_map<const Source*, std::shared_ptr<Source>> cloned;
+    const auto clone = [&](const std::shared_ptr<Source>& item) {
+        const auto found = cloned.find(item.get());
+        if (found != cloned.end()) return found->second;
+        auto copy = std::make_shared<Source>(*item);
+        copy->dump_owner = owner;
+        cloned.emplace(item.get(), copy);
+        result.sources.push_back(copy);
+        result.bytes += copy->words.size() * sizeof(uint16_t);
+        result.records += copy->records.size();
+        return copy;
+    };
+    for (auto& upload : result.uploads) upload.source = clone(upload.source);
+    for (auto& page : result.pages) page.source = clone(page.source);
+    /* Retired sources may still own observations awaiting a dump checkpoint. */
+    for (const auto& source_item : source.sources) clone(source_item);
+    return result;
+}
+}
+
+DuckTextureTrackingSnapshot* duck_texture_pack_capture_tracking(const DuckTexturePack* pack) {
+    if (!pack) return nullptr;
+    try { return new DuckTextureTrackingSnapshot(clone_tracking(*pack, nullptr)); }
+    catch (...) { return nullptr; }
+}
+int duck_texture_pack_apply_tracking(DuckTexturePack* pack, const DuckTextureTrackingSnapshot* snapshot) {
+    if (!pack || !snapshot || snapshot->bytes > pack->snapshot_budget) return 0;
+    try {
+        auto copy = clone_tracking(*snapshot, pack);
+        if (duck_texture_pack_flush_dumps(pack, nullptr, 0) < 0) return 0;
+        pack->uploads.swap(copy.uploads);
+        pack->pages.swap(copy.pages);
+        pack->sources.swap(copy.sources);
+        pack->copy_updates.swap(copy.copy_updates);
+        pack->copy_destination = copy.copy_destination;
+        pack->copy_pending = copy.copy_pending;
+        pack->snapshot_bytes = copy.bytes;
+        pack->palette_records = copy.records;
+        pack->rect_cache.clear();
+        pack->match_cache.clear();
+        ++pack->revision;
+        ++pack->tracking_generation;
+        return 1;
+    } catch (...) { return 0; }
+}
+void duck_texture_pack_free_tracking(DuckTextureTrackingSnapshot* snapshot) { delete snapshot; }
+
 namespace {
 void note(DuckTexturePack& p, const std::string& s) {
     ++p.ignored;

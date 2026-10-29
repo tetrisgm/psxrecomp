@@ -8,6 +8,22 @@
 extern "C" {
 #endif
 
+/* Native provenance has its own single-owner context and never calls GL.
+ * Select is thread-local and returns the previous context for scope restore;
+ * NULL selects the presentation context. Stop users before destruction. */
+typedef struct GpuHdTextureContext GpuHdTextureContext;
+GpuHdTextureContext* gpu_hd_textures_create_native_context(void);
+GpuHdTextureContext* gpu_hd_textures_select_context(GpuHdTextureContext* context);
+void gpu_hd_textures_destroy_context(GpuHdTextureContext* context);
+/* Immutable provenance travels with the native VRAM seed. Capture uses the
+ * selected source context; apply uses the selected destination, whose pack
+ * configuration must agree. On failure the caller must reject that frame.
+ * No source context or VRAM pointer is retained by the snapshot. */
+typedef struct GpuHdTextureTracking GpuHdTextureTracking;
+GpuHdTextureTracking* gpu_hd_textures_capture_tracking(void);
+int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracking);
+void gpu_hd_textures_free_tracking(GpuHdTextureTracking* tracking);
+
 /* Emulation-thread configuration. Roots are external user-owned directories;
  * a successful replacement session selects native CPU VRAM authority on GL.
  * Reconfiguration retains the previous session if opening the new root fails.

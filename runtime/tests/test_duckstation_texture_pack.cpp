@@ -344,6 +344,40 @@ void palettes(const fs::path& root) {
     check(duck_texture_pack_match(pack.get(),&q,&match) == HD_TEXTURE_LOOKUP_NONE,"misaligned/edge reduced CLUT rejected");
 }
 
+void packet_tracking(const fs::path& root) {
+    png(root/"replacements"/"texupload-C16-000CA76CB9B329DC-4x2-2-0-2x2.png");
+    std::vector<uint16_t> vram(1024*512); place(vram,66,257,4,words(8));
+    auto source = create(root);
+    check(duck_texture_pack_track_upload(source.get(),66,257,4,2,vram.data(),vram.size()),"packet upload captured");
+    using Snapshot = std::unique_ptr<DuckTextureTrackingSnapshot, decltype(&duck_texture_pack_free_tracking)>;
+    Snapshot snapshot(duck_texture_pack_capture_tracking(source.get()), &duck_texture_pack_free_tracking);
+    check(snapshot != nullptr,"packet provenance captured");
+    duck_texture_pack_invalidate(source.get(),66,257,1,1);
+    source.reset();
+    auto first = create(root), second = create(root);
+    auto q = query(vram,64,256,2,4,5,1,2);
+    /* Both consumers read the same frozen snapshot. Neither mutates another
+     * owner's source records, filename history, or lookup cache. */
+    std::atomic<int> errors{0};
+    const auto consume = [&](DuckTexturePack* pack) {
+        for (int i=0; i<100; ++i) {
+            DuckTextureMatch match{};
+            if (!duck_texture_pack_apply_tracking(pack,snapshot.get()) ||
+                duck_texture_pack_match(pack,&q,&match) != HD_TEXTURE_LOOKUP_FOUND) ++errors;
+            duck_texture_pack_invalidate(pack,66,257,1,1);
+            if (duck_texture_pack_match(pack,&q,&match) != HD_TEXTURE_LOOKUP_NONE) ++errors;
+        }
+    };
+    std::thread a(consume,first.get()), b(consume,second.get());
+    a.join(); b.join();
+    check(errors == 0,"packet provenance remains immutable across independent consumers");
+    check(duck_texture_pack_apply_tracking(first.get(),snapshot.get()),"last packet restore");
+    snapshot.reset();
+    DuckTextureMatch match{};
+    check(duck_texture_pack_match(first.get(),&q,&match) == HD_TEXTURE_LOOKUP_FOUND,
+          "destination owns provenance after packet release");
+}
+
 void st_alias_duplicates(const fs::path& root) {
     const char* ordinary = "texpage-C16-000CA76CB9B329DC-256x256-0-0-4x2.png";
     const char* st = "texpage-STC16-000CA76CB9B329DC-256x256-0-0-4x2.png";
@@ -613,6 +647,11 @@ void split_coalesce_copy_parts(const fs::path& root) {
     pack = create(root/"copy"); duck_texture_pack_track_upload(pack.get(),64,0,4,16,vram.data(),vram.size());
     q = query(vram,64,0,2,0,3,0,15); duck_texture_pack_dump_draw(pack.get(),&q,0,error,sizeof(error));
     check(duck_texture_pack_begin_copy(pack.get(),0,0,64,1,1,1,vram.data(),vram.size()),"copy begins before native write and retires old observation");
+    auto* pending_copy = duck_texture_pack_capture_tracking(pack.get());
+    check(pending_copy != nullptr,"capture unfinished native copy provenance");
+    duck_texture_pack_reset_tracking(pack.get());
+    check(duck_texture_pack_apply_tracking(pack.get(),pending_copy),"restore unfinished native copy provenance");
+    duck_texture_pack_free_tracking(pending_copy);
     vram[64+1024] = 0x8001;
     check(duck_texture_pack_end_copy(pack.get(),vram.data(),vram.size()),"copy commit records postmask native destination");
     check(duck_texture_pack_match(pack.get(),&q,&match) == HD_TEXTURE_LOOKUP_FOUND && match.key.source_hash == updated.source_hash && updated.source_hash != oldhash,
@@ -726,7 +765,7 @@ int main(int argc, char** argv) {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
         fixed_hash_vectors(); names(); page_and_decode(root/"page"); upload(root/"upload"); reload_tracking(root/"reload");
-        palettes(root/"palettes"); st_alias_duplicates(root/"keys"); failed_payloads(root/"invalid"); dumping(root/"dump");
+        palettes(root/"palettes"); packet_tracking(root/"packet"); st_alias_duplicates(root/"keys"); failed_payloads(root/"invalid"); dumping(root/"dump");
         official_binary_oracle(root/"official-oracle"); defaults_and_options(root/"defaults");
         immutable_palettes_and_pages(root/"snapshots"); split_coalesce_copy_parts(root/"lifecycle"); copied_pack_ownership(root/"ownership");
         resident_checkpoint(root/"resident"); preload(root/"preload"); preload_pool();

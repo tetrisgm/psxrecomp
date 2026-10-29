@@ -52,7 +52,38 @@ static void execute(void *user,const FramePacketView *packet) {
     if(packet->sequence==10000) frame_owner_tick_at(state.owner,owner_clock()+1000000);
     state.last.store(packet->sequence,std::memory_order_release);
 }
+static void test_attachments() {
+    struct Owned { int* destroyed; uint64_t value; };
+    const auto dispose=[](void* data) {
+        auto* owned=static_cast<Owned*>(data); ++*owned->destroyed; delete owned;
+    };
+    int destroyed=0;
+    auto* queue=frame_packet_create(sizeof(Owned),16);
+    assert(queue);
+    assert(frame_packet_begin(queue,1,nullptr,0));
+    auto* rejected=new Owned{&destroyed,0};
+    assert(!frame_packet_attach(queue,rejected,sizeof(Owned)+1,dispose));
+    delete rejected; // rejected attachment still belongs to caller
+    assert(frame_packet_attach(queue,new Owned{&destroyed,1},sizeof(Owned),dispose));
+    assert(frame_packet_publish(queue));
+    FramePacketView held{};
+    assert(frame_packet_acquire(queue,&held));
+    for(uint64_t n=2;n<=100;++n) {
+        assert(frame_packet_begin(queue,n,nullptr,0));
+        assert(frame_packet_attach(queue,new Owned{&destroyed,n},sizeof(Owned),dispose));
+        assert(frame_packet_publish(queue));
+        assert(static_cast<const Owned*>(held.attachment)->value==1);
+    }
+    assert(destroyed==97); // three bounded slots, including the held lease
+    frame_packet_invalidate(queue);
+    assert(static_cast<const Owned*>(held.attachment)->value==1);
+    frame_packet_release(queue);
+    frame_packet_destroy(queue);
+    assert(destroyed==100);
+}
+
 int main() {
+    test_attachments();
     OwnerTest state;
     const FrameOwnerConfig config{8,4096,execute,context,&state,tick,owner_clock};
     FrameOwner *owner=frame_owner_start(&config);assert(owner);

@@ -10,6 +10,13 @@ struct Packet {
     uint64_t sequence=0,epoch=0;
     size_t initial_bytes=0,record_bytes=0;
     std::vector<Block> initial,records;
+    void *attachment=nullptr;
+    void (*dispose)(void*)=nullptr;
+    void clear_attachment() {
+        if(dispose) dispose(attachment);
+        attachment=nullptr;dispose=nullptr;
+    }
+    ~Packet() { clear_attachment(); }
 };
 size_t blocks(size_t bytes) { return bytes/RT_ALIGN+(bytes%RT_ALIGN!=0); }
 }
@@ -29,13 +36,22 @@ extern "C" void frame_packet_destroy(FramePacketQueue *q) { delete q; }
 extern "C" int frame_packet_begin(FramePacketQueue *q,uint64_t sequence,const void *initial,size_t bytes) {
     if(!q || q->open) return 0;
     q->open=true;q->valid=false;q->command_sequence=0;
-    if(bytes>q->initial_limit || (bytes && !initial)) return 0;
     auto &p=q->mailbox.writing();
+    p.clear_attachment();
+    if(bytes>q->initial_limit || (bytes && !initial)) return 0;
     try { p.initial.resize(blocks(bytes)); } catch(...) { return 0; }
     if(bytes) std::memcpy(p.initial.data(),initial,bytes);
     p.sequence=sequence;p.epoch=q->epoch.load(std::memory_order_relaxed);
     p.initial_bytes=bytes;p.record_bytes=0;
     p.records.clear();q->valid=true;
+    return 1;
+}
+extern "C" int frame_packet_attach(FramePacketQueue *q,void *attachment,size_t bytes,
+                                     void (*dispose)(void*)) {
+    if(!q || !q->open || !q->valid || !attachment || !dispose) return 0;
+    auto &p=q->mailbox.writing();
+    if(p.attachment || bytes>q->initial_limit-p.initial_bytes) return 0;
+    p.attachment=attachment;p.dispose=dispose;
     return 1;
 }
 extern "C" void *frame_packet_append(FramePacketQueue *q,uint16_t op,uint16_t flags,uint32_t bytes) {
@@ -63,7 +79,7 @@ extern "C" int frame_packet_acquire(FramePacketQueue *q,FramePacketView *view) {
     if(!q || !view) return 0;
     const auto *p=q->mailbox.acquire();
     if(!p) { *view={};return 0; }
-    *view={p->sequence,p->epoch,p->initial.data(),p->initial_bytes,p->records.data(),p->record_bytes};
+    *view={p->sequence,p->epoch,p->initial.data(),p->initial_bytes,p->records.data(),p->record_bytes,p->attachment};
     return 1;
 }
 extern "C" void frame_packet_release(FramePacketQueue *q) { q->mailbox.release(); }

@@ -22,6 +22,7 @@ FrameOwner *frame_owner_start(const FrameOwnerConfig *config);
 void frame_owner_stop(FrameOwner *owner);
 /* Producer-only recording API. Failed append invalidates this whole frame. */
 int frame_owner_begin(FrameOwner *owner,uint64_t sequence,const void *initial,size_t bytes);
+int frame_owner_attach(FrameOwner *owner,void *attachment,size_t bytes,void (*dispose)(void*));
 void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags,uint32_t bytes);
 int frame_owner_publish(FrameOwner *owner);
 void frame_owner_invalidate(FrameOwner *owner);

@@ -88,6 +88,9 @@ extern "C" void frame_owner_stop(FrameOwner *owner) {
 extern "C" int frame_owner_begin(FrameOwner *owner,uint64_t sequence,const void *initial,size_t bytes) {
     return frame_packet_begin(owner->queue,sequence,initial,bytes);
 }
+extern "C" int frame_owner_attach(FrameOwner *owner,void *attachment,size_t bytes,void (*dispose)(void*)) {
+    return frame_packet_attach(owner->queue,attachment,bytes,dispose);
+}
 extern "C" void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags,uint32_t bytes) {
     return frame_packet_append(owner->queue,op,flags,bytes);
 }
