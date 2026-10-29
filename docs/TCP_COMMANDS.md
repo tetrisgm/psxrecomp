@@ -222,6 +222,30 @@ in-flight bound), `ring_full_waits`, `acquire_ms`, `render_busy_ms` /
 0 and `active` is 0. Reading it is not a sync point; a steady game frame
 should add no `acquires`.
 
+## `main_cadence` — main-thread wall cadence (native debug builds only)
+
+`{"cmd":"main_cadence","reset":1}` clears and enables an opt-in measurement
+window. `{"cmd":"main_cadence"}` reads it without resetting. Reset after
+loading a state, unpausing, and warming the renderer; debugger pauses and
+state loads inside a window intentionally remain visible as stalls.
+
+- `intervals`, `span_ms`, `fps`, `mean_ms`, `max_ms`: elapsed wall time between
+  consecutive main-thread VBlank presentation callbacks, including guest work,
+  render waits and pacing. These are not CPU-only times or distinct presents.
+  The first callback after reset establishes the baseline.
+- `pace_checks`: normal offline wall-pacer entries with an existing deadline.
+- `late_pace_entries`: those entries arriving strictly after that deadline.
+- `over_period_pace_entries`: those entries with debt at least one frame period.
+- `max_pace_debt_ms`: greatest positive entry-time debt before the pacer waits,
+  catches up, or reanchors. The pacer preserves debt up to its bounded catch-up
+  window, so successive entries can reflect the same earlier stall.
+
+Debt counts describe host scheduling, not missing guest interrupts. Tiny positive
+debt alone does not establish a visible hitch. Turbo, netplay and other paths
+that bypass the normal offline pacer do not contribute debt samples; callback
+intervals still count. Read alongside `audio_stats`, `vblank_rate` and
+`render_thread`. No guest timing or pacing behavior changes when enabled.
+
 ## `frame_fingerprint` — per-frame guest-write fingerprint (native only)
 
 Cumulative write hashes, snapshotted at every VBlank into a 32768-frame ring
@@ -493,9 +517,9 @@ between Play and TCP availability.
 
 ## Complete command index (generated)
 
-**392 commands registered** — 379 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
+**394 commands registered** — 381 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
 
-85 of 392 have prose above; **307 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
+86 of 394 have prose above; **308 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
 
 Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this block has drifted from the code.
 
@@ -692,6 +716,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `load_transitions` | ✓ |  |  |
 | `lockstep` | ✓ |  |  |
 | `lockstep_func` | ✓ |  |  |
+| `main_cadence` | ✓ |  | ✓ |
 | `mc_status` | ✓ |  |  |
 | `mdec_state` | ✓ |  |  |
 | `mdec_trace` | ✓ |  |  |

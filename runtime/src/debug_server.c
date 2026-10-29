@@ -16459,7 +16459,20 @@ static void handle_warm_cd_route(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, body);
 }
 
+#ifndef PSX_NO_DEBUG_TOOLS
+/* reset=1 starts a new opt-in wall-time window. See main.cpp for semantics. */
+extern void psx_debug_main_cadence_json(int reset, char *out, size_t cap);
+static void handle_main_cadence(int id, const char *json) {
+    char buf[768];
+    psx_debug_main_cadence_json(json_get_int(json, "reset", 0), buf, sizeof buf);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
+}
+#endif
+
 static const CmdEntry s_commands[] = {
+#ifndef PSX_NO_DEBUG_TOOLS
+    { "main_cadence",      handle_main_cadence },
+#endif
     { "phase_profile",     handle_phase_profile },
     { "starv_ring",        handle_starv_ring },
     { "data_shards",       handle_data_shards },

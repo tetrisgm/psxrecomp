@@ -213,6 +213,18 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-28 (`fix/race-cadence-metrics`):** Added opt-in native debug TCP
+  `main_cadence` counters for main-thread VBlank callback wall intervals and
+  pre-offline-pacer deadline debt, with an explicit reset/start command.
+  Instrumentation only: no guest timing, interrupt delivery, pacing or
+  catch-up semantics changed. Compilation and live reset/read commands passed.
+  R4 hidden 18x, 25-second receipts (`analysis/perf-20261028/clean18-baseline.json`
+  and `clean18-rewindoff.json` in the game checkout) reported 49.834 callbacks/s,
+  maximum interval 91.311 ms, and 56.525 callbacks/s, maximum 73.632 ms,
+  respectively; both had zero dispatch misses. These validate observation of
+  sub-realtime operation, not performance acceptance. Deadline-entry debt
+  is not a count of lost guest VBlanks; see `docs/TCP_COMMANDS.md`.
+
 - **2026-10-23 (`feat/queued-postfx-provenance`):** Queued interpolation now
   resolves the real source's post-effect mask/depth before its surfaces can be
   redrawn. This changes presentation only; guest cycle/IRQ behavior is

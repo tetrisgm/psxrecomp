@@ -4690,6 +4690,57 @@ struct RuntimePerfState {
 
 static RuntimePerfState g_runtime_perf;
 
+#ifndef PSX_NO_DEBUG_TOOLS
+/* Opt-in main-thread wall cadence. TCP commands execute on this thread.
+ * Intervals include guest work, presentation and pacing, not just CPU work.
+ * Reset after loading/unpausing: debugger pauses are deliberately not hidden. */
+struct MainCadenceStats {
+    bool enabled = false;
+    uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
+    uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
+};
+static MainCadenceStats s_main_cadence;
+static void main_cadence_frame() {
+    if (!s_main_cadence.enabled) return;
+    const uint64_t now = SDL_GetPerformanceCounter();
+    if (s_main_cadence.previous && now >= s_main_cadence.previous) {
+        const uint64_t elapsed = now - s_main_cadence.previous;
+        ++s_main_cadence.intervals;
+        s_main_cadence.ticks += elapsed;
+        if (elapsed > s_main_cadence.max_ticks) s_main_cadence.max_ticks = elapsed;
+    }
+    s_main_cadence.previous = now;
+}
+static void main_cadence_pace(uint64_t now) {
+    if (!s_main_cadence.enabled || !s_frame_pacer.next_deadline) return;
+    ++s_main_cadence.pace_checks;
+    if (now <= s_frame_pacer.next_deadline) return;
+    const uint64_t debt = now - s_frame_pacer.next_deadline;
+    const uint64_t period = (uint64_t)(SDL_GetPerformanceFrequency() * g_frame_period_ms / 1000.0);
+    ++s_main_cadence.late;
+    if (period && debt >= period) ++s_main_cadence.missed;
+    if (debt > s_main_cadence.max_late_ticks) s_main_cadence.max_late_ticks = debt;
+}
+extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
+    if (reset) {
+        s_main_cadence = MainCadenceStats{};
+        s_main_cadence.enabled = true;
+    }
+    const auto &s = s_main_cadence;
+    const double freq = (double)SDL_GetPerformanceFrequency();
+    const double ms = freq > 0.0 ? 1000.0 / freq : 0.0;
+    std::snprintf(out, cap,
+        "\"enabled\":%d,\"intervals\":%llu,\"span_ms\":%.3f,\"fps\":%.3f,"
+        "\"mean_ms\":%.3f,\"max_ms\":%.3f,\"pace_checks\":%llu,"
+        "\"late_pace_entries\":%llu,\"over_period_pace_entries\":%llu,\"max_pace_debt_ms\":%.3f",
+        s.enabled ? 1 : 0, (unsigned long long)s.intervals, s.ticks * ms,
+        s.ticks ? s.intervals * freq / s.ticks : 0.0,
+        s.intervals ? s.ticks * ms / s.intervals : 0.0, s.max_ticks * ms,
+        (unsigned long long)s.pace_checks, (unsigned long long)s.late,
+        (unsigned long long)s.missed, s.max_late_ticks * ms);
+}
+#endif
+
 static bool runtime_perf_parse_window(const char *text, uint64_t *start,
                                       uint64_t *end) {
     if (!text || !text[0]) return false;
@@ -9944,6 +9995,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         uint64_t perf_start = runtime_perf_section_begin();
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
+#ifndef PSX_NO_DEBUG_TOOLS
+            main_cadence_pace(dyn_t0);
+#endif
             frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
             const uint64_t waited = SDL_GetPerformanceCounter() - dyn_t0;
             if (g_dynres.active) g_dynres.pacer_ticks += waited;
@@ -11337,6 +11391,9 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
 
 
 static void sdl_vblank_present(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    main_cadence_frame();
+#endif
     sync_guest_cadence_to_video_standard();
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
     render_thread_vblank();
