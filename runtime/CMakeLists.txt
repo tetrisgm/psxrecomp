@@ -1809,6 +1809,18 @@ if(BUILD_TESTING)
                    src/stereo_shed_policy.c)
     target_include_directories(stereo_shed_policy_test PRIVATE include)
     add_test(NAME stereo_shed_policy_test COMMAND stereo_shed_policy_test)
+    add_executable(native_raster_test tests/test_native_raster.cpp
+                   src/native_raster.cpp src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
+    target_include_directories(native_raster_test PRIVATE include)
+    target_compile_features(native_raster_test PRIVATE cxx_std_17)
+    find_package(Threads REQUIRED)
+    target_link_libraries(native_raster_test PRIVATE Threads::Threads)
+    if(NOT MSVC)
+        target_compile_options(native_raster_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME native_raster_test COMMAND native_raster_test)
+    set_tests_properties(native_raster_test PROPERTIES TIMEOUT 30)
+
     # Render thread core ([video] render_thread, docs/RENDER_THREAD.md):
     # ordering across ring wraps, the frame bound, stale-frame detection and
     # the drain + context hand-off sync point, against a fake executor.

@@ -213,6 +213,21 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-28 (`feat/frame-arch-1-native-authority`, in progress):** Separate
+  software-raster contexts and an independent CPU native queue now have fixture
+  coverage for ownership isolation, masks/CLUTs/wrapping, queue ordering,
+  snapshot/restore and partially received A0 uploads. The existing hidden GL
+  render-thread fixture passes all six configurations after the context refactor.
+  This is not yet the runtime authority: the GP0 capture point must precede
+  presentation transforms and RGB555 truncation. The existing SW raster still
+  lacks the dither input and uses reduced-precision colour interpolation
+  documented in `accuracy/axis5_gpu.md`; moving its calls alone does not prove
+  pixel-exact hardware authority. No phase acceptance or performance claim.
+  R4's amended design adds a PGXP audit before generic packet interpolation;
+  private guest-draw workers are no longer the phase-4 destination. The central
+  Beads path `F:/Software/beads/issues` is absent on this machine; no local
+  database was created.
+
 - **2026-10-28 (`fix/race-cadence-metrics`):** Added opt-in native debug TCP
   `main_cadence` counters for main-thread VBlank callback wall intervals and
   pre-offline-pacer deadline debt, with an explicit reset/start command.

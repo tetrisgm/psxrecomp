@@ -383,6 +383,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/ws_ui_group.c
     ${PSXRECOMP_ROOT}/runtime/src/ws_aspect_cone_math.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/native_raster.cpp
     ${PSXRECOMP_ROOT}/runtime/src/gpu_vram_dirty.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
     ${PSXRECOMP_ROOT}/runtime/src/render_thread.c

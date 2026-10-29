@@ -41,67 +41,137 @@
 #define VRAM_WIDTH  1024
 #define VRAM_HEIGHT 512
 
-/* ------------------------------------------------------------------ */
-/* State                                                              */
-/* ------------------------------------------------------------------ */
-
-static uint16_t *g_vram;
-
-/* Hi-res supersampling mirror (see file header). g_scale==1 => disabled. */
-static uint16_t *g_hr      = NULL;
-static int       g_scale   = 1;
-static int       g_hr_w    = VRAM_WIDTH;
-static int       g_hr_h    = VRAM_HEIGHT;
-static int       g_precise_valid = 0;
-static int32_t   g_precise_x16[3], g_precise_y16[3];
-static int       g_perspective_valid = 0;
-static float     g_perspective_q[3];
-static uint32_t  g_perspective_triangles = 0;
-
-/* ---- Native-wide compositor (separate present surfaces) ------------------
- * Canonical VRAM stays faithful. For an opted-in wide game we ADDITIONALLY
- * mirror each framebuffer-targeting primitive into an independent wide surface
- * keyed by the back buffer's VRAM x-origin (base_x), at local x = vram_x -
- * base_x + OFFSET. Independent surfaces ⇒ no cross-buffer bleed; margins clear
- * cleanly; present reads the surface for the displayed buffer. Each surface is
- * (g_wide_w * scale) × (VRAM_HEIGHT * scale) 16-bit; y is unshifted so the
- * buffer's native VRAM y-band is reused directly. */
 #define WIDE_MAX_SURF 4
-static uint16_t *g_wide_surf[WIDE_MAX_SURF];   /* lazily-allocated surfaces */
-static int       g_wide_base[WIDE_MAX_SURF];   /* base_x per surface (-1 = free) */
-static int       g_wide_w        = 0;          /* wide width (native px); 0 = disabled */
-static int       g_wide_off      = 0;          /* centering OFFSET (native px) */
-static uint16_t *g_wide_cur      = NULL;       /* active mirror surface (NULL = no mirror) */
-static int       g_wide_cur_base = 0;          /* base_x of g_wide_cur */
-static void      wide_free_all(void);          /* defined with the surface helpers below */
+/* Independent mutable raster state. The legacy default follows GL context
+ * ownership; the native worker binds its own context and never shares it. */
+struct SwRendererContext {
+    uint16_t *g_vram;
+    uint16_t *g_hr;
+    int       g_scale;
+    int       g_hr_w;
+    int       g_hr_h;
+    int       g_precise_valid;
+    int32_t   g_precise_x16[3], g_precise_y16[3];
+    int       g_perspective_valid;
+    float     g_perspective_q[3];
+    uint32_t  g_perspective_triangles;
+    uint16_t *g_wide_surf[WIDE_MAX_SURF];
+    int       g_wide_base[WIDE_MAX_SURF];
+    int       g_wide_w;
+    int       g_wide_off;
+    uint16_t *g_wide_cur;
+    int       g_wide_cur_base;
+    int g_clip_x1, g_clip_y1, g_clip_x2, g_clip_y2;
+    int g_offset_x, g_offset_y;
+    int g_semi_trans_enabled;
+    int g_semi_trans_mode;
+    int g_mask_set_bit;
+    int g_mask_check_bit;
+    uint8_t g_tw_mask_x, g_tw_mask_y;
+    uint8_t g_tw_off_x, g_tw_off_y;
+    uint8_t g_mod_r, g_mod_g, g_mod_b;
+    int g_raw_texture;
+    int g_texture_filter;
+    int g_texture_filter_req;
+    int g_faithful_authority;
+    int view_enabled, view_shift, view_pad_left, view_pad_right;
+    int g_uv_lim[4];
+    int private_dirty;
+    uint64_t dirty_rows[8];
+};
+static SwRendererContext s_default = {
+    .g_scale = 1, .g_hr_w = VRAM_WIDTH, .g_hr_h = VRAM_HEIGHT,
+    .g_uv_lim = {0, 0, 255, 255}
+};
+#if defined(_MSC_VER)
+static __declspec(thread) SwRendererContext *s_sw = &s_default;
+#else
+static _Thread_local SwRendererContext *s_sw = &s_default;
+#endif
 
-/* Draw area clipping rectangle (native coordinates) */
-static int g_clip_x1, g_clip_y1, g_clip_x2, g_clip_y2;
+SwRendererContext *sw_context_create(void) {
+    SwRendererContext *c = (SwRendererContext *)calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->g_scale = 1; c->g_hr_w = VRAM_WIDTH; c->g_hr_h = VRAM_HEIGHT;
+    c->g_uv_lim[2] = c->g_uv_lim[3] = 255;
+    c->private_dirty = 1;
+    memset(c->dirty_rows, 0xff, sizeof c->dirty_rows);
+    return c;
+}
+SwRendererContext *sw_context_bind(SwRendererContext *c) {
+    SwRendererContext *previous = s_sw;
+    s_sw = c ? c : &s_default;
+    return previous == &s_default ? NULL : previous;
+}
+void sw_context_destroy(SwRendererContext *c) {
+    if (!c || c == &s_default) return;
+    free(c->g_hr);
+    for (int i = 0; i < WIDE_MAX_SURF; ++i) free(c->g_wide_surf[i]);
+    if (s_sw == c) s_sw = &s_default;
+    free(c);
+}
+void sw_context_take_dirty(uint64_t rows[8]) {
+    memcpy(rows, s_sw->dirty_rows, sizeof s_sw->dirty_rows);
+    memset(s_sw->dirty_rows, 0, sizeof s_sw->dirty_rows);
+}
+static void sw_dirty_row(uint32_t y) {
+    if (!s_sw->private_dirty) { gpu_vram_dirty_mark_row(y); return; }
+    y &= 511;
+    s_sw->dirty_rows[y >> 6] |= UINT64_C(1) << (y & 63);
+}
+static void sw_dirty_rect(int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    for (int i = 0; i < h && i < 512; ++i) sw_dirty_row((uint32_t)(y+i));
+    (void)x;
+}
+static void sw_dirty_all(void) { sw_dirty_rect(0, 0, 1024, 512); }
+#define g_vram (s_sw->g_vram)
+#define g_hr (s_sw->g_hr)
+#define g_scale (s_sw->g_scale)
+#define g_hr_w (s_sw->g_hr_w)
+#define g_hr_h (s_sw->g_hr_h)
+#define g_precise_valid (s_sw->g_precise_valid)
+#define g_precise_x16 (s_sw->g_precise_x16)
+#define g_precise_y16 (s_sw->g_precise_y16)
+#define g_perspective_valid (s_sw->g_perspective_valid)
+#define g_perspective_q (s_sw->g_perspective_q)
+#define g_perspective_triangles (s_sw->g_perspective_triangles)
+#define g_wide_surf (s_sw->g_wide_surf)
+#define g_wide_base (s_sw->g_wide_base)
+#define g_wide_w (s_sw->g_wide_w)
+#define g_wide_off (s_sw->g_wide_off)
+#define g_wide_cur (s_sw->g_wide_cur)
+#define g_wide_cur_base (s_sw->g_wide_cur_base)
+#define g_clip_x1 (s_sw->g_clip_x1)
+#define g_clip_y1 (s_sw->g_clip_y1)
+#define g_clip_x2 (s_sw->g_clip_x2)
+#define g_clip_y2 (s_sw->g_clip_y2)
+#define g_offset_x (s_sw->g_offset_x)
+#define g_offset_y (s_sw->g_offset_y)
+#define g_semi_trans_enabled (s_sw->g_semi_trans_enabled)
+#define g_semi_trans_mode (s_sw->g_semi_trans_mode)
+#define g_mask_set_bit (s_sw->g_mask_set_bit)
+#define g_mask_check_bit (s_sw->g_mask_check_bit)
+#define g_tw_mask_x (s_sw->g_tw_mask_x)
+#define g_tw_mask_y (s_sw->g_tw_mask_y)
+#define g_tw_off_x (s_sw->g_tw_off_x)
+#define g_tw_off_y (s_sw->g_tw_off_y)
+#define g_mod_r (s_sw->g_mod_r)
+#define g_mod_g (s_sw->g_mod_g)
+#define g_mod_b (s_sw->g_mod_b)
+#define g_raw_texture (s_sw->g_raw_texture)
+#define g_texture_filter (s_sw->g_texture_filter)
+#define g_texture_filter_req (s_sw->g_texture_filter_req)
+#define g_faithful_authority (s_sw->g_faithful_authority)
+#define view_enabled (s_sw->view_enabled)
+#define view_shift (s_sw->view_shift)
+#define view_pad_left (s_sw->view_pad_left)
+#define view_pad_right (s_sw->view_pad_right)
+#define g_uv_lim (s_sw->g_uv_lim)
 
-/* Draw offset */
-static int g_offset_x, g_offset_y;
-
-/* Semi-transparency state */
-static int g_semi_trans_enabled;
-static int g_semi_trans_mode; /* 0=B/2+F/2, 1=B+F, 2=B-F, 3=B+F/4 */
-
-/* Mask bit state */
-static int g_mask_set_bit;   /* force bit 15 on written pixels */
-static int g_mask_check_bit; /* skip write if dest bit 15 is set */
-
-/* Texture window (from GP0(E2h)) */
-static uint8_t g_tw_mask_x, g_tw_mask_y;
-static uint8_t g_tw_off_x, g_tw_off_y;
-
-/* Color modulation for textured primitives */
-static uint8_t g_mod_r, g_mod_g, g_mod_b;
-static int g_raw_texture; /* 1 = skip modulation */
-
-/* Texture filtering: 0 = nearest (native PSX), 1 = bilinear. */
-static int g_texture_filter = 0;
-/* The player's filter request, applied unless faithful authority is on. */
-static int g_texture_filter_req = 0;
-static int g_faithful_authority = 0;   /* see sw_set_faithful_authority */
+/* Native-wide presentation remains a separate set of surfaces, keyed by
+ * buffer origin. Private native contexts never enable those surfaces. */
+static void wide_free_all(void);
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -166,7 +236,7 @@ static inline RTarget rt_hires(void) {
  * into the OTHER buffer's band in the shared wide surface and corrupt it
  * (top/bottom edge flicker as the buffers flip). Canonical VRAM never showed
  * this because its draw-area clip already confines it. Scale matches SSAA. */
-static int view_enabled, view_shift, view_pad_left, view_pad_right;
+
 static inline RTarget rt_wide(void) {
     int s = g_scale;
     RTarget t;
@@ -194,7 +264,7 @@ static inline WideBd wide_bd_get(void) {
     WideBd b; b.on = 0; b.scale = 1.0f; b.center = 0.0f;
     extern int psx_ws_prim_in_backdrop(void);
     extern int g_ws_bd_stretch_on, g_ws_bd_stretch_pct;
-    if (g_ws_bd_stretch_on && g_wide_w > 0 && g_wide_cur && psx_ws_prim_in_backdrop()) {
+    if (g_wide_w > 0 && g_wide_cur && g_ws_bd_stretch_on && psx_ws_prim_in_backdrop()) {
         int native_w = g_wide_w - 2 * g_wide_off;
         if (native_w > 0) {
             b.on = 1;
@@ -282,7 +352,7 @@ static inline void put_opaque(const RTarget *t, int x, int y, uint16_t color) {
     t->buf[idx] = color;
     /* Canonical VRAM only (hi-res / wide mirrors are present-side). */
     if (t->buf == g_vram)
-        gpu_vram_dirty_mark_row((uint32_t)y);
+        sw_dirty_row((uint32_t)y);
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
@@ -328,7 +398,7 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
 
     t->buf[idx] = color;
     if (t->buf == g_vram)
-        gpu_vram_dirty_mark_row((uint32_t)y);
+        sw_dirty_row((uint32_t)y);
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,7 +450,7 @@ static uint16_t texel_fetch(int u, int v, uint16_t texpage,
  * texels from a neighbouring sprite/tile or empty VRAM. Set by every
  * textured prim entry point; ignored while a texture window is active
  * (texel_fetch applies the window instead, which wraps by design). */
-static int g_uv_lim[4] = { 0, 0, 255, 255 };
+
 
 static uint16_t bl_fetch(int u, int v, uint16_t texpage,
                          uint16_t clut_x, uint16_t clut_y) {
@@ -676,7 +746,7 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
             g_vram[py * VRAM_WIDTH + px] = color;
         }
     }
-    gpu_vram_dirty_mark_rect(x0, y0, w, h);
+    sw_dirty_rect(x0, y0, w, h);
 
     if (g_hr) hr_fill_block(x, y, w, h, color);
 }
@@ -742,7 +812,7 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
                 }
             }
         }
-        gpu_vram_dirty_mark_row((uint32_t)dy);
+        sw_dirty_row((uint32_t)dy);
     }
 
     if (hr_rows) free(hr_rows);
@@ -1580,7 +1650,7 @@ void sw_vram_write(int x, int y, uint16_t pixel) {
     x &= (VRAM_WIDTH - 1);
     y &= (VRAM_HEIGHT - 1);
     g_vram[y * VRAM_WIDTH + x] = pixel;
-    gpu_vram_dirty_mark_row((uint32_t)y);
+    sw_dirty_row((uint32_t)y);
 
     if (g_hr) {
         int s = g_scale;
@@ -1647,7 +1717,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
      * does s² stores per guest texel — multi-second hitches on 2×/4×. */
     if (x == 0 && y == 0 && w == VRAM_WIDTH && h == VRAM_HEIGHT) {
         memcpy(g_vram, data, (size_t)VRAM_WIDTH * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
-        gpu_vram_dirty_mark_all();
+        sw_dirty_all();
         if (g_hr) hr_rebuild_from_vram();
         return;
     }
@@ -1661,7 +1731,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
                    data + (size_t)row * (size_t)w,
                    (size_t)w * sizeof(uint16_t));
         }
-        gpu_vram_dirty_mark_rect(x, y, w, h);
+        sw_dirty_rect(x, y, w, h);
         return;
     }
 
@@ -1683,7 +1753,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
                 }
             }
         }
-        gpu_vram_dirty_mark_row((uint32_t)py);
+        sw_dirty_row((uint32_t)py);
     }
 }
 

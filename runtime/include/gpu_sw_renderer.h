@@ -7,6 +7,15 @@
 extern "C" {
 #endif
 
+/* Explicit contexts are exclusively owned by one thread at a time. Binding
+ * NULL restores the existing default renderer. Private contexts track dirty
+ * rows independently of the legacy global checkpoint tracker. */
+typedef struct SwRendererContext SwRendererContext;
+SwRendererContext *sw_context_create(void);
+SwRendererContext *sw_context_bind(SwRendererContext *context);
+void sw_context_destroy(SwRendererContext *context);
+void sw_context_take_dirty(uint64_t rows[8]);
+
 /* Maximum internal-resolution supersampling factor (linear, per axis). */
 #define SW_MAX_INTERNAL_SCALE 4
 
