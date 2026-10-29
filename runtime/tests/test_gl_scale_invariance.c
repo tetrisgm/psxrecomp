@@ -119,6 +119,8 @@ void gr_flush_native_upload(void){}
 int gpu_hd_textures_active(void){return 0;}
 #endif
 /* Host sampler (host_sampler.c): the render thread retargets it; none here. */
+/* The fixture supplies packet geometry directly, without a guest PGXP engine. */
+void gpu_pgxp_update_projection_tracking(void) {}
 void host_sampler_retarget_current(const char *name){(void)name;}
 int gpu_display_is_depth24(void){return 0;}
 void gpu_get_display_info(GpuDisplayInfo *out){memset(out,0,sizeof(*out));out->width=320;out->height=240;}
