@@ -1404,6 +1404,16 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
                 (float)(gte->OFX / 65536.0 * z + hx),
                 (float)(gte->OFY / 65536.0 * z + (double)gte->MAC2 * h_proj),
                 (float)z, (float)h_proj / 2.0f};
+            projection.view[0]=(float)((double)mac1/4096.0);
+            projection.view[1]=(float)((double)mac2/4096.0);
+            projection.view[2]=(float)((double)mac3/4096.0);
+            projection.h=(float)h_proj;
+            projection.ofx=(float)(gte->OFX/65536.0);
+            projection.ofy=(float)(gte->OFY/65536.0);
+            projection.x_scale=(float)((double)x_num/(double)x_den);
+            for(int i=0;i<3;++i) projection.model[i]=V[i];
+            projection.caller=gte->projection_caller;
+            projection.interpolation_valid=1;
             GTE_PGXP(gte, gte_set_projection, &projection);
         }
     }
@@ -2535,6 +2545,7 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
 
     GTEState gte;
     gte_import_cpu_state(&gte, cpu);
+    gte.projection_caller=cpu->gpr[31]&0x1fffffffu;
 
     uint8_t func = cmd & 0x3F;
     /* GTE-activity gameplay detector ([widescreen] gte_game_mode): note every

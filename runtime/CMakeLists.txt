@@ -2002,6 +2002,10 @@ if(BUILD_TESTING)
         target_link_libraries(dynamic_resolution_rt_test PRIVATE m)
     endif()
     add_test(NAME dynamic_resolution_rt_test COMMAND dynamic_resolution_rt_test)
+    add_executable(packet_interpolation_test tests/test_packet_interpolation.cpp src/packet_interpolation.cpp)
+    target_include_directories(packet_interpolation_test PRIVATE include)
+    add_test(NAME packet_interpolation_test COMMAND packet_interpolation_test)
+
     # Frame generation's matching, interpolation, plan and breaker.
     add_executable(frame_gen_test tests/test_frame_gen.c src/frame_gen.c)
     target_include_directories(frame_gen_test PRIVATE include)

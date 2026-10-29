@@ -388,6 +388,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
     ${PSXRECOMP_ROOT}/runtime/src/render_thread.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_packet.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/packet_interpolation.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/packet_interpolation_stream.cpp
     ${PSXRECOMP_ROOT}/runtime/src/frame_owner.cpp
     ${PSXRECOMP_ROOT}/runtime/src/present_thread.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_gen.c

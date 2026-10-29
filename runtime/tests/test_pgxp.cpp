@@ -942,6 +942,10 @@ int main(void) {
      * byte-identical partial writes must still discard the 3D association. */
     {
         PGXPProjection p={12345.5f,-7311.0f,-62.0f,150.0f}, out;
+        p.view[0]=10.25f;p.view[1]=-3.5f;p.view[2]=62.75f;
+        p.h=300;p.ofx=160;p.ofy=120;p.x_scale=0.75f;
+        p.model[0]=17;p.model[1]=-93;p.model[2]=1024;
+        p.caller=0x123456;p.interpolation_valid=1;
         pgxp_set_projection_tracking(1);
         pgxp_gte_push_sxy(X16,Y16,0,PACKED);
         pgxp_gte_set_projection(&p);
@@ -950,6 +954,12 @@ int main(void) {
         psx_pgxp_cop2(nullptr,MFC2(9,14),PACKED,0);
         psx_pgxp_store(nullptr,SW(1,9),ADDR_B,PACKED);
         CHECK(pgxp_load_projection(ADDR_B,PACKED,&out) && out.x==p.x && out.z==p.z);
+        CHECK(std::memcmp(&out,&p,sizeof p)==0);
+        /* The other DMA buffer carries exactly the same provenance. Neither
+         * its address nor ordering-table placement enters the identity. */
+        psx_pgxp_store(nullptr,SW(1,9),ADDR_B+0x400,PACKED);
+        CHECK(pgxp_load_projection(ADDR_B+0x400,PACKED,&out));
+        CHECK(std::memcmp(&out,&p,sizeof p)==0);
         CHECK(!pgxp_load_projection(ADDR_B,PACKED^1,&out));
         pgxp_checkpoint_begin();
         psx_pgxp_store(nullptr,SB(1,9),ADDR_B,PACKED&255);

@@ -1,4 +1,5 @@
-﻿/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
+#include "packet_interpolation_stream.h"
+/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
  *
  * Implements:
  *   - GPUSTAT register with correct bit semantics
@@ -4891,7 +4892,8 @@ void gpu_render_projective_end(void) {
 }
 void psx_mod_set_render_projective(int enabled) {
     s_render_projective = !!enabled;
-    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction);
+    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction ||
+                                 packet_interpolation_stream_enabled());
 }
 static uint64_t s_native_wide_projection_vertices = 0;
 extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
@@ -4922,7 +4924,8 @@ void psx_mod_set_native_wide_projection_correction(int enabled) {
     s_native_wide_projection_vertices = 0;
     /* Signed camera-space provenance is required for correct native-wide
      * faces, including corners behind the camera. Arm it with the mode. */
-    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction);
+    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction ||
+                                 packet_interpolation_stream_enabled());
     gpu_pgxp_rederive_enable();
 }
 
@@ -5034,6 +5037,17 @@ static void prepare_precise_triangle(int i0, int i1, int i2,
         gl_renderer_note_wide_triangle_recovery(s_native_wide_projection_correction &&
             ws_native_wide_active() &&
             psx_gpu_triangle_oversize(raw_x,raw_y,0,1,2));
+    }
+    if (gr_backend() == GR_BACKEND_OPENGL && packet_interpolation_stream_enabled()) {
+        PacketInterpolationSource source={0};
+        const int indices[3]={i0,i1,i2};
+        for(unsigned i=0;i<3;++i) {
+            source.x[i]=vx[i];source.y[i]=vy[i];
+            if(pgxp_load_projection(gp0_cmd_source_addr+4u*indices[i],
+                gp0_cmd_buf[indices[i]],&source.projection[i]) &&
+                source.projection[i].interpolation_valid) source.valid_mask|=1u<<i;
+        }
+        packet_interpolation_record(&source);
     }
     if (gr_backend() == GR_BACKEND_OPENGL &&
         gl_renderer_frame_generation() != gte_fg_source_enabled())

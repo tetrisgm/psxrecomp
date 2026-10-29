@@ -1,4 +1,5 @@
-﻿/*
+#include "packet_interpolation_stream.h"
+/*
  * debug_server.c -- TCP debug server for PSX recomp v4
  *
  * Single-threaded, non-blocking TCP server polled once per vblank.
@@ -11290,6 +11291,14 @@ static void handle_render_thread(int id, const char *json)
  *   {"cmd":"frame_gen"} -> enabled, active, generated / real presents, flips,
  *   the last plan (in-between frames per game frame, display slots), costs,
  *   match counts, breaker. Not a sync point (render-thread counters, racy). */
+static void handle_packet_interpolation(int id, const char *json)
+{
+    (void)json;
+    char buf[1024];
+    packet_interpolation_stream_json(buf,sizeof buf);
+    send_fmt("{\"id\":%d,\"ok\":true,\"interpolation\":%s}",id,buf);
+}
+
 static void handle_frame_gen(int id, const char *json)
 {
     (void)json;
@@ -16629,6 +16638,7 @@ static const CmdEntry s_commands[] = {
     { "present_image_ring_stats", handle_present_image_ring_stats },
     { "render_thread",     handle_render_thread },
     { "frame_gen",         handle_frame_gen },
+    { "packet_interpolation", handle_packet_interpolation },
     { "present_image_ring_get",   handle_present_image_ring_get },
     { "kernel_bless",      handle_kernel_bless },
     { "ws_aspect",         handle_ws_aspect },

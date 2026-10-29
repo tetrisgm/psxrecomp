@@ -1,4 +1,5 @@
-﻿/* gpu_gl_renderer.c — hardware OpenGL renderer backend.
+#include "packet_interpolation_stream.h"
+/* gpu_gl_renderer.c — hardware OpenGL renderer backend.
  *
  * ARCHITECTURE (v2 — GPU-authoritative VRAM)
  * -------------------------------------------
@@ -553,7 +554,7 @@ enum {
     RTH_PRESENT_WIDE, RTH_STATE, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
     RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_INIT,
-    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_DEBUG_CALL, RTH_BANK, RTH_NATIVE_SOURCE, RTH_GROUP
+    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_DEBUG_CALL, RTH_BANK, RTH_NATIVE_SOURCE, RTH_GROUP, RTH_PACKET_SOURCE
 };
 /* Bank definitions are immutable process-lifetime CPU assets. Resolve them
  * on the producer; the graphics owner never invokes a title resolver. */
@@ -16280,6 +16281,14 @@ int gl_renderer_frame_generation_method(void) {
     return s_fg_reproject ? GL_FG_METHOD_REPROJECTION : GL_FG_METHOD_REDRAW;
 }
 
+void packet_interpolation_record(const PacketInterpolationSource *source) {
+    if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
+    if(!rth_group_flush()) return;
+    void *payload=rt_cmd_begin(RTH_PACKET_SOURCE,0,sizeof *source);
+    if(!payload) return;
+    memcpy(payload,source,sizeof *source);rt_cmd_commit();
+}
+
 void gl_renderer_fg_source(const uint32_t id[3], const int32_t pc[9], const int32_t h[3],
                            const int32_t x[3], const int32_t y[3]) {
     if (!s_fg_on || !rth_record_mode()) return;
@@ -17219,6 +17228,10 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
         }
         return at==count;
     }
+    if(command->op==RTH_PACKET_SOURCE) {
+        if(command->payload!=sizeof(PacketInterpolationSource)) return 0;
+        packet_interpolation_stream_append(payload);return 1;
+    }
     if(command->op==RTH_NATIVE_SOURCE) {
         uint64_t source;
         if(command->payload!=sizeof source) return 0;
@@ -17233,6 +17246,8 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
     const RthPacketSeed *seed=packet->initial;
     const RthPacketInputs *inputs=packet->attachment;
     s_rth_packet_replaying=1;s_rth_packet_view=packet;
+    if(packet_interpolation_stream_enabled())
+        packet_interpolation_stream_begin(packet->epoch,packet->sequence);
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();
     memcpy(s_rth_vram_priv,seed->pixels,sizeof seed->pixels);
     rth_rebind_vram(s_rth_vram_priv);
@@ -17251,6 +17266,7 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
     }
     s_rth_packet_last_epoch=packet->epoch;
     s_rth_packet_last_sequence=packet->sequence;
+    if(packet_interpolation_stream_enabled()) packet_interpolation_stream_end();
 done:
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
 }
@@ -17258,6 +17274,7 @@ static void rth_packet_reset(void *user,uint64_t epoch) {
     (void)user;(void)epoch;
     fg_invalidate();gl_renderer_invalidate_present();
     s_rth_packet_last_sequence=s_rth_packet_last_epoch=0;
+    packet_interpolation_stream_reset();
 }
 
 /* ---- lifecycle / public ---------------------------------------------------- */

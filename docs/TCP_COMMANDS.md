@@ -518,9 +518,9 @@ between Play and TCP availability.
 
 ## Complete command index (generated)
 
-**394 commands registered** — 381 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
+**397 commands registered** — 384 on the native server (`runtime/src/debug_server.c`), 61 on the Beetle server (`runtime/src/beetle_debug_server.c`).
 
-86 of 394 have prose above; **308 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
+87 of 397 have prose above; **310 are index-only**. An index-only command still works — it just has no description here yet. Send it `{"cmd":"<name>"}` and read the reply, or find its `handle_*` function in the server source.
 
 Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this block has drifted from the code.
 
@@ -760,6 +760,7 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `overlay_shadow_dump` | ✓ |  |  |
 | `overlay_static_entries` | ✓ |  | ✓ |
 | `pace_state` | ✓ |  |  |
+| `packet_interpolation` | ✓ |  |  |
 | `pad_status` | ✓ | ✓ |  |
 | `parity_ctl` | ✓ | ✓ |  |
 | `parity_dump` | ✓ | ✓ |  |
@@ -769,8 +770,9 @@ Regenerate with `python tools/gen_tcp_commands.py`; `--check` fails if this bloc
 | `pc_probe_dump` | ✓ |  |  |
 | `perf` | ✓ |  |  |
 | `pgxp` | ✓ |  | ✓ |
-| `pgxp_frame` | ✓ |  |  |
+| `pgxp_frame` | ✓ |  | ✓ |
 | `pgxp_miss_ring` | ✓ |  |  |
+| `pgxp_raster` | ✓ |  |  |
 | `pgxp_shadow` | ✓ |  |  |
 | `pgxp_store_ring` | ✓ |  |  |
 | `pgxp_tri_ring` | ✓ |  |  |
