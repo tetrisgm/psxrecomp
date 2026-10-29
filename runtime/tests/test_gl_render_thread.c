@@ -131,6 +131,41 @@ static void check(int ok, const char *label) {
     checks++;
     if (!ok) { fprintf(stderr, "FAIL %s\n", label); failures++; }
 }
+static int bank_resolver_calls;
+static int resolve_test_bank(uint16_t id) {
+    check(!rt_on_render_thread(),"texture-bank resolver stays on producer");
+    ++bank_resolver_calls;
+    uint16_t pixels[64*64];
+    for(unsigned i=0;i<64*64;++i) pixels[i]=(uint16_t)(1+(i%32766));
+    return psx_mod_define_texture_bank(id,64,64,pixels);
+}
+static void test_queued_texture_banks(int threaded) {
+    if(threaded) gl_renderer_render_thread_frame_boundary();
+    psx_mod_set_texture_bank_resolver(resolve_test_bank);
+    RtStats before={0},after={0};
+    if(threaded) rt_get_stats(&before);
+    gr_set_native_source(UINT64_C(0x123456789abcdef));
+    check(gl_renderer_select_texture_bank(123),"bank definition accepted");
+    check(gl_renderer_select_texture_bank_live_clut(123),"live CLUT selection accepted");
+    gr_set_native_source(0);
+    if(threaded) {
+        rt_drain();rt_get_stats(&after);
+        check(before.acquires==after.acquires && !after.held,"bank selection never takes GL context");
+        check(s_rths_native_source==UINT64_C(0x123456789abcdef),"recorded native input source survives producer advance");
+    }
+    check(bank_resolver_calls==1,"immutable bank resolved once");
+    check(s_bank_tex[123]!=0 && s_selected_bank_live_clut,"owner created bank and selected live CLUT");
+    if(threaded) gl_renderer_render_thread_sync("fixture bank upload check");
+    uint16_t actual[64*64];
+    glBindTexture(GL_TEXTURE_2D,s_bank_tex[123]);
+    glGetTexImage(GL_TEXTURE_2D,0,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,actual);
+    for(unsigned i=0;i<64*64;++i) if(actual[i]!=(uint16_t)(1+(i%32766))) {
+        check(0,"bank upload owns exact immutable source");break;
+    }
+    check(gl_renderer_select_texture_bank(0),"bank deselection accepted");
+    psx_mod_set_texture_bank_resolver(NULL);
+    if(threaded) gl_renderer_render_thread_frame_boundary();
+}
 /* Force the real allocation-failure branch without exhausting VRAM. The
  * fixture includes the backend, so no production fault-injection API is needed. */
 static void (APIENTRY *saved_renderbuffer_storage)(GLenum, GLenum, GLsizei, GLsizei);
@@ -433,6 +468,7 @@ int main(int argc, char **argv) {
         if(threaded) gl_renderer_render_thread_frame_boundary();
     }
     test_live_resolution(scale);
+    test_queued_texture_banks(threaded);
     GlDynresStats live_baseline;
     gl_renderer_dynres_stats(&live_baseline);
     if (dynres) {

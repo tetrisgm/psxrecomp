@@ -194,6 +194,7 @@ static void fixture_present(int generated) {
 
 #define FRAME_W 320
 #define FRAME_H 240
+static int g_test_bank;
 
 static void textures(void) {
     static uint16_t page[64*64], clut[16];
@@ -203,6 +204,13 @@ static void textures(void) {
     for (int i = 0; i < 64*64; i++) vram[(i / 64) * 1024 + 896 + i % 64] = page[i];
     gr_vram_transfer_in(896, 0, 64, 64, page);
     gr_vram_transfer_in(512, 300, 16, 1, clut);
+    g_test_bank=getenv("FG_TEST_BANK")!=NULL;
+    if(g_test_bank) {
+        static uint16_t bank[1024*512];
+        for(int i=0;i<64*64;++i) bank[(i/64)*1024+896+i%64]=page[i]^0x5555;
+        memcpy(bank+300*1024+512,clut,sizeof clut);
+        check(psx_mod_define_texture_bank(12345,1024,512,bank),"immutable bank defined");
+    }
 }
 
 static int wide_mode;
@@ -326,6 +334,8 @@ static void game_frame_part(int g, int bx, int part) {
         int y = 12 + (i / 8) * 42 + (i == 5 ? g % 5 : 0);
         if (i == 0 && g % 5 == 0) { x = bx + 250 - (g * 37) % 200; y = 180; }
         fixture_sources(i, bx, x, y);
+        const int bank=g_test_bank && i%8<2;
+        if(bank) check(gl_renderer_select_texture_bank(12345),"queued bank selected");
         switch (i % 4) {
         case 0: gr_draw_shaded_textured_triangle(x, y, 0, 0, 0x808080, x + 30, y + 2, 63, 4, 0x6090b0,
                                                  x + 3, y + 32, 8, 63, 0xb09060, 512, 300, 0x000e, 0); break;
@@ -333,6 +343,7 @@ static void game_frame_part(int g, int bx, int part) {
         case 2: gr_draw_gouraud_triangle(x, y, 0x7c00, x + 26, y + 4, 0x03e0, x + 6, y + 30, 0x001f); break;
         default: gr_draw_flat_triangle(x, y, x + 24, y + 20, x - 4, y + 26, (uint16_t)(0x2108 * (i & 3) + 0x0421)); break;
         }
+        if(bank) check(gl_renderer_select_texture_bank(0),"queued bank deselected");
     }
     if (part == 0) return;
     if (g_occlude) occlude_quad(g, bx);
@@ -457,9 +468,11 @@ int main(int argc, char **argv) {
         setenv("PSX_FRAME_GEN_FORCE", "1", 1);
 #endif
         if (rp) gl_renderer_set_frame_generation_method(GL_FG_METHOD_REPROJECTION);
+        rt_drain(); /* test observes application of queued owner controls */
         check(gl_renderer_frame_generation_method() ==
               (rp ? GL_FG_METHOD_REPROJECTION : GL_FG_METHOD_REDRAW), "generation method");
         gl_renderer_set_frame_generation(1);
+        rt_drain();
         check(gl_renderer_frame_generation() == 1, "frame generation on");
     }
     gl_renderer_frame_gen_configure(120.0, 59.94);

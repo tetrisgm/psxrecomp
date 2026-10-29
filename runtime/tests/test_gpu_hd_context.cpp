@@ -146,8 +146,23 @@ int main() {
             if(!gpu_hd_textures_apply_tracking(tracking) || !gpu_hd_textures_invalidation_changes(64,0,4,2)) ++failures;
             gpu_hd_textures_free_tracking(tracking);
             NativeRasterState state{};state.right=1023;state.bottom=511;
+            state.page=1|256;
+            native_raster_inputs_enable(raster,1);
+            const uint32_t sample[4]={0x65000080,0x006402bc,0,0x00010001};
+            const uint64_t before_fill=native_raster_gp0_identified(raster,&state,sample,4);
+            const uint64_t unchanged=native_raster_gp0_identified(raster,&state,sample,4);
             const uint32_t fill[3]={0x020000ff,64,0x00020010};
             if(!native_raster_gp0(raster,&state,fill,3)) ++failures;
+            const uint64_t after_fill=native_raster_gp0_identified(raster,&state,sample,4);
+            auto* inputs=native_raster_inputs_seal(raster);
+            const auto* before_metadata=static_cast<const GpuHdTextureTracking*>(native_raster_inputs_metadata(inputs,before_fill));
+            const auto* after_metadata=static_cast<const GpuHdTextureTracking*>(native_raster_inputs_metadata(inputs,after_fill));
+            if(!native_raster_inputs_valid(inputs) || !before_metadata || !after_metadata ||
+               before_metadata==after_metadata ||
+               before_metadata!=native_raster_inputs_metadata(inputs,unchanged)) ++failures;
+            if(!gpu_hd_textures_apply_tracking(before_metadata) || !gpu_hd_textures_invalidation_changes(64,0,4,2) ||
+               !gpu_hd_textures_apply_tracking(after_metadata) || gpu_hd_textures_invalidation_changes(64,0,4,2)) ++failures;
+            native_raster_inputs_destroy(inputs);
             tracking=gpu_hd_textures_capture_native(pixels.data(),nullptr);
             if(!gpu_hd_textures_apply_tracking(tracking) || gpu_hd_textures_invalidation_changes(64,0,4,2) ||
                pixels[64]!=31 || gl_calls!=gl_before) ++failures;

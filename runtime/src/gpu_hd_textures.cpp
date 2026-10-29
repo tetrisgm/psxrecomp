@@ -77,9 +77,13 @@ struct GpuHdTextureContext {
     bool presentation = false;
     uint32_t native_window = 0;
     int native_semi = 0;
+    uint64_t input_generation = 0;
+    std::unique_ptr<GpuHdTextureTracking,decltype(&gpu_hd_textures_free_tracking)>
+        input_tracking{nullptr,gpu_hd_textures_free_tracking};
 };
 
 struct GpuHdTextureTracking {
+    std::atomic<unsigned> references{1};
     std::string root;
     bool configured = false, replacements = false, dump = false, copy_pending = false;
     uint32_t beetle_identity = 0;
@@ -359,7 +363,12 @@ extern "C" int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracki
         return 1;
     } catch (...) { return 0; }
 }
-extern "C" void gpu_hd_textures_free_tracking(GpuHdTextureTracking* tracking) { delete tracking; }
+extern "C" void gpu_hd_textures_free_tracking(GpuHdTextureTracking* tracking) {
+    if(tracking && tracking->references.fetch_sub(1,std::memory_order_acq_rel)==1) delete tracking;
+}
+extern "C" void gpu_hd_textures_retain_tracking(GpuHdTextureTracking* tracking) {
+    if(tracking) tracking->references.fetch_add(1,std::memory_order_relaxed);
+}
 extern "C" size_t gpu_hd_textures_tracking_bytes(const GpuHdTextureTracking* tracking) {
     if(!tracking) return 0;
     return sizeof(*tracking)+tracking->root.size()+tracking->beetle.size()+
@@ -563,11 +572,36 @@ void commit_native(void* data,const uint16_t* vram) {
     native_context->native_vram=vram;
     ++native_context->generation;
 }
+int capture_native_input_metadata(void* user,NativeRasterInputMetadata* out) {
+    auto* owner=static_cast<GpuHdTextureContext*>(user);
+    auto* previous=gpu_hd_textures_select_context(owner);
+    const uint64_t generation=gpu_hd_textures_tracking_generation();
+    int ok=1;
+    if(!gpu_hd_textures_active()) owner->input_tracking.reset();
+    else {
+        if(!owner->input_tracking || owner->input_generation!=generation) {
+            owner->input_tracking.reset(gpu_hd_textures_capture_tracking());
+            owner->input_generation=generation;
+        }
+        auto* tracking=owner->input_tracking.get();
+        if(!tracking) ok=0;
+        else {
+            gpu_hd_textures_retain_tracking(tracking);
+            out->data=tracking;out->bytes=gpu_hd_textures_tracking_bytes(tracking);
+            out->release=[](void* p) { gpu_hd_textures_free_tracking(static_cast<GpuHdTextureTracking*>(p)); };
+        }
+    }
+    gpu_hd_textures_select_context(previous);
+    return ok;
+}
 }
 
 extern "C" int gpu_hd_textures_attach_native(NativeRaster* raster,char* error,size_t capacity) {
     if(native_owner==raster) return 1;
-    if(native_owner) native_raster_set_observer(native_owner,nullptr,nullptr);
+    if(native_owner) {
+        native_raster_inputs_metadata_provider(native_owner,nullptr,nullptr);
+        native_raster_set_observer(native_owner,nullptr,nullptr);
+    }
     native_context.reset();native_owner=nullptr;
     native_attached.store(false,std::memory_order_release);
     if(!raster) return 1;
@@ -582,6 +616,7 @@ extern "C" int gpu_hd_textures_attach_native(NativeRaster* raster,char* error,si
     }
     native_owner=raster;
     native_raster_set_observer(raster,gpu_hd_textures_native_event,native_context.get());
+    native_raster_inputs_metadata_provider(raster,capture_native_input_metadata,native_context.get());
     native_attached.store(true,std::memory_order_release);
     return 1;
 }

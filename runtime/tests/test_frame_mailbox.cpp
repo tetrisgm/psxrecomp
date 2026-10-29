@@ -25,6 +25,7 @@ struct OwnerTest {
     std::atomic<uint64_t> last{0};
     std::atomic<unsigned> ticks{0};
     std::atomic<unsigned> requests{0},stale_requests{0};
+    std::atomic<unsigned> controls{0};
     FrameOwner *owner=nullptr;
 };
 static uint64_t owner_clock() {
@@ -61,6 +62,12 @@ static void request_done(void *user,const void *payload,size_t bytes,int stale) 
     if(stale) ++state.stale_requests;
     else assert(state.last.load(std::memory_order_acquire)>=expected);
     state.requests.fetch_add(1,std::memory_order_release);
+}
+static void control_done(void *user,const void *payload,size_t bytes,int stale) {
+    auto &state=*static_cast<OwnerTest *>(user);
+    assert(frame_owner_is_thread() && !stale && bytes==sizeof(uint64_t));
+    assert(state.last.load(std::memory_order_acquire)==*static_cast<const uint64_t *>(payload));
+    state.controls.fetch_add(1,std::memory_order_release);
 }
 static void test_attachments() {
     struct Owned { int* destroyed; uint64_t value; };
@@ -114,14 +121,18 @@ int main() {
     assert(frame_owner_replaced(owner)==9998);
     assert(state.acquire==1 && state.release==1);
     uint64_t requested=10000;
-    for(unsigned n=0;n<64;++n)
+    for(unsigned n=0;n<62;++n)
         assert(frame_owner_request(owner,requested,request_done,&state,&requested,sizeof requested));
+    uint64_t previous=1;
+    assert(frame_owner_control(owner,2,control_done,&state,&previous,sizeof previous));
+    assert(frame_owner_control(owner,10001,control_done,&state,&requested,sizeof requested));
     assert(!frame_owner_request(owner,requested,request_done,&state,&requested,sizeof requested));
     requested=UINT64_MAX; // accepted requests own their bytes
     state.unblock.store(true,std::memory_order_release);
     while(frame_owner_completed(owner)<2) std::this_thread::yield();
     assert(state.last.load(std::memory_order_acquire)==10000);
-    while(state.requests.load(std::memory_order_acquire)<64) std::this_thread::yield();
+    while(state.requests.load(std::memory_order_acquire)<62 ||
+          state.controls.load(std::memory_order_acquire)<2) std::this_thread::yield();
     assert(state.stale_requests==0);
     /* Timed presentation work continues while the guest publishes nothing. */
     while(state.ticks.load(std::memory_order_acquire)<2) std::this_thread::yield();

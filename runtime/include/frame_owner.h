@@ -38,6 +38,12 @@ void frame_owner_invalidate(FrameOwner *owner);
 typedef void (*FrameOwnerRequest)(void *user,const void *payload,size_t bytes,int stale);
 int frame_owner_request(FrameOwner *owner,uint64_t after_sequence,
                         FrameOwnerRequest callback,void *user,const void *payload,size_t bytes);
+/* Durable configuration ordered BEFORE the named next frame, including when
+ * that frame is replaced by a newer one. If idle with no pending frame it
+ * applies immediately. Controls and diagnostics share the bounded capacity.
+ * This distinct ordering prevents a setting from landing one frame late. */
+int frame_owner_control(FrameOwner *owner,uint64_t before_sequence,
+                        FrameOwnerRequest callback,void *user,const void *payload,size_t bytes);
 /* Consumer check before presenting; producer invalidation never frees a
  * consumer lease. Keep the image's epoch with any subsequent present job. */
 int frame_owner_current(const FrameOwner *owner,const FramePacketView *packet);

@@ -29,6 +29,110 @@ static uint16_t pixel(NativeRaster *r,int x,int y) {
     native_raster_read(r,x,y,1,1,&p);
     return p;
 }
+static void immutable_texture_inputs() {
+    auto* raster=native_raster_create(nullptr);assert(raster);
+    native_raster_inputs_enable(raster,1);
+    NativeRasterState state{0,0,1023,511,0,0,16|256,0,0,0,0};
+    send(raster,NR_WRITE,{0,256,31});
+    const uint32_t first[]={0x65000080,700u|(100u<<16),0,1u|(1u<<16)};
+    const uint64_t a=native_raster_gp0_identified(raster,&state,first,4);assert(a);
+    send(raster,NR_WRITE,{0,256,992});
+    const uint32_t second[]={0x65000080,701u|(100u<<16),0,1u|(1u<<16)};
+    const uint64_t b=native_raster_gp0_identified(raster,&state,second,4);assert(b>a);
+    auto* inputs=native_raster_inputs_seal(raster);assert(native_raster_inputs_valid(inputs));
+    NativeRasterTile before[128],after[128];
+    assert(native_raster_inputs_get(inputs,a,before,128)==16);
+    assert(native_raster_inputs_get(inputs,b,after,128)==16);
+    assert(native_raster_inputs_get(inputs,a,before,15)==-1);
+    assert(native_raster_inputs_get(inputs,b+1,before,128)==0);
+    assert(before[0].x==0 && before[0].y==256 && before[0].pixels[0]==31);
+    assert(after[0].pixels[0]==992 && before[0].version!=after[0].version);
+    for(unsigned n=1;n<16;++n) {
+        assert(before[n].version==after[n].version);
+        assert(before[n].pixels==after[n].pixels);
+    }
+    assert(native_raster_inputs_bytes(inputs)<150*1024); // 17 tiles, not two VRAM images
+    assert(pixel(raster,700,100)==31 && pixel(raster,701,100)==992);
+    // A subsequent collection shares unchanged native tile versions.
+    const uint64_t c=native_raster_gp0_identified(raster,&state,second,4);assert(c>b);
+    auto* next=native_raster_inputs_seal(raster);assert(native_raster_inputs_valid(next));
+    NativeRasterTile retained[128];
+    assert(native_raster_inputs_get(next,c,retained,128)==16);
+    for(unsigned n=0;n<16;++n) assert(retained[n].pixels==after[n].pixels);
+    // Eight-bit texpage and CLUT wrap horizontally at native VRAM's edge.
+    state.page=15|16|128;
+    const uint32_t wrap[]={0x65000080,702u|(100u<<16),uint32_t(63|(255<<6))<<16,1u|(1u<<16)};
+    const uint64_t d=native_raster_gp0_identified(raster,&state,wrap,4);assert(d>c);
+    auto* wrapped=native_raster_inputs_seal(raster);assert(native_raster_inputs_valid(wrapped));
+    NativeRasterTile tiles[128];
+    const int count=native_raster_inputs_get(wrapped,d,tiles,128);
+    assert(count==13); // eight page tiles and five wrapped CLUT tiles
+    bool found[128]{};
+    for(int n=0;n<count;++n) found[(tiles[n].y/64)*16+tiles[n].x/64]=true;
+    for(unsigned y=4;y<8;++y) assert(found[y*16] && found[y*16+15]);
+    for(unsigned x: {0u,1u,2u,3u,15u}) assert(found[3*16+x]);
+    // Restore invalidates future versions, not already sealed packets.
+    std::vector<uint16_t> zero(1024*512);
+    native_raster_restore(raster,zero.data());state.page=16|256;
+    const uint64_t e=native_raster_gp0_identified(raster,&state,second,4);
+    auto* restored=native_raster_inputs_seal(raster);assert(native_raster_inputs_valid(restored));
+    assert(native_raster_inputs_get(restored,e,tiles,128)==16);
+    assert(tiles[0].pixels[0]==0 && tiles[0].version!=after[0].version);
+    // Malicious/high-churn presentation cannot grow without bound or stop
+    // native work. A failed collection is rejected as a whole and recovers.
+    for(unsigned n=0;n<8500;++n) {
+        send(raster,NR_WRITE,{0,256,int(n+1)});
+        assert(native_raster_gp0_identified(raster,&state,second,4));
+    }
+    auto* overflow=native_raster_inputs_seal(raster);
+    assert(overflow && !native_raster_inputs_valid(overflow));
+    assert(native_raster_inputs_get(overflow,e,tiles,128)==-1);
+    assert(pixel(raster,701,100)==8500);
+    const uint64_t recovered=native_raster_gp0_identified(raster,&state,second,4);
+    auto* recovery=native_raster_inputs_seal(raster);
+    assert(native_raster_inputs_valid(recovery));
+    assert(native_raster_inputs_get(recovery,recovered,tiles,128)==16);
+    assert(tiles[0].pixels[0]==8500);
+    native_raster_destroy(raster);
+    assert(before[0].pixels[0]==31 && after[0].pixels[0]==992 && retained[0].pixels[0]==992);
+    native_raster_inputs_destroy(inputs);native_raster_inputs_destroy(next);
+    native_raster_inputs_destroy(wrapped);native_raster_inputs_destroy(restored);
+    native_raster_inputs_destroy(overflow);native_raster_inputs_destroy(recovery);
+}
+static void dropped_texture_input_packets() {
+    auto* raster=native_raster_create(nullptr);assert(raster);
+    native_raster_inputs_enable(raster,1);
+    auto* packets=frame_packet_create(64*1024*1024,1024);assert(packets);
+    NativeRasterState state{0,0,1023,511,0,0,16|256,0,0,0,0};
+    const uint32_t draw[]={0x65000080,700u|(100u<<16),0,0x00010001};
+    FramePacketView held{};
+    for(uint64_t n=1;n<=64;++n) {
+        send(raster,NR_WRITE,{0,256,int(n)});
+        const auto source=native_raster_gp0_identified(raster,&state,draw,4);assert(source);
+        auto* inputs=native_raster_inputs_seal(raster);assert(native_raster_inputs_valid(inputs));
+        assert(frame_packet_begin(packets,n,nullptr,0));
+        auto* record=static_cast<uint64_t*>(frame_packet_append(packets,1,0,sizeof source));
+        assert(record);*record=source;
+        assert(frame_packet_attach(packets,inputs,native_raster_inputs_bytes(inputs),
+            [](void* p) { native_raster_inputs_destroy(static_cast<NativeRasterInputs*>(p)); }));
+        assert(frame_packet_publish(packets));
+        if(n==1) assert(frame_packet_acquire(packets,&held));
+    }
+    assert(frame_packet_replaced(packets)==62);
+    native_raster_destroy(raster); // no borrowed pointer into live native VRAM
+    const auto sample=[](const FramePacketView& packet) {
+        NativeRasterTile tiles[128];
+        const auto* command=static_cast<const RtCmd*>(packet.records);
+        const uint64_t source=*reinterpret_cast<const uint64_t*>(command+1);
+        assert(native_raster_inputs_get(static_cast<const NativeRasterInputs*>(packet.attachment),
+                                       source,tiles,128)==16);
+        return tiles[0].pixels[0];
+    };
+    assert(sample(held)==1);
+    frame_packet_release(packets);
+    assert(frame_packet_acquire(packets,&held) && held.sequence==64 && sample(held)==64);
+    frame_packet_release(packets);frame_packet_destroy(packets);
+}
 static void provenance_observation() {
     struct Sample { int before,restore; uint16_t first,second,drawn; uint32_t opcode; };
     struct Observer {
@@ -83,6 +187,8 @@ static void provenance_observation() {
     native_raster_destroy(raster);
 }
 int main() {
+    immutable_texture_inputs();
+    dropped_texture_input_packets();
     provenance_observation();
     auto *r = native_raster_create(nullptr);
     auto *other = native_raster_create(nullptr);

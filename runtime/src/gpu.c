@@ -4157,6 +4157,7 @@ void gpu_init(void) {
     gpu_display_info_changed();
 }
 NativeRaster* gpu_native_owner(void) { return s_native_raster; }
+void gpu_native_flush_upload(void) { native_flush_upload(); }
 
 void gpu_set_power_on_video_mode(int pal) {
     gpu_display_info_changed();
@@ -7492,8 +7493,10 @@ static NativeRasterState native_draw_state(void) {
 static void native_packet(const uint32_t *words,size_t count) {
     if(!native_guest_work()) return;
     NativeRasterState state=native_draw_state();
-    if(!native_raster_gp0(s_native_raster,&state,words,count))
+    const uint64_t source=native_raster_gp0_identified(s_native_raster,&state,words,count);
+    if(!source)
         psx_fatal_halt("Native GPU packet allocation or validation failed");
+    gr_set_native_source(source);
 }
 static void native_polyline_segment(uint32_t vertex,int shaded) {
     uint32_t words[4];
@@ -7506,6 +7509,7 @@ static void native_polyline_segment(uint32_t vertex,int shaded) {
     native_packet(words,shaded?4:3);
 }
 static void gp0_execute_command(void) {
+    gr_set_native_source(0);
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
     /* Authoritative input is captured before title transforms, RGB555
      * conversion, shared-UI duplication or precision presentation work. */
@@ -7576,6 +7580,7 @@ static void gp0_execute_command(void) {
     } else {
         gp0_dispatch_command(opcode);
     }
+    gr_set_native_source(0);
 }
 
 static void gp0_dispatch_command(uint8_t opcode) {
@@ -7877,6 +7882,7 @@ static void gpu_write_gp0_body(uint32_t val) {
             !psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y)) {
             native_polyline_segment(val,0);
             gr_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
+            gr_set_native_source(0);
         }
         polyline_prev_x = x; polyline_prev_y = y;
         if (polyline_has_prev < 2) polyline_has_prev++;
@@ -7925,6 +7931,7 @@ static void gpu_write_gp0_body(uint32_t val) {
                 native_polyline_segment(val,1);
                 gr_draw_shaded_line(polyline_prev_x, polyline_prev_y,
                                     polyline_prev_c, x, y, polyline_color);
+                gr_set_native_source(0);
             }
             polyline_prev_x = x; polyline_prev_y = y;
             polyline_prev_c = polyline_color;

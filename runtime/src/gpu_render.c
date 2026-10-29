@@ -270,6 +270,9 @@ uint16_t gr_vram_read(int x, int y)                  { return g_b->vram_read(x, 
 void gr_vram_transfer_in(int x, int y, int w, int h, const uint16_t *d)  { g_b->vram_transfer_in(x, y, w, h, d); hd_note(GR_HD_NOTE_TRACK_UPLOAD, x, y, w, h, d); }
 void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       { g_b->vram_transfer_out(x, y, w, h, d); }
 void gr_set_draw_area(int x1, int y1, int x2, int y2){ g_b->set_draw_area(x1, y1, x2, y2); }
+static uint64_t g_native_source;
+void gr_set_native_source(uint64_t source) { g_native_source=source; }
+uint64_t gr_native_source(void) { return g_native_source; }
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2) { g_b->get_draw_area(x1, y1, x2, y2); }
 void gr_set_draw_offset(int x, int y)                { g_b->set_draw_offset(x, y); g_hd_offset_x=x; g_hd_offset_y=y; }
 

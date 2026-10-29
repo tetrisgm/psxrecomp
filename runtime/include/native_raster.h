@@ -74,6 +74,45 @@ void native_raster_visit(NativeRaster *raster,NativeRasterVisit visit,void *user
  * transfers use the existing state/fragment operations. */
 int native_raster_gp0(NativeRaster *raster,const NativeRasterState *state,
                       const uint32_t *words,size_t count);
+/* Same submission, returning a monotonic source identity (zero on failure).
+ * All enhanced primitives derived from this GP0 share its texture input. */
+uint64_t native_raster_gp0_identified(NativeRaster *raster,const NativeRasterState *state,
+                                      const uint32_t *words,size_t count);
+
+/* Immutable native texture inputs captured BEFORE each textured GP0 executes.
+ * Only sampled pages/CLUTs are retained, in shared 64x64 native tiles. Writes
+ * invalidate future versions without changing any packet's held inputs.
+ * This is presentation data; native GPU cache/guest semantics are unchanged.
+ * Enable/seal are CPU-only ordered barriers. Seal starts the next collection.
+ * An over-budget/allocation-failed collection is invalid and the whole
+ * presentation packet must be dropped; native guest work is never dropped. */
+typedef struct NativeRasterInputs NativeRasterInputs;
+typedef struct NativeRasterInputMetadata {
+    void *data;
+    size_t bytes;
+    void (*release)(void*);
+} NativeRasterInputMetadata;
+/* Optional immutable provenance captured on the native worker with each
+ * sampled input. A successful callback transfers one retained reference.
+ * Failure invalidates presentation only. Registration is a CPU barrier. */
+typedef int (*NativeRasterMetadataCapture)(void *user,NativeRasterInputMetadata *out);
+void native_raster_inputs_metadata_provider(NativeRaster *raster,
+                                            NativeRasterMetadataCapture capture,void *user);
+typedef struct NativeRasterTile {
+    uint32_t x,y;
+    uint64_t version;
+    const uint16_t *pixels; /* 64x64, borrowed until inputs destruction */
+} NativeRasterTile;
+void native_raster_inputs_enable(NativeRaster *raster,int enabled);
+NativeRasterInputs *native_raster_inputs_seal(NativeRaster *raster);
+void native_raster_inputs_destroy(NativeRasterInputs *inputs);
+int native_raster_inputs_valid(const NativeRasterInputs *inputs);
+size_t native_raster_inputs_bytes(const NativeRasterInputs *inputs);
+/* Returns tile count, zero for a non-textured source, -1 for invalid inputs
+ * or insufficient output capacity. It never silently truncates a page. */
+int native_raster_inputs_get(const NativeRasterInputs *inputs,uint64_t source,
+                             NativeRasterTile *tiles,size_t capacity);
+const void *native_raster_inputs_metadata(const NativeRasterInputs *inputs,uint64_t source);
 
 NativeRaster *native_raster_create(const uint16_t *initial_vram);
 void native_raster_destroy(NativeRaster *raster);

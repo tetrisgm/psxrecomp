@@ -547,8 +547,17 @@ enum {
     RTH_PRESENT_WIDE, RTH_STATE, RTH_RING_CAPTURE, RTH_DYN_STEP,
     RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK,
     RTH_PASS_BEGIN, RTH_PASS_END, RTH_ASYNC_RESERVE, RTH_ASYNC_BEGIN, RTH_INIT,
-    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_DEBUG_CALL, RTH_GROUP
+    RTH_PRESENT_CPU, RTH_PRESENT_BLANK, RTH_PRESENT_HOLD, RTH_CONTROL, RTH_DEBUG_CALL, RTH_BANK, RTH_NATIVE_SOURCE, RTH_GROUP
 };
+/* Bank definitions are immutable process-lifetime CPU assets. Resolve them
+ * on the producer; the graphics owner never invokes a title resolver. */
+typedef struct RthBank {
+    uint16_t id,live_clut;
+    uint32_t width,height;
+    const uint16_t *pixels;
+} RthBank;
+static RthBank s_bank_selected_definition;
+static int rth_record_bank(const RthBank *bank);
 /* Producer-side geometry publication for an optional seam-prepared pass.
  * Collection never reads the render owner's mutable snap index. */
 static PgxpRthSeamStream s_async_seam_stream;
@@ -934,6 +943,7 @@ static int           s_raster_ok = 0;      /* full GPU pipeline available */
 static GLuint s_bank_tex[65536];
 static GLuint s_selected_bank_tex;
 static int s_selected_bank_live_clut, s_tb_bank_live_clut;
+static int s_selected_bank_failed;
 
 /* Authoritative VRAM: hr color texture + stencil (mask bit) FBO. */
 static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
@@ -7081,16 +7091,17 @@ int gl_renderer_read_display_hires(int x, int y, int w, int h, uint32_t *out,
                                 cap_px, ow, oh);
 }
 
-int gl_renderer_select_texture_bank(uint16_t id) {
-    GL_RT_SYNC("select_texture_bank");
-    uint32_t width, height;
-    const uint16_t* pixels;
+static int select_texture_bank_now(const RthBank *bank) {
+    s_bank_selected_definition=*bank;
+    const uint16_t id=bank->id;
+    const uint32_t width=bank->width,height=bank->height;
+    const uint16_t *pixels=bank->pixels;
     GLint alignment, row_length;
-    s_selected_bank_live_clut = 0;
+    s_selected_bank_live_clut = bank->live_clut;
+    s_selected_bank_failed=0;
     if (!id) { s_selected_bank_tex = 0; return 1; }
     if (!gl_renderer_texture_banks_supported()) return 0;
     if (!s_bank_tex[id]) {
-        pixels = mod_texture_bank_pixels(id, &width, &height);
         if (!pixels) return 0;
         glGenTextures(1, &s_bank_tex[id]);
         p_glActiveTexture(PSXGL_TEXTURE0);
@@ -7116,12 +7127,18 @@ int gl_renderer_select_texture_bank(uint16_t id) {
     return 1;
 }
 
-int gl_renderer_select_texture_bank_live_clut(uint16_t id) {
-    GL_RT_SYNC("select_texture_bank_live_clut");
-    if (!gl_renderer_select_texture_bank(id)) return 0;
-    s_selected_bank_live_clut = id != 0;
-    return 1;
+static int select_texture_bank(uint16_t id,int live_clut) {
+    RthBank bank={.id=id,.live_clut=id && live_clut};
+    if(id) {
+        if(!gl_renderer_texture_banks_supported()) return 0;
+        bank.pixels=mod_texture_bank_pixels(id,&bank.width,&bank.height);
+        if(!bank.pixels) return 0;
+    }
+    if(rth_record_mode()) return rth_record_bank(&bank);
+    return select_texture_bank_now(&bank);
 }
+int gl_renderer_select_texture_bank(uint16_t id) { return select_texture_bank(id,0); }
+int gl_renderer_select_texture_bank_live_clut(uint16_t id) { return select_texture_bank(id,1); }
 
 int gl_renderer_init_context(SDL_Window *win) {
     s_win = win;
@@ -7267,6 +7284,8 @@ void gl_renderer_shutdown(void) {
         gl_renderer_set_bezel(NULL, 0, 0);
     }
     memset(s_bank_tex, 0, sizeof s_bank_tex);
+    memset(&s_bank_selected_definition,0,sizeof s_bank_selected_definition);
+    s_selected_bank_failed=0;
     s_selected_bank_tex = s_tb_bank_tex = 0;
     s_selected_bank_live_clut = s_tb_bank_live_clut = 0;
     if (s_ctx) {
@@ -13053,6 +13072,7 @@ typedef struct RthFrameState {
     int area[4],offset[2],wide[2],view[4],target,target_on;
     int stream[3];
     GpuDisplayInfo display;
+    RthBank bank;
 } RthFrameState;
 static RthFrameState s_rth_frame_state={.area={0,0,VRAM_W-1,VRAM_H-1}};
 static RthFrameState s_rth_frame_saved;
@@ -13071,6 +13091,7 @@ static void rth_frame_state_pop(void) {
 /* Last stream state sent (RTH_STATE); -1 forces the first send. */
 static int s_rthe_flat_bd = -1, s_rthe_vp_w = -1, s_rthe_bg_full = -1;
 static GpuDisplayInfo s_rthe_display;
+static uint64_t s_rthe_native_source,s_rths_native_source;
 static uint64_t s_rth_presents = 0, s_rth_presents_stale = 0;
 
 #define RTHF_PRIM      0x0001u
@@ -13078,6 +13099,7 @@ static uint64_t s_rth_presents = 0, s_rth_presents_stale = 0;
 #define RTHF_BD_SHIFT  2          /* bits 2-3: psx_ws_prim_in_backdrop() 0..3 */
 
 static void rth_mirror_resync(void) {
+    s_rthe_native_source=s_rths_native_source=gr_native_source();
     s_rthm_scale = s_out_scale;
     s_rthm_wide_w = g_wide_w;
     s_rthm_wide_off = g_wide_off;
@@ -13085,6 +13107,7 @@ static void rth_mirror_resync(void) {
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         s_rthm_base[i] = s_wide_fbo[i] ? s_wide_base[i] : -1;
     RthFrameState *st=&s_rth_frame_state;
+    st->bank=s_bank_selected_definition;
     st->area[0]=s_area_x1;st->area[1]=s_area_y1;
     st->area[2]=s_area_x2;st->area[3]=s_area_y2;
     st->offset[0]=s_off_x;st->offset[1]=s_off_y;
@@ -13156,6 +13179,14 @@ static int rth_rec_raw(uint16_t op, uint16_t flags, int n, const int32_t *v) {
     rt_cmd_commit();
     return 1;
 }
+static int rth_record_bank(const RthBank *bank) {
+    s_rth_frame_state.bank=*bank;
+    if(!rth_group_flush()) return 0;
+    void* payload=rt_cmd_begin(RTH_BANK,0,sizeof *bank);
+    if(!payload) return 0;
+    memcpy(payload,bank,sizeof *bank);rt_cmd_commit();
+    return 1;
+}
 
 /* Keep the exact state-call order, but publish a triangle and its short setup
  * sequence in one ring record. Non-integer payloads and context handoffs flush
@@ -13191,7 +13222,7 @@ static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
         }
     }
     int setup=op==RTH_SEMI || op==RTH_MASK || op==RTH_TWIN || op==RTH_MOD ||
-        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC;
+        op==RTH_PRECISE || op==RTH_PERSP || op==RTH_DEPTH || op==RTH_DITHER || op==RTH_FG_SRC || op==RTH_NATIVE_SOURCE;
     int triangle=op==RTH_FLAT_TRI || op==RTH_GOURAUD_TRI ||
         op==RTH_TEX_TRI || op==RTH_SHADED_TEX_TRI;
     if(!rth_group_on() || (!setup && !triangle) || n<0 || n>508) {
@@ -13211,6 +13242,12 @@ static int rth_rec_ints(uint16_t op,uint16_t flags,int n,const int32_t *v) {
  * and the backdrop gate; sent whenever it changes, before the call that would
  * first observe the change. */
 static void rth_send_state(void) {
+    const uint64_t source=gr_native_source();
+    if(source!=s_rthe_native_source) {
+        int32_t words[2];memcpy(words,&source,sizeof source);
+        rth_rec_ints(RTH_NATIVE_SOURCE,0,2,words);
+        s_rthe_native_source=source;
+    }
     int flat = gpu_ws_nw_flat_backdrop_enabled() ? 1 : 0;
     int vp = gpu_ws_netplay_local_viewport_width();
     int bg = gpu_ws_background_requires_full_composite() ? 1 : 0;
@@ -13616,6 +13653,10 @@ typedef struct {
     int semi_en, semi_mode, mask_set, mask_check, tw[4], mod[4];
     int area[4], off[2], wide_on, wide_base, view[4], rths[3];
     GpuDisplayInfo display;
+    RthBank bank;
+    GLuint bank_tex;
+    int bank_live_clut,bank_failed;
+    uint64_t native_source;
 } FgState;
 typedef struct {
     uint8_t  *buf; size_t len, cap;
@@ -13792,6 +13833,9 @@ static void fg_state_capture(FgState *st) {
     st->view[2] = view_pad_left; st->view[3] = view_pad_right;
     st->rths[0] = s_rths_flat_bd; st->rths[1] = s_rths_vp_w; st->rths[2] = s_rths_bg_full;
     st->display=s_rths_display;
+    st->bank=s_bank_selected_definition;st->bank_tex=s_selected_bank_tex;
+    st->bank_live_clut=s_selected_bank_live_clut;st->bank_failed=s_selected_bank_failed;
+    st->native_source=s_rths_native_source;
 }
 
 /* Restore draw state without the setters' side effects (stencil rebuilds,
@@ -13808,6 +13852,9 @@ static void fg_state_apply(const FgState *st, GLuint wide_cur) {
     view_pad_left = st->view[2]; view_pad_right = st->view[3];
     s_rths_flat_bd = st->rths[0]; s_rths_vp_w = st->rths[1]; s_rths_bg_full = st->rths[2];
     s_rths_display=st->display;
+    s_bank_selected_definition=st->bank;s_selected_bank_tex=st->bank_tex;
+    s_selected_bank_live_clut=st->bank_live_clut;s_selected_bank_failed=st->bank_failed;
+    s_rths_native_source=st->native_source;
     s_pc_valid = 0; s_pq_valid = 0; s_projected_uv_valid = 0; s_pz_valid = 0;
 }
 
@@ -13855,6 +13902,7 @@ static int fg_op_kept(uint16_t op) {
     case RTH_TEX_RECT_SCALED: case RTH_LINE: case RTH_SHADED_LINE: case RTH_AREA:
     case RTH_OFFSET: case RTH_WIDE_VIEW: case RTH_WIDE_TARGET: case RTH_WIDE_DISABLE:
     case RTH_WIDE_CLEAR: case RTH_WIDE_CLEAR_MARGINS: case RTH_PROJ_TRI: case RTH_STATE:
+    case RTH_BANK: case RTH_NATIVE_SOURCE:
         return 1;
     default:
         return 0;
@@ -14329,7 +14377,14 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
         s_rthx_backdrop = (h.flags >> RTHF_BD_SHIFT) & 3;
         const int area[4] = { s_area_x1, s_area_y1, s_area_x2, s_area_y2 };
         const int in = !s_fg_replay_objects_only && fg_area_meets(area, disp);
+        if(s_selected_bank_failed && (h.op==RTH_TEX_TRI || h.op==RTH_SHADED_TEX_TRI ||
+           h.op==RTH_TEX_RECT || h.op==RTH_TEX_RECT_SCALED)) continue;
         switch (h.op) {
+        case RTH_NATIVE_SOURCE: memcpy(&s_rths_native_source,v,sizeof s_rths_native_source);break;
+        case RTH_BANK: {
+            RthBank bank;if(h.bytes!=sizeof bank) abort();memcpy(&bank,pl,sizeof bank);
+            s_selected_bank_failed=!select_texture_bank_now(&bank);break;
+        }
         case RTH_SEMI:    glb_set_semi_transparency(v[0], v[1]); break;
         case RTH_DITHER:  glb_set_dither(v[0]); break;
         case RTH_MASK:    glb_set_mask_bits(v[0], v[1]); break;
@@ -16583,6 +16638,17 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
         rth_publish_diagnostics();
         return;
     }
+    if(c->op==RTH_BANK) {
+        if(c->payload!=sizeof(RthBank)) abort();
+        if(s_fg_on) fg_capture(c,payload);
+        RthBank bank;memcpy(&bank,payload,sizeof bank);
+        s_selected_bank_failed=!select_texture_bank_now(&bank);
+        return;
+    }
+    /* Match a refused synchronous bank allocation: its textured primitive
+     * is not drawn using some unrelated previously selected texture. */
+    if(s_selected_bank_failed && (c->op==RTH_TEX_TRI || c->op==RTH_SHADED_TEX_TRI ||
+       c->op==RTH_TEX_RECT || c->op==RTH_TEX_RECT_SCALED)) return;
     if (s_pass_dead && c->op != RTH_PASS_END && c->op != RTH_FRAME &&
         c->op != RTH_PRESENT_VRAM && c->op != RTH_PRESENT_WIDE &&
         c->op != RTH_PRESENT_CPU && c->op != RTH_PRESENT_BLANK && c->op != RTH_PRESENT_HOLD) {
@@ -16606,6 +16672,7 @@ static void gl_rth_exec_impl(void *user, const RtCmd *c, const void *payload) {
     if (agpu_op_open) agpu_op_begin(c->op);
     switch (c->op) {
     case RTH_SEMI:      glb_set_semi_transparency(v[0], v[1]); break;
+    case RTH_NATIVE_SOURCE: memcpy(&s_rths_native_source,v,sizeof s_rths_native_source);break;
     case RTH_DITHER:    glb_set_dither(v[0]); break;
     case RTH_MASK:      glb_set_mask_bits(v[0], v[1]); break;
     case RTH_TWIN:      glb_set_texture_window((uint32_t)v[0]); break;

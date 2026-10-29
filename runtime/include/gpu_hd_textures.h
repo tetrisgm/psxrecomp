@@ -23,6 +23,7 @@ typedef struct GpuHdTextureTracking GpuHdTextureTracking;
 GpuHdTextureTracking* gpu_hd_textures_capture_tracking(void);
 int gpu_hd_textures_apply_tracking(const GpuHdTextureTracking* tracking);
 void gpu_hd_textures_free_tracking(GpuHdTextureTracking* tracking);
+void gpu_hd_textures_retain_tracking(GpuHdTextureTracking* tracking);
 size_t gpu_hd_textures_tracking_bytes(const GpuHdTextureTracking* tracking);
 struct NativeRasterEvent;
 /* NativeRasterObserver callback; user is a native GpuHdTextureContext. */

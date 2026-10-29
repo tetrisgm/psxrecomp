@@ -32,6 +32,7 @@ struct FrameOwner {
     std::atomic<uint64_t> completed{0};
     std::atomic<uint64_t> epoch{1};
     std::deque<Request> requests;
+    std::deque<Request> controls;
     size_t request_bytes=0;
     uint64_t executed_sequence=0; // consumer only, reset for each epoch
     uint64_t executed_epoch=1;
@@ -68,7 +69,22 @@ struct FrameOwner {
                 }
             }
             FramePacketView packet{};
-            if(frame_packet_acquire(queue,&packet)) {
+            const bool has_packet=frame_packet_acquire(queue,&packet)!=0;
+            for(unsigned n=0;n<64;++n) {
+                Request request;
+                bool stale;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if(controls.empty()) break;
+                    const auto& front=controls.front();
+                    stale=stopping || front.epoch!=epoch.load(std::memory_order_acquire);
+                    if(!stale && has_packet && front.sequence>packet.sequence) break;
+                    request=std::move(controls.front());controls.pop_front();
+                    request_bytes-=request.bytes;
+                }
+                request.callback(request.user,request.payload.data(),request.bytes,stale);
+            }
+            if(has_packet) {
                 if(frame_packet_current(queue,&packet)) {
                     config.execute(config.user,&packet);
                     executed_epoch=packet.epoch;
@@ -76,6 +92,10 @@ struct FrameOwner {
                 }
                 completed.fetch_add(1,std::memory_order_release);
                 frame_packet_release(queue);
+                // A later control may have been deferred past this frame.
+                // Revisit idle work even if the guest now stops publishing.
+                std::lock_guard<std::mutex> lock(mutex);
+                if(!controls.empty()) ++published;
             }
             // Bounded drain prevents a flood of diagnostics starving frames.
             for(unsigned n=0;n<64;++n) {
@@ -143,23 +163,32 @@ extern "C" void frame_owner_invalidate(FrameOwner *owner) {
     owner->epoch.fetch_add(1,std::memory_order_release);
     owner->wake();
 }
-extern "C" int frame_owner_request(FrameOwner *owner,uint64_t after_sequence,
-    FrameOwnerRequest callback,void *user,const void *payload,size_t bytes) {
+static int submit_request(FrameOwner *owner,uint64_t sequence,
+    FrameOwnerRequest callback,void *user,const void *payload,size_t bytes,bool control) {
     if(!owner || !callback || (bytes && !payload) || bytes>1024*1024) return 0;
     try {
-        FrameOwner::Request request{after_sequence,owner->epoch.load(std::memory_order_acquire),
+        FrameOwner::Request request{sequence,owner->epoch.load(std::memory_order_acquire),
                                     callback,user,bytes,{}};
         request.payload.resize((bytes+sizeof(std::max_align_t)-1)/sizeof(std::max_align_t));
         if(bytes) std::memcpy(request.payload.data(),payload,bytes);
         {
             std::lock_guard<std::mutex> lock(owner->mutex);
-            if(owner->stop || owner->requests.size()==64 || bytes>1024*1024-owner->request_bytes) return 0;
-            owner->requests.push_back(std::move(request));owner->request_bytes+=bytes;
+            if(owner->stop || owner->requests.size()+owner->controls.size()==64 || bytes>1024*1024-owner->request_bytes) return 0;
+            auto& queue=control?owner->controls:owner->requests;
+            queue.push_back(std::move(request));owner->request_bytes+=bytes;
             ++owner->published;
         }
         owner->ready.notify_one();
         return 1;
     } catch(...) { return 0; }
+}
+extern "C" int frame_owner_request(FrameOwner *owner,uint64_t sequence,
+    FrameOwnerRequest callback,void *user,const void *payload,size_t bytes) {
+    return submit_request(owner,sequence,callback,user,payload,bytes,false);
+}
+extern "C" int frame_owner_control(FrameOwner *owner,uint64_t sequence,
+    FrameOwnerRequest callback,void *user,const void *payload,size_t bytes) {
+    return submit_request(owner,sequence,callback,user,payload,bytes,true);
 }
 extern "C" int frame_owner_current(const FrameOwner *owner,const FramePacketView *packet) {
     return frame_packet_current(owner->queue,packet);

@@ -127,6 +127,10 @@ void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *data);
 
 /* Draw area / offset */
 void gr_set_draw_area(int x1, int y1, int x2, int y2);
+/* Producer-only provenance of the original GP0 being translated; zero for
+ * host-only work. Presentation captures it, never reads it from its worker. */
+void gr_set_native_source(uint64_t source);
+uint64_t gr_native_source(void);
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2);
 void gr_set_draw_offset(int x, int y);
 
