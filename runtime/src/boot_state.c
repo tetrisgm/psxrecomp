@@ -14,6 +14,7 @@
 #include "gpu.h"           /* gpu_get_vram — CPU-auth mirror under dual-raster   */
 #include "gpu_render.h"    /* gr_vram_transfer_in / gr_vram_transfer_out          */
 #include "gpu_vram_dirty.h"
+#include "pgxp.h"
 #include "cpu_state.h"     /* gte_canonicalize_cpu_state after CPU wire restore   */
 #include "interrupts.h"
 #include "psx_cycles.h"
@@ -218,7 +219,44 @@ static int sync_vram_mirror_for_save(void)
 }
 
 /* File or growable memory sink — both save paths share one serializer. */
+static uint8_t native_module_scratch[16u*1024u*1024u];
+struct BootStatePending {
+    GpuNativeCapture *gpu;
+    size_t gpu_offset,vram_offset;
+#if !(defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+    uint8_t vram_wire[VRAM_SIZE];
+#endif
+};
+BootStatePending *boot_state_pending_create(void) {
+    BootStatePending *p=(BootStatePending*)calloc(1,sizeof(*p));
+    if(!p)return NULL;
+    for(size_t i=0;i<sizeof(native_module_scratch);i+=4096)
+        ((volatile uint8_t*)native_module_scratch)[i]=0;
+    p->gpu=gpu_native_capture_create();
+    if(!p->gpu){free(p);return NULL;}return p;
+}
+void boot_state_pending_destroy(BootStatePending *p) {
+    if(p){gpu_native_capture_destroy(p->gpu);free(p);}
+}
+int boot_state_pending_finish(BootStatePending *p,BootStatePatch patch,void *context) {
+    if(!gpu_native_capture_ready(p->gpu))return 0;
+    const uint8_t *gpu;const uint16_t *vram;uint32_t size;
+    gpu_native_capture_result(p->gpu,&gpu,&size,&vram);
+    if(!patch(context,p->gpu_offset,gpu,size))return -1;
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    return patch(context,p->vram_offset,vram,VRAM_SIZE)?1:-1;
+#else
+    uint8_t *wire=p->vram_wire;
+    PstW w;pst_w_init(&w,wire,VRAM_SIZE);
+    int ok=pst_w_pod(&w,vram,VRAM_SIZE,2) && patch(context,p->vram_offset,wire,VRAM_SIZE);
+    return ok?1:-1;
+#endif
+}
+
 typedef struct BsOut {
+    BootStatePending *pending;
+    BootStateSink sink;
+    void *sink_context;
     FILE*    f;       /* non-NULL => write to file */
     uint8_t* data;    /* memory sink (owned by caller / save_buffer) */
     size_t   len;
@@ -228,6 +266,7 @@ typedef struct BsOut {
 
 static int bs_write(BsOut* o, const void* p, size_t n) {
     if (!n) return 1;
+    if (o->sink) { int ok=o->sink(o->sink_context,p,n);if(ok)o->len+=n;return ok; }
     if (o->f)
         return fwrite(p, 1, n, o->f) == n;
     if (o->len + n > o->cap) {
@@ -265,16 +304,22 @@ static int write_header_le(BsOut* o, const BootStateHeader* h) {
     return bs_write(o, buf, sizeof buf);
 }
 
-static int write_section_raw(BsOut* o, uint32_t tag, uint32_t flags,
-                             const void* data, uint64_t len) {
+static int write_section_header(BsOut* o,uint32_t tag,uint32_t flags,uint64_t len) {
     uint8_t hdr[16];
     PstW w;
     pst_w_init(&w, hdr, sizeof hdr);
     if (!pst_w_u32(&w, tag) || !pst_w_u32(&w, flags) || !pst_w_u64(&w, len))
         return 0;
-    if (!bs_write(o, hdr, sizeof hdr)) return 0;
+    return bs_write(o,hdr,sizeof hdr);
+}
+static int write_section_raw(BsOut* o,uint32_t tag,uint32_t flags,const void *data,uint64_t len) {
+    if(!write_section_header(o,tag,flags,len))return 0;
     if (len && !bs_write(o, data, (size_t)len)) return 0;
     return 1;
+}
+
+static int bs_visit(void *context,const void *data,size_t size) {
+    return bs_write((BsOut*)context,data,size);
 }
 
 /* Prefer zlib for large blobs (smaller disk + faster load on slow storage).
@@ -304,15 +349,22 @@ static int write_section(BsOut* o, uint32_t tag, const void* data, uint64_t len)
     return write_section_raw(o, tag, 0u, data, len);
 }
 
+/* Emulation-thread-only scratch for the synchronous streaming visitor.
+ * A section is consumed before the next module may reuse this allocation. */
+
 static int write_module_section(BsOut* o, uint32_t tag,
                                 uint32_t (*bytes)(void),
                                 void (*write)(uint8_t*)) {
     uint32_t n = bytes();
-    uint8_t* buf = (uint8_t*)malloc(n ? n : 1);
-    if (!buf) return 0;
+    uint8_t *buf;
+    if(o->sink) {
+        if(n>sizeof(native_module_scratch))return 0;
+        buf=native_module_scratch;
+    } else buf=(uint8_t*)malloc(n?n:1);
+    if(!buf && n)return 0;
     write(buf);
-    int ok = write_section(o, tag, buf, n);
-    free(buf);
+    int ok=write_section(o,tag,buf,n);
+    if(!o->sink)free(buf);
     return ok;
 }
 
@@ -374,11 +426,10 @@ static int write_timer_section(BsOut* o) {
 /* Classic full VRAM section (offline / zlib / tracking off). */
 static int write_vram_section_full(BsOut *o)
 {
-    uint16_t *vbuf = (uint16_t *)malloc(VRAM_SIZE);
+    /* GPU section immediately precedes VRAM; its checkpoint already waited
+     * for native raster completion and captured the matching image. */
+    const uint16_t *vbuf = gpu_snapshot_native_vram();
     int ok;
-    if (!vbuf)
-        return 0;
-    gpu_native_vram_read(0, 0, VRAM_W, VRAM_H, vbuf);
     s_last_vram_dirty_rows = VRAM_H;
     s_last_vram_incremental = 0;
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
@@ -387,7 +438,6 @@ static int write_vram_section_full(BsOut *o)
     {
         uint8_t *wire = (uint8_t *)malloc(VRAM_SIZE);
         if (!wire) {
-            free(vbuf);
             return 0;
         }
         {
@@ -399,14 +449,20 @@ static int write_vram_section_full(BsOut *o)
         free(wire);
     }
 #endif
-    free(vbuf);
     return ok;
+}
+
+static double native_capture_profile[6];
+void boot_state_native_capture_profile(double out[6]) { memcpy(out,native_capture_profile,sizeof(native_capture_profile)); }
+static void native_capture_stamp(BsOut *o,double *time,unsigned index) {
+    if(o->sink) { double now=boot_state_mono_ms();native_capture_profile[index]+=now-*time;*time=now; }
 }
 
 static int boot_state_save_to(BsOut* o, const CPUState* cpu,
                               uint32_t bios_checksum, uint32_t entry_pc) {
     BootStateHeader h;
     int ok;
+    double profile_time=o->sink?boot_state_mono_ms():0;
     memset(&h, 0, sizeof h);
     h.magic         = BOOT_STATE_MAGIC;
     h.version       = BOOT_STATE_VERSION;
@@ -437,14 +493,18 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
      * amount (live pumps at VBlank, rollback replay suppresses output). */
     { extern void spu_catch_up(void); spu_catch_up(); }
 
+    native_capture_stamp(o,&profile_time,0);
     ok = write_header_le(o, &h);
 
     if (ok) ok = write_cpu_section(o, cpu);
     if (ok) ok = write_section(o, BS_SEC_RAM,  memory_get_ram_ptr(),        memory_get_ram_bytes());
     if (ok) ok = write_section(o, BS_SEC_SPAD, memory_get_scratchpad_ptr(), SPAD_SIZE);
-    if (ok && psx_mod_memory_snapshot_bytes())
-        ok = write_module_section(o, BS_SEC_MODMEM, psx_mod_memory_snapshot_bytes,
-                                  psx_mod_memory_snapshot_write);
+    if (ok && psx_mod_memory_snapshot_bytes()) {
+        if(o->sink) ok=write_section_header(o,BS_SEC_MODMEM,0,psx_mod_memory_snapshot_bytes()) &&
+                       psx_mod_memory_snapshot_visit(bs_visit,o);
+        else ok=write_module_section(o,BS_SEC_MODMEM,psx_mod_memory_snapshot_bytes,
+                                     psx_mod_memory_snapshot_write);
+    }
     if (ok) {
         /* 12B: i_stat, i_mask, cycles_since_vblank. Zeroing csv on warm load
          * rebased every tip to phase 0 and forked MotK wait-loop resim
@@ -466,11 +526,20 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
         ok = pst_w_u64(&w, psx_cycle_count) &&
              write_section(o, BS_SEC_CLOCK, cyc, 8);
     }
-    if (ok) ok = write_module_section(o, BS_SEC_GPU, gpu_snapshot_bytes, gpu_snapshot_write);
+    native_capture_stamp(o,&profile_time,1);
+    if(ok && o->pending) {
+        ok=gpu_native_capture_begin(o->pending->gpu);
+        o->pending->gpu_offset=o->len+16;
+        if(ok) ok=write_section_raw(o,BS_SEC_GPU,0,NULL,gpu_snapshot_bytes());
+    } else if (ok) ok = write_module_section(o, BS_SEC_GPU, gpu_snapshot_bytes, gpu_snapshot_write);
+    native_capture_stamp(o,&profile_time,2);
     if (ok) {
         /* §96 incremental mirror only while RB dirty-tracking is on.
          * Offline / delay-sync / zlib disk: classic full transfer_out. */
-        if (o->no_zlib && gpu_vram_dirty_tracking()) {
+        if(o->pending) {
+            o->pending->vram_offset=o->len+16;
+            ok=write_section_raw(o,BS_SEC_VRAM,0,NULL,VRAM_SIZE);
+        } else if (o->no_zlib && gpu_vram_dirty_tracking()) {
             ok = sync_vram_mirror_for_save();
             if (ok) {
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
@@ -493,8 +562,10 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
             ok = write_vram_section_full(o);
         }
     }
+    native_capture_stamp(o,&profile_time,3);
     if (ok) ok = write_module_section(o, BS_SEC_SPU, spu_snapshot_bytes, spu_snapshot_write);
     if (ok) ok = write_section(o, BS_SEC_SPURAM, spu_get_ram_ptr(), spu_get_ram_bytes());
+    native_capture_stamp(o,&profile_time,4);
     if (ok) ok = write_module_section(o, BS_SEC_CDROM, cdrom_snapshot_bytes, cdrom_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_DMA,   dma_snapshot_bytes,   dma_snapshot_write);
     if (ok) ok = write_module_section(o, BS_SEC_SIO,   sio_snapshot_bytes,   sio_snapshot_write);
@@ -514,7 +585,8 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) {
         uint32_t wc = dirty_ram_get_bitmap_word_count();
         uint64_t nbytes = (uint64_t)wc * 4u;
-        uint8_t* db = (uint8_t*)malloc(nbytes ? (size_t)nbytes : 1);
+        uint8_t* db = o->sink ? (nbytes<=sizeof(native_module_scratch)?native_module_scratch:NULL)
+                              : (uint8_t*)malloc(nbytes ? (size_t)nbytes : 1);
         if (!db) ok = 0;
         else {
             PstW w;
@@ -523,7 +595,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
             for (uint32_t i = 0; ok && i < wc; i++)
                 ok = pst_w_u32(&w, dirty_ram_get_bitmap_word(i));
             if (ok) ok = write_section(o, BS_SEC_DIRTY, db, nbytes);
-            free(db);
+            if(!o->sink)free(db);
         }
     }
     if (ok) {
@@ -569,6 +641,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
         ok = pst_w_u32(&w, g[0]) && pst_w_u32(&w, g[1]) && pst_w_u32(&w, g[2]) &&
              write_section(o, BS_SEC_GCS, gb, sizeof gb);
     }
+    native_capture_stamp(o,&profile_time,5);
     return ok;
 }
 
@@ -621,6 +694,31 @@ int boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
                                size_t* out_len) {
     return boot_state_save_buffer_ex(cpu, bios_checksum, entry_pc, out_data,
                                      out_len, 1);
+}
+
+/* Reusable native-only staging buffer for per-frame history. */
+int boot_state_save_buffer_reuse(const CPUState *cpu, uint32_t bios,
+        uint32_t entry, uint8_t **data, size_t *capacity, size_t *length) {
+    BsOut o;
+    memset(&o, 0, sizeof(o));
+    o.data=*data; o.cap=*capacity; o.no_zlib=1;
+    int ok=boot_state_save_to(&o,cpu,bios,entry);
+    *data=o.data; *capacity=o.cap; *length=ok?o.len:0;
+    return ok;
+}
+
+int boot_state_begin_native(const CPUState *cpu,uint32_t bios,uint32_t entry,
+        BootStateSink sink,void *context,BootStatePending *pending) {
+    BsOut o;memset(&o,0,sizeof(o));
+    o.no_zlib=1;o.sink=sink;o.sink_context=context;o.pending=pending;
+    return sink && pending && boot_state_save_to(&o,cpu,bios,entry);
+}
+
+int boot_state_visit_native(const CPUState *cpu,uint32_t bios,uint32_t entry,
+        BootStateSink sink,void *context) {
+    BsOut o; memset(&o,0,sizeof(o));
+    o.no_zlib=1;o.sink=sink;o.sink_context=context;
+    return sink && boot_state_save_to(&o,cpu,bios,entry);
 }
 
 /* ============================ LOAD ============================ */
@@ -1132,19 +1230,15 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     if (!ok)
         return 0;
 
+    /* Raw RAM/register replacement bypasses the store hooks. Precision
+     * provenance from the abandoned timeline must never alias restored words.
+     * This invalidates metadata, not any PGXP feature/configuration. */
+#ifdef PSX_PGXP
+    pgxp_invalidate_all();
+#endif
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();
 
-    {
-        const double total_ms = boot_state_mono_ms() - t0;
-        fprintf(stderr,
-                "savestate: load_timing read=0.0 inflate=%.1f "
-                "apply_ram=%.1f apply_vram=%.1f apply_spuram=%.1f "
-                "apply_other=%.1f total=%.1f ms (file=%zu)\n",
-                inflate_ms,
-                apply_ram_ms, apply_vram_ms, apply_spuram_ms,
-                apply_other_ms, total_ms, file_len);
-    }
     return 1;
 }
 

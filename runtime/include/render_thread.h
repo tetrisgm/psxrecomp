@@ -92,8 +92,22 @@ void rt_batch_discard(void);
 /* Seal/publish a complete frame and capture the next native seed. No GPU wait. */
 void rt_frame_end(void);
 
-/* Number of complete packets awaiting acquisition (zero or one). This is an
- * advisory admission signal, never a reason to block guest publication. */
+
+/* Optional rewind presentation history. CPU packets only, no GL readbacks.
+ * mark binds the latest completed guest packet to a native snapshot tick. */
+void rt_history_configure(size_t depth,size_t budget);
+void rt_history_mark(uint64_t tick);
+void rt_history_reverse(int active);
+int rt_history_present(uint64_t tick);
+int rt_history_ready(void);
+int rt_history_available(uint64_t tick);
+void rt_history_branch(uint64_t tick);
+size_t rt_history_bytes(void);
+uint64_t rt_history_replays(void);
+uint64_t rt_history_misses(void);
+
+/* Complete packets awaiting acquisition (zero or one), advisory only. */
+
 int  rt_frames_ahead(void);
 /* Consumer running total of idle time awaiting packets or tick deadlines. */
 uint64_t rt_render_idle_ns(void);

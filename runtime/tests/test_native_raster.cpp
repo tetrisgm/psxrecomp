@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cstring>
 #include <initializer_list>
 #include <thread>
 #include <vector>
@@ -430,6 +431,7 @@ int main() {
         }
         assert(digest==fixture.digest);
     }
+
     // A held presentation packet cannot delay native work. After replacing
     // intermediate frames, the newest frame's seed and commands reproduce
     // the exact native image, including mask and overlapping-copy semantics.
@@ -479,6 +481,64 @@ int main() {
     native_raster_read(other,0,0,1024,512,restored.data());
     assert(saved==restored);
     frame_packet_release(frames);frame_packet_destroy(frames);
+
+    // Reuse one completion token across changing pixels and an idle consumer.
+    NativeRasterCheckpoint *reusable=native_raster_checkpoint_create();
+    assert(reusable);
+    for(unsigned i=0;i<256;i++) {
+        send(r,NR_WRITE,{11,12,(int32_t)i});
+        assert(native_raster_checkpoint_submit(reusable,r,restored.data(),dirty,&texture));
+        while(!native_raster_checkpoint_ready(reusable))std::this_thread::yield();
+        assert(restored[12*1024+11]==i);
+    }
+    // Wrap the preallocated draw ring, then interleave two checkpoint clients
+    // and later draws. Mailbox and ordinary-queue snapshots share exact order.
+    for(unsigned i=0;i<40000;i++)send(r,NR_WRITE,{11,12,(int32_t)(i&32767)});
+    NativeRasterCheckpoint *second=native_raster_checkpoint_create();assert(second);
+    std::vector<uint16_t> second_vram(1024*512);
+    uint64_t second_dirty[8]{};
+    for(unsigned i=0;i<256;i++) {
+        send(r,NR_WRITE,{11,12,(int32_t)i});
+        assert(native_raster_checkpoint_submit(reusable,r,restored.data(),dirty,&texture));
+        send(r,NR_WRITE,{11,12,(int32_t)(1000+i)});
+        assert(native_raster_checkpoint_submit(second,r,second_vram.data(),second_dirty,nullptr));
+        send(r,NR_WRITE,{11,12,(int32_t)(2000+i)});
+        while(!native_raster_checkpoint_ready(reusable) || !native_raster_checkpoint_ready(second))
+            std::this_thread::yield();
+        assert(restored[12*1024+11]==i && second_vram[12*1024+11]==1000+i);
+        assert(pixel(r,11,12)==2000+i);
+    }
+    native_raster_checkpoint_release(second);
+    NativeRasterCommand checkpoint_fragment{};checkpoint_fragment.op=NR_CPU_UPLOAD;
+    checkpoint_fragment.args[0]=30;checkpoint_fragment.args[1]=40;checkpoint_fragment.args[2]=5;checkpoint_fragment.args[3]=1;checkpoint_fragment.args[4]=1;
+    uint16_t fragment_pixels[2]={0x1234,0x5678};
+    checkpoint_fragment.args[2]=0;
+    assert(!native_raster_checkpoint_submit_upload(reusable,r,restored.data(),dirty,&texture,
+                                                 &checkpoint_fragment,fragment_pixels,2));
+    assert(native_raster_checkpoint_ready(reusable));
+    checkpoint_fragment.args[2]=5;
+    assert(!native_raster_checkpoint_submit_upload(reusable,r,restored.data(),dirty,&texture,
+                                                 &checkpoint_fragment,fragment_pixels,SIZE_MAX));
+    assert(native_raster_checkpoint_submit_upload(reusable,r,restored.data(),dirty,&texture,
+                                                &checkpoint_fragment,fragment_pixels,2));
+    send(r,NR_WRITE,{31,40,0x9999});
+    while(!native_raster_checkpoint_ready(reusable))std::this_thread::yield();
+    assert(restored[40*1024+31]==0x1234 && restored[40*1024+32]==0x5678);
+    assert(pixel(r,31,40)==0x9999);
+    native_raster_checkpoint_release(reusable);
+    // Async checkpoint owns the exact queue position, despite later writes;
+    // release is safe after worker destruction and preserves texture caches.
+    native_raster_checkpoint(r,saved.data(),dirty,&texture);
+    SwNativeTextureState async_texture{};
+    NativeRasterCheckpoint *pending=native_raster_checkpoint_async(r,restored.data(),dirty,&async_texture);
+    assert(pending);
+    send(r,NR_WRITE,{11,12,0x1234});
+    native_raster_destroy(r);r=nullptr;
+    assert(native_raster_checkpoint_ready(pending));
+    assert(saved==restored);
+    assert(!memcmp(&texture,&async_texture,sizeof(texture)));
+    native_raster_checkpoint_release(pending);
+
     native_raster_destroy(other);
     native_raster_destroy(r);
 }

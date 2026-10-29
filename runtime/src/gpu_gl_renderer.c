@@ -1,4 +1,4 @@
-/* gpu_gl_renderer.c — hardware OpenGL renderer backend.
+﻿/* gpu_gl_renderer.c — hardware OpenGL renderer backend.
  *
  * ARCHITECTURE (v2 — GPU-authoritative VRAM)
  * -------------------------------------------
@@ -875,6 +875,7 @@ static uint64_t      s_interp_duplicates = 0;
  * wherever render passes supply no in-between image. */
 static _Atomic int s_interp_hold = 0;
 static void pass_gens_invalidate(void);
+static void restore_presentation_invalidate(void);
 static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
                                 int pw, int ph);
 static void pass_apply_promotion(void);
@@ -3722,6 +3723,10 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
  * conservative strict-inside test. 4:3 never runs any of this (g_wide_cur == 0).
  * Toggle via gl_wide_fast for A/B; default ON. */
 static _Atomic int s_wide_fast = 1;
+/* A native snapshot is not an enhanced canonical image: its unshifted HUD
+ * cannot be spliced into the wide target. Once seeded, use full mirroring
+ * for this renderer session, including frames that only flip buffers. */
+static int s_wide_native_seeded;
 void gl_renderer_set_wide_fast(int on) {
     RTH_CALLI(gl_renderer_set_wide_fast,on); s_wide_fast = on ? 1 : 0; }
 int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
@@ -3787,7 +3792,7 @@ static int wide_fast_center_valid(void) {
      * draws. Tags are installed before DMA, so no earlier center draws skip. */
     // The native split seam occupies canonical edge columns that the expanded
     // camera renders as world. Copying those columns reinstates the divider.
-    return s_wide_fast && ctx_vp_width() <= 0 && !ctx_bg_full();
+    return s_wide_fast && !s_wide_native_seeded && ctx_vp_width() <= 0 && !ctx_bg_full();
 }
 /* The one predicate for "the wide surface's centre columns [g_wide_off,
  * g_wide_off+native_w) are the canonical framebuffer, unshifted". A camera view
@@ -7651,6 +7656,7 @@ void gl_renderer_invalidate_present(void) {
 
 void gl_renderer_restage_vram_after_savestate(void) {
     RTH_CALL0(gl_renderer_restage_vram_after_savestate);
+    restore_presentation_invalidate();
     gpu_hd_textures_restage();
     if (!s_raster_ok || !s_vram) return;
     /* Belt-and-suspenders after boot_state VRAM apply: force CPU mirror → FBO
@@ -9402,6 +9408,21 @@ uint64_t gl_renderer_perf_frequency(void) { return SDL_GetPerformanceFrequency()
 static void pass_gens_invalidate(void) {
     for(int i=0;i<PASS_GENERATIONS;++i)s_pgen[i].valid=s_pgen[i].promoted=0;
     s_pgen_promote = -1;
+}
+
+/* Native restore/packet discontinuity invalidates every derived transaction
+ * backup, not just the swap's dirty flag. Reusing an old backup after a new
+ * seed can put abandoned HUD pixels back into the canonical/wide surfaces. */
+static void restore_presentation_invalidate(void) {
+    s_wide_native_seeded=1;
+    s_pb_valid=0;
+    pass_gens_invalidate();
+    s_native_surface_pending=0;
+    DEPTH_REQUEST_CLEAR(DCLR_CONFIG);
+    s_depth_used=0;s_depth_last_avg=0;
+    if(s_snap)pgxp_snap_reset(s_snap);
+    gl_renderer_clear_hd_texture_cache();
+    hold_invalidate();interp_reset_history();
 }
 
 static int s_pass_force_refuse = -1;   /* -1: read PSX_RENDER_PASS_REFUSE */

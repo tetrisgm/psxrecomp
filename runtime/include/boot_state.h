@@ -139,6 +139,27 @@ int  boot_state_save_buffer(const CPUState* cpu, uint32_t bios_checksum,
 
 /* In-memory ring snaps: same sections, no zlib. Load accepts either form.
  * Avoids compress2 on ~3.5 MiB RAM+VRAM+SPU every live/resim snap (FPS). */
+typedef struct BootStatePending BootStatePending;
+typedef int (*BootStatePatch)(void *context,size_t offset,const void *data,size_t size);
+BootStatePending *boot_state_pending_create(void);
+void boot_state_pending_destroy(BootStatePending *pending);
+/* Guest-thread completion: 0 pending, 1 complete, -1 sink failure. No live
+ * guest state is read. Callback byte spans remain valid until the next begin
+ * or pending_destroy, allowing CPU delta finalization on a separate worker. */
+int boot_state_pending_finish(BootStatePending *pending,BootStatePatch patch,void *context);
+void boot_state_native_capture_profile(double out[6]);
+typedef int (*BootStateSink)(void *context,const void *data,size_t size);
+/* Safe guest-edge begin: consumes all CPU/device bytes synchronously and
+ * queues GPU/VRAM at this exact native command-stream position. A NULL data
+ * pointer reserves bytes in the sink. Keep the transaction unpublished until
+ * pending_finish returns 1; destroy drains native work before freeing buffers.
+ * Single emulation-thread producer; no GL work or reads. */
+int boot_state_begin_native(const CPUState *cpu,uint32_t bios,uint32_t entry,
+    BootStateSink sink,void *context,BootStatePending *pending);
+int boot_state_visit_native(const CPUState *cpu,uint32_t bios,uint32_t entry,
+        BootStateSink sink,void *context);
+int boot_state_save_buffer_reuse(const CPUState *cpu, uint32_t bios,
+        uint32_t entry, uint8_t **data, size_t *capacity, size_t *length);
 int  boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
                                 uint32_t entry_pc, uint8_t** out_data,
                                 size_t* out_len);

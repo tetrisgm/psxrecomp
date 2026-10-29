@@ -44,6 +44,16 @@ void     gpu_set_power_on_video_mode(int pal);
 
 /* Display presentation accessors (Phase 3). */
 const uint16_t* gpu_get_vram(void);    /* Pointer to 1024x512 16-bit VRAM */
+/* Immutable until the next native read/checkpoint: captured together with
+ * GPU registers/cache by gpu_snapshot_write, on the guest thread. */
+typedef struct GpuNativeCapture GpuNativeCapture;
+GpuNativeCapture *gpu_native_capture_create(void);
+void gpu_native_capture_destroy(GpuNativeCapture *capture);
+int gpu_native_capture_begin(GpuNativeCapture *capture);
+int gpu_native_capture_ready(GpuNativeCapture *capture);
+void gpu_native_capture_result(GpuNativeCapture *capture,const uint8_t **gpu,
+    uint32_t *gpu_size,const uint16_t **vram);
+const uint16_t *gpu_snapshot_native_vram(void);
 void gpu_native_vram_read(int x,int y,int w,int h,uint16_t *out);
 void gpu_native_vram_restore(const uint16_t *source);
 int gpu_snapshot_valid_size(uint32_t size);

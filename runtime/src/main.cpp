@@ -1,4 +1,4 @@
-#include "audio_sync.h"
+﻿#include "audio_sync.h"
 #include "audio_catchup.h"
 /* main.cpp — Phase 3 runtime entry point.
  *
@@ -8642,13 +8642,11 @@ static int rewind_toggle_buttons_down(void) {
 }
 
 static void rewind_poll_toggle_buttons(void) {
-    static int was_down;
-    int down = rewind_toggle_buttons_down();
-    if (down && !was_down && !psx_rewind_is_open()) {
-        psx_local_mouse_reset();
-        psx_rewind_toggle();
-    }
-    was_down = down;
+    const uint8_t *keys=(const uint8_t*)SDL_GetKeyboardState(nullptr);
+    int down=rewind_toggle_buttons_down();
+    if(!g_headless && host_hotkey_input_focused())
+        down |= host_keymap_down(HOST_KEYMAP_REWIND,keys,(int)SDL_GetModState());
+    psx_rewind_set_held(down);
 }
 
 static void savestate_menu_poll_toggle_buttons(void) {
@@ -8686,54 +8684,6 @@ static void fast_forward_toggle_poll_buttons(void) {
     if (down && !was_down)
         fast_forward_toggle_flip();
     was_down = down;
-}
-
-static void rewind_poll_nav(uint32_t now_ms) {
-    const Uint8 *keys = SDL_GetKeyboardState(NULL);
-    int left = keys[SDL_SCANCODE_LEFT] ? 1 : 0;
-    int right = keys[SDL_SCANCODE_RIGHT] ? 1 : 0;
-    /* Direct menu keys supplement the configured pad bindings below. Letter
-     * aliases conflict with remaps: X is Cross by default, so treating X as
-     * Cancel sets both edges and silently cancels every keyboard load. */
-    int acc = (keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_SPACE]) ? 1 : 0;
-    int can = (keys[SDL_SCANCODE_ESCAPE] || keys[SDL_SCANCODE_BACKSPACE]) ? 1 : 0;
-    /* Honor remapped Cross/Circle (and Select/R3) via the same pad path as
-     * gameplay — GameController A/B alone miss keyboard-as-pad and remaps. */
-    uint16_t btn = pad_buttons_for(g_players[0], 1, true);
-    {
-        uint16_t host_word;
-        uint8_t host_st[4], host_lt, host_rt;
-        if (host_pad_layer(&host_word, host_st, &host_lt, &host_rt))
-            btn = host_word;
-    }
-    if ((btn & PAD_LEFT) == 0)
-        left = 1;
-    if ((btn & PAD_RIGHT) == 0)
-        right = 1;
-    if ((btn & PAD_CROSS) == 0)
-        acc = 1;
-    if ((btn & PAD_CIRCLE) == 0 || (btn & PAD_SELECT) == 0 ||
-        (btn & PAD_R3) == 0)
-        can = 1;
-    SDL_GameController *h = g_players[0].handle;
-    if (h) {
-        const Sint16 lx =
-            SDL_GameControllerGetAxis(h, SDL_CONTROLLER_AXIS_LEFTX);
-        const int dz = 16000;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_LEFT) ||
-            lx < -dz)
-            left = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ||
-            lx > dz)
-            right = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_A))
-            acc = 1;
-        if (SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_B) ||
-            SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_BACK) ||
-            SDL_GameControllerGetButton(h, SDL_CONTROLLER_BUTTON_RIGHTSTICK))
-            can = 1;
-    }
-    psx_rewind_nav_held(left, right, acc, can, now_ms);
 }
 
 static void rewind_pause_present(void) {
@@ -8838,63 +8788,75 @@ static void runtime_menu_host_loop(void) {
     savestate_input_guard_arm();
 }
 
-/* Freeze guest in vblank present while the rewind filmstrip is open. */
-static void rewind_host_pause_loop(void) {
-    jogcon_ffb_neutral_all();   /* the wheel goes slack while paused */
-    psx_local_mouse_begin(sdl_window, false);
-    psx_local_mouse_reset();
-    freeze_heartbeat_set_paused(1);
-    while (psx_rewind_is_open()) {
-#ifndef PSX_NO_DEBUG_TOOLS
-        /* The guest is frozen; keep the debug endpoint live so injected
-         * input, screenshots and status reads can drive the filmstrip. */
-        debug_server_poll();
-#endif
-        if (g_headless) {
-            rewind_poll_nav((uint32_t)SDL_GetTicks());
-            starvation_watchdog_heartbeat();
-            SDL_Delay(1);
-            continue;
+/* Called only at a resumable guest boundary by psx_rewind_poll. */
+extern "C" void psx_frontend_rewind_audio(int paused) {
+    freeze_heartbeat_set_paused(paused);
+    if(paused) {
+        psx_sdl_audio_set_paused(sdl_audio_device,1);
+        jogcon_ffb_neutral_all();
+        psx_sdl_audio_clear(sdl_audio_device);
+        if(sdl_audio_device && s_drc_ready) {
+            psx_sdl_audio_lock(sdl_audio_device);
+            /* Drop the abandoned timeline including the resampler's filter
+             * history; preserve telemetry and the allocated filter bank. */
+            s_drc.reset_timeline();
+            psx_sdl_audio_unlock(sdl_audio_device);
         }
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            (void)psx_local_mouse_event(ev);
-            if (ev.type == SDL_QUIT) {
-                psx_crash_trace_set_exit_origin("sdl_window_close");
-                shutdown_runtime();
-                std::exit(0);
-            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
-                refresh_player_devices();
-            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-                close_controller();
-                refresh_player_devices();
-            } else if (ev.type == SDL_KEYDOWN) {
-#if defined(PSX_SDL3)
-                const SDL_Keymod mod = ev.key.mod;
-                const SDL_Keycode key = ev.key.key;
-                const SDL_Scancode scancode = ev.key.scancode;
-                const int repeat = ev.key.repeat ? 1 : 0;
-#else
-                const Uint16 mod = ev.key.keysym.mod;
-                const SDL_Keycode key = ev.key.keysym.sym;
-                const SDL_Scancode scancode = ev.key.keysym.scancode;
-                const int repeat = ev.key.repeat ? 1 : 0;
-#endif
-                if (!repeat &&
-                    host_keymap_match_event(HOST_KEYMAP_REWIND, (int)key,
-                                            (int)scancode, (int)mod)) {
-                    psx_rewind_toggle();
-                }
-            }
-        }
-        rewind_poll_nav((uint32_t)SDL_GetTicks());
-        rewind_pause_present();
-        starvation_watchdog_heartbeat();
-        SDL_Delay(8);
+    } else {
+        spu_output_flush(); g_audio_cycle_resync=1;
+        sdl_audio_fadein_left=sdl_audio_fade_samples;
+        present_session_reset();
+        psx_sdl_audio_set_paused(sdl_audio_device,0);
     }
-    freeze_heartbeat_set_paused(0);
-    /* Swallow the still-held close press so it doesn't bleed into the game. */
-    savestate_input_guard_arm();
+}
+extern "C" void psx_frontend_rewind_service(int present) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    debug_server_poll();
+#endif
+    SDL_Event ev;
+    while(!g_headless && SDL_PollEvent(&ev)) {
+        if(ev.type==SDL_QUIT) {
+            psx_crash_trace_set_exit_origin("sdl_window_close");
+            shutdown_runtime(); std::exit(0);
+        } else if(ev.type==SDL_CONTROLLERDEVICEADDED || ev.type==SDL_CONTROLLERDEVICEREMOVED)
+            refresh_player_devices();
+    }
+    rewind_poll_toggle_buttons();
+    starvation_watchdog_heartbeat();
+    if(!present) return;
+    /* Flush grouped restore records into the incomplete producer packet, then
+     * invalidate it before replaying the captured frame's owned provenance. */
+    if(g_gl_active && rt_running()) {
+        gl_renderer_render_thread_frame_boundary();
+        PsxRewindStats restored;psx_rewind_get_stats(&restored);
+        if(rt_history_present(restored.frame)) return;
+    }
+    GpuDisplayInfo di; gpu_get_display_info(&di);
+    unsigned w=di.width, h=di.height;
+    if(!w || !h || w>1024 || h>512) return;
+    static uint32_t pixels[1024*512];
+    const uint16_t *vram=gpu_get_vram();
+    for(unsigned y=0;y<h;y++) for(unsigned x=0;x<w;x++) {
+        uint8_t r=0,g=0,b=0;
+        if(!di.disabled) gpu_display_pixel_rgb_in(vram,&di,x,y,&r,&g,&b);
+        pixels[y*w+x]=0xff000000u|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+    }
+#ifndef PSX_SDL_NO_RENDER
+    if(g_gl_active) {
+        gl_renderer_set_interpolation_suspended(1);
+        gl_renderer_present(pixels,(int)w,(int)h,0,1,0,psx_cycle_count,
+                            0,0,0,0,0,0);
+        gl_renderer_render_thread_frame_boundary();
+    } else if(sdl_renderer) {
+        SDL_Texture *texture=SDL_CreateTexture(sdl_renderer,SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STREAMING,(int)w,(int)h);
+        if(texture) {
+            SDL_UpdateTexture(texture,nullptr,pixels,(int)w*4);
+            SDL_RenderClear(sdl_renderer); SDL_RenderCopy(sdl_renderer,texture,nullptr,nullptr);
+            software_present_with_telemetry(sdl_renderer); SDL_DestroyTexture(texture);
+        }
+    }
+#endif
 }
 
 /* Host pause (host_overlay.h, P1). Same freeze as the save-state menu: the
@@ -9227,7 +9189,7 @@ static bool drain_host_events() {
                 host_keymap_match_event(HOST_KEYMAP_REWIND, (int)key,
                                         (int)scancode, (int)mod)) {
                 psx_local_mouse_reset();
-                psx_rewind_toggle();
+                psx_rewind_set_held(1);
             }
             else if (!key_repeat &&
                      host_keymap_match_event(HOST_KEYMAP_SAVE_STATE_MENU,
@@ -9530,6 +9492,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     }
 #endif
 
+    psx_rewind_note_frame();
     /* Direct-shortcut claims are settled before any shortcut poll or pad
      * sample this frame (no-op unless a title allowed a direct shortcut). */
     direct_shortcut_claim_update();
@@ -9542,13 +9505,12 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         savestate_menu_poll_toggle_buttons();
         rewind_poll_toggle_buttons();
         fast_forward_toggle_poll_buttons();
-        psx_rewind_note_frame();
+
         psx_rewind_present_tick((uint32_t)SDL_GetTicks());
         if (psx_runtime_menu_is_open()) runtime_menu_host_loop();
         if (savestate_menu_open)
             savestate_menu_host_pause_loop();
-        if (psx_rewind_is_open())
-            rewind_host_pause_loop();
+
         if (psx_host_pause_depth() > 0)
             host_pause_loop();
     } else if (host_pad_layer(nullptr, nullptr, nullptr, nullptr)) {
@@ -9557,9 +9519,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * windowed, so scripted runs can drive them. */
         rewind_poll_toggle_buttons();
         fast_forward_toggle_poll_buttons();
-        psx_rewind_note_frame();
-        if (psx_rewind_is_open())
-            rewind_host_pause_loop();
+
+
     }
     /* Headless: a host pause (debug host_pause, scripted overlay tests)
      * holds the guest exactly as it does windowed; the loop polls the debug
@@ -9967,7 +9928,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 host_pause_service();
                 // A hotkey acquired during pacing may open a host menu.
                 if (savestate_menu_open) savestate_menu_host_pause_loop();
-                if (psx_rewind_is_open()) rewind_host_pause_loop();
+
                 if (psx_host_pause_depth() > 0) host_pause_loop();
                 psx_local_mouse_begin(sdl_window, local_mouse_live(override));
             } else {

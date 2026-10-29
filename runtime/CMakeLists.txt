@@ -23,6 +23,20 @@ psxrecomp_add_runtime_target(psx-runtime
 # (docs/ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    add_executable(rewind_worker_test tests/test_rewind_worker.cpp src/rewind_worker.cpp)
+    target_include_directories(rewind_worker_test PRIVATE include)
+    target_compile_options(rewind_worker_test PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UNDEBUG>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    find_package(Threads REQUIRED)
+    target_link_libraries(rewind_worker_test PRIVATE Threads::Threads)
+    add_test(NAME rewind_worker_test COMMAND rewind_worker_test)
+    add_executable(rewind_hold_test tests/test_rewind_hold.c)
+    target_include_directories(rewind_hold_test PRIVATE include)
+    target_compile_options(rewind_hold_test PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-UNDEBUG>)
+    add_test(NAME rewind_hold_test COMMAND rewind_hold_test)
+    add_executable(rewind_delta_test tests/test_rewind_delta.c)
+    add_test(NAME rewind_delta_test COMMAND rewind_delta_test)
     add_executable(gpu_fmv_hd_test tests/test_gpu_fmv_hd.cpp src/gpu_fmv_hd.c)
     target_include_directories(gpu_fmv_hd_test PRIVATE include ${PSX_SDL_INCLUDE_DIRS})
     target_compile_definitions(gpu_fmv_hd_test PRIVATE SDL_MAIN_HANDLED PSX_FMV_HD_TESTING=1
