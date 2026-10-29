@@ -213,13 +213,11 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
-<<<<<<< HEAD
 - 2026-10-29: Phase-3b continuation adds diagnostic-only GTE projection
   provenance and per-frame accuracy classes. Matched R4 scene: 324 IR saturation
   recoveries, 518 exact fractional projections, zero unexplained. Guest timing,
   integer results and presentation scheduling unchanged; focused GTE/PGXP suites
   pass. See `docs/PGXP_AUDIT.md`.
-=======
 - 2026-10-29, phase-5 enhanced rewind: integrate packet presenter through
   27d6d167, preserving the ordered native checkpoint mailbox. Bound immutable
   CPU packet history to 512 MiB and align it with native capture ticks; replay
@@ -262,7 +260,6 @@ on a fixed region -> next.
   9800X3D. Host capture cost, not a hard maximum or phase-2/4 acceptance.
   Topic only; supervisor integrates.
 
->>>>>>> c544b04a
 
 - **2026-10-28 (`feat/frame-arch-1-native-authority`, in progress):** Separate
   software-raster contexts and an independent CPU native queue now have fixture
