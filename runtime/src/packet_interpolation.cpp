@@ -105,7 +105,6 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
             }
             c->stats.snapped=a->epoch!=b->epoch || b->sequence<=a->sequence || a->discontinuity || b->discontinuity;
             size_t local_cuts=0;
-            std::unordered_map<Key,size_t,Hash> model_points,model_cuts;
             for(size_t i=0;i<c->b.size();++i) {
                 const auto& p=c->b[i]; if(!p.spatial) continue;
                 if(p.vertices<3 || p.vertices>4) {++c->stats.invalid;continue;}
@@ -146,10 +145,10 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                                 double delta=value-v.view[d];distance+=delta*delta;
                             }
                             c->source_masks[i]|=1u<<j;++c->stats.source_matched;
-                    ++model_points[{v.model.object,v.model.primitive}];++c->stats.model_reconstructed;
+                    ++c->stats.model_reconstructed;
                             if(distance>1e-12) ++c->stats.source_moving;
                             if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) {
-                                ++model_cuts[{v.model.object,v.model.primitive}];++local_cuts;
+                                ++local_cuts;
                             }
                         } else {
                             ++c->stats.new_source;
@@ -172,23 +171,16 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                     }
                     if(!finite) {++c->stats.invalid;++c->stats.source_unmatched;continue;}
                     c->source_masks[i]|=1u<<j;++c->stats.source_matched;
-                    ++model_points[{v.model.object,v.model.primitive}];
                     if(distance>1e-12) ++c->stats.source_moving;
                     if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) {
-                        ++model_cuts[{v.model.object,v.model.primitive}];++local_cuts;
+                        ++local_cuts;
                     }
                 }
                 if(c->source_masks[i]==(1u<<p.vertices)-1) ++c->stats.matched;
             }
-            // Near-camera vertices can move farther than their depth during
-            // an ordinary tick. A cut requires a majority of a model's uses,
-            // never a single near-plane point. Hold the entire model on a cut.
-            for(size_t i=0;i<c->b.size();++i) for(unsigned j=0;j<c->b[i].vertices && j<4;++j) {
-                const auto& v=c->b[i].vertex[j];
-                const Key model{v.model.object,v.model.primitive};
-                auto cut=model_cuts.find(model);
-                if(cut!=model_cuts.end() && cut->second*2>model_points[model]) c->source_masks[i]=0;
-            }
+            // Local near-plane motion is not a cut. Holding one model here
+            // can strand neighbouring retiring geometry. Explicit epochs/cuts
+            // or a scene-wide motion discontinuity snap the complete pair.
             // A scene-wide discontinuity also snaps title metadata.
             if(local_cuts && local_cuts*2>c->stats.source_matched) c->stats.snapped=1;
             std::unordered_map<Key,size_t,Hash> slots;

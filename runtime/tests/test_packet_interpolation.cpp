@@ -116,6 +116,22 @@ int main() {
         assert(packet_interpolation_pair(context,&a,&b,0));
         assert(packet_interpolation_sample(context,0.5,out,2));
         assert(std::memcmp(out,mesh,sizeof mesh)==0);
+        mesh[1].vertex[2].source={7,3};
+        mesh[1].spatial=0;
+        assert(packet_interpolation_pair(context,&a,&b,0));
+        assert(packet_interpolation_sample(context,0.5,out,2));
+        // A GTE-less neighbour sharing the integer screen edge holds both.
+        assert(std::memcmp(out,mesh,sizeof mesh)==0);
+        mesh[1].spatial=1;
+        old[0].view[0]=-1000;
+        assert(packet_interpolation_pair(context,&a,&b,0.5));
+        assert(!packet_interpolation_stats(context).snapped);
+        assert(packet_interpolation_stats(context).sampled_primitives==2);
+        old[1].view[0]=old[2].view[0]=-1000;
+        assert(packet_interpolation_pair(context,&a,&b,0.5));
+        assert(packet_interpolation_stats(context).snapped);
+        assert(packet_interpolation_sample(context,0.5,out,2));
+        assert(std::memcmp(out,mesh,sizeof mesh)==0);
         packet_interpolation_destroy(context);
     }
     auto *ctx=packet_interpolation_create(); assert(ctx);

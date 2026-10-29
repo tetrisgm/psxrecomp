@@ -65,6 +65,8 @@ std::mutex stats_mutex;
 PacketInterpolationStats published{};
 uint64_t published_sequence=0,published_missing=0,published_count=0;
 bool published_failed=false,published_source_mode=false;
+size_t retiring_unresolved=0,retiring_count=0;
+size_t published_retiring_unresolved=0,published_retiring_count=0;
 std::atomic<unsigned> output_rate{0},display_rate{60};
 std::atomic<bool> capture_requested{false};
 std::vector<PacketInterpolationPrimitive> captured[2];
@@ -266,6 +268,7 @@ static void stream_end_impl(void) {
     }
     // Keep geometry culled at N until it actually leaves the interpolated
     // frustum. Both old-only and current faces use one canonical source table.
+    retiring_unresolved=retiring_count=0;
     stream.union_geometry=stream.current;
     stream.retiring_endpoints=stream.older;
     stream.retiring_indices.assign(stream.older.size(),SIZE_MAX);
@@ -291,11 +294,16 @@ static void stream_end_impl(void) {
                 if(!point) for(unsigned k=0;k<3;++k) v.view[d]+=model->affine[d*4+k]*v.model_position[k];
             }
             v.h=transform.h;v.ofx=transform.ofx;v.ofy=transform.ofy;v.x_scale=transform.x_scale;
+            if(v.view[2]>0) {
+                v.screen[0]=v.ofx+v.h*v.x_scale*v.view[0]/v.view[2];
+                v.screen[1]=v.ofy+v.h*v.view[1]/v.view[2];
+            }
+
         }
         if(reconstructed) {
             stream.retiring_indices[i]=stream.union_geometry.size();
-            stream.union_geometry.push_back(p);
-        }
+            stream.union_geometry.push_back(p);++retiring_count;
+        } else ++retiring_unresolved;
     }
     PacketInterpolationPacket a{stream.old_epoch,stream.old_sequence,stream.older.data(),stream.older.size(),0};
     PacketInterpolationPacket b{stream.epoch,stream.sequence,stream.union_geometry.data(),stream.union_geometry.size(),0};
@@ -309,6 +317,7 @@ static void stream_end_impl(void) {
         published_source_mode=stream.source_mode;
         published_sequence=stream.sequence;published_missing=stream.missing;
         published_count=stream.union_geometry.size();published_failed=stream.failed;
+        published_retiring_count=retiring_count;published_retiring_unresolved=retiring_unresolved;
         if(capture_requested.exchange(false)) {
             try {
                 captured[0]=stream.older;captured[1]=stream.current;
@@ -342,6 +351,7 @@ extern "C" void packet_interpolation_stream_reset(void) {
     stream.older.clear();stream.current.clear();stream.old_epoch=stream.old_sequence=0;
     std::lock_guard<std::mutex> lock(stats_mutex);
     published_source_mode=false;published={};published_sequence=published_missing=published_count=0;published_failed=false;
+    published_retiring_count=published_retiring_unresolved=0;
     for(unsigned i=0;i<2;++i) {
         captured[i].clear();captured_sources[i].clear();captured_sequence[i]=0;
     }
@@ -350,10 +360,11 @@ extern "C" void packet_interpolation_stream_reset(void) {
 extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
     std::lock_guard<std::mutex> lock(stats_mutex);
     return std::snprintf(out,capacity,
-        "{\"status\":\"ok\",\"mode\":\"%s\",\"sequence\":%llu,\"primitives\":%llu,"
+        "{\"status\":\"ok\",\"mode\":\"%s\",\"retiring\":%llu,\"retiring_unresolved\":%llu,\"sequence\":%llu,\"primitives\":%llu,"
         "\"matched\":%llu,\"unmatched\":%llu,\"disappeared\":%llu,\"ambiguous\":%llu,"
         "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"source_moving\":%llu,\"verified_appearance\":%llu,\"unexplained\":%llu,\"model_reconstructed\":%llu,\"sampled_primitives\":%llu,\"held_primitives\":%llu,\"snapped\":%d,\"failed\":%s}",
         published_source_mode?"vertex_source_audit":"candidate_audit",
+        (unsigned long long)published_retiring_count,(unsigned long long)published_retiring_unresolved,
         (unsigned long long)published_sequence,(unsigned long long)published_count,
         (unsigned long long)published.matched,(unsigned long long)published.unmatched,
         (unsigned long long)published.disappeared,(unsigned long long)published.ambiguous,

@@ -17263,7 +17263,8 @@ static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source
     return !tracking || gpu_hd_textures_apply_tracking(tracking);
 }
 static int s_packet_collect,s_packet_sample,s_packet_content,s_packet_collect_target,s_packet_collect_y;
-static struct {int x,y;unsigned count;} s_packet_targets[128];
+static struct {int x,y;unsigned count;size_t last_vertex;} s_packet_targets[128];
+static size_t s_packet_last_spatial_index;
 static unsigned s_packet_target_count;
 static size_t s_packet_vertex_count,s_packet_vertex_index;
 static const PacketInterpolationPrimitive *s_packet_vertex,*s_packet_endpoint;
@@ -17351,6 +17352,7 @@ static int s_packet_retiring_drawn;
 static void rth_packet_draw_retiring(void) {
     FgState saved;fg_state_capture(&saved);
     const GLuint target=g_wide_cur;
+    const int dither=s_dither_bit;
     const size_t index=s_packet_vertex_index;
     flush_flat_batch();flush_tex_batch();
     if(s_packet_sample) {
@@ -17376,6 +17378,8 @@ static void rth_packet_draw_retiring(void) {
     }
     flush_flat_batch();flush_tex_batch();
     fg_state_apply(&saved,target);
+    s_dither_bit=dither;
+    rth_packet_native_input(s_rth_packet_view->attachment,saved.native_source);
     s_packet_vertex_index=index;s_packet_vertex=s_packet_endpoint=NULL;
 }
 static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,const void *payload) {
@@ -17407,12 +17411,13 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
                         s_packet_targets[i].y=s_packet_collect_y;s_packet_targets[i].count=0;
                     }
                     ++s_packet_targets[i].count;
+                    s_packet_targets[i].last_vertex=s_packet_vertex_count-1;
                 }
             }
         }
         else if(s_packet_sample) {
             if(!s_packet_retiring && !s_packet_retiring_drawn &&
-               g_wide_cur_base==s_packet_display_target && s_off_y==s_packet_display_y &&
+               s_packet_vertex_index==s_packet_last_spatial_index &&
                ((const PacketInterpolationSource*)payload)->valid_mask) {
                 s_packet_retiring_drawn=1;rth_packet_draw_retiring();
             }
@@ -17572,6 +17577,7 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
         for(unsigned i=0;i<s_packet_target_count;++i) if(s_packet_targets[i].count>best) {
             best=s_packet_targets[i].count;s_packet_display_target=s_packet_targets[i].x;
             s_packet_display_y=s_packet_targets[i].y;
+            s_packet_last_spatial_index=s_packet_targets[i].last_vertex;
         }
     }
     if(s_packet_vertex_count || !packet_interpolation_rate()) packet_metadata_pair(inputs->metadata,packet->epoch);
