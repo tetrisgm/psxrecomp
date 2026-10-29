@@ -1,0 +1,47 @@
+#ifndef PSX_FRAME_PACKET_H
+#define PSX_FRAME_PACKET_H
+#include <stddef.h>
+#include <stdint.h>
+#include "render_thread.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Owned, bounded presentation packets. The producer supplies a complete
+ * initial state and native inputs, never references into the live machine.
+ * Neither publication nor replacement waits for a consumer. Commands within
+ * a packet retain their original order. This transport does not decide which
+ * renderer commands are state, nor make incremental streams independent. */
+typedef struct FramePacketQueue FramePacketQueue;
+typedef struct FramePacketView {
+    uint64_t sequence,epoch;
+    const void *initial;
+    size_t initial_bytes;
+    const void *records;
+    size_t record_bytes;
+} FramePacketView;
+
+/* Limits are per slot, with three slots total (writing, pending, reading).
+ * Allocate/grow only on the producer. A failed append invalidates the whole
+ * packet; it can never publish a truncated draw list. */
+FramePacketQueue *frame_packet_create(size_t initial_limit,size_t record_limit);
+void frame_packet_destroy(FramePacketQueue *queue); /* stopped owners only */
+int frame_packet_begin(FramePacketQueue *queue,uint64_t sequence,
+                       const void *initial,size_t bytes);
+void *frame_packet_append(FramePacketQueue *queue,uint16_t op,uint16_t flags,
+                          uint32_t bytes);
+int frame_packet_publish(FramePacketQueue *queue);
+int frame_packet_acquire(FramePacketQueue *queue,FramePacketView *view);
+void frame_packet_release(FramePacketQueue *queue);
+uint64_t frame_packet_replaced(const FramePacketQueue *queue);
+/* Producer: load/rewind changes timeline. Discard pending/open packets;
+ * an already leased packet remains immutable, but is no longer presentable.
+ * Consumer checks current immediately before handing an image to present. */
+void frame_packet_invalidate(FramePacketQueue *queue);
+int frame_packet_current(const FramePacketQueue *queue,const FramePacketView *view);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

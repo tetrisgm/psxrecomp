@@ -56,8 +56,10 @@ void native_raster_destroy(NativeRaster *raster);
 int native_raster_submit(NativeRaster *raster,
                          const NativeRasterCommand *command,
                          const uint16_t *upload, size_t words);
-/* Reads fence only preceding native work. Snapshot also consumes this
- * instance's dirty-row mask, never the renderer's global dirty tracker. */
+/* Reads fence only preceding native work. With non-NULL dirty_rows, a snapshot
+ * consumes this instance's dirty-row mask, never the global tracker. NULL
+ * leaves dirty tracking intact (immutable presentation seeds are observers,
+ * not save/rewind checkpoints). */
 void native_raster_read(NativeRaster *raster, int x, int y, int w, int h,
                         uint16_t *destination);
 void native_raster_snapshot(NativeRaster *raster, uint16_t *destination,

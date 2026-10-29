@@ -209,7 +209,7 @@ struct NativeRaster {
             case Kind::Read: sw_vram_transfer_out(a[0],a[1],a[2],a[3],job.destination); break;
             case Kind::Snapshot:
                 std::memcpy(job.destination,vram.data(),sizeof(vram));
-                sw_context_take_dirty(job.dirty);
+                if(job.dirty) sw_context_take_dirty(job.dirty);
                 if(job.texture_destination) sw_native_texture_save(job.texture_destination);
                 break;
             case Kind::Restore:

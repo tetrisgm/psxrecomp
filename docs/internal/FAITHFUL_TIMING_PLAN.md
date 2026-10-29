@@ -2129,3 +2129,12 @@ smoke frame 8767 has zero dispatch/segment misses. Same-save 18x/all-on15s:
 53.075 VBlanks/s, max67.360ms,79173starved,53.16swap completions/s;
 scene/presentGPU3.670/12.813ms,zero acquisitions. Render queue backpressure still
 exists; neither real-time nor distinct-image acceptance is claimed.
+
+2026-10-28 frame architecture phase 2 WIP: callback-owned resampler behind a
+lock-free SPSC transport, Games/Pro Audio MMCSS, old push-audio diagnostic path
+removed, and callback-side timeline reset preserving subsequent PCM. Focused
+parity/concurrency/reset tests pass. Three-slot immutable frame-packet transport
+passes replacement/ownership/epoch/overflow tests and exact native replay after
+dropped packets; native seed observation does not consume rewind dirty rows.
+This transport is not yet connected to GL; the old render ring still applies
+backpressure. R4 dev build and 32 tests pass. No phase-2 acceptance or merge.

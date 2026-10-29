@@ -1,11 +1,14 @@
 #include "native_raster.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_vram_dirty.h"
+#include "frame_packet.h"
 #include <array>
 #include <cassert>
 #include <initializer_list>
 #include <thread>
 #include <vector>
+#include <memory>
+#include <cstring>
 #include "native_raster_oracle_fixtures.h"
 
 /* Native contexts do not use title-specific wide presentation. */
@@ -199,6 +202,16 @@ int main() {
     send(r,NR_NATIVE_RECT,{500,400,1,1,0,0,144,16,480,16,3});
     assert(pixel(r,500,400)==31);
 
+    // Presentation seeds observe exact bytes/cache without consuming the
+    // guest's dirty tracker. A skipped presentation cannot hide rewind data.
+    native_raster_snapshot(r,restored.data(),dirty);
+    send(r,NR_WRITE,{17,123,0x4321});
+    SwNativeTextureState seed_texture{};
+    native_raster_checkpoint(r,restored.data(),nullptr,&seed_texture);
+    assert(restored[123*1024+17]==0x4321);
+    native_raster_snapshot(r,restored.data(),dirty);
+    assert(dirty[123/64]&(UINT64_C(1)<<(123%64)));
+
     // Interlaced drawing skips the display field for fills too; copies and
     // CPU uploads still touch both fields. Fill ignores the draw rectangle.
     state.skip_field=1;
@@ -222,6 +235,53 @@ int main() {
         }
         assert(digest==fixture.digest);
     }
+    // A held presentation packet cannot delay native work. After replacing
+    // intermediate frames, the newest frame's seed and commands reproduce
+    // the exact native image, including mask and overlapping-copy semantics.
+    struct Seed {
+        std::array<uint16_t,1024*512> pixels;
+        SwNativeTextureState texture;
+    };
+    struct Draw { NativeRasterState state; std::array<uint32_t,4> words; uint32_t count; };
+    auto seed=std::make_unique<Seed>();
+    FramePacketQueue *frames=frame_packet_create(sizeof(Seed),4096);
+    assert(frames);
+    FramePacketView held{};
+    for(unsigned tick=1;tick<=64;++tick) {
+        native_raster_checkpoint(r,seed->pixels.data(),nullptr,&seed->texture);
+        assert(frame_packet_begin(frames,tick,seed.get(),sizeof(Seed)));
+        NativeRasterState draw_state={0,0,1023,511,0,0,0,0,tick&1u,(tick>>1)&1u,0};
+        const Draw draws[]={
+            {draw_state,{0x600000ffu,80u|(120u<<16),32u|(8u<<16),0},3},
+            {draw_state,{0x80000000u,80u|(120u<<16),81u|(120u<<16),32u|(8u<<16)},4},
+            {draw_state,{0x6000ff00u,90u|(122u<<16),4u|(2u<<16),0},3}
+        };
+        for(const auto &d:draws) {
+            void *payload=frame_packet_append(frames,1,0,sizeof(Draw));
+            assert(payload);std::memcpy(payload,&d,sizeof d);
+            assert(native_raster_gp0(r,&d.state,d.words.data(),d.count));
+        }
+        assert(frame_packet_publish(frames));
+        if(tick==1) assert(frame_packet_acquire(frames,&held));
+    }
+    assert(held.sequence==1 && frame_packet_replaced(frames)==62);
+    frame_packet_release(frames);
+    FramePacketView latest{};assert(frame_packet_acquire(frames,&latest));
+    assert(latest.sequence==64 && latest.initial_bytes==sizeof(Seed));
+    std::memcpy(seed.get(),latest.initial,sizeof(Seed));
+    native_raster_restore_checkpoint(other,seed->pixels.data(),&seed->texture);
+    size_t at=0;
+    while(at<latest.record_bytes) {
+        const auto *cmd=reinterpret_cast<const RtCmd *>(static_cast<const uint8_t *>(latest.records)+at);
+        assert(cmd->op==1 && cmd->payload==sizeof(Draw));
+        Draw d;std::memcpy(&d,cmd+1,sizeof d);
+        assert(native_raster_gp0(other,&d.state,d.words.data(),d.count));
+        at+=cmd->size;
+    }
+    native_raster_read(r,0,0,1024,512,saved.data());
+    native_raster_read(other,0,0,1024,512,restored.data());
+    assert(saved==restored);
+    frame_packet_release(frames);frame_packet_destroy(frames);
     native_raster_destroy(other);
     native_raster_destroy(r);
 }
