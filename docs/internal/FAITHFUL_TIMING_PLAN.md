@@ -213,6 +213,13 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- 2026-10-29 final phase-4 validation: 45-pair identity census passes, but
+  full-PGXP captures reveal interpolation-only geometry gaps. 8K requested
+  60/120 yields 25.6/26.1 distinct images/s with starvation. Presenter cutover
+  and legacy removal are not accepted for integration. Whole-model cut gate
+  experiment worsened captures and was reverted. See PACKET_INTERPOLATION.md.
+
+
 - 2026-10-29: Phase-4 topic adds render-owned retained packet sampling and opaque
   interpolated metadata; no guest redraw is executed by the presenter. Source
   classification separates whole-model appearances from missing points in an

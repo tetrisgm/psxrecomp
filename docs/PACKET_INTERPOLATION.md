@@ -47,5 +47,10 @@ never select a guest re-execution or serial interpolation path.
 Sampler, stream, presenter/metadata and lease fixtures pass. R4's 45-pair driving
 census has zero unexplained/unmatched/ambiguous uses. Runtime visual and 8K-rate
 acceptance are tracked in R4 `docs/FRAME_INTERPOLATION_STATUS.md`; they must not be
-inferred from the census. The latest memory-cost and cross-caller staging fixes
-are undergoing fresh hidden-game validation.
+inferred from the census. Final hidden full-PGXP 8K comparisons at `2e39cbe6`
+show interpolation-only wall/roof gaps absent with generic rate 0. Requested
+60/120 output produced 25.6/26.1 distinct images/s, with audio starvation in both
+interpolated and stock runs. The presenter cutover is NOT accepted for integration.
+A whole-model cut-threshold experiment worsened geometry and was reverted.
+Compact-layout rewind restored 49 snapshots without failures and resumed a clean
+45-pair census; the hidden complete-frame GL fixture passed 111 checks.
