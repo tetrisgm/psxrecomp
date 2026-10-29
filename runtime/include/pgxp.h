@@ -206,8 +206,6 @@ typedef void (*PGXPTransformRecorder)(const PGXPProjection *projection, const PG
 /* Producer-only observer, before guest culling. Private contexts never publish. */
 void pgxp_set_transform_recorder(PGXPTransformRecorder recorder);
 void pgxp_set_projection_tracking(int enabled);
-/* Producer-owned demand, updated at packet boundaries independently of audit. */
-void pgxp_set_interpolation_tracking(int enabled);
 int pgxp_projection_tracking(void);
 /* source_vertex 1..6 requests the corresponding GTE input register origin;
  * stored projections contain the resolved RAM address, never a register ID. */

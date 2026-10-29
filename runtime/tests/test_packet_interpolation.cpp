@@ -96,6 +96,7 @@ int main() {
             old[v].source={7,v+1};old[v].view[0]=v;old[v].view[2]=100;
         }
         mesh[1].vertex[0].colour=0xabcdef;
+        mesh[1].vertex[0].view[0]=std::nextafter(mesh[0].vertex[0].view[0],11.0);
         PacketInterpolationPacket a{1,1,nullptr,0,0,old,3,1};
         PacketInterpolationPacket b{1,2,mesh,2,0,nullptr,0,1};
         assert(packet_interpolation_pair(context,&a,&b,0));

@@ -4890,6 +4890,10 @@ void gpu_render_projective_end(void) {
     pgxp_projective_scope_end(&s_render_pgxp_scope);
     s_render_scope = 0;
 }
+void gpu_pgxp_update_projection_tracking(void) {
+    pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction ||
+                                 packet_interpolation_stream_enabled());
+}
 void psx_mod_set_render_projective(int enabled) {
     s_render_projective = !!enabled;
     pgxp_set_projection_tracking(s_render_projective || s_native_wide_projection_correction ||

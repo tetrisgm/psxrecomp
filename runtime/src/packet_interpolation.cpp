@@ -105,6 +105,7 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
             }
             c->stats.snapped=a->epoch!=b->epoch || b->sequence<=a->sequence || a->discontinuity || b->discontinuity;
             size_t local_cuts=0;
+            std::unordered_map<Key,size_t,Hash> model_points,model_cuts;
             for(size_t i=0;i<c->b.size();++i) {
                 const auto& p=c->b[i]; if(!p.spatial) continue;
                 if(p.vertices<3 || p.vertices>4) {++c->stats.invalid;continue;}
@@ -144,10 +145,11 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                                 c->source_previous[i].vertex[j].view[d]=value;
                                 double delta=value-v.view[d];distance+=delta*delta;
                             }
-                            c->source_masks[i]|=1u<<j;++c->stats.source_matched;++c->stats.model_reconstructed;
+                            c->source_masks[i]|=1u<<j;++c->stats.source_matched;
+                    ++model_points[{v.model.object,v.model.primitive}];++c->stats.model_reconstructed;
                             if(distance>1e-12) ++c->stats.source_moving;
                             if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) {
-                                c->source_masks[i]&=~(1u<<j);++local_cuts;
+                                ++model_cuts[{v.model.object,v.model.primitive}];++local_cuts;
                             }
                         } else {
                             ++c->stats.new_source;
@@ -170,15 +172,24 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                     }
                     if(!finite) {++c->stats.invalid;++c->stats.source_unmatched;continue;}
                     c->source_masks[i]|=1u<<j;++c->stats.source_matched;
+                    ++model_points[{v.model.object,v.model.primitive}];
                     if(distance>1e-12) ++c->stats.source_moving;
                     if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) {
-                                c->source_masks[i]&=~(1u<<j);++local_cuts;
-                            }
+                        ++model_cuts[{v.model.object,v.model.primitive}];++local_cuts;
+                    }
                 }
                 if(c->source_masks[i]==(1u<<p.vertices)-1) ++c->stats.matched;
             }
-            // Local discontinuities (respawns, changing procedural geometry)
-            // take N. A scene-wide discontinuity snaps metadata and all geometry.
+            // Near-camera vertices can move farther than their depth during
+            // an ordinary tick. A cut requires a majority of a model's uses,
+            // never a single near-plane point. Hold the entire model on a cut.
+            for(size_t i=0;i<c->b.size();++i) for(unsigned j=0;j<c->b[i].vertices && j<4;++j) {
+                const auto& v=c->b[i].vertex[j];
+                const Key model{v.model.object,v.model.primitive};
+                auto cut=model_cuts.find(model);
+                if(cut!=model_cuts.end() && cut->second*2>model_points[model]) c->source_masks[i]=0;
+            }
+            // A scene-wide discontinuity also snaps title metadata.
             if(local_cuts && local_cuts*2>c->stats.source_matched) c->stats.snapped=1;
             std::unordered_map<Key,size_t,Hash> slots;
             c->source_slots.assign(c->b.size()*4,missing);
@@ -214,7 +225,13 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
             std::vector<bool> hold(c->b.size(),false);
             for(size_t i=0;i<c->b.size();++i)
                 if(!c->b[i].spatial || c->source_masks[i]!=(1u<<c->b[i].vertices)-1) hold[root(i)]=true;
-            for(size_t i=0;i<c->b.size();++i) if(hold[root(i)]) c->source_masks[i]=0;
+            for(size_t i=0;i<c->b.size();++i) {
+                if(hold[root(i)]) c->source_masks[i]=0;
+                if(c->b[i].spatial) {
+                    if(c->source_masks[i]) ++c->stats.sampled_primitives;
+                    else ++c->stats.held_primitives;
+                }
+            }
             c->source_samples.resize(c->source_owners.size());
             c->stats.unmatched=c->stats.source_unmatched;
             c->stats.ambiguous=c->stats.source_ambiguous;
@@ -356,21 +373,7 @@ extern "C" int packet_interpolation_sample(const PacketInterpolation *c,double t
                     p.screen[0]=value.screen[0];p.screen[1]=value.screen[1];
                     continue;
                 }
-                if(!c->stats.snapped && t!=1 && (c->source_masks[i]&(1u<<v))) {
-                    for(unsigned d=0;d<3;++d) p.view[d]=c->source_previous[i].vertex[v].view[d]+t*(p.view[d]-c->source_previous[i].vertex[v].view[d]);
-                    const auto& old=c->source_previous[i].vertex[v];
-                    p.h=old.h+t*(p.h-old.h);p.ofx=old.ofx+t*(p.ofx-old.ofx);
-                    p.ofy=old.ofy+t*(p.ofy-old.ofy);p.x_scale=old.x_scale+t*(p.x_scale-old.x_scale);
-                }
-                p.homogeneous[0]=p.ofx*p.view[2]+p.h*p.x_scale*p.view[0];
-                p.homogeneous[1]=p.ofy*p.view[2]+p.h*p.view[1];
-                p.homogeneous[2]=p.view[2];
-                // Nonpositive depth is valid geometry. The renderer clips
-                // homogeneous coordinates before performing the divide.
-                if(p.view[2]>0 && t!=1 && !c->stats.snapped && (c->source_masks[i]&(1u<<v))) {
-                    p.screen[0]=p.homogeneous[0]/p.view[2];
-                    p.screen[1]=p.homogeneous[1]/p.view[2];
-                }
+
             }
             continue;
         }

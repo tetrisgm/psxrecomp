@@ -45,6 +45,8 @@ void acquire_transform_block() {
 struct Stream {
     PacketInterpolation *pair=packet_interpolation_create();
     std::vector<PacketInterpolationPrimitive> older,current,sampled;
+    std::vector<PacketInterpolationPrimitive> union_geometry,retiring_endpoints;
+    std::vector<size_t> retiring_indices;
     std::vector<PacketInterpolationSource> old_sources,sources;
     uint64_t old_epoch=0,old_sequence=0,epoch=0,sequence=0;
     std::vector<PacketInterpolationTransform> transforms,old_transforms;
@@ -262,8 +264,41 @@ static void stream_end_impl(void) {
             return stream.sequence>r.sequence && stream.sequence-r.sequence>8;
         }),stream.history.end());
     }
+    // Keep geometry culled at N until it actually leaves the interpolated
+    // frustum. Both old-only and current faces use one canonical source table.
+    stream.union_geometry=stream.current;
+    stream.retiring_endpoints=stream.older;
+    stream.retiring_indices.assign(stream.older.size(),SIZE_MAX);
+    std::unordered_map<uint64_t,std::unordered_set<uint64_t>> present;
+    for(const auto& p:stream.current) present[p.identity.object].insert(p.identity.primitive);
+    std::unordered_map<uint64_t,std::unordered_map<uint64_t,const PacketInterpolationTransform*>> models,points;
+    for(const auto& v:stream.transforms) {
+        models[v.model.object][v.model.primitive]=&v;
+        points[v.source.object][v.source.primitive]=&v;
+    }
+    if(stream.old_epoch==stream.epoch) for(size_t i=0;i<stream.older.size();++i) {
+        auto p=stream.older[i];
+        if(!p.spatial || present[p.identity.object].count(p.identity.primitive)) continue;
+        bool reconstructed=true;
+        for(unsigned j=0;j<p.vertices;++j) {
+            auto& v=p.vertex[j];
+            const auto* point=points[v.source.object][v.source.primitive];
+            const auto* model=models[v.model.object][v.model.primitive];
+            if(!point && (!model || !model->affine_valid)) {reconstructed=false;break;}
+            const auto& transform=*(point?point:model);
+            for(unsigned d=0;d<3;++d) {
+                v.view[d]=point?point->view[d]:model->affine[d*4+3];
+                if(!point) for(unsigned k=0;k<3;++k) v.view[d]+=model->affine[d*4+k]*v.model_position[k];
+            }
+            v.h=transform.h;v.ofx=transform.ofx;v.ofy=transform.ofy;v.x_scale=transform.x_scale;
+        }
+        if(reconstructed) {
+            stream.retiring_indices[i]=stream.union_geometry.size();
+            stream.union_geometry.push_back(p);
+        }
+    }
     PacketInterpolationPacket a{stream.old_epoch,stream.old_sequence,stream.older.data(),stream.older.size(),0};
-    PacketInterpolationPacket b{stream.epoch,stream.sequence,stream.current.data(),stream.current.size(),0};
+    PacketInterpolationPacket b{stream.epoch,stream.sequence,stream.union_geometry.data(),stream.union_geometry.size(),0};
     a.transforms=stream.old_transforms.data();a.transform_count=stream.old_transforms.size();
     b.transforms=stream.transforms.data();b.transform_count=stream.transforms.size();
     a.source_mode=b.source_mode=stream.source_mode;
@@ -273,7 +308,7 @@ static void stream_end_impl(void) {
         published=stream.failed?PacketInterpolationStats{}:packet_interpolation_stats(stream.pair);
         published_source_mode=stream.source_mode;
         published_sequence=stream.sequence;published_missing=stream.missing;
-        published_count=stream.current.size();published_failed=stream.failed;
+        published_count=stream.union_geometry.size();published_failed=stream.failed;
         if(capture_requested.exchange(false)) {
             try {
                 captured[0]=stream.older;captured[1]=stream.current;
@@ -300,6 +335,7 @@ extern "C" void packet_interpolation_stream_end(void) {
     }
 }
 extern "C" void packet_interpolation_stream_reset(void) {
+    stream.union_geometry.clear();stream.retiring_indices.clear();stream.retiring_endpoints.clear();
     stream.staging_addresses.clear();
     stream.transforms.clear();stream.old_transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();stream.history.clear();
     stream.old_sources.clear();stream.sources.clear();
@@ -316,7 +352,7 @@ extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
     return std::snprintf(out,capacity,
         "{\"status\":\"ok\",\"mode\":\"%s\",\"sequence\":%llu,\"primitives\":%llu,"
         "\"matched\":%llu,\"unmatched\":%llu,\"disappeared\":%llu,\"ambiguous\":%llu,"
-        "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"source_moving\":%llu,\"verified_appearance\":%llu,\"unexplained\":%llu,\"model_reconstructed\":%llu,\"snapped\":%d,\"failed\":%s}",
+        "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"source_moving\":%llu,\"verified_appearance\":%llu,\"unexplained\":%llu,\"model_reconstructed\":%llu,\"sampled_primitives\":%llu,\"held_primitives\":%llu,\"snapped\":%d,\"failed\":%s}",
         published_source_mode?"vertex_source_audit":"candidate_audit",
         (unsigned long long)published_sequence,(unsigned long long)published_count,
         (unsigned long long)published.matched,(unsigned long long)published.unmatched,
@@ -325,7 +361,7 @@ extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
         (unsigned long long)published.appeared_candidates,(unsigned long long)published.invalid,(unsigned long long)published_missing,
         (unsigned long long)published.duplicate_equal,
         (unsigned long long)published.source_matched,(unsigned long long)published.new_source,
-        (unsigned long long)published.source_unmatched,(unsigned long long)published.source_ambiguous,(unsigned long long)published.source_moving,(unsigned long long)published.verified_appearance,(unsigned long long)published.unexplained,(unsigned long long)published.model_reconstructed,published.snapped,published_failed?"true":"false");
+        (unsigned long long)published.source_unmatched,(unsigned long long)published.source_ambiguous,(unsigned long long)published.source_moving,(unsigned long long)published.verified_appearance,(unsigned long long)published.unexplained,(unsigned long long)published.model_reconstructed,(unsigned long long)published.sampled_primitives,(unsigned long long)published.held_primitives,published.snapped,published_failed?"true":"false");
 }
 
 extern "C" void packet_interpolation_capture_request(void) {
@@ -366,7 +402,7 @@ extern "C" unsigned packet_interpolation_rate(void) {unsigned rate=output_rate.l
 extern "C" void packet_interpolation_display_rate(double hz) {if(hz>=1 && hz<=1000) display_rate.store(unsigned(hz+0.5));}
 extern "C" size_t packet_interpolation_stream_count(void) {return stream.older.size();}
 extern "C" int packet_interpolation_stream_sample(double t) {
-    try {stream.sampled.resize(stream.older.size());}
+    try {stream.sampled.resize(stream.union_geometry.size());}
     catch(...) {return 0;}
     return packet_interpolation_sample(stream.pair,t,stream.sampled.data(),stream.sampled.size());
 }
@@ -375,6 +411,13 @@ extern "C" const PacketInterpolationPrimitive *packet_interpolation_stream_verte
 }
 extern "C" const PacketInterpolationPrimitive *packet_interpolation_stream_endpoint(size_t i) {
     return i<stream.older.size()?&stream.older[i]:nullptr;
+}
+extern "C" const PacketInterpolationPrimitive *packet_interpolation_stream_retiring(size_t i) {
+    return i<stream.retiring_indices.size() && stream.retiring_indices[i]<stream.sampled.size()?
+        &stream.sampled[stream.retiring_indices[i]]:nullptr;
+}
+extern "C" const PacketInterpolationPrimitive *packet_interpolation_stream_retiring_endpoint(size_t i) {
+    return i<stream.retiring_endpoints.size()?&stream.retiring_endpoints[i]:nullptr;
 }
 
 extern "C" int packet_interpolation_stream_snapped(void) {return packet_interpolation_stats(stream.pair).snapped;}

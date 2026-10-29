@@ -13565,6 +13565,11 @@ static int rth_record_cpu_present(const uint32_t *pixels,const RthCpuPresent *cp
 
 static int s_packet_display_target=-1,s_packet_display_y,s_packet_drawing;
 static int s_packet_previous_target=-1,s_packet_previous_y;
+static int s_packet_presented_x=-1,s_packet_presented_y;
+int gl_renderer_packet_display(int *x,int *y) {
+    if(!packet_presenter_active() || s_packet_presented_x<0) return 0;
+    *x=s_packet_presented_x;*y=s_packet_presented_y;return 1;
+}
 static void rth_present_payload(uint16_t op, const uint8_t *p);
 static void rth_replay_present(const RtCmd *c, const uint8_t *p) {
     static int skipped_last = 0;
@@ -13619,6 +13624,7 @@ static void rth_present_payload(uint16_t op, const uint8_t *p) {
         hd.args[0]=s_packet_display_target;
         hd.args[1]=s_packet_display_y;
     }
+    if(s_packet_drawing) {s_packet_presented_x=hd.args[0];s_packet_presented_y=hd.args[1];}
     const int32_t *a = hd.args;
     if (op == RTH_PRESENT_VRAM)
         gl_renderer_present_vram(a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -17181,9 +17187,11 @@ static void rth_packet_dispose(void *data) {
     free(inputs);
     atomic_fetch_add(&s_rth_packet_dispose_ns,pt_clock_ns()-begin);
 }
+/* Internal producer demand; it does not change the guest execution ABI. */
+extern void gpu_pgxp_update_projection_tracking(void);
 static int rth_packet_begin(void *user,FrameOwner *owner,uint64_t sequence) {
     (void)user;
-    pgxp_set_interpolation_tracking(packet_interpolation_stream_enabled());
+    gpu_pgxp_update_projection_tracking();
     uint64_t begin=pt_clock_ns();
     rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
     RthPacketSeed *seed=NULL;
@@ -17259,6 +17267,8 @@ static struct {int x,y;unsigned count;} s_packet_targets[128];
 static unsigned s_packet_target_count;
 static size_t s_packet_vertex_count,s_packet_vertex_index;
 static const PacketInterpolationPrimitive *s_packet_vertex,*s_packet_endpoint;
+static int s_packet_retiring;
+static int s_packet_retiring_target,s_packet_retiring_y;
 static const void *s_packet_present_payload;
 static uint16_t s_packet_present_op;
 static void rth_packet_draw(const FramePacketView *,double);
@@ -17278,8 +17288,6 @@ static void rth_packet_geometry(void) {
     }
     for(unsigned i=0;i<3;++i) {
         const PacketInterpolationVertex *v=&p->vertex[i],*n0=&n->vertex[i];
-        const double nx=n0->ofx+n0->h*n0->x_scale*n0->view[0]/n0->view[2];
-        const double ny=n0->ofy+n0->h*n0->view[1]/n0->view[2];
         if(s_pc_valid) {s_pc_x[i]=v->screen[0]+s_off_x;
                        s_pc_y[i]=v->screen[1]+s_off_y;}
         if(s_pq_valid) s_pq[i]*=(float)(n0->view[2]/v->view[2]);
@@ -17338,6 +17346,38 @@ static int rth_packet_clip_ordinary(const RtCmd *command,const int32_t *words) {
     }
     precise_consumed();return 1;
 }
+static int rth_packet_record(const RthPacketInputs *,const RtCmd *,const void *);
+static int s_packet_retiring_drawn;
+static void rth_packet_draw_retiring(void) {
+    FgState saved;fg_state_capture(&saved);
+    const GLuint target=g_wide_cur;
+    const size_t index=s_packet_vertex_index;
+    flush_flat_batch();flush_tex_batch();
+    if(s_packet_sample) {
+        const FramePacketView *old=packet_presenter_previous();
+        if(old && old->epoch==s_rth_packet_view->epoch) {
+            s_packet_retiring=1;s_packet_vertex_index=0;s_packet_vertex=s_packet_endpoint=NULL;
+            const RthPacketSeed *old_seed=old->initial;
+            RthFrameState state=old_seed->draw;
+            s_packet_retiring_target=state.target_on?state.target:-1;
+            s_packet_retiring_y=state.offset[1];
+            state.offset[1]+=s_packet_display_y-s_packet_previous_y;
+            state.area[1]+=s_packet_display_y-s_packet_previous_y;
+            state.area[3]+=s_packet_display_y-s_packet_previous_y;
+            state.target=s_packet_display_target;state.target_on=1;
+            rth_frame_state_apply(&state);
+            for(size_t at=0;at<old->record_bytes;) {
+                const RtCmd *command=(const RtCmd *)((const uint8_t*)old->records+at);
+                if(!rth_packet_record(old->attachment,command,command+1)) break;
+                at+=command->size;
+            }
+            s_packet_retiring=0;
+        }
+    }
+    flush_flat_batch();flush_tex_batch();
+    fg_state_apply(&saved,target);
+    s_packet_vertex_index=index;s_packet_vertex=s_packet_endpoint=NULL;
+}
 static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,const void *payload) {
     if(s_rth_packet_view && !rt_packet_current(s_rth_packet_view)) return 0;
     if(command->op==RTH_GROUP) {
@@ -17371,8 +17411,15 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
             }
         }
         else if(s_packet_sample) {
-            s_packet_vertex=packet_interpolation_stream_vertex(s_packet_vertex_index);
-            s_packet_endpoint=packet_interpolation_stream_endpoint(s_packet_vertex_index++);
+            if(!s_packet_retiring && !s_packet_retiring_drawn &&
+               g_wide_cur_base==s_packet_display_target && s_off_y==s_packet_display_y &&
+               ((const PacketInterpolationSource*)payload)->valid_mask) {
+                s_packet_retiring_drawn=1;rth_packet_draw_retiring();
+            }
+            s_packet_vertex=s_packet_retiring?packet_interpolation_stream_retiring(s_packet_vertex_index):
+                packet_interpolation_stream_vertex(s_packet_vertex_index);
+            s_packet_endpoint=s_packet_retiring?packet_interpolation_stream_retiring_endpoint(s_packet_vertex_index++):
+                packet_interpolation_stream_endpoint(s_packet_vertex_index++);
         }
         return 1;
     }
@@ -17386,6 +17433,28 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
            command->op==RTH_SHADED_LINE || command->op==RTH_FILL ||
            command->op==RTH_PRESENT_CPU || command->op==RTH_PRESENT_BLANK) s_packet_content=1;
         return 1;
+    }
+    if(s_packet_retiring) {
+        const int32_t *v=payload;
+        switch(command->op) {
+        case RTH_OFFSET:
+            s_packet_retiring_y=v[1];
+            glb_set_draw_offset(v[0],v[1]+s_packet_display_y-s_packet_previous_y);return 1;
+        case RTH_AREA: glb_set_draw_area(v[0],v[1]+s_packet_display_y-s_packet_previous_y,
+            v[2],v[3]+s_packet_display_y-s_packet_previous_y);return 1;
+        case RTH_WIDE_TARGET:
+            s_packet_retiring_target=v[0];glb_wide_set_target(s_packet_display_target);return 1;
+        case RTH_WIDE_DISABLE:s_packet_retiring_target=-1;return 1;
+        case RTH_FLAT_TRI:case RTH_GOURAUD_TRI:case RTH_TEX_TRI:
+        case RTH_SHADED_TEX_TRI:case RTH_PROJ_TRI:
+            if(s_packet_retiring_target!=s_packet_previous_target || s_packet_retiring_y!=s_packet_previous_y ||
+               !s_packet_vertex || !s_packet_vertex->interpolated) {precise_consumed();return 1;}
+            break;
+        case RTH_SEMI:case RTH_MASK:case RTH_TWIN:case RTH_MOD:case RTH_PRECISE:
+        case RTH_PERSP:case RTH_DEPTH:case RTH_DITHER:case RTH_BANK:case RTH_NATIVE_SOURCE:
+            break;
+        default:return 1; // no clears, transfers, HUD, effects or presents from N-1
+        }
     }
     if(s_packet_drawing && (command->op==RTH_PRESENT_VRAM || command->op==RTH_PRESENT_WIDE ||
        command->op==RTH_PRESENT_HOLD || command->op==RTH_PRESENT_CPU || command->op==RTH_PRESENT_BLANK)) {
@@ -17434,6 +17503,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     s_rth_packet_replaying=1;s_rth_packet_view=packet;
     s_packet_drawing=packet_interpolation_rate()!=0;
     s_packet_present_payload=NULL;
+    s_packet_retiring_drawn=0;
     s_packet_vertex_index=0;s_packet_vertex=s_packet_endpoint=NULL;
     s_packet_sample=t>=0 && t<1.0 && !packet_interpolation_stream_snapped() && packet_interpolation_rate() && packet_interpolation_stream_sample(t);
     if(t<0 || t==1) packet_metadata_endpoint(inputs->metadata);

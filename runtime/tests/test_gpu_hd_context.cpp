@@ -105,6 +105,12 @@ int main() {
             if (!gpu_hd_textures_configure(path.c_str(),1,0,error,sizeof(error)) ||
                 !gpu_hd_textures_apply_tracking(tracking) ||
                 !gpu_hd_textures_invalidation_changes(64,0,1,1)) ++failures;
+            const auto applied_generation=gpu_hd_textures_tracking_generation();
+            if(!gpu_hd_textures_apply_tracking(tracking) ||
+               gpu_hd_textures_tracking_generation()!=applied_generation) ++failures;
+            gpu_hd_textures_invalidate(64,0,4,2);
+            if(!gpu_hd_textures_apply_tracking(tracking) ||
+               !gpu_hd_textures_invalidation_changes(64,0,1,1)) ++failures;
             gpu_hd_textures_free_tracking(tracking); tracking = nullptr;
             if (!gpu_hd_textures_invalidation_changes(64,0,1,1)) ++failures;
             gpu_hd_textures_shutdown();

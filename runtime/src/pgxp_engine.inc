@@ -98,13 +98,7 @@ PGXP_API void pgxp_set_projection_tracking(int enabled) {
     s_projection_tracking = !!enabled;
     pgxp_invalidate_all();
 }
-PGXP_API int pgxp_projection_tracking(void) {
-#ifdef PGXP_INTERPOLATION_TRACKING
-    return s_projection_tracking || PGXP_INTERPOLATION_TRACKING;
-#else
-    return s_projection_tracking;
-#endif
-}
+PGXP_API int pgxp_projection_tracking(void) { return s_projection_tracking; }
 
 PGXP_API void  pgxp_set_tolerance(float pixels) { s_tolerance = pixels; }
 PGXP_API float pgxp_tolerance(void) { return s_tolerance; }
@@ -1533,7 +1527,7 @@ PGXP_API int pgxp_get_gte_sxy(uint32_t index, int32_t *x16, int32_t *y16) {
 }
 
 PGXP_API void pgxp_gte_set_projection(const PGXPProjection *projection) {
-    if (!g_pgxp_active || !pgxp_projection_tracking() || !projection) return;
+    if (!g_pgxp_active || !s_projection_tracking || !projection) return;
     s_gte[14].projection = *projection;
     // GTE supplies its input register pair before the FIFO shift. RAM origins
     // survive exact full-word copies; resets/partial arithmetic kill them.
@@ -1548,13 +1542,13 @@ PGXP_API void pgxp_gte_set_projection(const PGXPProjection *projection) {
 }
 #ifdef PGXP_TRANSFORM_RECORD
 PGXP_API void pgxp_gte_record_transform(const PGXPAffineTransform *affine) {
-    if(g_pgxp_active && pgxp_projection_tracking() && (s_gte[14].flags&PGXP_F_PROJECTION))
+    if(g_pgxp_active && s_projection_tracking && (s_gte[14].flags&PGXP_F_PROJECTION))
         PGXP_TRANSFORM_RECORD(&s_gte[14].projection,affine);
 }
 #endif
 PGXP_S int projection_read(const PGXPValue *pv, uint32_t packed, PGXPProjection *out) {
     const uint16_t flags = PGXP_F_VXY | PGXP_F_PROJECTION;
-    if (!s_enabled || !pgxp_projection_tracking() || !pv || pv->gen != s_gen || pv->value != packed ||
+    if (!s_enabled || !s_projection_tracking || !pv || pv->gen != s_gen || pv->value != packed ||
         (pv->flags & flags) != flags) return 0;
     if (out) *out = pv->projection;
     return 1;

@@ -52,6 +52,7 @@ typedef struct PacketInterpolationStats {
     uint64_t resolved_occurrence, resolved_assignment, appeared_candidates;
     uint64_t source_matched, new_source, source_unmatched, source_ambiguous, source_moving;
     uint64_t verified_appearance, unexplained, model_reconstructed;
+    uint64_t sampled_primitives, held_primitives;
     int snapped;
 } PacketInterpolationStats;
 typedef struct PacketInterpolation PacketInterpolation;

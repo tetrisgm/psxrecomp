@@ -135,7 +135,14 @@ int main() {
         packet_interpolation_transform_free(table);
     }
     packet_interpolation_stream_json(json,sizeof json);
-    assert(std::strstr(json,"\"source_matched\":3,"));
+    assert(std::strstr(json,"\"source_matched\":6,"));
+    assert(packet_interpolation_stream_sample(0.5));
+    const auto* departing=packet_interpolation_stream_retiring(0);
+    assert(departing && departing->interpolated);
+    const auto* current=packet_interpolation_stream_vertex(0);
+    // The shared edge uses the same sampled source table in both topologies.
+    for(unsigned v=1;v<3;++v)
+        assert(std::memcmp(departing->vertex[v].view,current->vertex[v].view,sizeof current->vertex[v].view)==0);
     assert(std::strstr(json,"\"model_reconstructed\":1,"));
     assert(std::strstr(json,"\"unexplained\":0,"));
 

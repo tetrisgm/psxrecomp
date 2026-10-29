@@ -11292,11 +11292,18 @@ static void handle_render_thread(int id, const char *json)
  *   {"cmd":"frame_gen"} -> enabled, active, generated / real presents, flips,
  *   the last plan (in-between frames per game frame, display slots), costs,
  *   match counts, breaker. Not a sync point (render-thread counters, racy). */
+static void packet_sample_request(const void *payload) {
+    if(packet_presenter_request_sample(*(const int *)payload)) rt_tick_at(rt_now_ns());
+}
 static void handle_packet_interpolation(int id, const char *json)
 {
     char buf[16384];
     int rate=json_get_int(json,"rate",-1);
     if(rate>=0 && rate<=1000) packet_interpolation_set_rate((unsigned)rate);
+    int sample=json_get_int(json,"sample_milli",-1);
+    if(sample>=0 && (sample>1000 || !rt_request(packet_sample_request,&sample,sizeof sample))) {
+        send_err(id,"sample request rejected");return;
+    }
     if(json_get_int(json,"capture",0)) packet_interpolation_capture_request();
     if(json_get_int(json,"detail",0))
         packet_interpolation_capture_json(buf,sizeof buf,json_get_int(json,"older",0),
@@ -17697,7 +17704,12 @@ typedef struct RenderDebugRequest {
 static void execute_render_debug_request(const void *data) {
     const RenderDebugRequest *request=data;
     s_in_command=1;
-    s_debug_wide_snapshot=request->wide?&request->wide_snapshot:NULL;
+    DebugWideSnapshot snapshot=request->wide_snapshot;
+    if(request->wide && json_get_int(request->json,"packet",0)) {
+        int x,y;
+        if(gl_renderer_packet_display(&x,&y)) {snapshot.base_x=x;snapshot.display.display_y=y;}
+    }
+    s_debug_wide_snapshot=request->wide?&snapshot:NULL;
     request->handler(request->id,request->json);
     s_debug_wide_snapshot=NULL;
     s_in_command=0;

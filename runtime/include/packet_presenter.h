@@ -11,7 +11,10 @@ extern "C" {
 typedef void (*PacketPresenterDraw)(const FramePacketView *, double);
 void packet_presenter_reset(void);
 int packet_presenter_active(void);
+const FramePacketView *packet_presenter_previous(void);
 int packet_presenter_json(char *,size_t);
+/* Debug request, consumed asynchronously by the render owner. -1: disabled. */
+int packet_presenter_request_sample(int thousandths);
 int packet_presenter_submit(const FramePacketView *, uint64_t now,
                             double guest_hz, PacketPresenterDraw);
 uint64_t packet_presenter_tick(uint64_t now, PacketPresenterDraw);
