@@ -1,3 +1,5 @@
+#include "guest_wait_trace.h"
+#include "deferred_return.h"
 #include "packet_interpolation_stream.h"
 #include "packet_interpolation.h"
 #include <cstdio>
@@ -17,29 +19,24 @@ struct TransformRecord {PGXPProjection projection;PGXPAffineTransform affine;boo
 // The guest only appends and exchanges prepared storage. A CPU worker owns
 // allocation and reclamation, including attachments evicted by rewind. Empty
 // spare blocks are uninitialized: preparing capacity does not touch megabytes.
-struct TransformBlock {
+struct TransformBlock : DeferredReturnLink {
     std::array<TransformRecord,32768> values;
     size_t count=0;
     std::atomic<unsigned> references{1};
     TransformBlock *next=nullptr;
 };
-struct PacketTransformTable {
+struct PacketTransformTable : DeferredReturnLink {
     std::array<TransformBlock*,9> blocks{};
     TransformBlock *spare=nullptr;
     PacketTransformTable *next=nullptr;
 };
 namespace {
-template<class T> void return_node(std::atomic<T*>& stack,T* node) {
-    auto* head=stack.load(std::memory_order_relaxed);
-    do {node->next=head;} while(!stack.compare_exchange_weak(head,node,
-        std::memory_order_release,std::memory_order_relaxed));
-}
 struct TransformStorage {
     static constexpr size_t capacity=128;
     std::array<PacketTransformTable*,capacity> ready{};
     std::atomic<size_t> written{0},read{0};
-    std::atomic<TransformBlock*> returned_blocks{nullptr};
-    std::atomic<PacketTransformTable*> returned_tables{nullptr};
+    DeferredReturn<TransformBlock> returned_blocks;
+    DeferredReturn<PacketTransformTable> returned_tables;
     std::atomic<bool> stopping{false};
     std::atomic<uint64_t> misses{0};
     std::vector<std::unique_ptr<TransformBlock>> blocks;
@@ -49,19 +46,16 @@ struct TransformStorage {
     std::thread worker;
     void release(TransformBlock* block) {
         if(block && block->references.fetch_sub(1,std::memory_order_acq_rel)==1)
-            return_node(returned_blocks,block);
+            returned_blocks.push(block);
     }
     void reclaim() {
-        auto* table=returned_tables.exchange(nullptr,std::memory_order_acquire);
-        while(table) {
-            auto* next=table->next;
+        while(auto* table=returned_tables.pop()) {
             for(auto*& block:table->blocks) {release(block);block=nullptr;}
             release(table->spare);table->spare=nullptr;
-            table->next=free_tables;free_tables=table;table=next;
+            table->next=free_tables;free_tables=table;
         }
-        auto* block=returned_blocks.exchange(nullptr,std::memory_order_acquire);
-        while(block) {
-            auto* next=block->next;block->next=free_blocks;free_blocks=block;block=next;
+        while(auto* block=returned_blocks.pop()) {
+            block->next=free_blocks;free_blocks=block;
         }
     }
     void prepare() {
@@ -109,7 +103,7 @@ struct TransformProducer {
     bool failed=false;
     TransformProducer() {
         auto* table=transform_storage.take();block=table->spare;table->spare=nullptr;
-        return_node(transform_storage.returned_tables,table);
+        transform_storage.returned_tables.push(table);
     }
     ~TransformProducer() {
         for(auto* item:history) transform_storage.release(item);
@@ -215,6 +209,7 @@ extern "C" void packet_interpolation_transform(const PGXPProjection *p,const PGX
     producer.block->values[producer.block->count++]={*p,affine?*affine:PGXPAffineTransform{},affine!=nullptr};
 }
 extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
+    guest_wait_trace::Scope trace(guest_wait_trace::History);
     if(producer.failed) transform_storage.misses.fetch_add(1);
     auto* result=producer.failed?nullptr:transform_storage.take();
     if(!result) {producer.failed=false;producer.block->count=0;return nullptr;}
@@ -227,7 +222,8 @@ extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
     return result;
 }
 extern "C" void packet_interpolation_transform_free(PacketTransformTable *p) {
-    if(p) return_node(transform_storage.returned_tables,p);
+    guest_wait_trace::Scope trace(guest_wait_trace::History);
+    if(p) transform_storage.returned_tables.push(p);
 }
 extern "C" size_t packet_interpolation_transform_bytes(const PacketTransformTable *p) {
     if(!p) return 0;

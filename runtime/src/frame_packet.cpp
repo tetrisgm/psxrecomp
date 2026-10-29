@@ -1,3 +1,4 @@
+#include "guest_wait_trace.h"
 #include "frame_packet.h"
 #include "frame_mailbox.h"
 #include <cstring>
@@ -43,6 +44,7 @@ extern "C" FramePacketQueue *frame_packet_create(size_t initial,size_t records) 
 }
 extern "C" void frame_packet_destroy(FramePacketQueue *q) { delete q; }
 extern "C" int frame_packet_reserve_initial(FramePacketQueue *q,uint64_t sequence,size_t bytes,void **initial) {
+    guest_wait_trace::Scope trace(guest_wait_trace::Reserve);
     if(!initial) return 0;
     *initial=nullptr;
     if(!q || q->open) return 0;

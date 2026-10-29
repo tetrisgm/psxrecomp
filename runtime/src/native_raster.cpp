@@ -1,3 +1,4 @@
+#include "guest_wait_trace.h"
 #include "native_raster.h"
 #include "gpu_sw_renderer.h"
 #include "host_scheduling.h"
@@ -290,8 +291,12 @@ struct NativeRaster {
             read_row_y=-1;
         const size_t cost = job.bytes();
 
-        std::unique_lock<std::mutex> lock(mutex);
-        space.wait(lock, [&] { return bytes + cost <= queue_budget && count<queue.size(); });
+        std::unique_lock<std::mutex> lock(mutex,std::defer_lock);
+        { guest_wait_trace::Scope trace(guest_wait_trace::NativeLock); lock.lock(); }
+        if(bytes + cost > queue_budget || count>=queue.size()) {
+            guest_wait_trace::Scope trace(guest_wait_trace::NativeSpace);
+            space.wait(lock, [&] { return bytes + cost <= queue_budget && count<queue.size(); });
+        }
         job.sequence=submitted++;
         queue[(head+count)%queue.size()]=std::move(job);count++;
         bytes += cost;
@@ -461,6 +466,7 @@ static void sync_job(NativeRaster *r, Job job) {
     auto result = done.get_future();
     job.completion = &done;
     r->push(std::move(job));
+    guest_wait_trace::Scope trace(guest_wait_trace::NativeCompletion);
     result.get();
 }
 extern "C" void native_raster_set_observer(NativeRaster *r,NativeRasterObserver observer,void *user) {

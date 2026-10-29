@@ -71,7 +71,19 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
         /* Waitable timer on Win32; usleep on Unix — not coarse Sleep/SDL_Delay. */
         /* Keep completed optional frames serviceable while main is paced.
          * Poll checks thread ownership, so render-thread waits remain inert. */
-        psx_host_sleep_ms(draw_service_active() && ms > 1 ? 1 : ms);
+        const uint32_t sleep_ms=draw_service_active() && ms > 1 ? 1 : ms;
+#ifndef PSX_NO_DEBUG_TOOLS
+        const uint64_t sleep_start=p->trace_waits?SDL_GetPerformanceCounter():0;
+#endif
+        psx_host_sleep_ms(sleep_ms);
+#ifndef PSX_NO_DEBUG_TOOLS
+        if(p->trace_waits) {
+            const uint64_t elapsed=SDL_GetPerformanceCounter()-sleep_start;
+            const uint64_t requested=(uint64_t)sleep_ms*freq/1000;
+            p->sleep_ticks+=elapsed;
+            if(elapsed>requested) p->sleep_overshoot_ticks+=elapsed-requested;
+        }
+#endif
     }
     while (SDL_GetPerformanceCounter() < p->next_deadline) {
         /* final sub-ms spin */

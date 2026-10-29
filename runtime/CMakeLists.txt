@@ -1999,6 +1999,11 @@ if(BUILD_TESTING)
     add_executable(packet_interpolation_test tests/test_packet_interpolation.cpp src/packet_interpolation.cpp)
     target_include_directories(packet_interpolation_test PRIVATE include)
     add_test(NAME packet_interpolation_test COMMAND packet_interpolation_test)
+    add_executable(deferred_return_test tests/test_deferred_return.cpp)
+    target_include_directories(deferred_return_test PRIVATE include)
+    target_link_libraries(deferred_return_test PRIVATE Threads::Threads)
+    add_test(NAME deferred_return COMMAND deferred_return_test)
+
     add_executable(packet_interpolation_stream_test tests/test_packet_interpolation_stream.cpp
         src/packet_interpolation.cpp src/packet_interpolation_stream.cpp)
     target_include_directories(packet_interpolation_stream_test PRIVATE include)

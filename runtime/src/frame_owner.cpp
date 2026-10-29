@@ -1,7 +1,8 @@
+#include "guest_wait_trace.h"
 #include "frame_owner.h"
 #include "host_scheduling.h"
 #include <atomic>
-#include <condition_variable>
+#include "presentation_wake.h"
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -26,9 +27,8 @@ struct FrameOwner {
     FramePacketQueue *queue=nullptr;
     std::thread thread;
     std::mutex mutex;
-    std::condition_variable ready;
-    uint64_t published=0; // wake generation, protected only by mutex
-    bool stop=false;
+    PresentationWake ready;
+    std::atomic<bool> stop{false};
     std::atomic<uint64_t> completed{0};
     std::atomic<uint64_t> idle_ns{0};
     std::atomic<uint64_t> epoch{1};
@@ -50,30 +50,24 @@ struct FrameOwner {
     }
     ~FrameOwner() { frame_packet_destroy(queue); }
     void wake() {
-        { std::lock_guard<std::mutex> lock(mutex); ++published; }
-        ready.notify_one();
+        ready.notify();
     }
     void run() {
         psx_host_schedule_thread(PsxHostThreadRole::Render);
         current_owner=this;
         config.context(config.user,1);
-        uint64_t seen=0;
         for(;;) {
-            bool stopping;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                while(!stop && published==seen) {
-                    const auto wait_begin=std::chrono::steady_clock::now();
-                    if(deadline) {
-                        const uint64_t now=config.clock_ns();
-                        if(now>=deadline) break;
-                        ready.wait_for(lock,std::chrono::nanoseconds(deadline-now));
-                    } else ready.wait(lock);
-                    idle_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now()-wait_begin).count()),std::memory_order_relaxed);
-                }
-                seen=published;stopping=stop;
+            const auto wait_begin=std::chrono::steady_clock::now();
+            // A retained event closes the check-to-wait race without a mutex.
+            if(!stop.load(std::memory_order_acquire)) {
+                if(deadline) {
+                    const uint64_t now=config.clock_ns();
+                    if(now<deadline) ready.wait(deadline-now);
+                } else ready.wait();
             }
+            idle_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()-wait_begin).count()),std::memory_order_relaxed);
+            const bool stopping=stop.load(std::memory_order_acquire);
             observe_epoch();
             FramePacketView packet{};
             const bool has_packet=frame_packet_acquire(queue,&packet)!=0;
@@ -114,7 +108,7 @@ struct FrameOwner {
                 // A later control may have been deferred past this frame.
                 // Revisit idle work even if the guest now stops publishing.
                 std::lock_guard<std::mutex> lock(mutex);
-                if(!controls.empty()) ++published;
+                if(!controls.empty()) ready.notify();
             }
             // Bounded drain prevents a flood of diagnostics starving frames.
             for(unsigned n=0;n<64;++n) {
@@ -155,8 +149,8 @@ extern "C" FrameOwner *frame_owner_start(const FrameOwnerConfig *config) {
 }
 extern "C" void frame_owner_stop(FrameOwner *owner) {
     if(!owner) return;
-    { std::lock_guard<std::mutex> lock(owner->mutex);owner->stop=true; }
-    owner->ready.notify_one();
+    owner->stop.store(true,std::memory_order_release);
+    owner->ready.notify();
     owner->thread.join();
     owner->config.context(owner->config.user,1);
     delete owner;
@@ -174,6 +168,7 @@ extern "C" void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags
     return frame_packet_append(owner->queue,op,flags,bytes);
 }
 extern "C" int frame_owner_publish(FrameOwner *owner) {
+    guest_wait_trace::Scope trace(guest_wait_trace::Publish);
     const int result=frame_packet_publish(owner->queue);
     if(result) owner->wake();
     return result;
@@ -200,9 +195,8 @@ static int submit_request(FrameOwner *owner,uint64_t sequence,
             if(owner->stop || owner->requests.size()+owner->controls.size()==64 || bytes>1024*1024-owner->request_bytes) return 0;
             auto& queue=control?owner->controls:owner->requests;
             queue.push_back(std::move(request));owner->request_bytes+=bytes;
-            ++owner->published;
         }
-        owner->ready.notify_one();
+        owner->ready.notify();
         return 1;
     } catch(...) { return 0; }
 }

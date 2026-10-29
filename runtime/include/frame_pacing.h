@@ -27,6 +27,10 @@ extern "C" {
 
 typedef struct FramePacer {
     uint64_t next_deadline;   /* perf-counter ticks; 0 = not started */
+#ifndef PSX_NO_DEBUG_TOOLS
+    int trace_waits; /* opt-in, owned by this pacer's thread */
+    uint64_t sleep_ticks, sleep_overshoot_ticks;
+#endif
 } FramePacer;
 
 /* Pure decision function (unit-testable, no SDL).

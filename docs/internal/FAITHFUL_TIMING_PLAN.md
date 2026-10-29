@@ -213,6 +213,17 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+### 2026-10-29: phase-4 guest wait attribution
+
+On `feat/frame-arch-4-interp`, opt-in `main_cadence reset=1` now retains the
+worst 20 guest VBlank intervals with pacer sleep/overshoot, publication,
+packet reservation, native enqueue/completion and history retirement timings.
+Publication wakes the render owner without its request mutex; transform history
+returns use a fixed-step intrusive MPSC handoff. No guest timing/core semantics
+change. Locked A/B evidence and acceptance disposition are maintained in R4's
+`docs/FRAME_INTERPOLATION_STATUS.md`; baseline hitch work belongs to phase 3.
+
+
 2026-10-29 interpolation follow-up (d516f5fa): canonical source slots,
 connected fallback and retained departing geometry; immutable transform blocks
 and HD tracking cache. Final moving census 45/45 clean. Three sampled 8K midpoint
