@@ -38,6 +38,12 @@
 #include "gl_batch_policy_lle.c"
 #include "gl_batch_policy_hle.c"
 #include "gl_batch_policy_select.c"
+/* This renderer-only fixture supplies transforms directly; retain the
+ * observer registration just as the PGXP engine does in the runtime. */
+static PGXPTransformRecorder test_transform_recorder;
+void pgxp_set_transform_recorder(PGXPTransformRecorder observer) {
+    test_transform_recorder=observer;
+}
 /* gpu_render.c (the facade) observes draws for HD texture packs: no pack here. */
 static int test_hd_active, test_hd_overlap;
 static uint64_t test_hd_tracking;

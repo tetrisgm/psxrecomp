@@ -74,6 +74,12 @@ int main() {
         assert(stats.verified_appearance==1 && !stats.unexplained && !stats.unmatched);
         assert(packet_interpolation_sample(source,0.25,&result,1));
         assert(result.vertex[2].view[0]==p.vertex[2].view[0]);
+        // Projection constants belong to the retained source as well.
+        old[0].h=200;old[0].ofx=100;old[0].ofy=80;old[0].x_scale=0.5;
+        assert(packet_interpolation_pair(source,&a,&b,0));
+        assert(packet_interpolation_sample(source,0.5,&result,1));
+        assert(result.vertex[0].h==245 && result.vertex[0].ofx==130);
+        assert(result.vertex[0].ofy==100 && result.vertex[0].x_scale==0.75);
         b.epoch=2;assert(packet_interpolation_pair(source,&a,&b,0));
         assert(packet_interpolation_stats(source).snapped);
         packet_interpolation_destroy(source);

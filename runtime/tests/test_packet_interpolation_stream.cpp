@@ -61,13 +61,14 @@ int main() {
     source.valid_mask=7;source.spatial_mask=7;
     for(unsigned frame=1;frame<=2;++frame) {
         packet_interpolation_stream_begin(3,frame*2);
-        for(unsigned i=0;i<3;++i) {
+        for(unsigned slot=0;slot<3;++slot) {
+            const unsigned i=frame==2?2-slot:slot; // reordered generated mesh
             auto& p=source.projection[i];p={};
-            p.source_vertex=0x1000; // shared staging slot, distinguished by pre-cull ordinal
+            p.source_vertex=0x1000; // shared staging slot, distinguished by model point
             p.source_matrix=0x2000;p.caller=0x3000;
             p.interpolation_valid=1;p.transform=frame;
             p.view[0]=float(frame*10+i);p.view[2]=100;p.h=290;p.x_scale=1;
-            p.model[0]=int16_t(frame*10+i); // mutable mesh values are not identity
+            p.model[0]=int16_t(i);
             PacketInterpolationSource transform{};
             transform.transform_only=1;transform.projection[0]=p;
             packet_interpolation_stream_append(&transform);
@@ -84,7 +85,7 @@ int main() {
     // A held immutable attachment survives dropped transport packets and
     // producer advancement. The consumer never needs live PGXP or guest RAM.
     packet_interpolation_stream_reset();
-    for(unsigned i=0;i<3;++i) packet_interpolation_transform(&source.projection[i]);
+    for(unsigned i=0;i<3;++i) packet_interpolation_transform(&source.projection[i],nullptr);
     auto *held=packet_interpolation_transform_seal();assert(held);
     for(unsigned i=0;i<12;++i) {
         auto *drop=packet_interpolation_transform_seal();assert(drop);
@@ -98,5 +99,30 @@ int main() {
     packet_interpolation_stream_json(json,sizeof json);
     assert(std::strstr(json,"\"source_matched\":3,"));
     assert(std::strstr(json,"\"source_unmatched\":0,"));
+
+    // One caller sees one point at a shared address, another emits many.
+    // Classification belongs to the storage address, not each caller's count.
+    packet_interpolation_stream_reset();packet_interpolation_transform(nullptr,nullptr);
+    for(unsigned frame=1;frame<=2;++frame) {
+        PGXPAffineTransform affine{};
+        affine.rotation[0]=affine.rotation[4]=affine.rotation[8]=4096;
+        affine.translation[0]=int32_t(frame*10);affine.translation[2]=100;
+        for(unsigned i=0;i<3;++i) {
+            auto& p=source.projection[i];p={};
+            p.source_vertex=0x4000;p.source_matrix=0x5000;p.caller=i?0x6000:0x7000;
+            p.interpolation_valid=1;p.transform=frame;
+            p.model[0]=int16_t(i?i:frame*10);p.view[0]=float(p.model[0]+frame*10);
+            p.view[2]=100;p.h=290;p.x_scale=1;
+            packet_interpolation_transform(&p,&affine);
+        }
+        auto *table=packet_interpolation_transform_seal();assert(table);
+        packet_interpolation_stream_begin(5,frame);packet_interpolation_stream_table(table);
+        packet_interpolation_stream_append(&source);packet_interpolation_stream_end();
+        packet_interpolation_transform_free(table);
+    }
+    packet_interpolation_stream_json(json,sizeof json);
+    assert(std::strstr(json,"\"source_matched\":3,"));
+    assert(std::strstr(json,"\"model_reconstructed\":1,"));
+    assert(std::strstr(json,"\"unexplained\":0,"));
 
 }

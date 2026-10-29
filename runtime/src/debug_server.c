@@ -1,4 +1,5 @@
 #include "packet_interpolation_stream.h"
+#include "packet_presenter.h"
 /*
  * debug_server.c -- TCP debug server for PSX recomp v4
  *
@@ -11294,12 +11295,15 @@ static void handle_render_thread(int id, const char *json)
 static void handle_packet_interpolation(int id, const char *json)
 {
     char buf[16384];
+    int rate=json_get_int(json,"rate",-1);
+    if(rate>=0 && rate<=1000) packet_interpolation_set_rate((unsigned)rate);
     if(json_get_int(json,"capture",0)) packet_interpolation_capture_request();
     if(json_get_int(json,"detail",0))
         packet_interpolation_capture_json(buf,sizeof buf,json_get_int(json,"older",0),
                                           (size_t)json_get_int(json,"start",0));
     else packet_interpolation_stream_json(buf,sizeof buf);
-    send_fmt("{\"id\":%d,\"ok\":true,\"interpolation\":%s}",id,buf);
+    char presenter[512];packet_presenter_json(presenter,sizeof presenter);
+    send_fmt("{\"id\":%d,\"ok\":true,\"interpolation\":%s,\"presenter\":%s}",id,buf,presenter);
 }
 
 static void handle_frame_gen(int id, const char *json)

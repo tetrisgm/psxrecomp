@@ -27,7 +27,7 @@ const PacketInterpolationPrimitive *packet_interpolation_stream_vertex(size_t in
 const PacketInterpolationPrimitive *packet_interpolation_stream_endpoint(size_t index);
 
 typedef struct PacketTransformTable PacketTransformTable;
-void packet_interpolation_transform(const PGXPProjection *projection);
+void packet_interpolation_transform(const PGXPProjection *projection, const PGXPAffineTransform *affine);
 PacketTransformTable *packet_interpolation_transform_seal(void);
 void packet_interpolation_transform_free(PacketTransformTable *table);
 size_t packet_interpolation_transform_bytes(const PacketTransformTable *table);

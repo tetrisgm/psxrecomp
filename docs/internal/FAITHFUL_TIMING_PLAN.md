@@ -213,6 +213,15 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- 2026-10-29: Phase-4 topic adds render-owned retained packet sampling and opaque
+  interpolated metadata; no guest redraw is executed by the presenter. Source
+  classification separates whole-model appearances from missing points in an
+  existing invocation. Removed the unused private draw worker pool. GTE affine
+  observer data lives in packet attachments, avoiding per-shadow rewind growth.
+  R4 census has zero unexplained uses; visual/rate acceptance remains separately
+  gated (R4 FRAME_INTERPOLATION_STATUS.md), not claimed by counters alone.
+
+
 2026-10-29: Phase-4 topic adds pre-cull PGXP transform capture, immutable
 packet transform-history attachments, a source-table sampler and signed-depth
 clipping fixtures. Guest timing is unchanged. Moving audit still fails on

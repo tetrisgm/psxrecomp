@@ -82,7 +82,24 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                 if(!result.second) for(unsigned d=0;d<3;++d)
                     if(result.first->second.value->view[d]!=v.view[d]) result.first->second.ambiguous=true;
             }
+            // A reused matrix slot's invocation ordinal may shift when a
+            // preceding object disappears. Shared pre-cull source identities
+            // establish the whole invocation's correspondence instead.
+            std::unordered_map<Key,Entry,Hash> correspondence;
+            for(size_t i=0;i<b->transform_count;++i) {
+                const auto& v=b->transforms[i];
+                auto old=table.find({v.source.object,v.source.primitive});
+                if(old==table.end() || old->second.ambiguous) continue;
+                auto result=correspondence.emplace(Key{v.model.object,v.model.primitive},old->second);
+                if(!result.second) {
+                    const auto& first=result.first->second.value->model;
+                    const auto& next=old->second.value->model;
+                    if(first.object!=next.object || first.primitive!=next.primitive)
+                        result.first->second.ambiguous=true;
+                }
+            }
             c->stats.snapped=a->epoch!=b->epoch || b->sequence<=a->sequence || a->discontinuity || b->discontinuity;
+            size_t local_cuts=0;
             for(size_t i=0;i<c->b.size();++i) {
                 const auto& p=c->b[i]; if(!p.spatial) continue;
                 if(p.vertices<3 || p.vertices>4) {++c->stats.invalid;continue;}
@@ -96,13 +113,25 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                     }
                     auto found=table.find({v.source.object,v.source.primitive});
                     if(found==table.end()) {
-                        const auto model=models.find({v.model.object,v.model.primitive});
+                        auto model=models.find({v.model.object,v.model.primitive});
+                        const auto mapped=correspondence.find({v.model.object,v.model.primitive});
+                        if(mapped!=correspondence.end() && mapped->second.ambiguous) {
+                            ++c->stats.unexplained;++c->stats.source_unmatched;continue;
+                        }
+                        if(mapped!=correspondence.end() && !mapped->second.ambiguous) {
+                            const auto& identity=mapped->second.value->model;
+                            model=models.find({identity.object,identity.primitive});
+                        }
                         if(model!=models.end() && !model->second.ambiguous && model->second.value->affine_valid) {
                             // A streamed/generated vertex was not emitted last time, but
                             // its model invocation was. Apply that invocation's exact
                             // GTE matrix to this model-space point before interpolating.
                             // No nearest-neighbour guess or false appearance exemption.
                             const auto& m=*model->second.value;
+                            if(m.h>0 && m.x_scale>0) {
+                                auto& previous=c->source_previous[i].vertex[j];
+                                previous.h=m.h;previous.ofx=m.ofx;previous.ofy=m.ofy;previous.x_scale=m.x_scale;
+                            }
                             double distance=0;
                             for(unsigned d=0;d<3;++d) {
                                 double value=m.affine[4*d+3];
@@ -112,7 +141,9 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                             }
                             c->source_masks[i]|=1u<<j;++c->stats.source_matched;++c->stats.model_reconstructed;
                             if(distance>1e-12) ++c->stats.source_moving;
-                            if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) c->stats.snapped=1;
+                            if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) {
+                                c->source_masks[i]&=~(1u<<j);++local_cuts;
+                            }
                         } else {
                             ++c->stats.new_source;
                             if((v.model.object || v.model.primitive) && model==models.end()) ++c->stats.verified_appearance;
@@ -122,6 +153,10 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                     }
                     if(found->second.ambiguous) {++c->stats.source_ambiguous;++c->stats.source_unmatched;continue;}
                     const auto& old=*found->second.value;
+                    if(old.h>0 && old.x_scale>0) {
+                        auto& previous=c->source_previous[i].vertex[j];
+                        previous.h=old.h;previous.ofx=old.ofx;previous.ofy=old.ofy;previous.x_scale=old.x_scale;
+                    }
                     double distance=0;
                     for(unsigned d=0;d<3;++d) {
                         if(!std::isfinite(old.view[d])) finite=false;
@@ -131,10 +166,15 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                     if(!finite) {++c->stats.invalid;++c->stats.source_unmatched;continue;}
                     c->source_masks[i]|=1u<<j;++c->stats.source_matched;
                     if(distance>1e-12) ++c->stats.source_moving;
-                    if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) c->stats.snapped=1;
+                    if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) {
+                                c->source_masks[i]&=~(1u<<j);++local_cuts;
+                            }
                 }
                 if(c->source_masks[i]==(1u<<p.vertices)-1) ++c->stats.matched;
             }
+            // Local discontinuities (respawns, changing procedural geometry)
+            // take N. A scene-wide discontinuity snaps metadata and all geometry.
+            if(local_cuts && local_cuts*2>c->stats.source_matched) c->stats.snapped=1;
             c->stats.unmatched=c->stats.source_unmatched;
             c->stats.ambiguous=c->stats.source_ambiguous;
             c->ready=true;return 1;
@@ -250,8 +290,12 @@ extern "C" int packet_interpolation_sample(const PacketInterpolation *c,double t
             if(!out[i].spatial) continue;
             for(unsigned v=0;v<out[i].vertices && v<4;++v) {
                 auto& p=out[i].vertex[v];
-                if(!c->stats.snapped && t!=1 && (c->source_masks[i]&(1u<<v)))
+                if(!c->stats.snapped && t!=1 && (c->source_masks[i]&(1u<<v))) {
                     for(unsigned d=0;d<3;++d) p.view[d]=c->source_previous[i].vertex[v].view[d]+t*(p.view[d]-c->source_previous[i].vertex[v].view[d]);
+                    const auto& old=c->source_previous[i].vertex[v];
+                    p.h=old.h+t*(p.h-old.h);p.ofx=old.ofx+t*(p.ofx-old.ofx);
+                    p.ofy=old.ofy+t*(p.ofy-old.ofy);p.x_scale=old.x_scale+t*(p.x_scale-old.x_scale);
+                }
                 p.homogeneous[0]=p.ofx*p.view[2]+p.h*p.x_scale*p.view[0];
                 p.homogeneous[1]=p.ofy*p.view[2]+p.h*p.view[1];
                 p.homogeneous[2]=p.view[2];

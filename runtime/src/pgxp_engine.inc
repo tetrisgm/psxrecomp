@@ -48,7 +48,7 @@ PGXP_S void ck_wrapped(void);
 
 PGXP_API void pgxp_invalidate_all(void) {
 #ifdef PGXP_TRANSFORM_RECORD
-    PGXP_TRANSFORM_RECORD(nullptr);
+    PGXP_TRANSFORM_RECORD(nullptr,nullptr);
 #endif
     if (s_suppress != 0) { s_deferred_invalidate = 1; return; }
     s_stats.invalidations++;
@@ -1537,12 +1537,15 @@ PGXP_API void pgxp_gte_set_projection(const PGXPProjection *projection) {
         s_gte[14].projection.source_vertex=input->gen==s_gen?input->source_address:0;
         s_gte[14].projection.source_matrix=s_gtc[0].gen==s_gen?s_gtc[0].source_address:0;
     }
-    #ifdef PGXP_TRANSFORM_RECORD
-    PGXP_TRANSFORM_RECORD(&s_gte[14].projection);
-    #endif
     s_gte[14].flags |= PGXP_F_PROJECTION;
     s_gte[15] = s_gte[14];
 }
+#ifdef PGXP_TRANSFORM_RECORD
+PGXP_API void pgxp_gte_record_transform(const PGXPAffineTransform *affine) {
+    if(g_pgxp_active && s_projection_tracking && (s_gte[14].flags&PGXP_F_PROJECTION))
+        PGXP_TRANSFORM_RECORD(&s_gte[14].projection,affine);
+}
+#endif
 PGXP_S int projection_read(const PGXPValue *pv, uint32_t packed, PGXPProjection *out) {
     const uint16_t flags = PGXP_F_VXY | PGXP_F_PROJECTION;
     if (!s_enabled || !s_projection_tracking || !pv || pv->gen != s_gen || pv->value != packed ||

@@ -2,11 +2,14 @@
 #include "packet_interpolation_stream.h"
 #include <algorithm>
 #include <cmath>
+#include <atomic>
+#include <cstdio>
 
 namespace {
 FramePacketLease *current=nullptr;
 uint64_t start=0,period=0,index=0,last_sequence=0,last_epoch=0;
 unsigned rate=0;
+std::atomic<uint64_t> submitted{0},generated{0},endpoints{0};
 }
 extern "C" void packet_presenter_reset(void) {
     frame_packet_lease_release(current);current=nullptr;
@@ -27,6 +30,7 @@ extern "C" int packet_presenter_submit(const FramePacketView *packet,uint64_t no
     last_sequence=packet->sequence;last_epoch=packet->epoch;
     start=now;index=1;rate=hz;
     draw(frame_packet_lease_view(current),period?0.0:1.0);
+    ++submitted;
     return 1;
 }
 extern "C" uint64_t packet_presenter_tick(uint64_t now,PacketPresenterDraw draw) {
@@ -35,8 +39,17 @@ extern "C" uint64_t packet_presenter_tick(uint64_t now,PacketPresenterDraw draw)
     if(now<due) return due;
     const double t=std::min(1.0,double(now-start)/double(period));
     draw(frame_packet_lease_view(current),t);
+    if(t<1) ++generated;else ++endpoints;
     if(t==1) {period=0;return 0;}
     // Skip missed display deadlines: presentation never builds a backlog.
-    index=uint64_t(double(now-start)*rate/1e9)+1;
+    index=std::max(index+1,uint64_t(double(now-start)*rate/1e9)+1);
     return packet_interpolation_deadline(start,index,rate,1);
 }
+
+extern "C" int packet_presenter_json(char *out,size_t bytes) {
+    return std::snprintf(out,bytes,"{\"rate\":%u,\"submitted\":%llu,\"in_between\":%llu,\"endpoints\":%llu}",
+        packet_interpolation_rate(),(unsigned long long)submitted.load(),
+        (unsigned long long)generated.load(),(unsigned long long)endpoints.load());
+}
+
+extern "C" int packet_presenter_active(void) {return current && packet_interpolation_rate()!=0;}

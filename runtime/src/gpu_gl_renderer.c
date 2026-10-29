@@ -13563,6 +13563,7 @@ static int rth_record_cpu_present(const uint32_t *pixels,const RthCpuPresent *cp
     return rth_record_present_data(RTH_PRESENT_CPU,0,NULL,pixels,cpu);
 }
 
+static int s_packet_display_target=-1,s_packet_display_y,s_packet_drawing;
 static void rth_present_payload(uint16_t op, const uint8_t *p);
 static void rth_replay_present(const RtCmd *c, const uint8_t *p) {
     static int skipped_last = 0;
@@ -13602,6 +13603,21 @@ static void rth_present_payload(uint16_t op, const uint8_t *p) {
             s_rth_ov.h[i] = hd.h[i];
             q += (size_t)hd.w[i] * hd.h[i] * 4u;
         }
+    if(s_packet_drawing && s_packet_display_target>=0 && op==RTH_PRESENT_HOLD) {
+        /* The packet has drawn the next buffer. Its guest scanout can still
+         * hold the old front buffer; interpolation presents the sampled draw. */
+        GpuDisplayInfo display;
+        ctx_display_info(&display);
+        op=RTH_PRESENT_WIDE;
+        hd.args[0]=s_packet_display_target;
+        hd.args[1]=(int32_t)display.display_y;
+        hd.args[2]=(int32_t)display.height;
+        hd.args[3]=1;
+    }
+    if(s_packet_drawing && s_packet_display_target>=0 && (op==RTH_PRESENT_VRAM || op==RTH_PRESENT_WIDE)) {
+        hd.args[0]=s_packet_display_target;
+        hd.args[1]=s_packet_display_y;
+    }
     const int32_t *a = hd.args;
     if (op == RTH_PRESENT_VRAM)
         gl_renderer_present_vram(a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -16285,10 +16301,10 @@ int gl_renderer_frame_generation_method(void) {
     return s_fg_reproject ? GL_FG_METHOD_REPROJECTION : GL_FG_METHOD_REDRAW;
 }
 
-static void rth_packet_transform_record(const PGXPProjection *projection) {
-    if(!projection) {packet_interpolation_transform(NULL);return;}
+static void rth_packet_transform_record(const PGXPProjection *projection,const PGXPAffineTransform *affine) {
+    if(!projection) {packet_interpolation_transform(NULL,NULL);return;}
     if(!s_rth_on || rt_on_render_thread() || rt_held() || !packet_interpolation_stream_enabled()) return;
-    packet_interpolation_transform(projection);
+    packet_interpolation_transform(projection,affine);
 }
 static void rth_packet_interpolation_record(const PacketInterpolationSource *source) {
     if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
@@ -17224,7 +17240,11 @@ static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source
     int count=native_raster_inputs_get(inputs->draws,source,tiles,128);
     if(count<0) return 0;
     if(!count) return 1;
-    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+    /* These tiles update CPU-side keys only. Already queued GPU geometry
+     * owns its texture/bank state; flushing it for each source destroys
+     * batching without adding a device dependency. Land pending CPU uploads
+     * before replacing their source pixels. */
+    flush_cpu_upload();
     for(int t=0;t<count;++t)
         for(unsigned row=0;row<64;++row)
             memcpy(s_rth_vram_priv+(tiles[t].y+row)*VRAM_W+tiles[t].x,
@@ -17232,9 +17252,13 @@ static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source
     const GpuHdTextureTracking *tracking=native_raster_inputs_metadata(inputs->draws,source);
     return !tracking || gpu_hd_textures_apply_tracking(tracking);
 }
-static int s_packet_collect,s_packet_sample;
+static int s_packet_collect,s_packet_sample,s_packet_content,s_packet_collect_target,s_packet_collect_y;
+static struct {int x,y;unsigned count;} s_packet_targets[128];
+static unsigned s_packet_target_count;
 static size_t s_packet_vertex_count,s_packet_vertex_index;
 static const PacketInterpolationPrimitive *s_packet_vertex,*s_packet_endpoint;
+static const void *s_packet_present_payload;
+static uint16_t s_packet_present_op;
 static void rth_packet_draw(const FramePacketView *,double);
 static uint64_t rth_packet_tick(void *user,uint64_t now) {
     uint64_t next=packet_presenter_tick(now,rth_packet_draw);
@@ -17260,6 +17284,58 @@ static void rth_packet_geometry(void) {
         if(s_pz_valid) s_pz[i]=(float)v->view[2];
     }
 }
+/* An ordinary endpoint can cross the eye plane between packets. Clip that
+ * sample in homogeneous space, retaining N's material and edge attributes. */
+static int rth_packet_clip_ordinary(const RtCmd *command,const int32_t *words) {
+    int crossing=0;
+    for(unsigned i=0;i<3;++i) if(s_packet_vertex->vertex[i].view[2]<1.0) crossing=1;
+    if(!crossing) return 0;
+    const int textured=command->op==RTH_TEX_TRI || command->op==RTH_SHADED_TEX_TRI;
+    const int shaded=command->op==RTH_GOURAUD_TRI || command->op==RTH_SHADED_TEX_TRI;
+    PSXProjectedVertex input[3],polygon[12];
+    for(unsigned i=0;i<3;++i) {
+        const PacketInterpolationVertex *v=&s_packet_vertex->vertex[i];
+        PSXProjectedVertex *p=&input[i];memset(p,0,sizeof *p);
+        p->x=v->homogeneous[0]+s_off_x*v->view[2];
+        p->y=v->homogeneous[1]+s_off_y*v->view[2];p->z=v->view[2];
+        if(textured) {
+            unsigned stride=shaded?5:4;
+            p->u=words[i*stride+2];p->v=words[i*stride+3];
+            uint32_t colour=shaded?(uint32_t)words[i*stride+4]:
+                (uint32_t)s_mod_r|((uint32_t)s_mod_g<<8)|((uint32_t)s_mod_b<<16);
+            p->r=(colour&255)/255.0;p->g=((colour>>8)&255)/255.0;p->b=((colour>>16)&255)/255.0;
+        } else {
+            uint16_t colour=(uint16_t)words[shaded?i*3+2:6];
+            p->r=colour&31;p->g=(colour>>5)&31;p->b=(colour>>10)&31;
+        }
+    }
+    int n=psx_projective_clip_triangle(input,polygon,fmin(s_area_x1,-wide_dx())-1,
+        fmax(s_area_x2+1,g_wide_w-wide_dx())+1,s_area_y1-1,s_area_y2+1);
+    s_rthx_prim=(command->flags&RTHF_PRIM)!=0;s_rthx_tagged=(command->flags&RTHF_TAGGED)!=0;
+    s_rthx_backdrop=(command->flags>>RTHF_BD_SHIFT)&3;
+    for(int k=1;k+1<n;++k) {
+        PSXProjectedVertex v[3]={polygon[0],polygon[k],polygon[k+1]};
+        int x[3],y[3],u[3],uv[3];uint16_t colour[3];float rgb[9];
+        s_pc_valid=s_pz_valid=1;s_projected_uv_valid=textured;
+        for(unsigned i=0;i<3;++i) {
+            s_pc_x[i]=v[i].x/v[i].z;s_pc_y[i]=v[i].y/v[i].z;s_pz[i]=(float)v[i].z;
+            s_pq[i]=(float)(1.0/v[i].z);x[i]=(int)floor(s_pc_x[i]);y[i]=(int)floor(s_pc_y[i]);
+            s_projected_u[i]=(float)v[i].u;s_projected_v[i]=(float)v[i].v;u[i]=(int)v[i].u;uv[i]=(int)v[i].v;
+            colour[i]=(uint16_t)((int)lround(v[i].r)|((int)lround(v[i].g)<<5)|((int)lround(v[i].b)<<10));
+            rgb[i*3]=(float)v[i].r;rgb[i*3+1]=(float)v[i].g;rgb[i*3+2]=(float)v[i].b;
+        }
+        if(textured) {
+            int end=shaded?15:12;
+            gpu_textured_triangle(x,y,u,uv,rgb,(uint16_t)words[end+2],(uint16_t)words[end],
+                (uint16_t)words[end+1],shaded?words[18]:s_mod_raw,s_semi_en?s_semi_mode:-1,NULL);
+        } else {
+            s_prim_shaded=shaded;
+            gpu_triangle(x[0],y[0],colour[0],x[1],y[1],colour[1],x[2],y[2],colour[2],s_semi_en?s_semi_mode:-1);
+            s_prim_shaded=0;
+        }
+    }
+    precise_consumed();return 1;
+}
 static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,const void *payload) {
     if(s_rth_packet_view && !rt_packet_current(s_rth_packet_view)) return 0;
     if(command->op==RTH_GROUP) {
@@ -17276,14 +17352,45 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
     }
     if(command->op==RTH_PACKET_SOURCE) {
         if(command->payload!=sizeof(PacketInterpolationSource)) return 0;
-        if(s_packet_collect) {packet_interpolation_stream_append(payload);++s_packet_vertex_count;}
+        if(s_packet_collect) {
+            packet_interpolation_stream_append(payload);++s_packet_vertex_count;
+            const PacketInterpolationSource *source=payload;
+            if((source->valid_mask|source->spatial_mask) && s_packet_collect_target>=0) {
+                unsigned i=0;
+                while(i<s_packet_target_count && (s_packet_targets[i].x!=s_packet_collect_target ||
+                      s_packet_targets[i].y!=s_packet_collect_y)) ++i;
+                if(i<128) {
+                    if(i==s_packet_target_count) {
+                        ++s_packet_target_count;s_packet_targets[i].x=s_packet_collect_target;
+                        s_packet_targets[i].y=s_packet_collect_y;s_packet_targets[i].count=0;
+                    }
+                    ++s_packet_targets[i].count;
+                }
+            }
+        }
         else if(s_packet_sample) {
             s_packet_vertex=packet_interpolation_stream_vertex(s_packet_vertex_index);
             s_packet_endpoint=packet_interpolation_stream_endpoint(s_packet_vertex_index++);
         }
         return 1;
     }
-    if(s_packet_collect) return 1;
+    if(s_packet_collect) {
+        if(command->op==RTH_WIDE_TARGET) s_packet_collect_target=*(const int32_t*)payload;
+        if(command->op==RTH_OFFSET) s_packet_collect_y=((const int32_t*)payload)[1];
+        if(command->op==RTH_WIDE_DISABLE) s_packet_collect_target=-1;
+        if(command->op==RTH_FLAT_RECT || command->op==RTH_TEX_RECT || command->op==RTH_TEX_RECT_SCALED ||
+           command->op==RTH_FLAT_TRI || command->op==RTH_GOURAUD_TRI || command->op==RTH_TEX_TRI ||
+           command->op==RTH_SHADED_TEX_TRI || command->op==RTH_PROJ_TRI || command->op==RTH_LINE ||
+           command->op==RTH_SHADED_LINE || command->op==RTH_FILL ||
+           command->op==RTH_PRESENT_CPU || command->op==RTH_PRESENT_BLANK) s_packet_content=1;
+        return 1;
+    }
+    if(s_packet_drawing && (command->op==RTH_PRESENT_VRAM || command->op==RTH_PRESENT_WIDE ||
+       command->op==RTH_PRESENT_HOLD || command->op==RTH_PRESENT_CPU || command->op==RTH_PRESENT_BLANK)) {
+        // Guest scanout can occur before this packet's back-buffer draws.
+        // The presenter emits exactly once, after the sampled draw completes.
+        s_packet_present_op=command->op;s_packet_present_payload=payload;return 1;
+    }
     if(s_packet_sample && s_packet_vertex && s_packet_vertex->spatial) {
         if(command->op==RTH_PROJ_TRI) {
             unsigned char adjusted[sizeof(PSXProjectedVertex)*3+6*sizeof(int32_t)];
@@ -17302,6 +17409,9 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
         }
         if(command->op==RTH_FLAT_TRI || command->op==RTH_GOURAUD_TRI ||
            command->op==RTH_TEX_TRI || command->op==RTH_SHADED_TEX_TRI) {
+            if(rth_packet_clip_ordinary(command,payload)) {
+                s_packet_vertex=s_packet_endpoint=NULL;return 1;
+            }
             rth_packet_geometry();s_packet_vertex=s_packet_endpoint=NULL;
         }
     }
@@ -17318,6 +17428,8 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     const RthPacketSeed *seed=packet->initial;
     const RthPacketInputs *inputs=packet->attachment;
     s_rth_packet_replaying=1;s_rth_packet_view=packet;
+    s_packet_drawing=packet_interpolation_rate()!=0;
+    s_packet_present_payload=NULL;
     s_packet_vertex_index=0;s_packet_vertex=s_packet_endpoint=NULL;
     s_packet_sample=t<1.0 && !packet_interpolation_stream_snapped() && packet_interpolation_rate() && packet_interpolation_stream_sample(t);
     packet_metadata_sample(packet_interpolation_stream_snapped()?1.0:t);
@@ -17326,7 +17438,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     rth_rebind_vram(s_rth_vram_priv);
     sw_native_texture_load(&seed->cache);
     if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
-    if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence!=s_rth_packet_last_sequence+1) {
+    if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence>s_rth_packet_last_sequence+1) {
         gl_renderer_restage_vram_after_savestate();fg_invalidate();
     }
     rth_frame_state_apply(&seed->draw);
@@ -17336,9 +17448,14 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
         if(!rt_packet_current(packet) || !rth_packet_record(inputs,command,command+1)) goto done;
         at+=command->size;
     }
-    s_rth_packet_last_epoch=packet->epoch;s_rth_packet_last_sequence=packet->sequence;
+    if(s_packet_present_payload && rt_packet_current(packet))
+        rth_present_payload(s_packet_present_op,s_packet_present_payload);
+    if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence>s_rth_packet_last_sequence)
+        s_rth_packet_last_sequence=packet->sequence;
+    s_rth_packet_last_epoch=packet->epoch;
  done:
     packet_metadata_end();
+    s_packet_drawing=0;
     s_packet_sample=0;s_packet_vertex=s_packet_endpoint=NULL;
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
 }
@@ -17346,7 +17463,10 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
     (void)user;
     if(packet->initial_bytes!=sizeof(RthPacketSeed) || !packet->attachment) return;
     const RthPacketInputs *inputs=packet->attachment;
-    s_packet_vertex_count=0;
+    s_packet_vertex_count=0;s_packet_content=0;
+    const RthPacketSeed *seed=packet->initial;
+    s_packet_collect_target=seed->draw.target_on?seed->draw.target:-1;
+    s_packet_collect_y=seed->draw.offset[1];s_packet_target_count=0;
     if(packet_interpolation_stream_enabled()) {
         packet_interpolation_stream_begin(packet->epoch,packet->sequence);
         packet_interpolation_stream_table(inputs->transforms);
@@ -17358,6 +17478,24 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
             at+=command->size;
         }
         s_packet_collect=0;packet_interpolation_stream_end();
+    }
+    // Held-display VBlanks do not publish a new geometry endpoint. Presenting
+    // their native endpoint between samples would jump forward then backward.
+    if(!s_packet_vertex_count && !s_packet_content && packet_presenter_active()) {
+        // This transport packet contains no draw to lose. Account for its
+        // sequence so the next geometry sample does not trigger a full VRAM
+        // restage merely because the guest held scanout for one VBlank.
+        if(packet->epoch==s_rth_packet_last_epoch && packet->sequence==s_rth_packet_last_sequence+1)
+            s_rth_packet_last_sequence=packet->sequence;
+        return;
+    }
+    if(!s_packet_vertex_count && s_packet_content) {packet_presenter_reset();s_packet_display_target=-1;}
+    if(s_packet_vertex_count) {
+        unsigned best=0;s_packet_display_target=-1;
+        for(unsigned i=0;i<s_packet_target_count;++i) if(s_packet_targets[i].count>best) {
+            best=s_packet_targets[i].count;s_packet_display_target=s_packet_targets[i].x;
+            s_packet_display_y=s_packet_targets[i].y;
+        }
     }
     if(s_packet_vertex_count || !packet_interpolation_rate()) packet_metadata_pair(inputs->metadata,packet->epoch);
     if(s_packet_vertex_count && packet_presenter_submit(packet,rt_now_ns(),
@@ -17432,6 +17570,8 @@ void gl_renderer_render_thread_stop(void) {
     if (!s_rth_on) return;
     rth_group_flush();
     rt_stop();                       /* drains; the context is current here again */
+    packet_presenter_reset();
+    packet_metadata_reset();
     native_raster_inputs_enable(gr_native_raster(),0);
     rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
     pt_end();

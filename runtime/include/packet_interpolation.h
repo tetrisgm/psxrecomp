@@ -33,6 +33,7 @@ typedef struct PacketInterpolationTransform {
     FramePrimitiveIdentity model; /* whole model invocation, independent of vertex */
     double view[3];
     double affine[12]; /* row-major model to view, including translation */
+    double h, ofx, ofy, x_scale;
     uint32_t affine_valid;
 } PacketInterpolationTransform;
 typedef struct PacketInterpolationPacket {

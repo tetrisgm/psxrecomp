@@ -10,9 +10,10 @@
 #include <unordered_set>
 #include <array>
 
-struct PacketTransformTable { std::vector<PGXPProjection> values; };
+struct TransformRecord {PGXPProjection projection;PGXPAffineTransform affine;bool valid;};
+struct PacketTransformTable { std::vector<TransformRecord> values; };
 namespace {
-struct ProducerTransform {PGXPProjection value; uint64_t generation;};
+struct ProducerTransform {TransformRecord value; uint64_t generation;};
 std::vector<ProducerTransform> producer_transforms;
 uint64_t producer_generation=0;
 bool producer_failed=false;
@@ -23,10 +24,12 @@ struct Stream {
     std::vector<PacketInterpolationSource> old_sources,sources;
     uint64_t old_epoch=0,old_sequence=0,epoch=0,sequence=0;
     std::vector<PacketInterpolationTransform> transforms,old_transforms;
-    struct Raw { PGXPProjection projection; uint64_t sequence; };
+    struct Raw { PGXPProjection projection; uint64_t sequence; PGXPAffineTransform affine{};bool valid=false; };
     std::vector<Raw> history;
     std::unordered_map<uint64_t,std::vector<uint64_t>> invocations;
     std::unordered_map<uint64_t,std::unordered_map<uint64_t,std::vector<std::array<int16_t,3>>>> ordinals;
+    std::unordered_map<uint64_t,std::vector<uint64_t>> model_invocations;
+    std::unordered_set<uint32_t> staging_addresses;
     bool source_mode=false;
     uint64_t missing=0;
     bool failed=false;
@@ -45,6 +48,16 @@ std::atomic<PacketInterpolationRecorder> recorder{nullptr};
 uint64_t hash(uint64_t seed,uint32_t value) {
     for(unsigned i=0;i<4;++i) seed=(seed^((value>>(i*8))&255))*1099511628211ULL;
     return seed;
+}
+FramePrimitiveIdentity model_identity(const PGXPProjection& v,bool record) {
+    const uint64_t base=hash(hash(14695981039346656037ULL,v.source_matrix),v.caller);
+    auto& instances=stream.model_invocations[base];
+    auto at=std::find(instances.begin(),instances.end(),v.transform);
+    if(at==instances.end()) {
+        if(!record) return {};
+        instances.push_back(v.transform);at=instances.end()-1;
+    }
+    return {base,uint64_t(at-instances.begin())+1};
 }
 FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
     uint64_t base=14695981039346656037ULL;
@@ -67,15 +80,24 @@ FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
         if(!record) return {};
         vertices.push_back(model);vertex=vertices.end()-1;
     }
-    return {base,((uint64_t(at-instances.begin())+1)<<32)|(uint64_t(vertex-vertices.begin())+1)};
+    if(vertices.size()>1) stream.staging_addresses.insert(v.source_vertex);
+    // A staging address can emit a changing number/order of subdivision
+    // vertices. Ordinal pairing tears adjacent faces when that order shifts.
+    // Real vertex addresses retain identity through animation; shared staging
+    // addresses use the model-space point and reconstruct missing points from
+    // the preceding whole invocation's matrix.
+    if(!record && stream.staging_addresses.count(v.source_vertex)) {
+        for(int16_t coordinate:model) base=hash(base,uint16_t(coordinate));
+    }
+    return {base,uint64_t(at-instances.begin())+1};
 }
 }
-extern "C" void packet_interpolation_transform(const PGXPProjection *p) {
+extern "C" void packet_interpolation_transform(const PGXPProjection *p,const PGXPAffineTransform *affine) {
     if(!p) {producer_transforms.clear();producer_generation=0;producer_failed=false;return;}
     if(!p->interpolation_valid || producer_failed) return;
     try {
         if(producer_transforms.size()>=262144) {producer_failed=true;return;}
-        producer_transforms.push_back({*p,producer_generation});
+        producer_transforms.push_back({{*p,affine?*affine:PGXPAffineTransform{},affine!=nullptr},producer_generation});
     } catch(...) {producer_failed=true;}
 }
 extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
@@ -96,12 +118,12 @@ extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
 }
 extern "C" void packet_interpolation_transform_free(PacketTransformTable *p) {delete p;}
 extern "C" size_t packet_interpolation_transform_bytes(const PacketTransformTable *p) {
-    return p?sizeof(*p)+p->values.capacity()*sizeof(PGXPProjection):0;
+    return p?sizeof(*p)+p->values.capacity()*sizeof(TransformRecord):0;
 }
 extern "C" void packet_interpolation_stream_table(const PacketTransformTable *p) {
     stream.source_mode=true;stream.history.clear();
     if(!p) {stream.failed=true;return;}
-    try { for(const auto& v:p->values) stream.history.push_back({v,stream.sequence}); }
+    try { for(const auto& v:p->values) stream.history.push_back({v.projection,stream.sequence,v.affine,v.valid}); }
     catch(...) {stream.failed=true;}
 }
 extern "C" void packet_interpolation_set_recorder(PacketInterpolationRecorder callback) {
@@ -133,13 +155,14 @@ extern "C" void packet_interpolation_stream_append(const PacketInterpolationSour
             stream.history.push_back({v,stream.sequence});
             PacketInterpolationTransform transform{};
             transform.source=source_identity(v,true);
-            transform.model={transform.source.object,transform.source.primitive>>32};
+            transform.model=model_identity(v,true);
             for(unsigned d=0;d<3;++d) {
                 transform.view[d]=v.view[d];
-                for(unsigned k=0;k<3;++k) transform.affine[4*d+k]=double(v.rotation[3*d+k])/4096.0;
-                transform.affine[4*d+3]=v.translation[d];
+                for(unsigned k=0;k<3;++k) transform.affine[4*d+k]=0.0;
+                transform.affine[4*d+3]=0;
             }
-            transform.affine_valid=v.transform_valid;
+            transform.affine_valid=0;
+            transform.h=v.h;transform.ofx=v.ofx;transform.ofy=v.ofy;transform.x_scale=v.x_scale;
             stream.transforms.push_back(transform);
         } catch(...) {stream.failed=true;}
         return;
@@ -180,25 +203,39 @@ static void stream_end_impl(void) {
         std::unordered_set<uint64_t> groups;
         for(const auto& source:stream.sources) for(const auto& p:source.projection)
             if(p.interpolation_valid) groups.insert(p.transform);
-        stream.transforms.clear();stream.invocations.clear();stream.ordinals.clear();
+        stream.transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();
+        for(const auto& raw:stream.history) if(groups.count(raw.projection.transform)) {
+            (void)source_identity(raw.projection,true);
+            (void)model_identity(raw.projection,true);
+        }
         for(const auto& raw:stream.history) if(groups.count(raw.projection.transform)) {
             const auto& v=raw.projection;
             PacketInterpolationTransform transform{};
-            transform.source=source_identity(v,true);
-            transform.model={transform.source.object,transform.source.primitive>>32};
+            transform.source=source_identity(v,false);
+            transform.model=model_identity(v,false);
             for(unsigned d=0;d<3;++d) {
                 transform.view[d]=v.view[d];
-                for(unsigned k=0;k<3;++k) transform.affine[4*d+k]=double(v.rotation[3*d+k])/4096.0;
-                transform.affine[4*d+3]=v.translation[d];
+                for(unsigned k=0;k<3;++k) transform.affine[4*d+k]=double(raw.affine.rotation[3*d+k])/4096.0;
+                transform.affine[4*d+3]=raw.affine.translation[d];
             }
-            transform.affine_valid=v.transform_valid;
+            transform.affine_valid=raw.valid;
+            transform.h=v.h;transform.ofx=v.ofx;transform.ofy=v.ofy;transform.x_scale=v.x_scale;
             stream.transforms.push_back(transform);
         }
-        for(size_t i=0;i<stream.current.size();++i) for(unsigned j=0;j<3;++j)
-        {
-            stream.current[i].vertex[j].source=source_identity(stream.sources[i].projection[j],false);
-            const auto id=stream.current[i].vertex[j].source;
-            stream.current[i].vertex[j].model={id.object,id.primitive>>32};
+        for(size_t i=0;i<stream.current.size();++i) {
+            uint64_t identity=hash(14695981039346656037ULL,stream.sources[i].primitive_type);
+            uint64_t model=7809847782465536322ULL;
+            for(unsigned j=0;j<3;++j) {
+                auto& vertex=stream.current[i].vertex[j];
+                vertex.source=source_identity(stream.sources[i].projection[j],false);
+                vertex.model=model_identity(stream.sources[i].projection[j],false);
+                identity=hash(hash(identity,uint32_t(vertex.source.object)),uint32_t(vertex.source.object>>32));
+                identity=hash(hash(identity,uint32_t(vertex.source.primitive)),uint32_t(vertex.source.primitive>>32));
+                model=hash(hash(model,uint32_t(vertex.model.object)),uint32_t(vertex.model.object>>32));
+            }
+            // Texture animation, OT bucket and alternating packet addresses
+            // do not change the identity of a polygon's source vertices.
+            stream.current[i].identity={model,identity};
         }
         stream.history.erase(std::remove_if(stream.history.begin(),stream.history.end(),[](const Stream::Raw& r) {
             return stream.sequence>r.sequence && stream.sequence-r.sequence>8;
@@ -229,7 +266,7 @@ static void stream_end_impl(void) {
         }
     }
     stream.old_transforms.swap(stream.transforms);
-    stream.transforms.clear();stream.invocations.clear();stream.ordinals.clear();stream.source_mode=false;
+    stream.transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();stream.source_mode=false;
     stream.older.swap(stream.current);stream.old_sources.swap(stream.sources);
     stream.old_epoch=stream.epoch;stream.old_sequence=stream.sequence;
 }
@@ -242,7 +279,8 @@ extern "C" void packet_interpolation_stream_end(void) {
     }
 }
 extern "C" void packet_interpolation_stream_reset(void) {
-    stream.transforms.clear();stream.old_transforms.clear();stream.invocations.clear();stream.ordinals.clear();stream.history.clear();
+    stream.staging_addresses.clear();
+    stream.transforms.clear();stream.old_transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();stream.history.clear();
     stream.old_sources.clear();stream.sources.clear();
     stream.older.clear();stream.current.clear();stream.old_epoch=stream.old_sequence=0;
     std::lock_guard<std::mutex> lock(stats_mutex);

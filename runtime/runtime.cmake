@@ -478,7 +478,6 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/pgxp.cpp
     ${PSXRECOMP_ROOT}/runtime/src/pgxp_ctx.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_exec_ctx.c
-    ${PSXRECOMP_ROOT}/runtime/src/draw_worker_pool.cpp
     ${PSXRECOMP_ROOT}/runtime/src/draw_service.c
     ${PSXRECOMP_ROOT}/runtime/src/draw_call_gate.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_dctx_bios.c

@@ -196,11 +196,13 @@ typedef struct PGXPProjection {
     uint32_t caller;
     uint32_t source_vertex, source_matrix; /* canonical RAM origins, zero if unknown */
     uint64_t transform; /* value fingerprint: invocation evidence, not temporal identity */
+} PGXPProjection;
+/* Pre-cull observer data: never copied into per-word PGXP shadows/rewind. */
+typedef struct PGXPAffineTransform {
     int16_t rotation[9];
     int32_t translation[3];
-    uint32_t transform_valid;
-} PGXPProjection;
-typedef void (*PGXPTransformRecorder)(const PGXPProjection *projection);
+} PGXPAffineTransform;
+typedef void (*PGXPTransformRecorder)(const PGXPProjection *projection, const PGXPAffineTransform *affine);
 /* Producer-only observer, before guest culling. Private contexts never publish. */
 void pgxp_set_transform_recorder(PGXPTransformRecorder recorder);
 void pgxp_set_projection_tracking(int enabled);
@@ -208,6 +210,7 @@ int pgxp_projection_tracking(void);
 /* source_vertex 1..6 requests the corresponding GTE input register origin;
  * stored projections contain the resolved RAM address, never a register ID. */
 void pgxp_gte_set_projection(const PGXPProjection *projection);
+void pgxp_gte_record_transform(const PGXPAffineTransform *affine);
 int pgxp_load_projection(uint32_t addr, uint32_t packed, PGXPProjection *out);
 int pgxp_get_gte_projection(uint32_t index, uint32_t packed, PGXPProjection *out);
 
