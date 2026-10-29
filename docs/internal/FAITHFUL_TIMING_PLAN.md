@@ -2065,3 +2065,17 @@ cases; retained 16 full-VRAM digests and native checkpoint regressions pass.
 Manifest/proof: runtime/tests/NATIVE_RASTER_ORACLE.md and
 runtime/tests/native_raster_oracle_fixtures.h. Production capture/read routing
 is not yet switched; no frame-architecture phase is accepted or merged.
+
+### 2026-10-28 - Native authority production integration (phase 1 ongoing)
+
+Original GP0 packets now enter the native worker before presentation transforms.
+Guest reads, machine VRAM snapshots and native 15/24-bit scanout use CPU-only
+completion. Snapshot wire state preserves native texture/palette caches and
+partial upload/polyline state. Fixed the odd GPUREAD final high halfword and
+interlaced fill gating against the pinned GPU oracle. A write-invalidated row
+cache avoids worker rendezvous per halfword. The 2000 field and 2000 fill/copy
+oracle comparisons pass, as do ten parser/native/scanout fixtures, the actual
+parser debug/production check, dev build, and 32 R4 tests. Hidden race smoke
+passed with zero dispatch misses. The integrated 18x all-on run remains below
+target at 39.716 VBlanks/s, max 77.948 ms, 224724 starved samples. Render queue
+backpressure and presentation work remain. No phase accepted or merged.

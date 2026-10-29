@@ -15,6 +15,7 @@
 #include "gpu_exec_stubs.inc"
 
 int main(void) {
+    fixture_native_start();
     ws_mode = 2;
     ws_cfg_num = 16; ws_cfg_den = 9;
     hres1 = 1; hres2 = 0; video_mode = 0; /* 320 wide */

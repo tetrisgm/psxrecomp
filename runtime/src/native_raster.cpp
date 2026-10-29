@@ -52,6 +52,7 @@ void packet(const Job &job) {
     sw_set_draw_area(s.left,s.top,s.right,s.bottom);
     sw_set_mask_bits(s.set_mask,s.check_mask);
     sw_set_texture_window(s.window);
+    sw_native_set_skip_field(s.skip_field);
     unsigned page=s.page,clut=0;
     if(op==2) {
         sw_fill_rect(p[1]&0x3f0,(p[1]>>16)&511,((p[2]&1023)+15)&~15,
@@ -153,6 +154,7 @@ void draw(const Job &j) {
         sw_draw_native_rect(a[0],a[1],a[2],a[3],uint32_t(a[4]),a[5],a[6],
                             a[7],a[8],a[9],unsigned(a[10]));
         break;
+    case NR_CACHE_CLEAR: sw_native_cache_clear(a[0]); break;
     }
 }
 }
@@ -167,8 +169,15 @@ struct NativeRaster {
     bool stop = false;
     std::atomic<uint64_t> completed{0};
     std::thread thread;
+    /* Producer-only read cache. Any queued mutation invalidates it before
+     * publication; reads can therefore reuse a completed row without another
+     * worker wake, including GPUREAD's halfword-at-a-time interface. */
+    std::array<uint16_t,1024> read_row{};
+    int read_row_y = -1;
 
     void push(Job job) {
+        if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore)
+            read_row_y=-1;
         const size_t cost = job.bytes();
         std::unique_lock<std::mutex> lock(mutex);
         space.wait(lock, [&] { return bytes + cost <= queue_budget; });
@@ -240,7 +249,7 @@ extern "C" void native_raster_destroy(NativeRaster *r) {
 }
 extern "C" int native_raster_submit(NativeRaster *r, const NativeRasterCommand *c,
                                      const uint16_t *upload, size_t words) {
-    if (!r || !c || c->op < NR_AREA || c->op > NR_NATIVE_RECT) return 0;
+    if (!r || !c || c->op < NR_AREA || c->op > NR_CACHE_CLEAR) return 0;
     if (c->op == NR_UPLOAD || c->op == NR_CPU_UPLOAD) {
         if (c->args[2] <= 0 || c->args[2] > 1024 || c->args[3] <= 0 || c->args[3] > 512 ||
             !upload || !words) return 0;
@@ -276,6 +285,19 @@ static void sync_job(NativeRaster *r, Job job) {
     result.get();
 }
 extern "C" void native_raster_read(NativeRaster *r, int x,int y,int w,int h,uint16_t *out) {
+    if(h==1 && w>0 && w<=32) {
+        y&=511;
+        if(r->read_row_y!=y) {
+            Job row;
+            row.kind=Kind::Read;
+            row.command.args[1]=y;row.command.args[2]=1024;row.command.args[3]=1;
+            row.destination=r->read_row.data();
+            sync_job(r,std::move(row));
+            r->read_row_y=y;
+        }
+        for(int i=0;i<w;++i) out[i]=r->read_row[(x+i)&1023];
+        return;
+    }
     Job job;
     job.kind = Kind::Read;
     job.command.args[0]=x; job.command.args[1]=y; job.command.args[2]=w; job.command.args[3]=h;

@@ -13,6 +13,7 @@ static int64_t area(const int32_t *p) {
 }
 
 int main(void) {
+    fixture_native_start();
     reset_gpu_state_for_test();
     configure_native_wide_16_9();
     hres1=2; ws_cfg_num=125; ws_cfg_den=30; /* 512 pixels, owner's ultrawide view */

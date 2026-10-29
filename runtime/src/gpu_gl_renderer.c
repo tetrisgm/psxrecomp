@@ -16088,11 +16088,9 @@ static void hd_note_exec(int op, int x, int y, int w, int h, int sx, int sy) {
 static void rtb_vram_upload_open(int open) {
     s_rth_a0_open = open;
     if (!open && s_hd_authority_pending) gl_renderer_set_hd_texture_mode(1);
-    /* gpu.c streams the payload into its array and reads it back for
-     * mask-checked words: under HD authority take the context so that array
-     * holds every earlier native draw, and keep it until the commit
-     * (eligibility). Also when a savestate restores a state mid-A0. */
-    if (open && s_hd_native_authority) GL_RT_SYNC("hd_upload");
+    /* The CPU-native queue owns partial uploads and mask checks. The render
+     * queue receives an immutable completed rectangle, including on abort;
+     * opening a guest transfer no longer needs the GL context or its VRAM. */
 }
 static void rtb_hd_texture_note(int op, int x, int y, int w, int h, int sx, int sy) {
     RTH_DIRECT_OR(RTH_REC(RTH_HD_NOTE, 0, op, x, y, w, h, sx, sy)); hd_note_exec(op, x, y, w, h, sx, sy); }

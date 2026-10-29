@@ -10552,16 +10552,8 @@ static void handle_screenshot_file(int id, const char *json)
     if (di.disabled || di.width == 0 || di.height == 0) {
         send_err(id, "display disabled"); return;
     }
-    /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
-     * the freshest frame and is presented without a readback). Sync it down so
-     * the capture reflects what's on screen. NEVER sync on depth24: FBO
-     * readback clobbers packed RGB888 MDEC bytes in the CPU mirror. */
-    if (!di.depth24) {
-        extern void gl_renderer_sync_cpu(void);
-        gl_renderer_sync_cpu();
-        extern void vk_renderer_sync_cpu(void);
-        vk_renderer_sync_cpu();
-    }
+    /* This command captures native guest scanout. Presented-image captures
+     * use the renderer's separate output surface. */
 
     uint32_t w = di.width;  if (w > 640) w = 640;
     uint32_t h = di.height; if (h > 512) h = 512;
@@ -10787,9 +10779,8 @@ static void handle_dynres_force(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"level\":%d,\"forced\":%d}", id, l, s > 0);
 }
 
-/* FNV-1a over the guest-visible VRAM (the CPU array after a GL sync). */
+/* FNV-1a over native guest-visible VRAM, independent of presentation. */
 static uint64_t dynres_vram_hash(void) {
-    gl_renderer_sync_cpu();
     uint64_t h = 1469598103934665603ull;
     for (int y = 0; y < 512; y++)
         for (int x = 0; x < 1024; x++) {
@@ -11053,10 +11044,6 @@ static void handle_host_osd_shot(int id, const char *json)
  * strobing character is present in one buffer only. */
 static void handle_dump_buffer(int id, const char *json)
 {
-    extern void gl_renderer_sync_cpu(void);
-    gl_renderer_sync_cpu();
-    extern void vk_renderer_sync_cpu(void);
-    vk_renderer_sync_cpu();
 
     int y0 = json_get_int(json, "y", 0);
     char path[512];
@@ -11101,8 +11088,6 @@ static const char *write_wide_png(const char *path, int *out_w, int *out_h)
     extern int gr_scale(void);
     extern int gr_render_wide_display(uint32_t *out, int pitch, int base_x,
                                       int disp_y, int disp_h);
-    extern void gl_renderer_sync_cpu(void);
-    gl_renderer_sync_cpu();   /* no-op on SW / when no GL frame pending */
 
     if (!gr_wide_supported()) return "active backend has no wide compositor";
     int extra = ws_nw_extra();
@@ -11308,8 +11293,6 @@ static void handle_wide_full(int id, const char *json)
      * wide-surface dump (SW: sw_wide_dump_full; GL: glb_wide_dump_full), so the
      * whole compositor surface can be inspected on either backend over TCP. */
     extern int gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
-    extern void gl_renderer_sync_cpu(void);
-    gl_renderer_sync_cpu();   /* no-op on SW; ensures pending GL frame is flushed */
     int base_x = json_get_int(json, "base_x", 0);
     /* "alpha":1 writes bit 15 (GL: the surface alpha) as white/black. */
     int show_alpha = json_get_int(json, "alpha", 0);

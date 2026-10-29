@@ -8,6 +8,13 @@ uint64_t s_frame_count;
 uint64_t psx_cycle_count;          /* gpu_timeline.c stamps notes with it */
 int g_exec_phase;
 int g_psx_render_pass_active;
+int g_ws_bd_stretch_on, g_ws_bd_stretch_pct;
+static void fixture_native_start(void) {
+    if(s_native_raster) return;
+    s_native_raster=native_raster_create(NULL);
+    assert(s_native_raster);
+    atexit(native_shutdown);
+}
 void psx_mod_counter_add(const char *name, uint32_t delta) { (void)name; (void)delta; }
 static int fixture_pgxp_enabled;
 int pgxp_enabled(void) { return fixture_pgxp_enabled; }
@@ -32,7 +39,6 @@ void pgxp_projective_scope_end(PGXPProjectiveScope *scope) {
 uint32_t g_debug_current_func_addr;
 uint32_t g_debug_last_store_pc;
 CPUState *debug_cpu_ptr;
-int g_psx_vram_dirty_tracking;
 uint32_t g_psx_ram_size = 0x00200000u;
 uint32_t g_psx_ram_mask = 0x001FFFFFu;
 
@@ -212,7 +218,6 @@ int gte_precision_load_word(uint32_t addr, uint32_t packed,
     }
     return 0;
 }
-uint32_t sw_perspective_triangle_count(void) { return 0; }
 
 uint32_t psx_ws_widen_angle_q12(uint32_t vanilla, int extent_pixels) {
     (void)extent_pixels;
@@ -240,8 +245,6 @@ int32_t ws_ui_anchor_for_bounds(int32_t x, int32_t width,
 }
 #endif
 
-void gpu_vram_dirty_mark_all(void) {}
-void gpu_vram_dirty_mark_row_impl(uint32_t y) { (void)y; }
 void psx_irq_raise(uint32_t bit, uint32_t detail) { (void)bit; (void)detail; }
 void event_ring_record_aux(uint16_t kind, uint8_t detail, uint32_t aux) {
     (void)kind; (void)detail; (void)aux;

@@ -1823,6 +1823,20 @@ if(BUILD_TESTING)
     add_test(NAME native_raster_test COMMAND native_raster_test)
     set_tests_properties(native_raster_test PROPERTIES TIMEOUT 30)
 
+    # Parser fixtures use the real native authority, not a fake VRAM reader.
+    add_library(gpu_fixture_native STATIC src/native_raster.cpp src/gpu_sw_renderer.c
+                src/gpu_vram_dirty.c)
+    target_include_directories(gpu_fixture_native PRIVATE include)
+    target_compile_features(gpu_fixture_native PRIVATE cxx_std_17)
+    target_link_libraries(gpu_fixture_native PUBLIC Threads::Threads)
+    foreach(fixture gpu_display_cache_test gpu_textured_dot_nw_shift_exec_test
+            ws_auto_ui_untextured_exec_test ws_shared_split_ui_exec_test
+            ws_local_view_margin_test depth24_present_hold_exec_test
+            ws_view_anchor_gpu_test native_wide_projection_test
+            gpu_render_pass_provenance_test)
+        target_link_libraries(${fixture} PRIVATE gpu_fixture_native)
+    endforeach()
+
     # Render thread core ([video] render_thread, docs/RENDER_THREAD.md):
     # ordering across ring wraps, the frame bound, stale-frame detection and
     # the drain + context hand-off sync point, against a fake executor.

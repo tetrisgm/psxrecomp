@@ -38,6 +38,7 @@ void timers_set_snapshot(const uint16_t c[3],const uint32_t m[3],const uint16_t 
     void name##_snapshot_write(uint8_t* p){memset(p,0,4);} \
     int name##_snapshot_read(const uint8_t* p,uint32_t n){(void)p;return n==4;}
 MODULE(gpu) MODULE(spu) MODULE(cdrom) MODULE(dma) MODULE(sio) MODULE(mdec) MODULE(spu_cd)
+int gpu_snapshot_valid_size(uint32_t n){return n==4;}
 int spu_snapshot_len_ok(uint32_t n){return n==4;}
 int cdrom_snapshot_validate(const uint8_t* p,uint32_t n){(void)p;return n==4;}
 void psx_devices_service_to_now(void){}
@@ -57,6 +58,8 @@ const uint64_t* gpu_vram_dirty_mask(void){static const uint64_t mask[8]={0};retu
 void gpu_vram_dirty_clear(void){}
 void gr_vram_transfer_in(int x,int y,int w,int h,const uint16_t* p){(void)x;(void)y;memcpy(vram,p,(size_t)w*h*2);}
 void gr_vram_transfer_out(int x,int y,int w,int h,uint16_t* p){(void)x;(void)y;memcpy(p,vram,(size_t)w*h*2);}
+void gpu_native_vram_read(int x,int y,int w,int h,uint16_t* p){gr_vram_transfer_out(x,y,w,h,p);}
+void gpu_native_vram_restore(const uint16_t* p){memcpy(vram,p,sizeof vram);}
 
 static void u32(uint8_t* p,uint32_t n){PstW w;pst_w_init(&w,p,4);assert(pst_w_u32(&w,n));}
 static uint32_t r32(const uint8_t* p){PstR r;uint32_t n=0;pst_r_init(&r,p,4);assert(pst_r_u32(&r,&n));return n;}

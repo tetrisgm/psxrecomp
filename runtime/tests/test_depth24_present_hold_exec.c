@@ -144,6 +144,7 @@ static int present(uint64_t *frame_hash, int honor_hold) {
 }
 
 static void reset_gpu(void) {
+    fixture_native_start();
     gpu_reset_state(1);
     memset(test_ram, 0, sizeof(test_ram));
 }
@@ -252,15 +253,15 @@ static void check_rollback_and_disk(void) {
         gpu_vblank_tick();
         record(&live[f]);
         gpu_snapshot_write(snaps[f]);
-        memcpy(vrams[f], vram, sizeof vram);
+        gpu_native_vram_read(0,0,1024,512,vrams[f]);
         live[f].presented = present_checked(f, &live[f].frame_hash);
     }
 
     for (int k = RETARGET_1 - 2; k < FRAMES - 1; k++) {
         for (int latch = 0; latch < 2; latch++) {
             s_d24_present_skip = latch;            /* whatever the tip had */
-            memcpy(vram, vrams[k], sizeof vram);
             assert(gpu_snapshot_read(snaps[k], n));
+            gpu_native_vram_restore(vrams[k]);
             /* psx_frontend_on_rb_snap_loaded keeps the hold. */
             assert(s_d24_present_hold == live[k].hold);
             assert(s_d24_upload_x1 == live[k].span);
@@ -291,8 +292,8 @@ static void check_rollback_and_disk(void) {
      * the restored frame presents at once. */
     for (int k = RETARGET_2; k < RETARGET_2 + 3; k++) {
         s_d24_present_skip = 1;
-        memcpy(vram, vrams[k], sizeof vram);
         assert(gpu_snapshot_read(snaps[k], n));
+        gpu_native_vram_restore(vrams[k]);
         gpu_depth24_on_savestate_loaded();
         assert(s_d24_present_hold == 0);
         assert(s_d24_upload_x1 == live[k].span);
@@ -303,8 +304,8 @@ static void check_rollback_and_disk(void) {
         assert(gpu_depth24_present_hold_tick() == 0);
     }
     /* A disk load after the hold keeps the restored span. */
-    memcpy(vram, vrams[RETARGET_1 + 3], sizeof vram);
     assert(gpu_snapshot_read(snaps[RETARGET_1 + 3], n));
+    gpu_native_vram_restore(vrams[RETARGET_1 + 3]);
     gpu_depth24_on_savestate_loaded();
     assert(s_d24_upload_x1 == B_HALFWORDS);
     uint64_t h = 0;

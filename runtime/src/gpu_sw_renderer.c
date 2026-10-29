@@ -81,6 +81,7 @@ struct SwRendererContext {
     struct { uint32_t tag; uint16_t words[4]; } native_texture[256];
     uint16_t native_palette[256];
     uint32_t native_palette_key, native_page;
+    unsigned native_skip_field;
 };
 static SwRendererContext s_default = {
     .g_scale = 1, .g_hr_w = VRAM_WIDTH, .g_hr_h = VRAM_HEIGHT,
@@ -461,13 +462,19 @@ void sw_native_cache_clear(int palette) {
     for(int i=0;i<256;++i) s_sw->native_texture[i].tag=UINT32_MAX;
     if(palette) s_sw->native_palette_key=UINT32_MAX;
 }
+void sw_native_set_skip_field(unsigned field) { s_sw->native_skip_field=field; }
+static int native_skip_row(int y) {
+    return s_sw->native_skip_field && (unsigned)(y&1)==s_sw->native_skip_field-1;
+}
 void sw_native_texture_save(SwNativeTextureState *state) {
     for(int i=0;i<256;++i) {
         state->tags[i]=s_sw->native_texture[i].tag;
-        memcpy(state->words[i],s_sw->native_texture[i].words,8);
+        if(state->tags[i]==UINT32_MAX) memset(state->words[i],0,8);
+        else memcpy(state->words[i],s_sw->native_texture[i].words,8);
     }
     memcpy(state->palette,s_sw->native_palette,sizeof state->palette);
     state->palette_key=s_sw->native_palette_key;
+    if(state->palette_key==UINT32_MAX) memset(state->palette,0,sizeof state->palette);
     state->page=s_sw->native_page;
 }
 void sw_native_texture_load(const SwNativeTextureState *state) {
@@ -610,6 +617,7 @@ void sw_draw_native_triangle(const SwNativeVertex input[3],uint16_t cx,uint16_t 
       for(int row=0;row<hi-lo;++row) {
         int y=descending?hi-1-row:lo+row;
         const int py=(y&1023)-(y&1024);
+        if(native_skip_row(py)) continue;
         if(py<0 || py>=512 || py<g_clip_y1 || py>g_clip_y2) continue;
         int a,b;
         psx_triangle_edges_at_y(v[0].x,v[0].y,v[1].x,v[1].y,v[2].x,v[2].y,y,&a,&b);
@@ -675,7 +683,7 @@ void sw_draw_native_line(const SwNativeVertex input[2],unsigned flags) {
     static const int8_t matrix[4][4]={{-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},{3,-1,2,-2}};
     for(int i=0;i<=steps;++i,x+=sx,y+=sy) {
         int px=(int)(((uint64_t)x>>32)&2047),py=(int)(((uint64_t)y>>32)&2047);
-        if(px>=g_clip_x1 && px<=g_clip_x2 && px<1024 &&
+        if(!native_skip_row(py) && px>=g_clip_x1 && px<=g_clip_x2 && px<1024 &&
            py>=g_clip_y1 && py<=g_clip_y2 && py<512) {
             uint16_t *dst=g_vram+py*1024+px;
             if(!g_mask_check_bit || !(*dst&0x8000)) {
@@ -699,6 +707,7 @@ void sw_draw_native_rect(int x,int y,int w,int h,uint32_t rgb,int u,int v,
     const int right=min_i(min_i(x+w,g_clip_x2+1),1024);
     const int bottom=min_i(min_i(y+h,g_clip_y2+1),512);
     for(int py=top;py<bottom;++py) {
+        if(native_skip_row(py)) continue;
         int wrote=0;
         for(int px=left;px<right;++px) {
             uint16_t *dst=g_vram+py*1024+px,stp=0,color;
@@ -1011,6 +1020,7 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
 
     for (int row = 0; row < h; row++) {
         int py = (y0 + row) & (VRAM_HEIGHT - 1);
+        if (native_skip_row(py)) continue;
         for (int col = 0; col < w; col++) {
             int px = (x0 + col) & (VRAM_WIDTH - 1);
             g_vram[py * VRAM_WIDTH + px] = color;

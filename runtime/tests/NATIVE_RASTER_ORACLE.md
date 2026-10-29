@@ -30,6 +30,8 @@ The bridge never calls a frontend, opens a window or loads a game.
 | 2000 untextured packets, random destination masks and blend modes | exact |
 | 10000 mixed triangle/quad/line/sprite packets, all three texture formats, flips, dithering, masks and feedback | exact |
 | 10000 mixed packets with signed 11-bit offsets and coordinate stress | exact |
+| 2000 mixed packets with interlaced field gating | exact |
+| 2000 fill/copy packets with wrapping, overlap, masks and interlace | exact |
 | Native unit fixture including 16 full-VRAM reference digests | pass |
 | Partial A0 snapshot/resume and stale palette checkpoint restore | pass |
 
@@ -39,6 +41,13 @@ The mixed and coordinate receipts are `native-parity.json` and
 and FNV-1a over little-endian VRAM bytes. Digest checks are regression tests;
 the live oracle runner compares every halfword, not only a hash.
 
-This is component evidence, not phase-1 acceptance. Production GP0 capture,
-guest read routing, GPU snapshot wire integration, interlaced draw gating,
-and complete cache lifecycle integration must pass before promotion.
+The field and transfer receipts are `native-field-gate/native-parity.json`
+and `native-transfer-gate/native-parity.json`. The transfer runner reproduced
+incorrect fills in the skipped interlace field before the fix.
+
+Production GP0 capture, guest reads, native scanout and GPU snapshot wire
+integration now use this worker. The actual-parser debug/production fixture
+tests partial-upload save/load, odd GPUREAD high-halfwords and cache invalidation
+after writes. Ten parser/native/scanout fixtures pass, including depth24
+rollback at every tick. This is component evidence, not phase-1 acceptance:
+runtime configuration/diagnostic context migration still requires removal.

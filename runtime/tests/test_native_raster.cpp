@@ -199,6 +199,14 @@ int main() {
     send(r,NR_NATIVE_RECT,{500,400,1,1,0,0,144,16,480,16,3});
     assert(pixel(r,500,400)==31);
 
+    // Interlaced drawing skips the display field for fills too; copies and
+    // CPU uploads still touch both fields. Fill ignores the draw rectangle.
+    state.skip_field=1;
+    uint32_t fill[]={0x020000ff,0x01f001f0,0x00020010};
+    uint16_t even_before=pixel(r,496,496);
+    assert(native_raster_gp0(r,&state,fill,3));
+    assert(pixel(r,496,496)==even_before && pixel(r,496,497)==31);
+
     // Full-VRAM oracle digests include masked pixels, texture feedback,
     // shading, clipping, sprite flips and palette/texture fetches.
     for(size_t i=0;i<saved.size();++i)

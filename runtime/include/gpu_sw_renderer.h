@@ -26,6 +26,7 @@ void sw_draw_native_triangle(const SwNativeVertex vertices[3],
                              uint16_t texpage, unsigned flags);
 void sw_draw_native_line(const SwNativeVertex vertices[2], unsigned flags);
 void sw_native_cache_clear(int palette);
+void sw_native_set_skip_field(unsigned field);
 void sw_native_copy(int sx,int sy,int dx,int dy,int w,int h);
 /* Guest-observable cache contents: serialize fields explicitly, not padding. */
 typedef struct SwNativeTextureState {

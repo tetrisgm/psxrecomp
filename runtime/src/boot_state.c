@@ -157,7 +157,7 @@ static int sync_vram_mirror_for_save(void)
         if (live)
             memcpy(s_vram_mirror, live, VRAM_SIZE);
         else
-            gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, s_vram_mirror);
+            gpu_native_vram_read(0, 0, VRAM_W, VRAM_H, s_vram_mirror);
         s_vram_mirror_valid = 1;
         s_last_vram_dirty_rows = VRAM_H;
         s_last_vram_incremental = 0;
@@ -168,7 +168,7 @@ static int sync_vram_mirror_for_save(void)
     s_last_vram_dirty_rows = dirty_n;
 
     if (!live) {
-        gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, s_vram_mirror);
+        gpu_native_vram_read(0, 0, VRAM_W, VRAM_H, s_vram_mirror);
         s_vram_mirror_valid = 1;
         s_last_vram_dirty_rows = VRAM_H;
         s_last_vram_incremental = 0;
@@ -198,7 +198,7 @@ static int sync_vram_mirror_for_save(void)
     if (gpu_vram_dirty_verify_enabled()) {
         uint16_t *full = (uint16_t *)malloc(VRAM_SIZE);
         if (full) {
-            gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, full);
+            gpu_native_vram_read(0, 0, VRAM_W, VRAM_H, full);
             if (memcmp(full, s_vram_mirror, VRAM_SIZE) != 0) {
                 fprintf(stderr,
                         "psxrecomp: VRAM dirty VERIFY FAIL dirty_rows=%u "
@@ -378,7 +378,7 @@ static int write_vram_section_full(BsOut *o)
     int ok;
     if (!vbuf)
         return 0;
-    gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, vbuf);
+    gpu_native_vram_read(0, 0, VRAM_W, VRAM_H, vbuf);
     s_last_vram_dirty_rows = VRAM_H;
     s_last_vram_incremental = 0;
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
@@ -714,6 +714,7 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         if (len != VRAM_SIZE) return 0;
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
         /* Wire == host layout: upload straight from the section buffer. */
+        gpu_native_vram_restore((const uint16_t*)p);
         gr_vram_transfer_in(0, 0, VRAM_W, VRAM_H, (const uint16_t*)p);
         if (gpu_vram_dirty_tracking()) {
             memcpy(s_vram_mirror, p, VRAM_SIZE);
@@ -734,6 +735,7 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
                 free(vbuf);
                 return 0;
             }
+            gpu_native_vram_restore(vbuf);
             gr_vram_transfer_in(0, 0, VRAM_W, VRAM_H, vbuf);
             if (gpu_vram_dirty_tracking()) {
                 memcpy(s_vram_mirror, vbuf, VRAM_SIZE);
@@ -858,7 +860,7 @@ static int validate_section(uint32_t tag, const uint8_t* p, uint32_t len) {
     case BS_SEC_IRQ:    return len == 8u || len == 12u;
     case BS_SEC_TIMER:  return len == TIMER_REGS_WIRE_BYTES;
     case BS_SEC_CLOCK:  return len == 8u;
-    case BS_SEC_GPU:    return len == gpu_snapshot_bytes();
+    case BS_SEC_GPU:    return gpu_snapshot_valid_size(len);
     case BS_SEC_VRAM:   return len == VRAM_SIZE;
     case BS_SEC_SPU:    return spu_snapshot_len_ok(len);
     case BS_SEC_SPURAM: return len == spu_get_ram_bytes();

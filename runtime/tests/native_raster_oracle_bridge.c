@@ -26,3 +26,8 @@ ORACLE_EXPORT void oracle_write(const uint32_t *words,unsigned count) {
 ORACLE_EXPORT void oracle_read(uint16_t *vram) {
     memcpy(vram,GPU.vram,1024*512*2);
 }
+ORACLE_EXPORT void oracle_field(unsigned field) {
+    GPU.DisplayMode=field?0x24:0;
+    GPU.dfe=false;
+    GPU.field_ram_readout=field?field-1:0;
+}

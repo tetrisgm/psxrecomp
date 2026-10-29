@@ -27,7 +27,8 @@ typedef enum NativeRasterOp {
     NR_NATIVE_LINE,
     /* x,y,w,h,rgb,u,v,clut_x,clut_y,page,flags (texture=1,raw=2,
      * horizontal texture flip=16,vertical texture flip=32). */
-    NR_NATIVE_RECT
+    NR_NATIVE_RECT,
+    NR_CACHE_CLEAR
 } NativeRasterOp;
 typedef struct NativeRasterCommand {
     NativeRasterOp op;
@@ -41,6 +42,8 @@ typedef struct NativeRasterCommand {
 typedef struct NativeRasterState {
     int32_t left,top,right,bottom,offset_x,offset_y;
     uint32_t page,window,set_mask,check_mask;
+    /* 0 draws every line; 1 skips even native rows, 2 skips odd rows. */
+    uint32_t skip_field;
 } NativeRasterState;
 /* Complete fixed-length draw/fill/copy packets only. Environment and partial
  * transfers use the existing state/fragment operations. */

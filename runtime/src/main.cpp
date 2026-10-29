@@ -2920,12 +2920,6 @@ extern "C" void psx_frontend_netplay_force_sw_gpu(void) {
     }
 #endif
 #ifndef PSX_SDL_NO_RENDER
-    /* If we were on FBO-auth GL (offline), pull VRAM to CPU once before
-     * arming dual. Caller must invoke this before g_np.active (ensure_cpu
-     * no-ops while netplay is active). */
-    if (g_gl_active && gr_backend() == GR_BACKEND_OPENGL &&
-        !gl_renderer_cpu_auth_dual())
-        gl_renderer_sync_cpu();
     if (g_vk_active) {
         /* Vulkan CPU-auth present not wired yet — tear down to SW SDL. */
         vk_renderer_sync_cpu();
@@ -10261,7 +10255,6 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 return ep;
             }
         }
-        if (g_gl_active && !di.depth24) gl_renderer_sync_cpu();
         /* Vulkan owns every frame: 15-bit frames present straight from the GPU
          * VRAM image (deterministic blit, no readback), mirroring the GL path;
          * 24-bit (FMV) frames go through the CPU present (Phase 3). The Vulkan

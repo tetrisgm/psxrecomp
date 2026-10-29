@@ -24,7 +24,7 @@ extern "C" { extern uint64_t s_frame_count; }
 /* Renderer VRAM facade (gpu_render.h) — the same read/write path the GP0 0xA0
  * upload uses, so vram-strip patches stay coherent across software/GL backends
  * and the supersampling mirror. */
-extern "C" uint16_t gr_vram_read(int x, int y);
+extern "C" uint16_t gpu_vram_peek(int x, int y);
 extern "C" void     gr_vram_write(int x, int y, uint16_t pixel);
 // Bless an in-place RAM patch into the text-image guard so it isn't mistaken for
 // self-modifying code (memory.c). Our patches (string/glyph tables) share pages
@@ -767,7 +767,7 @@ int vram_patches_apply_locked(int ux, int uy, int uw, int uh, bool force) {
         bool match = true;
         for (int r = 0; match && r < vp.h; ++r)
             for (int c = 0; match && c < vp.w; ++c)
-                if (gr_vram_read(vp.x + c, vp.y + r) != vp.src[(size_t)r * vp.w + c])
+                if (gpu_vram_peek(vp.x + c, vp.y + r) != vp.src[(size_t)r * vp.w + c])
                     match = false;
         if (!match) continue;
         for (int r = 0; r < vp.h; ++r)

@@ -12,6 +12,7 @@ static void equal(void) {
     assert(!memcmp(&cached,&raw,sizeof raw)); assert(!memcmp(&hit,&raw,sizeof raw));
 }
 int main(void) {
+    fixture_native_start();
     uint32_t *fields[]={&display_area_x,&display_area_y,&display_depth,&display_disabled,
         &hres1,&hres2,&h_display_x1,&h_display_x2,&video_mode,&v_display_y1,&v_display_y2,&vres};
     const uint32_t masks[]={1023,511,1,1,3,1,4095,4095,1,1023,1023,1};
@@ -22,7 +23,7 @@ int main(void) {
     for(unsigned command=3;command<=8;command++) {
         gpu_write_gp1((command<<24)|0x00081234u); equal();
     }
-    uint8_t snapshot[2048]; assert(gpu_snapshot_bytes()<=sizeof snapshot);
+    uint8_t snapshot[8192]; assert(gpu_snapshot_bytes()<=sizeof snapshot);
     gpu_snapshot_write(snapshot);
     gpu_write_gp1(0x08000000u); equal();
     PstR reader; pst_r_init(&reader,snapshot,gpu_snapshot_bytes());

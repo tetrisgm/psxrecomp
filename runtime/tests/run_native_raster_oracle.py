@@ -12,6 +12,8 @@ ap.add_argument('--output',type=Path,required=True)
 ap.add_argument('--dll-dir',type=Path,action='append',default=[])
 ap.add_argument('--cases',type=int,default=10000)
 ap.add_argument('--coordinate-stress',action='store_true')
+ap.add_argument('--field-stress',action='store_true')
+ap.add_argument('--transfer-stress',action='store_true')
 args=ap.parse_args()
 root=args.output.resolve()
 root.mkdir(parents=True,exist_ok=True)
@@ -20,7 +22,7 @@ ref=c.CDLL(str(args.oracle.resolve()))
 native=c.CDLL(str(args.native.resolve()))
 U16=c.c_uint16*524288
 class State(c.Structure):
-    _fields_=[(k,c.c_int32) for k in ('left','top','right','bottom','offset_x','offset_y')]+[(k,c.c_uint32) for k in ('page','window','set_mask','check_mask')]
+    _fields_=[(k,c.c_int32) for k in ('left','top','right','bottom','offset_x','offset_y')]+[(k,c.c_uint32) for k in ('page','window','set_mask','check_mask','skip_field')]
 native.native_raster_create.argtypes=[c.POINTER(c.c_uint16)]
 native.native_raster_create.restype=c.c_void_p
 native.native_raster_gp0.argtypes=[c.c_void_p,c.POINTER(State),c.POINTER(c.c_uint32),c.c_size_t]
@@ -60,11 +62,25 @@ try:
             p.append(pts[0])
             if op&4:p.append(rng.randrange(256)|(rng.randrange(256)<<8)|((480<<6)<<16))
             if (op&24)==0:p.append(xy(rng.randrange(1,40),rng.randrange(1,40)))
+        if args.transfer_stress:
+            # Include zero dimensions, wrap, self-overlap within/across the
+            # 128-halfword copy chunks, and masked/interlaced destinations.
+            op=rng.choice([2,0x80])
+            x,y=rng.randrange(1024),rng.randrange(512)
+            w=rng.choice([0,1,15,16,127,128,129,255,511,1023])
+            h=rng.choice([0,1,2,3,31,511])
+            p=[(op<<24)|colors[0],xy(x,y)]
+            if op==0x80:
+                p.append(xy((x+rng.randrange(-150,151))&1023,(y+rng.randrange(-2,3))&511))
+            p.append(xy(w,h))
         native.native_raster_restore(nr,initial)
         ref.oracle_reset(initial)
         write([0xe1000000|s.page,0xe2000000|s.window,0xe3000000,
                0xe4000000|1023|(511<<10),0xe5000000|(s.offset_x&2047)|((s.offset_y&2047)<<11),
                0xe6000000|s.set_mask|(s.check_mask<<1)])
+        if args.field_stress:
+            s.skip_field=rng.randrange(3)
+            ref.oracle_field(s.skip_field)
         write(p)
         packet=(c.c_uint32*len(p))(*p)
         assert native.native_raster_gp0(nr,c.byref(s),packet,len(p))
