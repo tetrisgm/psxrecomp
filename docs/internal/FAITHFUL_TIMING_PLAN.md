@@ -213,6 +213,16 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-10-29 interpolation follow-up (d516f5fa): canonical source slots,
+connected fallback and retained departing geometry; immutable transform blocks
+and HD tracking cache. Final moving census 45/45 clean. Three sampled 8K midpoint
+captures have zero excess clear-colour pixels; repeated endpoints are identical.
+Acceptance still FAILS: final 60/120 requests yield 27.0/30.7 distinct images/s,
+51.5/49.4 guest VBlanks/s, 60339/78290 starved samples. Earlier zero-starvation
+runs were not reproducible. No scheduling/power-policy experiment is shipped.
+Details and limits: R4 docs/FRAME_INTERPOLATION_STATUS.md.
+
+
 - 2026-10-29 final phase-4 validation: 45-pair identity census passes, but
   full-PGXP captures reveal interpolation-only geometry gaps. 8K requested
   60/120 yields 25.6/26.1 distinct images/s with starvation. Presenter cutover
