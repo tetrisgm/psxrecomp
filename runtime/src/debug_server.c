@@ -16560,7 +16560,7 @@ static void handle_warm_cd_route(int id, const char *json)
 /* reset=1 starts a new opt-in wall-time window. See main.cpp for semantics. */
 extern void psx_debug_main_cadence_json(int reset, char *out, size_t cap);
 static void handle_main_cadence(int id, const char *json) {
-    char buf[768];
+    char buf[1280];
     psx_debug_main_cadence_json(json_get_int(json, "reset", 0), buf, sizeof buf);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
 }

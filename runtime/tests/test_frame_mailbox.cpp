@@ -177,6 +177,8 @@ static void rewind_packets() {
 }
 
 int main() {
+    FramePacketProducerTiming allocation_before{},allocation_after{};
+    frame_packet_producer_timing(1,&allocation_before);
     rewind_packets();
     test_attachments();
     test_optional_batches();
@@ -280,6 +282,8 @@ int main() {
     const auto *cmd=static_cast<const RtCmd *>(held_view.records);
     assert(cmd->op==1 && cmd->flags==7 && cmd->payload==12 && cmd->size==32);
     assert(static_cast<const uint32_t *>(static_cast<const void *>(cmd+1))[2]==33);
+    const auto *payload=reinterpret_cast<const unsigned char*>(cmd+1);
+    for(size_t n=cmd->payload;n<cmd->size-sizeof *cmd;++n)assert(payload[n]==0);
     assert(frame_packet_replaced(queue)==62);
     /* Failing a later packet must not erase the last complete pending one. */
     assert(frame_packet_begin(queue,65,native.data(),native.size()*2));
@@ -334,5 +338,8 @@ int main() {
         }
     }
     producer.join();assert(done.load(std::memory_order_acquire));
+    frame_packet_producer_timing(0,&allocation_after);
+    assert(allocation_after.growth_count>allocation_before.growth_count);
+    assert(allocation_after.growth_bytes>allocation_before.growth_bytes);
     puts("latest-frame mailbox: stalled consumer, bounded reuse and immutable concurrent packets passed");
 }

@@ -2222,3 +2222,17 @@ flat Gouraud differences bounded to one RGB code (362pixels at18x), alpha
 exact, all page positions byte-identical. Production still uses full-VRAM
 allocation: no acceptance or promotion. Dev build/R4 32tests passed. Ghidra
 MCP available with OpenBIOS and game analyzed. All runs dummy audio.
+
+2026-10-29 phase3 WIP: common explicit-region colour/depth allocator and
+multi-source enhanced copy staging pass hidden1x/4x/9x/18x fixture
+phase3-region-allocation-18x/rth-9_kedxl7. Native texture uploads now share
+bounded fenced persistent/fixed-storage streams; removed per-upload PBO
+orphaning/client-memory branch. Hidden vertex+upload lifetime fixture passes
+4626checks in persistent and GL3.3-compatible modes, including strided uploads
+across ring wraps: phase3-native-upload-stream/rth-fo1q54gz. Production full
+HR allocation remains, no phase promotion. Packet growth avoids redundant
+zero-fill; opt-in timings show .079ms allocation/.036ms cleanup in worst
+35.670ms interval, not a pacing fix. Sampler overhead A/B inconclusive and
+contended with a non-owned runtime. Latest distinct receipt31.766/s despite
+60swaps/s, zero missing receipts/starved/misses. Absolute worst-frame marker
+and existing span/frame/sampler probes support continued hitch attribution.

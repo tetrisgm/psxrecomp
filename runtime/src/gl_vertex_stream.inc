@@ -4,6 +4,9 @@
  * platform contract (including macOS) uses fixed storage + subdata, with
  * the same explicit segment lifetime; neither path orphans per batch. */
 #define VERTEX_STREAM_SEGMENTS 8
+#ifndef PSXGL_PIXEL_UNPACK_BUFFER
+#define PSXGL_PIXEL_UNPACK_BUFFER 0x88EC
+#endif
 typedef void (APIENTRY *StreamStorage)(GLenum,ptrdiff_t,const void *,GLbitfield);
 typedef void *(APIENTRY *StreamMap)(GLenum,ptrdiff_t,ptrdiff_t,GLbitfield);
 typedef void (APIENTRY *StreamSubData)(GLenum,ptrdiff_t,ptrdiff_t,const void *);
@@ -21,6 +24,7 @@ typedef struct VertexStream {
     uint64_t uploads,bytes,rotations,waits;
 } VertexStream;
 static VertexStream s_vertex_stream[3]; /* flat, textured, upload/copy quad */
+static VertexStream s_unpack_stream; /* immutable native texture upload bytes */
 static StreamStorage s_stream_storage;
 static StreamMap s_stream_map;
 static StreamSubData s_stream_subdata;
@@ -68,26 +72,24 @@ static void vertex_stream_layout(int kind,size_t offset,int initialize) {
         p_glVertexAttribPointer(i,sizes[kind][i],GL_FLOAT,GL_FALSE,stride,
             (const void *)(uintptr_t)(offset+positions[kind][i]*sizeof(float)));
 }
-static void vertex_stream_upload(int kind,const void *data,size_t bytes) {
-    VertexStream *stream=&s_vertex_stream[kind];
+static size_t buffer_stream_upload(VertexStream *stream,GLenum target,GLuint buffer,
+                                  size_t segment_bytes,const void *data,size_t bytes) {
     vertex_stream_load();
     if(!stream->initialized) {
-        stream->buffer=kind==0?s_geo_vbo:kind==1?s_tex_vbo:s_blit_vbo;
-        stream->segment_bytes=s_stream_test_segment_bytes?s_stream_test_segment_bytes:
-            (kind==1?4u*1024u*1024u:1024u*1024u);
-        stream->binding=s_stream_bindings;
-        p_glBindBuffer(PSXGL_ARRAY_BUFFER,stream->buffer);
+        stream->buffer=buffer;
+        stream->segment_bytes=segment_bytes;
+        p_glBindBuffer(target,stream->buffer);
         size_t capacity=stream->segment_bytes*VERTEX_STREAM_SEGMENTS;
         if(s_stream_persistent) {
             const GLbitfield access=0x0002|0x0040|0x0080; /* WRITE,PERSISTENT,COHERENT */
-            s_stream_storage(PSXGL_ARRAY_BUFFER,(ptrdiff_t)capacity,NULL,access);
-            stream->mapped=s_stream_map(PSXGL_ARRAY_BUFFER,0,(ptrdiff_t)capacity,access);
+            s_stream_storage(target,(ptrdiff_t)capacity,NULL,access);
+            stream->mapped=s_stream_map(target,0,(ptrdiff_t)capacity,access);
             if(!stream->mapped) { fprintf(stderr,"psxrecomp: persistent vertex mapping failed\n");abort(); }
-        } else p_glBufferData(PSXGL_ARRAY_BUFFER,(ptrdiff_t)capacity,NULL,PSXGL_STREAM_DRAW);
-        vertex_stream_layout(kind,0,1);stream->initialized=1;
+        } else p_glBufferData(target,(ptrdiff_t)capacity,NULL,PSXGL_STREAM_DRAW);
+        stream->initialized=1;
     }
     if(bytes>stream->segment_bytes) { fprintf(stderr,"psxrecomp: vertex batch exceeds stream segment\n");abort(); }
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER,stream->buffer);
+    p_glBindBuffer(target,stream->buffer);
     if(bytes>stream->segment_bytes-stream->used) {
         stream->fence[stream->segment]=p_glFenceSync(0x9117 /* GPU_COMMANDS_COMPLETE */,0);
         if(!stream->fence[stream->segment])abort();
@@ -105,20 +107,32 @@ static void vertex_stream_upload(int kind,const void *data,size_t bytes) {
     }
     const size_t offset=stream->segment*stream->segment_bytes+stream->used;
     if(stream->mapped)memcpy(stream->mapped+offset,data,bytes);
-    else s_stream_subdata(PSXGL_ARRAY_BUFFER,(ptrdiff_t)offset,(ptrdiff_t)bytes,data);
-    vertex_stream_layout(kind,offset,0);
+    else s_stream_subdata(target,(ptrdiff_t)offset,(ptrdiff_t)bytes,data);
     stream->used+=(bytes+63u)&~(size_t)63u;
     ++stream->uploads;stream->bytes+=bytes;
+    return offset;
+}
+static void vertex_stream_upload(int kind,const void *data,size_t bytes) {
+    VertexStream *stream=&s_vertex_stream[kind];
+    const int initialize=!stream->initialized;
+    const GLuint buffer=kind==0?s_geo_vbo:kind==1?s_tex_vbo:s_blit_vbo;
+    const size_t segment_bytes=s_stream_test_segment_bytes?s_stream_test_segment_bytes:
+        (kind==1?4u*1024u*1024u:1024u*1024u);
+    const size_t offset=buffer_stream_upload(stream,PSXGL_ARRAY_BUFFER,buffer,segment_bytes,data,bytes);
+    stream->binding=s_stream_bindings;
+    vertex_stream_layout(kind,offset,initialize);
 }
 static void vertex_stream_reset(void) {
-    for(unsigned k=0;k<3;++k) {
-        VertexStream *stream=&s_vertex_stream[k];
+    for(unsigned k=0;k<4;++k) {
+        VertexStream *stream=k<3?&s_vertex_stream[k]:&s_unpack_stream;
+        const GLenum target=k<3?PSXGL_ARRAY_BUFFER:PSXGL_PIXEL_UNPACK_BUFFER;
         for(unsigned i=0;i<VERTEX_STREAM_SEGMENTS;++i)
             if(stream->fence[i])p_glDeleteSync(stream->fence[i]);
         if(stream->mapped) {
-            p_glBindBuffer(PSXGL_ARRAY_BUFFER,stream->buffer);
-            p_glUnmapBuffer(PSXGL_ARRAY_BUFFER);
+            p_glBindBuffer(target,stream->buffer);
+            p_glUnmapBuffer(target);
         }
     }
-    memset(s_vertex_stream,0,sizeof s_vertex_stream);s_stream_loaded=0;
+    memset(s_vertex_stream,0,sizeof s_vertex_stream);
+    memset(&s_unpack_stream,0,sizeof s_unpack_stream);s_stream_loaded=0;
 }

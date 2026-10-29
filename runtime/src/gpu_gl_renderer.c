@@ -3430,29 +3430,7 @@ static const HiwTile *hiw_ensure(int x0, int x1) {
 }
 
 /* ---- coherency: hr FBO -> raw mirror (pack) ------------------------------ */
-#ifndef PSXGL_PIXEL_UNPACK_BUFFER
-#define PSXGL_PIXEL_UNPACK_BUFFER 0x88EC
-#endif
 static GLuint s_raw_pbo = 0;
-/* On by default only on macOS, where the stall was measured (Apple's GL on
- * Metal); elsewhere opt-in until there is AMD/NVIDIA/Intel data (an AMD iGPU
- * on Windows showed no stall and no change). PSX_GL_PBO_UPLOAD=0/1 overrides
- * it on any platform. */
-#if defined(__APPLE__)
-#define PSXGL_PBO_UPLOAD_DEFAULT 1
-#else
-#define PSXGL_PBO_UPLOAD_DEFAULT 0
-#endif
-static int raw_upload_pbo_on(void) {
-    static int env = -1;
-    if (env < 0) {
-        const char *e = getenv("PSX_GL_PBO_UPLOAD");
-        env = (e && e[0]) ? (e[0] != '0') : PSXGL_PBO_UPLOAD_DEFAULT;
-    }
-    if (!env) return 0;
-    if (!s_raw_pbo) p_glGenBuffers(1, &s_raw_pbo);
-    return s_raw_pbo != 0;
-}
 static void pack_flush(void) {
     if (!s_raster_ok || !s_pack_dirty.set) return;
     /* A generated frame draws into its own surfaces: the raw mirror keeps
@@ -3471,26 +3449,18 @@ static void pack_flush(void) {
         p_glActiveTexture(PSXGL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, s_raw_tex);
         glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-        if (raw_upload_pbo_on()) {
-            /* Through an orphaned pixel-unpack buffer: the copy into a
-             * texture the GPU is still sampling is queued on the GPU, where
-             * a client-memory upload makes the driver wait for those draws
-             * (Apple's GL: GLDShareGroupRec::waitUsage, about 40 % of the
-             * render thread's work in an R4 race with the HD HUD). Same
-             * bytes, same order. PSX_GL_PBO_UPLOAD=0 for the direct path. */
-            const size_t rows = (size_t)(y + h - 1) * VRAM_W + (size_t)x + (size_t)w;
-            const size_t first = (size_t)y * VRAM_W + (size_t)x;
-            const size_t bytes = (rows - first) * sizeof(uint16_t);
-            p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER, s_raw_pbo);
-            p_glBufferData(PSXGL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)bytes,
-                           s_vram + first, PSXGL_STREAM_DRAW);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, PSXGL_RED_INTEGER,
-                            GL_UNSIGNED_SHORT, (const void *)0);
-            p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER, 0);
-        } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, PSXGL_RED_INTEGER,
-                           GL_UNSIGNED_SHORT, s_vram + (size_t)y * VRAM_W + x);
-        }
+        /* Native inputs remain immutable in the upload ring until the GPU
+         * has consumed them. The same persistent/fixed-storage contract as
+         * vertex streams replaces both driver-managed orphaning and client
+         * memory uploads into a texture still being sampled. */
+        if(!s_raw_pbo)p_glGenBuffers(1,&s_raw_pbo);
+        const size_t first=(size_t)y*VRAM_W+x;
+        const size_t bytes=((size_t)(h-1)*VRAM_W+w)*sizeof(uint16_t);
+        const size_t offset=buffer_stream_upload(&s_unpack_stream,PSXGL_PIXEL_UNPACK_BUFFER,
+            s_raw_pbo,VRAM_W*VRAM_H*sizeof(uint16_t),s_vram+first,bytes);
+        glTexSubImage2D(GL_TEXTURE_2D,0,x,y,w,h,PSXGL_RED_INTEGER,
+            GL_UNSIGNED_SHORT,(const void *)(uintptr_t)offset);
+        p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER,0);
         glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
         return;
     }
@@ -5888,8 +5858,17 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
 /* VRAM->VRAM copy: blit the source region to the scratch texture (resolves
  * overlap), then draw it back at the destination through the BLIT program so
  * mask set/check and the stencil mirror apply, exactly like sw_copy_rect. */
-static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
-                              int sx,int sy,int dx,int dy,int w,int h) {
+typedef struct GlCopyRegion {
+    GLuint fbo;
+    int x,y,w,h,scale;
+} GlCopyRegion;
+
+/* Gather enhanced source regions before writing any destination. A copy may
+ * cross independently allocated RT tiles or overlap its own source. Sources
+ * are ordered back to front; the caller supplies complete coverage (native
+ * seed first, then any retained enhanced regions). */
+static void gpu_copy_rect_regions(const GlCopyRegion *sources,int source_count,
+                                 int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -5912,13 +5891,20 @@ static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
      * high-resolution window stages its S-scaled source in a scratch of its
      * own (hiw_mirror_copy), so this one never grows past the hr surface. */
     if (!scratch_ensure(w * S, h * S)) return;
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, source_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer((sx-source_x)*S,(sy-source_y)*S,
-                        (sx+w-source_x)*S,(sy+h-source_y)*S,
-                        0, 0, w*S, h*S,
-                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    for(int i=0;i<source_count;++i) {
+        const GlCopyRegion *r=sources+i;
+        int x0=sx>r->x?sx:r->x,y0=sy>r->y?sy:r->y;
+        int x1=sx+w<r->x+r->w?sx+w:r->x+r->w;
+        int y1=sy+h<r->y+r->h?sy+h:r->y+r->h;
+        if(x1<=x0 || y1<=y0)continue;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,r->fbo);
+        p_glBlitFramebuffer((x0-r->x)*r->scale,(y0-r->y)*r->scale,
+                            (x1-r->x)*r->scale,(y1-r->y)*r->scale,
+                            (x0-sx)*S,(y0-sy)*S,(x1-sx)*S,(y1-sy)*S,
+                            GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    }
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 
@@ -5953,6 +5939,14 @@ static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
         s_gpu_dirty = 1;
     coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
     coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+}
+
+static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
+                              int sx,int sy,int dx,int dy,int w,int h) {
+    const GlCopyRegion source={source_fbo,source_x,source_y,
+        source_fbo==s_hr_fbo?s_hr_width:VRAM_W-source_x,
+        source_fbo==s_hr_fbo?s_hr_height:VRAM_H-source_y,s_hr_scale};
+    gpu_copy_rect_regions(&source,1,sx,sy,dx,dy,w,h);
 }
 
 static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
@@ -6729,12 +6723,16 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
     return 1;
 }
 
-/* A new hr surface (colour texture, depth-stencil RB, FBO) at scale S for a
- * dynamic-resolution step, depth and stencil cleared. 0 on failure (nothing
- * left allocated). */
-static int hr_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
+/* Allocate exactly one enhanced region, with no implicit VRAM-sized extent.
+ * Output targets and RT tiles share the same complete colour/depth/stencil
+ * ownership and failure cleanup. No allocation can silently lower scale. */
+static int raster_surface_alloc(int width,int height,int S,
+                                GLuint *tex,GLuint *rb,GLuint *fbo) {
+    *tex=*rb=*fbo=0;
+    if(width<=0 || height<=0 || S<=0 || width>INT_MAX/S || height>INT_MAX/S)return 0;
     while (glGetError() != GL_NO_ERROR) {}
-    int hw = VRAM_W * S, hh = VRAM_H * S;
+    int hw=width*S,hh=height*S;
+    if(s_gl_max_dim>0 && (hw>s_gl_max_dim || hh>s_gl_max_dim))return 0;
     *tex = make_tex(GL_RGBA8, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE);
     p_glGenRenderbuffers(1, rb);
     p_glBindRenderbuffer(PSXGL_RENDERBUFFER, *rb);
@@ -6747,8 +6745,11 @@ static int hr_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
         glDisable(GL_SCISSOR_TEST);
         glClearStencil(0);
         glClearDepth(1.0);
+        glClearColor(0,0,0,0);
         glStencilMask(0xFF);
-        glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glDepthMask(GL_TRUE);
+        glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
         ok = glGetError() == GL_NO_ERROR;
     }
@@ -6777,9 +6778,9 @@ static void free_hr_targets(void) {
  * surfaces as GL_INVALID_VALUE or GL_OUT_OF_MEMORY, not always as an
  * incomplete FBO). */
 static int alloc_hr_targets(int S) {
-    while (glGetError() != GL_NO_ERROR) {}
     int hw = VRAM_W * S, hh = VRAM_H * S;
-    s_hr_tex = make_tex(GL_RGBA8, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE);
+    s_hr_alloc=0;
+    if(!raster_surface_alloc(VRAM_W,VRAM_H,S,&s_hr_tex,&s_hr_rb,&s_hr_fbo))return 0;
     /* Copy/stencil scratch. Up to 2x it covers the whole surface as before
      * (<= 8 MiB); above that it starts at one tile and grows to the largest
      * copy on demand (scratch_ensure), instead of costing 4 MiB*S^2 up front. */
@@ -6789,12 +6790,7 @@ static int alloc_hr_targets(int S) {
         s_scratch_h = hh < GL_SCRATCH_TILE ? hh : GL_SCRATCH_TILE;
     }
     s_scratch_tex = make_tex(GL_RGBA8, s_scratch_w, s_scratch_h, GL_RGBA, GL_UNSIGNED_BYTE);
-    p_glGenRenderbuffers(1, &s_hr_rb);
-    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, s_hr_rb);
-    p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, hw, hh);
-    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
     int ok = glGetError() == GL_NO_ERROR;
-    if (ok) ok = make_fbo(&s_hr_fbo, s_hr_tex, s_hr_rb);
     if (ok) ok = make_fbo(&s_scratch_fbo, s_scratch_tex, 0);
     if (ok) ok = glGetError() == GL_NO_ERROR;
     if (!ok) free_hr_targets();
@@ -7913,31 +7909,8 @@ static void wide_free_all(void) {
  * scale S, cleared to black with a zero stencil. 0 on failure (nothing left
  * allocated). */
 static int wide_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
-    int w = g_wide_w * S, h = VRAM_H * S;
     s_cw_fbo_creates++;
-    *tex = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
-    /* Depth-stencil RB, same as the hr FBO: the stencil carries the PSX
-     * mask-bit mirror for the wide surface, and (the hard lesson) a
-     * stencil-less FBO turns every stencil-enabled mirror draw into ~0.6ms of
-     * driver-side work — the 16:9 GL perf collapse. */
-    p_glGenRenderbuffers(1, rb);
-    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, *rb);
-    p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, w, h);
-    if (!make_fbo(fbo, *tex, *rb)) {
-        glDeleteTextures(1, tex); *tex = 0;
-        p_glDeleteRenderbuffers(1, rb); *rb = 0;
-        *fbo = 0;
-        return 0;
-    }
-    /* Clear to black so unwritten margins are clean (not stale). */
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, *fbo);
-    glDisable(GL_SCISSOR_TEST);
-    glClearColor(0, 0, 0, 0);
-    glClearStencil(0);
-    glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
-    return 1;
+    return raster_surface_alloc(g_wide_w,VRAM_H,S,tex,rb,fbo);
 }
 
 /* Lazily allocate (or find) the wide FBO+tex for base_x. Returns the FBO id, or
@@ -13024,7 +12997,7 @@ static int dyn_apply(int snew) {
      *    step down reseeds the old surface's corner in place; a step up past
      *    the old allocation is refused. */
     GLuint ntex = 0, nrb = 0, nfbo = 0;
-    if (!hr_alloc_surface(snew, &ntex, &nrb, &nfbo)) {
+    if (!raster_surface_alloc(s_hr_width,s_hr_height,snew,&ntex,&nrb,&nfbo)) {
         if (snew > s_hr_alloc) {
             s_dyn_stats.refused++;
             fprintf(stdout, "psxrecomp: dynamic resolution %dx -> %dx refused (the "
@@ -14508,7 +14481,7 @@ static int fg_surfaces_ensure(int wide) {
             s_fg_hr_fbo = s_fg_hr_tex = s_fg_hr_rb = 0;
         }
         s_fg_hr_S = 0;
-        if (!hr_alloc_surface(S, &s_fg_hr_tex, &s_fg_hr_rb, &s_fg_hr_fbo)) return 0;
+        if (!raster_surface_alloc(VRAM_W,VRAM_H,S,&s_fg_hr_tex,&s_fg_hr_rb,&s_fg_hr_fbo)) return 0;
         s_fg_hr_S = S;
         fg_surface_warm(s_fg_hr_fbo);
     }

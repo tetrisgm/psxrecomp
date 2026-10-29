@@ -14,6 +14,12 @@ extern "C" {
  * a packet retain their original order. This transport does not decide which
  * renderer commands are state, nor make incremental streams independent. */
 typedef struct FramePacketQueue FramePacketQueue;
+/* Opt-in calling-thread allocation/cleanup timing, for guest hitch attribution.
+ * Cumulative nanoseconds, never a wait on the presentation consumer. */
+typedef struct FramePacketProducerTiming {
+    uint64_t growth_ns, cleanup_ns, growth_count, growth_bytes;
+} FramePacketProducerTiming;
+void frame_packet_producer_timing(int enable,FramePacketProducerTiming *out);
 typedef struct FramePacketView {
     uint64_t sequence,epoch;
     const void *initial;

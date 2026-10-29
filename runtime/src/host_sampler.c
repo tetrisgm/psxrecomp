@@ -32,6 +32,11 @@ static volatile uint64_t s_seq;
 static uintptr_t s_image_base;
 static int s_supported;
 
+static int sampler_disabled(void) {
+    const char *value=getenv("PSX_HOST_SAMPLER");
+    return value && !strcmp(value,"0");
+}
+
 #ifndef PSX_NO_DEBUG_TOOLS
 static void record(uintptr_t pc, uintptr_t caller) {
     const uint64_t n = s_seq;
@@ -136,7 +141,7 @@ static DWORD WINAPI sampler_main(LPVOID arg) {
 }
 
 void host_sampler_start(void) {
-    if (s_supported) return;
+    if (s_supported || sampler_disabled()) return;
     s_image_base = (uintptr_t)GetModuleHandleW(NULL);
     {
         const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)s_image_base;
@@ -226,7 +231,7 @@ static void on_prof(int sig, siginfo_t *si, void *uc_) {
 }
 
 void host_sampler_start(void) {
-    if (s_supported) return;
+    if (s_supported || sampler_disabled()) return;
     Dl_info info;
     if (dladdr((void *)&host_sampler_start, &info) && info.dli_fbase)
         s_image_base = (uintptr_t)info.dli_fbase;

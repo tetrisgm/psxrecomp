@@ -70,14 +70,22 @@ static int run_scale(int scale) {
     uint16_t texels[256*64];for(unsigned i=0;i<256*64;++i)texels[i]=0x8000|((i*37)&32767);
     gr_vram_transfer_in(640,256,256,64,texels);flush_cpu_upload();
     GLuint full_fbo=s_hr_fbo,full_tex=s_hr_tex,full_rb=s_hr_rb;
-    GLuint tex=make_tex(GL_RGBA8,320*scale,240*scale,GL_RGBA,GL_UNSIGNED_BYTE),rb,fbo;
-    p_glGenRenderbuffers(1,&rb);p_glBindRenderbuffer(PSXGL_RENDERBUFFER,rb);
-    p_glRenderbufferStorage(PSXGL_RENDERBUFFER,PSXGL_DEPTH24_STENCIL8,320*scale,240*scale);
-    check(make_fbo(&fbo,tex,rb),"cropped target allocation");
-    GLuint direct_tex=make_tex(GL_RGBA8,426*scale,240*scale,GL_RGBA,GL_UNSIGNED_BYTE),direct_rb,direct_fbo;
-    p_glGenRenderbuffers(1,&direct_rb);p_glBindRenderbuffer(PSXGL_RENDERBUFFER,direct_rb);
-    p_glRenderbufferStorage(PSXGL_RENDERBUFFER,PSXGL_DEPTH24_STENCIL8,426*scale,240*scale);
-    check(make_fbo(&direct_fbo,direct_tex,direct_rb),"direct wide target allocation");
+    GLuint tex,rb,fbo,direct_tex,direct_rb,direct_fbo;
+    check(raster_surface_alloc(320,240,scale,&tex,&rb,&fbo),"cropped target allocation");
+    check(raster_surface_alloc(426,240,scale,&direct_tex,&direct_rb,&direct_fbo),"direct wide target allocation");
+    glBindTexture(GL_TEXTURE_2D,direct_tex);
+    GLint allocated_w=0,allocated_h=0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH,&allocated_w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT,&allocated_h);
+    check(allocated_w==426*scale && allocated_h==240*scale,"direct allocation contains only output pixels");
+    GLuint invalid_tex=7,invalid_rb=7,invalid_fbo=7;
+    check(!raster_surface_alloc(INT_MAX,240,2,&invalid_tex,&invalid_rb,&invalid_fbo) &&
+        !invalid_tex && !invalid_rb && !invalid_fbo,"oversized region refuses without partial allocation");
+    GLuint tile_tex[2],tile_fbo[2];
+    for(int i=0;i<2;++i) {
+        tile_tex[i]=make_tex(GL_RGBA8,160*scale,240*scale,GL_RGBA,GL_UNSIGNED_BYTE);
+        check(make_fbo(&tile_fbo[i],tile_tex[i],0),"independent RT copy tile allocation");
+    }
     size_t bytes=(size_t)320*240*scale*scale*4;
     uint8_t *reference=malloc(bytes),*cropped=malloc(bytes);
     size_t wide_bytes=(size_t)426*240*scale*scale*4;
@@ -180,6 +188,29 @@ static int run_scale(int scale) {
                 "cross-target copy translates cropped source origin");
         }
         gr_set_mask_bits(0,0);
+        /* A source straddling two enhanced allocations is gathered before
+         * the destination write; no downsample to native pixels is allowed. */
+        for(int i=0;i<2;++i) {
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,full_fbo);
+            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,tile_fbo[i]);
+            glDisable(GL_SCISSOR_TEST);
+            p_glBlitFramebuffer((x+i*160)*scale,y*scale,(x+(i+1)*160)*scale,(y+240)*scale,
+                0,0,160*scale,240*scale,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+        }
+        const GlCopyRegion tiles[2]={{tile_fbo[0],x,y,160,240,scale},
+                                     {tile_fbo[1],x+160,y,160,240,scale}};
+        s_hr_fbo=full_fbo;s_hr_tex=full_tex;s_hr_rb=full_rb;
+        s_hr_origin_x=s_hr_origin_y=0;s_hr_width=1024;s_hr_height=512;
+        gpu_copy_rect(x+144,y+60,x+100,y+180,32,16);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,full_fbo);
+        glReadPixels((x+100)*scale,(y+180)*scale,32*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,reference);
+        s_hr_fbo=fbo;s_hr_tex=tex;s_hr_rb=rb;
+        s_hr_origin_x=x;s_hr_origin_y=y;s_hr_width=320;s_hr_height=240;
+        gpu_copy_rect_regions(tiles,2,x+144,y+60,x+100,y+180,32,16);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+        glReadPixels(100*scale,180*scale,32*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+        check(!memcmp(reference,cropped,(size_t)32*16*scale*scale*4),
+            "copy gathers adjacent enhanced RT tiles without losing subpixel colour");
         /* Display extraction consumes only its requested rows, and translates
          * a cropped source without touching another framebuffer band. */
         s_hr_fbo=fbo;s_hr_tex=tex;s_hr_rb=rb;
@@ -225,6 +256,7 @@ static int run_scale(int scale) {
     check(glGetError()==GL_NO_ERROR,"cropped GL errors");
     p_glDeleteFramebuffers(1,&fbo);p_glDeleteRenderbuffers(1,&rb);glDeleteTextures(1,&tex);
     p_glDeleteFramebuffers(1,&direct_fbo);p_glDeleteRenderbuffers(1,&direct_rb);glDeleteTextures(1,&direct_tex);
+    p_glDeleteFramebuffers(2,tile_fbo);glDeleteTextures(2,tile_tex);
     free(reference);free(cropped);free(wide_reference);free(wide_cropped);free(wide_page_zero);
     gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();
     return failures?1:0;

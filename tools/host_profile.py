@@ -91,6 +91,10 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--exe", required=True)
     ap.add_argument("--frames", type=int, default=0)
+    ap.add_argument("--frame-lo", type=int, default=-1,
+                    help="first absolute guest frame, inclusive (e.g. a recorded hitch)")
+    ap.add_argument("--frame-hi", type=int, default=-1,
+                    help="last absolute guest frame, inclusive")
     ap.add_argument("--since", type=int, default=-1)
     ap.add_argument("--pass", dest="in_pass", type=int, default=-1)
     ap.add_argument("--top", type=int, default=40)
@@ -102,6 +106,10 @@ def main():
     kw = {"top": 400}
     if a.frames > 0:
         kw["frames"] = a.frames
+    if a.frame_lo >= 0:
+        kw["frame_lo"] = a.frame_lo
+    if a.frame_hi >= 0:
+        kw["frame_hi"] = a.frame_hi
     if a.since >= 0:
         kw["since"] = a.since
     if a.in_pass >= 0:

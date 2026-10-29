@@ -1,6 +1,7 @@
 ﻿#include "audio_sync.h"
 #include "audio_catchup.h"
 #include "native_raster.h"
+#include "frame_packet.h"
 /* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
@@ -4652,6 +4653,9 @@ struct MainCadenceStats {
     unsigned stage = 0; /* guest, frontend, packet publication, epilogue, pacing */
     uint64_t return_previous=0, return_max=0, return_over20=0;
     uint64_t native_submit=0,native_sync=0,worst_submit=0,worst_sync=0;
+    uint64_t worst_end=0;
+    uint64_t worst_frame=0;
+    FramePacketProducerTiming packet_timing={},worst_packet_timing={};
 };
 static MainCadenceStats s_main_cadence;
 static uint64_t main_cadence_cpu() {
@@ -4689,6 +4693,8 @@ static void main_cadence_frame() {
     const uint64_t cpu = main_cadence_cpu();
     uint64_t submit=0,sync=0;
     native_raster_producer_timing(1,&submit,&sync);
+    FramePacketProducerTiming packet_timing;
+    frame_packet_producer_timing(1,&packet_timing);
     if (s_main_cadence.previous && now >= s_main_cadence.previous) {
         const uint64_t elapsed = now - s_main_cadence.previous;
         ++s_main_cadence.intervals;
@@ -4699,13 +4705,21 @@ static void main_cadence_frame() {
             memcpy(s_main_cadence.worst_ticks,s_main_cadence.stage_ticks,sizeof s_main_cadence.worst_ticks);
             s_main_cadence.worst_cpu=cpu-s_main_cadence.previous_cpu;
             s_main_cadence.worst_index=s_main_cadence.intervals;
+            s_main_cadence.worst_end=now;
+            s_main_cadence.worst_frame=s_frame_count;
             s_main_cadence.worst_submit=submit-s_main_cadence.native_submit;
             s_main_cadence.worst_sync=sync-s_main_cadence.native_sync;
+            const auto &previous=s_main_cadence.packet_timing;
+            s_main_cadence.worst_packet_timing={packet_timing.growth_ns-previous.growth_ns,
+                packet_timing.cleanup_ns-previous.cleanup_ns,
+                packet_timing.growth_count-previous.growth_count,
+                packet_timing.growth_bytes-previous.growth_bytes};
         }
     }
     s_main_cadence.previous = now;
     s_main_cadence.previous_cpu=cpu;
     s_main_cadence.native_submit=submit;s_main_cadence.native_sync=sync;
+    s_main_cadence.packet_timing=packet_timing;
     memset(s_main_cadence.stage_ticks,0,sizeof s_main_cadence.stage_ticks);
 }
 static void main_cadence_pace(uint64_t now) {
@@ -4741,11 +4755,15 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         "\"worst_guest_ms\":%.3f,\"worst_frontend_ms\":%.3f,\"worst_packet_ms\":%.3f,"
         "\"worst_epilogue_ms\":%.3f,\"worst_pacer_ms\":%.3f,"
         "\"return_max_ms\":%.3f,\"return_over20\":%llu,"
-        "\"worst_native_submit_ms\":%.3f,\"worst_native_sync_ms\":%.3f",
+        "\"worst_native_submit_ms\":%.3f,\"worst_native_sync_ms\":%.3f,\"worst_end_ns\":%llu,"
+        "\"worst_alloc_ms\":%.3f,\"worst_cleanup_ms\":%.3f,\"worst_alloc_count\":%llu,\"worst_alloc_bytes\":%llu,\"worst_frame\":%llu",
         (unsigned long long)s.over20,(unsigned long long)s.worst_index,s.worst_cpu*.0001,
         s.worst_ticks[0]*ms,s.worst_ticks[1]*ms,s.worst_ticks[2]*ms,
         s.worst_ticks[3]*ms,s.worst_ticks[4]*ms,s.return_max*ms,(unsigned long long)s.return_over20,
-        s.worst_submit*1e-6,s.worst_sync*1e-6);
+        s.worst_submit*1e-6,s.worst_sync*1e-6,(unsigned long long)(s.worst_end*(1e9/freq)),
+        s.worst_packet_timing.growth_ns*1e-6,s.worst_packet_timing.cleanup_ns*1e-6,
+        (unsigned long long)s.worst_packet_timing.growth_count,(unsigned long long)s.worst_packet_timing.growth_bytes,
+        (unsigned long long)s.worst_frame);
 }
 
 static bool runtime_perf_parse_window(const char *text, uint64_t *start,
@@ -4850,7 +4868,7 @@ static void runtime_perf_bench_tick(uint64_t now) {
     }
     if (s_frame_count != g_runtime_perf.bench_end_frame) return;
 
-    char cadence[768];psx_debug_main_cadence_json(0,cadence,sizeof cadence);
+    char cadence[1280];psx_debug_main_cadence_json(0,cadence,sizeof cadence);
     std::fprintf(stdout,"[BENCH_CADENCE] {%s}\n",cadence);
     RuntimePerfSnapshot end = runtime_perf_snapshot(now);
     const RuntimePerfSnapshot &start = g_runtime_perf.bench_start;

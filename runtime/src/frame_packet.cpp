@@ -4,10 +4,30 @@
 #include <vector>
 #include <memory>
 #include <deque>
+#include <chrono>
 
 namespace {
+thread_local bool timing_enabled=false;
+thread_local FramePacketProducerTiming timing={};
+struct GrowthTiming {
+    std::chrono::steady_clock::time_point start;
+    bool enabled;
+    GrowthTiming():enabled(timing_enabled) { if(enabled)start=std::chrono::steady_clock::now(); }
+    ~GrowthTiming() { if(enabled) {
+        timing.growth_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now()-start).count();
+        ++timing.growth_count;
+    } }
+};
 /* Match RtCmd's 16-byte payload alignment, including after vector growth. */
-struct alignas(RT_ALIGN) Block { unsigned char bytes[RT_ALIGN]; };
+struct alignas(RT_ALIGN) Block {
+    unsigned char bytes[RT_ALIGN];
+    /* Every published seed/payload byte is supplied by the producer and
+     * record padding is cleared explicitly. History retains old storage,
+     * so vector growth can occur every tick: value-initializing each new
+     * block would write the complete stream once before writing it again. */
+    Block() noexcept {}
+};
 struct Storage {
     size_t attachment_bytes=0;
     size_t initial_bytes=0,record_bytes=0;
@@ -15,7 +35,12 @@ struct Storage {
     void *attachment=nullptr;
     void (*dispose)(void*)=nullptr;
     void clear_attachment() {
-        if(dispose) dispose(attachment);
+        if(dispose) {
+            const auto start=timing_enabled?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            dispose(attachment);
+            if(timing_enabled)timing.cleanup_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now()-start).count();
+        }
         attachment=nullptr;dispose=nullptr;
     }
     ~Storage() { clear_attachment(); }
@@ -26,6 +51,18 @@ struct Packet {
     std::shared_ptr<Storage> data;
 };
 size_t blocks(size_t bytes) { return bytes/RT_ALIGN+(bytes%RT_ALIGN!=0); }
+void grow(std::vector<Block>& data,size_t needed) {
+    if(data.size()>=needed)return;
+    if(data.capacity()>=needed) { data.resize(needed);return; }
+    GrowthTiming watch;
+    const size_t previous=data.capacity();
+    data.resize(needed);
+    if(timing_enabled)timing.growth_bytes+=(data.capacity()-previous)*RT_ALIGN;
+}
+}
+extern "C" void frame_packet_producer_timing(int enable,FramePacketProducerTiming *out) {
+    timing_enabled=enable!=0;
+    if(out)*out=timing;
 }
 struct FramePacketQueue {
     PsxFrameMailbox<Packet> mailbox;
@@ -48,12 +85,12 @@ extern "C" int frame_packet_reserve_initial(FramePacketQueue *q,uint64_t sequenc
     if(!q || q->open) return 0;
     q->open=true;q->valid=false;q->command_sequence=0;
     auto &slot=q->mailbox.writing();
-    try { if(!slot.data || !slot.data.unique()) slot.data=std::make_shared<Storage>(); }
+    try { if(!slot.data || !slot.data.unique()) { GrowthTiming watch;slot.data=std::make_shared<Storage>(); } }
     catch(...) { return 0; }
     auto &p=*slot.data;
     p.clear_attachment();p.attachment_bytes=0;
     if(bytes>q->initial_limit) return 0;
-    try { p.initial.resize(blocks(bytes)); } catch(...) { return 0; }
+    try { grow(p.initial,blocks(bytes)); } catch(...) { return 0; }
     slot.sequence=sequence;slot.epoch=q->epoch.load(std::memory_order_relaxed);
     p.initial_bytes=bytes;p.record_bytes=0;
     q->valid=true;
@@ -86,7 +123,7 @@ extern "C" void *frame_packet_append(FramePacketQueue *q,uint16_t op,uint16_t fl
     }
     const size_t offset=p.record_bytes/RT_ALIGN;
     const size_t needed=offset+size/RT_ALIGN;
-    try { if(p.records.size()<needed) p.records.resize(needed); } catch(...) { q->valid=false;return nullptr; }
+    try { grow(p.records,needed); } catch(...) { q->valid=false;return nullptr; }
     auto *cmd=reinterpret_cast<RtCmd *>(p.records.data()+offset);
     *cmd=RtCmd{uint32_t(size),op,flags,bytes,q->command_sequence++};
     /* Retain allocated storage between frames; only alignment padding needs
@@ -127,7 +164,7 @@ extern "C" int frame_packet_append_records(FramePacketQueue *q,const void *recor
         at+=command.size;
     }
     const size_t offset=p.record_bytes/RT_ALIGN,needed=offset+bytes/RT_ALIGN;
-    try { if(p.records.size()<needed) p.records.resize(needed); } catch(...) { return 0; }
+    try { grow(p.records,needed); } catch(...) { return 0; }
     if(bytes) std::memcpy(p.records.data()+offset,source,bytes);
     for(size_t at=offset;at<needed;) {
         auto* command=reinterpret_cast<RtCmd*>(p.records.data()+at);

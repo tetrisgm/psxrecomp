@@ -22,7 +22,9 @@ typedef struct HostSample {
                           the executable, its innermost exe caller (rva), else 0 */
 } HostSample;
 
-/* Start sampling the calling thread (the emulation thread). Idempotent. */
+/* Start sampling the calling thread (the emulation thread). Idempotent.
+ * PSX_HOST_SAMPLER=0 suppresses diagnostic suspension for overhead comparisons.
+ * Production builds never start the sampler. */
 void host_sampler_start(void);
 /* Windows: when PSX_HOST_SAMPLER_THREAD equals `name`, sample the calling
  * thread from now on ("render": the render thread). No-op elsewhere. */
