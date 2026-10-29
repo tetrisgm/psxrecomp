@@ -80,3 +80,8 @@ attachments, immutable held history, reset, source matching and shared retiring
 edges. Sampler, presenter, HD context and hidden GL packet fixtures also pass.
 Performance acceptance awaits the exclusive 60-second A/B measurements recorded
 in R4's FRAME_INTERPOLATION_STATUS.md; this is not a phase-4 acceptance claim.
+
+The follow-up also leases the nine immutable transform blocks on the render
+consumer, removing a complete history copy per consumed packet. Iteration order
+and matching inputs are unchanged. The fixture releases both the source table
+and producer history before consumer matching to verify lease lifetime.

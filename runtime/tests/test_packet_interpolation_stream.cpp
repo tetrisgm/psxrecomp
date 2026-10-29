@@ -124,8 +124,9 @@ int main() {
     packet_interpolation_stream_begin(4,1);packet_interpolation_stream_table(held);
     packet_interpolation_stream_append(&source);packet_interpolation_stream_end();
     packet_interpolation_stream_begin(4,2);packet_interpolation_stream_table(held);
-    packet_interpolation_stream_append(&source);packet_interpolation_stream_end();
     packet_interpolation_transform_free(held);
+    packet_interpolation_transform(nullptr,nullptr); // producer and attachment release before consumption
+    packet_interpolation_stream_append(&source);packet_interpolation_stream_end();
     packet_interpolation_stream_json(json,sizeof json);
     assert(std::strstr(json,"\"source_matched\":3,"));
     assert(std::strstr(json,"\"source_unmatched\":0,"));

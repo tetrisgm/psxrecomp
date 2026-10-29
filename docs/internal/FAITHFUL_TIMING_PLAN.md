@@ -2247,3 +2247,11 @@ RAM-origin transport through PGXP and deterministic duplicate correspondence
 are covered by focused tests. Added frozen-pair TCP provenance inspection.
 No guest timing changes. Production cutover remains behind identity and
 visual gates; see ../PACKET_INTERPOLATION.md.
+
+2026-10-29 interpolation profiling follow-up: transform attachment allocation
+and reclamation moved to a CPU worker with bounded prepared storage and a
+nonblocking guest append/seal path. Provenance records share draw groups.
+Focused allocation/retained-history, sampler, presenter, HD context and hidden
+GL tests pass. Cumulative pair failure/admission counters added for timed
+validation. No guest instruction timing or generated code changed; exclusive
+A/B acceptance results are tracked in R4 FRAME_INTERPOLATION_STATUS.md.

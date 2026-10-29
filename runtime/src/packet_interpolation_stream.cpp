@@ -69,12 +69,13 @@ struct TransformStorage {
         if(tail-read.load(std::memory_order_acquire)==capacity) return;
         TransformBlock* block;
         if(free_blocks) {block=free_blocks;free_blocks=block->next;}
-        else {blocks.emplace_back(new TransformBlock);block=blocks.back().get();}
+        else {auto owned=std::unique_ptr<TransformBlock>(new TransformBlock);
+            block=owned.get();blocks.push_back(std::move(owned));}
         block->count=0;block->references.store(1,std::memory_order_relaxed);
         PacketTransformTable* table;
         if(free_tables) {table=free_tables;free_tables=table->next;}
         else {
-            try {tables.emplace_back(new PacketTransformTable);}
+            try {tables.push_back(std::unique_ptr<PacketTransformTable>(new PacketTransformTable));}
             catch(...) {release(block);throw;}
             table=tables.back().get();
         }
@@ -126,6 +127,7 @@ struct Stream {
     std::vector<PacketInterpolationTransform> transforms,old_transforms;
     struct Raw { PGXPProjection projection; uint64_t sequence; PGXPAffineTransform affine{};bool valid=false; };
     std::vector<Raw> history;
+    std::array<TransformBlock*,9> history_blocks{};
     std::unordered_map<uint64_t,std::vector<uint64_t>> invocations;
     std::unordered_map<uint64_t,std::unordered_map<uint64_t,std::vector<std::array<int16_t,3>>>> ordinals;
     std::unordered_map<uint64_t,std::vector<uint64_t>> model_invocations;
@@ -133,7 +135,15 @@ struct Stream {
     bool source_mode=false;
     uint64_t missing=0;
     bool failed=false;
-    ~Stream() { packet_interpolation_destroy(pair); }
+    void clear_blocks() {
+        for(auto*& block:history_blocks) {transform_storage.release(block);block=nullptr;}
+    }
+    template<class F> void each_history(F visit) const {
+        for(const auto& raw:history) visit(raw);
+        for(const auto* block:history_blocks) if(block)
+            for(size_t i=0;i<block->count;++i) visit(block->values[i]);
+    }
+    ~Stream() { clear_blocks();packet_interpolation_destroy(pair); }
 } stream;
 std::mutex stats_mutex;
 PacketInterpolationStats published{};
@@ -205,6 +215,7 @@ extern "C" void packet_interpolation_transform(const PGXPProjection *p,const PGX
     producer.block->values[producer.block->count++]={*p,affine?*affine:PGXPAffineTransform{},affine!=nullptr};
 }
 extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
+    if(producer.failed) transform_storage.misses.fetch_add(1);
     auto* result=producer.failed?nullptr:transform_storage.take();
     if(!result) {producer.failed=false;producer.block->count=0;return nullptr;}
     transform_storage.release(producer.history.front());
@@ -225,12 +236,12 @@ extern "C" size_t packet_interpolation_transform_bytes(const PacketTransformTabl
     return bytes;
 }
 extern "C" void packet_interpolation_stream_table(const PacketTransformTable *p) {
-    stream.source_mode=true;stream.history.clear();
+    stream.source_mode=true;stream.history.clear();stream.clear_blocks();
     if(!p) {stream.failed=true;return;}
-    try {for(const auto& block:p->blocks) if(block) for(size_t i=0;i<block->count;++i) {
-        const auto& v=block->values[i];
-        stream.history.push_back({v.projection,stream.sequence,v.affine,v.valid});
-    }} catch(...) {stream.failed=true;}
+    // Lease immutable blocks instead of copying nine ticks of observer data
+    // into another render-side vector for every packet.
+    stream.history_blocks=p->blocks;
+    for(auto* block:stream.history_blocks) if(block) block->references.fetch_add(1,std::memory_order_relaxed);
 }
 extern "C" void packet_interpolation_set_recorder(PacketInterpolationRecorder callback) {
     recorder.store(callback,std::memory_order_release);
@@ -310,11 +321,13 @@ static void stream_end_impl(void) {
         for(const auto& source:stream.sources) for(const auto& p:source.projection)
             if(p.interpolation_valid) groups.insert(p.transform);
         stream.transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();
-        for(const auto& raw:stream.history) if(groups.count(raw.projection.transform)) {
+        stream.each_history([&](const auto& raw) {
+            if(!groups.count(raw.projection.transform)) return;
             (void)source_identity(raw.projection,true);
             (void)model_identity(raw.projection,true);
-        }
-        for(const auto& raw:stream.history) if(groups.count(raw.projection.transform)) {
+        });
+        stream.each_history([&](const auto& raw) {
+            if(!groups.count(raw.projection.transform)) return;
             const auto& v=raw.projection;
             PacketInterpolationTransform transform{};
             transform.source=source_identity(v,false);
@@ -327,7 +340,7 @@ static void stream_end_impl(void) {
             transform.affine_valid=raw.valid;
             transform.h=v.h;transform.ofx=v.ofx;transform.ofy=v.ofy;transform.x_scale=v.x_scale;
             stream.transforms.push_back(transform);
-        }
+        });
         for(size_t i=0;i<stream.current.size();++i) {
             uint64_t identity=hash(14695981039346656037ULL,stream.sources[i].primitive_type);
             uint64_t model=7809847782465536322ULL;
@@ -428,6 +441,7 @@ extern "C" void packet_interpolation_stream_end(void) {
     }
 }
 extern "C" void packet_interpolation_stream_reset(void) {
+    stream.clear_blocks();
     stream.union_geometry.clear();stream.retiring_indices.clear();stream.retiring_endpoints.clear();
     stream.staging_addresses.clear();
     stream.transforms.clear();stream.old_transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();stream.history.clear();
