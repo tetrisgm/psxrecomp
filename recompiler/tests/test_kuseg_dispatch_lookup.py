@@ -272,7 +272,7 @@ def main():
               "bodies are named by their PC, the variant's included (§5.1): %s" % sorted(bodies))
         home = bodies["func_00010000"] + bodies["func_00010020"]
         check("cpu->gpr[31] = 0x00010010u;" in home, "the jal links a KUSEG PC")
-        check("psx_icache_fetch(cpu, 0x00010000u)" in home, "fetch tags are KUSEG")
+        check("psx_icache_fetch_compiled(cpu, 0x00010000u)" in home, "fetch tags are KUSEG")
         check(not re.search(r"0x8001[0-9A-F]{4}u", home),
               "no KSEG0 PC of the image appears in the KUSEG bodies")
         keys = [a & PHYS_MASK for a, _, _ in rows]
@@ -306,7 +306,7 @@ def main():
                   "a cached variant is the home C with the segment swapped (%s)" % v0)
             v1 = vbodies["func_%08X" % (KSEG1 | int(fn[5:], 16))]
             insns = re.findall(r"/\* 0x([0-9A-F]{8}): ", v1)
-            fetched = set(re.findall(r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)", v1))
+            fetched = set(re.findall(r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)", v1))
             check(insns and all(i in fetched and i.startswith("A") for i in insns),
                   "every instruction of a KSEG1 variant is charged its own fetch (§5.6)")
             check(not re.search(r"0x[08]001[0-9A-F]{4}u", v1),
@@ -459,7 +459,7 @@ def main():
                            re.M | re.S)
         check(body_a, "the KSEG1 image's entry is named func_A0010000")
         insns = re.findall(r"/\* 0x([0-9A-F]{8}): ", body_a.group(1))
-        fetched = set(re.findall(r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)", body_a.group(1)))
+        fetched = set(re.findall(r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)", body_a.group(1)))
         check(insns and all(i in fetched for i in insns),
               "every KSEG1 instruction is charged its own fetch (§5.6)")
 

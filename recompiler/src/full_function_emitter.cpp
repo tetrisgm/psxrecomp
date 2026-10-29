@@ -1,3 +1,4 @@
+#include "static_timing.h"
 // full_function_emitter.cpp — Phase 2 full BIOS C emitter.
 // See full_function_emitter.h for the design contract.
 
@@ -813,7 +814,7 @@ bool FullFunctionEmitter::emit_function(
         const uint32_t pc = relocate_ra(rom_addr);
         if (!psx_fetch_uncached(pc) &&
             !(block_leaders.count(rom_addr) || (pc & 0xCu) == 0)) return;
-        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch(cpu, 0x{:08X}u);\n#endif\n",
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch_compiled(cpu, 0x{:08X}u);\n#endif\n",
                            pc);
     };
 
@@ -960,6 +961,34 @@ bool FullFunctionEmitter::emit_function(
             }
             if (should_probe_pc(addr)) {
                 out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
+            }
+        }
+
+        if (per_insn_cycles && PSXStaticTiming::enabled() &&
+            !psx_fetch_uncached(relocate_ra(addr))) {
+            std::vector<uint32_t> words;
+            std::vector<std::string> bodies, precise;
+            auto scan = it;
+            for (; scan != addr_to_raw.end() && words.size() < 4; ++scan) {
+                uint32_t a = scan->first, w = scan->second;
+                if (a != addr + words.size() * 4u ||
+                    (relocate_ra(a) & ~15u) != (relocate_ra(addr) & ~15u) ||
+                    (a != addr && block_leaders.count(a)) || pending_at.count(a) ||
+                    ldd_sites.count(a - 4u) || !PSXStaticTiming::pure(w)) break;
+                auto d = PSXRecomp::MipsDecoder::decode(w, a);
+                auto tr = StrictTranslator::translate(d, relocate_ra(a));
+                if (!tr.supported || tr.is_terminator) break;
+                words.push_back(w);
+                bodies.push_back("    " + tr.c_code);
+                precise.push_back(fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n"
+                    "    /* 0x{:08X}: {:08X}  {} */\n    {}\n",
+                    psx_cyc_dep_res_mask(w), a, w, tr.comment, tr.c_code) + emit_cosim_instr(a));
+            }
+            if (words.size() >= 2) {
+                emit_icache_fetch(addr);
+                out += PSXStaticTiming::emit(words, bodies, precise);
+                std::advance(it, words.size() - 1u);
+                continue;
             }
         }
 

@@ -17154,6 +17154,8 @@ void debug_server_init(int port)
 {
     if (port > 0) s_port = port;
     {const char* enabled=getenv("PSX_DISPLAY_RING");s_display_ring_enabled=enabled && *enabled && *enabled!='0';}
+    { const char *fp = getenv("PSX_FRAME_FINGERPRINT");
+      if (fp && *fp && *fp != '0') g_debug_write_hooks |= 1u; }
     if(getenv("PSX_WTRACE_BOOT_RANGES") || getenv("PSX_RECORD_FRAME"))g_debug_write_hooks|=1u;
 
     /* Deterministic cold-boot controller probe. Unlike a TCP set_input command,

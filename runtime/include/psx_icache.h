@@ -30,6 +30,31 @@ void psx_icache_fetch_miss(CPUState *cpu, uint32_t addr);
  * `value` the stored register value (only its low byte lanes matter). */
 void psx_icache_isc_store(uint32_t biu, uint32_t addr, uint32_t value);
 
+/* Compiled fetch: the literal PC makes the tag index a constant. Replay and
+ * lazy setup remain on the shared path, including transactional shadow replay. */
+#if defined(_MSC_VER)
+static __forceinline void psx_icache_fetch_compiled(
+#elif defined(__GNUC__) || defined(__clang__)
+static inline __attribute__((always_inline)) void psx_icache_fetch_compiled(
+#else
+static inline void psx_icache_fetch_compiled(
+#endif
+CPUState *cpu, uint32_t addr) {
+#if defined(PSX_OVERLAY_DLL_BUILD)
+    /* DLLs own no cache globals; the host callback owns the transactional view. */
+    psx_icache_fetch(cpu, addr);
+#elif defined(PSX_ENABLE_BLOCK_CYCLES)
+    if (g_ls_replay_active || g_psx_icache_active < 0) {
+        psx_icache_fetch(cpu, addr);
+        return;
+    }
+    if (g_psx_icache_active && g_psx_icache_tv[(addr & 0xFFCu) >> 2] != addr)
+        psx_icache_fetch_miss(cpu, addr);
+#else
+    (void)cpu; (void)addr;
+#endif
+}
+
 /* Keep the interpreter's steady-state tag hit inside its translation unit.
  * Misses use the shared slow path, preserving exact cache evolution/timing. */
 static inline void psx_icache_fetch_interp(CPUState *cpu, uint32_t addr) {

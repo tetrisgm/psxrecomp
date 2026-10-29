@@ -176,7 +176,7 @@ def interp_program(pcs):
 # ---------------------------------------------------------------------------
 FUNC_RE = re.compile(r"^(?:static )?void \w+\(CPUState")
 LABEL_RE = re.compile(r"^label_([0-9A-F]{8}):")
-FETCH_RE = re.compile(r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)")
+FETCH_RE = re.compile(r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)")
 INSN_RE = re.compile(r"/\* (DELAY \(orphaned\) )?0x([0-9A-F]{8}): [0-9A-F]{8} ")
 
 
@@ -262,7 +262,7 @@ def bios_runs(text, problems):
     return runs
 
 
-STUB_FETCH_RE = re.compile(r"psx_icache_fetch\(cpu, addr(?: \+ (\d+)u)?\);")
+STUB_FETCH_RE = re.compile(r"psx_icache_fetch(?:_compiled)?\(cpu, addr(?: \+ (\d+)u)?\);")
 
 
 def stub_shapes(dispatch_c):
@@ -275,7 +275,7 @@ def stub_shapes(dispatch_c):
         s = body.index(name)
         e = body.find("} else", s)
         seg = body[s:e if e >= 0 else len(body)]
-        events = re.findall(r"psx_icache_fetch\(cpu, addr(?: \+ \d+u)?\);|psx_cyc_step\(", seg)
+        events = re.findall(r"psx_icache_fetch(?:_compiled)?\(cpu, addr(?: \+ \d+u)?\);|psx_cyc_step\(", seg)
         offs = [int(m.group(1) or 0) for m in STUB_FETCH_RE.finditer(seg)]
         shapes[name] = (offs, events)
     return shapes

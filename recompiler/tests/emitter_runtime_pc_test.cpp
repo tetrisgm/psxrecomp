@@ -310,7 +310,7 @@ const Site kSites[] = {
     {"link", R"(= 0x([0-9A-F]{8})u;  /\* (?:jal link|jalr link|branch-and-link))", true},
     {"cps-jal-note", R"(/\* CPS jal -> 0x([0-9A-F]{8}) \*/)", true},
     {"delay-slot-link", R"(= 0x([0-9A-F]{8});  cpu->pc = _jt_)", true},
-    {"fetch-tag", R"(psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\))", true},
+    {"fetch-tag", R"(psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\))", true},
     {"irq-resume", R"(psx_check_interrupts_at\(cpu, 0x([0-9A-F]{8})u\))", true},
     {"exit-pc", R"(cpu->pc = 0x([0-9A-F]{8})u;)", true},
     {"continuation-key", R"(case 0x([0-9A-F]{8})u:)", true},
@@ -431,9 +431,9 @@ void check_game_emitter(Mode mode) {
     // KSEG1 code segment at KSEG0 compile addresses charges exactly what the
     // same bytes compiled at KSEG1 addresses charge: a fetch per instruction.
     const auto k1_tags = constants(generate(KSEG0, KSEG1, mode),
-                                   R"(psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\))");
+                                   R"(psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\))");
     const auto k1_image_tags = constants(k1_image,
-                                         R"(psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\))");
+                                         R"(psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\))");
     check(k1_tags == k1_image_tags,
           m + ": a KSEG1 code segment does not charge like a KSEG1 image");
     std::set<uint32_t> charged(k1_tags.begin(), k1_tags.end());
@@ -442,7 +442,7 @@ void check_game_emitter(Mode mode) {
         check(charged.count(KSEG1 | (kPhys + i * 4u)) == 1,
               m + ": KSEG1 instruction +" + hex(i * 4u) + " has no fetch of its own");
     }
-    const auto k0_tags = constants(def, R"(psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\))");
+    const auto k0_tags = constants(def, R"(psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\))");
     check(k0_tags.size() < k1_tags.size(),
           m + ": the cached KSEG0 body lost the line-leader rule");
 }

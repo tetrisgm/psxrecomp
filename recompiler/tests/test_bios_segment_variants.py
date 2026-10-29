@@ -214,7 +214,7 @@ def run_lookup_harness(compiler, disp, full, tmp, name):
     entry_pc = {}
     for key, sym in re.findall(r"\{ 0x([0-9A-F]{8})u, (\w+) \}", rows.group(1)):
         text = None if "_cont_" in sym else body(full, sym)
-        m = text and re.search(r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)", text)
+        m = text and re.search(r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)", text)
         if m:
             entry_pc[key] = m.group(1)
     check({int(pc, 16) & 0xE0000000 for pc in entry_pc.values()} == {0, KSEG0, KSEG1},
@@ -306,7 +306,7 @@ def main():
               "by a conditional branch: %s" % sorted(n for n in names if n[14] in "8A"))
         check("cpu->pc = 0xA00006F8u; return;" in body(full, "OpenBIOS_func_A00012BC"),
               "a KSEG1 variant's jal keeps the KSEG1 top bits")
-        pcs = r"(?:psx_icache_fetch\(cpu, |g_debug_last_store_pc = |psx_unaligned_access" \
+        pcs = r"(?:psx_icache_fetch(?:_compiled)?\(cpu, |g_debug_last_store_pc = |psx_unaligned_access" \
               r"\(cpu, psx_addr, |psx_check_interrupts_at\(cpu, |cpu->gpr\[\d+\] = |" \
               r"cpu->pc = )0x([0-9A-F]{8})u"
         for name in sorted(want):
@@ -319,7 +319,7 @@ def main():
                   "%s bakes only its segment's kernel PCs, got %s" %
                   (name, sorted({"%08X" % v for v in window if (v & 0xE0000000) != seg})))
             insns = re.findall(r"/\* 0x([0-9A-F]{8}): [0-9A-F]{8} ", text)
-            fetches = re.findall(r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)", text)
+            fetches = re.findall(r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)", text)
             if seg == KSEG1:
                 check(len(fetches) == len(insns),
                       "%s charges a fetch per instruction (%d fetches, %d instructions)"

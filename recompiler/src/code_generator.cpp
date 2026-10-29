@@ -1,3 +1,4 @@
+#include "static_timing.h"
 #include "code_generator.h"
 #include "pgxp_hook_emitter.h"
 #include "control_flow.h"
@@ -2193,7 +2194,7 @@ std::string CodeGenerator::translate_basic_block(
             !(insn_addr == block.start_addr || (insn_addr & 0xCu) == 0 ||
               extra_labels_.count(insn_addr))) return;
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << indent << fmt::format("psx_icache_fetch(cpu, 0x{:08X}u);\n", pc);
+        ss << indent << fmt::format("psx_icache_fetch_compiled(cpu, 0x{:08X}u);\n", pc);
         ss << "#endif\n";
     };
     auto emit_cosim_instr = [&](uint32_t insn_addr, const std::string& indent) {
@@ -2319,6 +2320,32 @@ std::string CodeGenerator::translate_basic_block(
             const std::string& inote = annotations_->lookup(addr);
             if (!inote.empty())
                 ss << config_.indent << fmt::format("/* [NOTE] {} */\n", inote);
+        }
+
+        if (!is_cf && cycle_per_insn && PSXStaticTiming::enabled() &&
+            !delayed_load_active && !psx_fetch_uncached(runtime_pc(addr))) {
+            std::vector<uint32_t> words;
+            std::vector<std::string> bodies, precise;
+            for (uint32_t a = addr; a <= block.end_addr && words.size() < 4; a += 4) {
+                if ((runtime_pc(a) & ~15u) != (runtime_pc(addr) & ~15u) ||
+                    (a != addr && extra_labels_.count(a))) break;
+                auto w = exe_.read_word(a);
+                if (!w || !PSXStaticTiming::pure(*w)) break;
+                std::string body = translate_instruction(a, *w);
+                if (body.find("psx_mod_") != std::string::npos) break;
+                words.push_back(*w);
+                bodies.push_back(body);
+                precise.push_back(fmt::format(
+                    "    psx_cyc_step(cpu, 0x{:X}u);\n{}\n"
+                    "#ifdef PSX_COSIM\n    cosim_instr(0x{:08X}u);\n#endif\n",
+                    psx_cyc_dep_res_mask(*w), body, runtime_pc(a)));
+            }
+            if (words.size() >= 2) {
+                emit_pre_icache(addr, config_.indent);
+                ss << PSXStaticTiming::emit(words, bodies, precise);
+                addr += static_cast<uint32_t>(words.size()) * 4u;
+                continue;
+            }
         }
 
         if (!is_cf) {

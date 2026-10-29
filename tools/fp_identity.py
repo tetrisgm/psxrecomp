@@ -108,7 +108,7 @@ HASHES = ("mmio", "sp", "ws", "wr", "pc")
 MASK64 = (1 << 64) - 1
 RING_CAP = 32768
 OVERLAY_STATE = ("cache", "overlay_captures.json", "overlay_captures.json.d")
-DEFAULT_ENV = {"PSX_DEBUG_FMV_QUIET": "0", "PSX_OVERLAY_AUTOCOMPILE_OFF": "1"}
+DEFAULT_ENV = {"PSX_FRAME_FINGERPRINT": "1", "PSX_DEBUG_FMV_QUIET": "0", "PSX_OVERLAY_AUTOCOMPILE_OFF": "1"}
 SCHEMA = 2
 
 
