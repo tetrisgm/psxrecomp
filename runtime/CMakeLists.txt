@@ -1881,7 +1881,7 @@ if(BUILD_TESTING)
 
     # Parser fixtures use the real native authority, not a fake VRAM reader.
     add_library(gpu_fixture_native STATIC src/native_raster.cpp src/gpu_sw_renderer.c
-                src/gpu_vram_dirty.c src/packet_interpolation.cpp src/packet_interpolation_stream.cpp)
+                src/gpu_vram_dirty.c src/packet_metadata.cpp src/packet_presenter.cpp src/packet_interpolation.cpp src/packet_interpolation_stream.cpp)
     target_include_directories(gpu_fixture_native PRIVATE include)
     target_compile_features(gpu_fixture_native PRIVATE cxx_std_17)
     target_link_libraries(gpu_fixture_native PUBLIC Threads::Threads)

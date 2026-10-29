@@ -13,7 +13,9 @@ extern "C" {
 typedef struct FramePrimitiveIdentity { uint64_t object, primitive; } FramePrimitiveIdentity;
 typedef struct PacketInterpolationVertex {
     FramePrimitiveIdentity source; /* model invocation + source vertex */
+    FramePrimitiveIdentity model; /* whole model invocation, independent of vertex */
     double view[3];
+    double model_position[3];
     double h, ofx, ofy, x_scale;
     double screen[2]; /* precise packet N endpoint, including GPU transforms */
     double uv[2];
@@ -28,7 +30,10 @@ typedef struct PacketInterpolationPrimitive {
 } PacketInterpolationPrimitive;
 typedef struct PacketInterpolationTransform {
     FramePrimitiveIdentity source;
+    FramePrimitiveIdentity model; /* whole model invocation, independent of vertex */
     double view[3];
+    double affine[12]; /* row-major model to view, including translation */
+    uint32_t affine_valid;
 } PacketInterpolationTransform;
 typedef struct PacketInterpolationPacket {
     uint64_t epoch, sequence;
@@ -44,6 +49,7 @@ typedef struct PacketInterpolationStats {
     uint64_t duplicate_equal;
     uint64_t resolved_occurrence, resolved_assignment, appeared_candidates;
     uint64_t source_matched, new_source, source_unmatched, source_ambiguous, source_moving;
+    uint64_t verified_appearance, unexplained, model_reconstructed;
     int snapped;
 } PacketInterpolationStats;
 typedef struct PacketInterpolation PacketInterpolation;

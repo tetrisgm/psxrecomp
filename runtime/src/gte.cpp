@@ -1420,6 +1420,11 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0, uint32_t instr) 
                 transform=(transform^uint32_t(gte->TR[r]))*1099511628211ULL;
             }
             projection.transform=transform;
+            for(int r=0;r<3;++r) {
+                projection.translation[r]=gte->TR[r];
+                for(int c=0;c<3;++c) projection.rotation[3*r+c]=gte->RT[r][c];
+            }
+            projection.transform_valid=1;
             projection.interpolation_valid=1;
             GTE_PGXP(gte, gte_set_projection, &projection);
         }

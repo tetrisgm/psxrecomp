@@ -1,6 +1,7 @@
 #ifndef PSX_PACKET_INTERPOLATION_STREAM_H
 #define PSX_PACKET_INTERPOLATION_STREAM_H
 #include "pgxp.h"
+#include "packet_interpolation.h"
 #include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +17,15 @@ typedef struct PacketInterpolationSource {
     uint32_t spatial_mask; /* depth evidence, including missing provenance */
 } PacketInterpolationSource;
 int packet_interpolation_stream_enabled(void);
+void packet_interpolation_set_rate(unsigned hz);
+unsigned packet_interpolation_rate(void);
+void packet_interpolation_display_rate(double hz);
+size_t packet_interpolation_stream_count(void);
+int packet_interpolation_stream_snapped(void);
+int packet_interpolation_stream_sample(double t);
+const PacketInterpolationPrimitive *packet_interpolation_stream_vertex(size_t index);
+const PacketInterpolationPrimitive *packet_interpolation_stream_endpoint(size_t index);
+
 typedef struct PacketTransformTable PacketTransformTable;
 void packet_interpolation_transform(const PGXPProjection *projection);
 PacketTransformTable *packet_interpolation_transform_seal(void);

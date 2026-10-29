@@ -167,3 +167,21 @@ need proof. That run predates the final diagnostic-only `source_moving` counter;
 its gate used `--stationary` to disable motion-counter enforcement, despite
 steering input. No motion/no-pop acceptance should be inferred from that option.
 The final gate explicitly rejects stationary samples unless requested.
+
+## Presenter continuation (work in progress)
+
+The render owner now retains immutable packet leases, samples source vertices
+and replays the packet at timed output deadlines through a separate
+`packet_presenter` module. `packet_metadata` captures title-owned values on the
+producer and blends them only on the consumer; it never reads guest RAM during
+presentation. R4 wires its FPS option and camera/car metadata to these APIs.
+
+Source-model appearance classification uses source origin, matrix origin, caller
+and transform occurrence, excluding the streamed vertex ordinal. An absent
+vertex within an existing invocation is reconstructed with its retained exact
+GTE affine transform, rather than exempted as an appearance. Sampler fixtures
+cover this distinction. This expands PGXP metadata and requires fresh local
+savestates; old raw PGXP snapshots are not compatible.
+
+Runtime acceptance, no-pop captures and performance measurements are pending.
+Legacy code is retained until the generic rendered output has been checked.

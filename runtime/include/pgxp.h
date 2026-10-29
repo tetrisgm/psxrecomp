@@ -196,6 +196,9 @@ typedef struct PGXPProjection {
     uint32_t caller;
     uint32_t source_vertex, source_matrix; /* canonical RAM origins, zero if unknown */
     uint64_t transform; /* value fingerprint: invocation evidence, not temporal identity */
+    int16_t rotation[9];
+    int32_t translation[3];
+    uint32_t transform_valid;
 } PGXPProjection;
 typedef void (*PGXPTransformRecorder)(const PGXPProjection *projection);
 /* Producer-only observer, before guest culling. Private contexts never publish. */

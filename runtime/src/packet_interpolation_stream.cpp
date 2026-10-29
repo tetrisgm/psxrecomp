@@ -19,7 +19,7 @@ bool producer_failed=false;
 
 struct Stream {
     PacketInterpolation *pair=packet_interpolation_create();
-    std::vector<PacketInterpolationPrimitive> older,current;
+    std::vector<PacketInterpolationPrimitive> older,current,sampled;
     std::vector<PacketInterpolationSource> old_sources,sources;
     uint64_t old_epoch=0,old_sequence=0,epoch=0,sequence=0;
     std::vector<PacketInterpolationTransform> transforms,old_transforms;
@@ -36,6 +36,7 @@ std::mutex stats_mutex;
 PacketInterpolationStats published{};
 uint64_t published_sequence=0,published_missing=0,published_count=0;
 bool published_failed=false,published_source_mode=false;
+std::atomic<unsigned> output_rate{0},display_rate{60};
 std::atomic<bool> capture_requested{false};
 std::vector<PacketInterpolationPrimitive> captured[2];
 std::vector<PacketInterpolationSource> captured_sources[2];
@@ -115,7 +116,7 @@ extern "C" int packet_interpolation_stream_enabled(void) {
         const char *value=std::getenv("PSX_PACKET_INTERPOLATION_AUDIT");
         return value && value[0]=='1';
     }();
-    return enabled;
+    return enabled || output_rate.load(std::memory_order_relaxed)!=0;
 }
 extern "C" void packet_interpolation_stream_begin(uint64_t epoch,uint64_t sequence) {
     stream.epoch=epoch;stream.sequence=sequence;stream.current.clear();stream.sources.clear();
@@ -132,7 +133,13 @@ extern "C" void packet_interpolation_stream_append(const PacketInterpolationSour
             stream.history.push_back({v,stream.sequence});
             PacketInterpolationTransform transform{};
             transform.source=source_identity(v,true);
-            for(unsigned d=0;d<3;++d) transform.view[d]=v.view[d];
+            transform.model={transform.source.object,transform.source.primitive>>32};
+            for(unsigned d=0;d<3;++d) {
+                transform.view[d]=v.view[d];
+                for(unsigned k=0;k<3;++k) transform.affine[4*d+k]=double(v.rotation[3*d+k])/4096.0;
+                transform.affine[4*d+3]=v.translation[d];
+            }
+            transform.affine_valid=v.transform_valid;
             stream.transforms.push_back(transform);
         } catch(...) {stream.failed=true;}
         return;
@@ -153,7 +160,7 @@ extern "C" void packet_interpolation_stream_append(const PacketInterpolationSour
         b=hash(b,v.caller);
         auto& out=p.vertex[i];
 
-        for(unsigned d=0;d<3;++d) out.view[d]=v.view[d];
+        for(unsigned d=0;d<3;++d) {out.view[d]=v.view[d];out.model_position[d]=v.model[d];}
         out.h=v.h;out.ofx=v.ofx;out.ofy=v.ofy;out.x_scale=v.x_scale;
         out.screen[0]=s->x[i];out.screen[1]=s->y[i];
     }
@@ -178,11 +185,21 @@ static void stream_end_impl(void) {
             const auto& v=raw.projection;
             PacketInterpolationTransform transform{};
             transform.source=source_identity(v,true);
-            for(unsigned d=0;d<3;++d) transform.view[d]=v.view[d];
+            transform.model={transform.source.object,transform.source.primitive>>32};
+            for(unsigned d=0;d<3;++d) {
+                transform.view[d]=v.view[d];
+                for(unsigned k=0;k<3;++k) transform.affine[4*d+k]=double(v.rotation[3*d+k])/4096.0;
+                transform.affine[4*d+3]=v.translation[d];
+            }
+            transform.affine_valid=v.transform_valid;
             stream.transforms.push_back(transform);
         }
         for(size_t i=0;i<stream.current.size();++i) for(unsigned j=0;j<3;++j)
+        {
             stream.current[i].vertex[j].source=source_identity(stream.sources[i].projection[j],false);
+            const auto id=stream.current[i].vertex[j].source;
+            stream.current[i].vertex[j].model={id.object,id.primitive>>32};
+        }
         stream.history.erase(std::remove_if(stream.history.begin(),stream.history.end(),[](const Stream::Raw& r) {
             return stream.sequence>r.sequence && stream.sequence-r.sequence>8;
         }),stream.history.end());
@@ -240,7 +257,7 @@ extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
     return std::snprintf(out,capacity,
         "{\"status\":\"ok\",\"mode\":\"%s\",\"sequence\":%llu,\"primitives\":%llu,"
         "\"matched\":%llu,\"unmatched\":%llu,\"disappeared\":%llu,\"ambiguous\":%llu,"
-        "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"source_moving\":%llu,\"snapped\":%d,\"failed\":%s}",
+        "\"resolved_occurrence\":%llu,\"resolved_assignment\":%llu,\"appeared_candidates\":%llu,\"invalid\":%llu,\"partial_provenance\":%llu,\"duplicate_equal\":%llu,\"source_matched\":%llu,\"new_source\":%llu,\"source_unmatched\":%llu,\"source_ambiguous\":%llu,\"source_moving\":%llu,\"verified_appearance\":%llu,\"unexplained\":%llu,\"model_reconstructed\":%llu,\"snapped\":%d,\"failed\":%s}",
         published_source_mode?"vertex_source_audit":"candidate_audit",
         (unsigned long long)published_sequence,(unsigned long long)published_count,
         (unsigned long long)published.matched,(unsigned long long)published.unmatched,
@@ -249,7 +266,7 @@ extern "C" int packet_interpolation_stream_json(char *out,size_t capacity) {
         (unsigned long long)published.appeared_candidates,(unsigned long long)published.invalid,(unsigned long long)published_missing,
         (unsigned long long)published.duplicate_equal,
         (unsigned long long)published.source_matched,(unsigned long long)published.new_source,
-        (unsigned long long)published.source_unmatched,(unsigned long long)published.source_ambiguous,(unsigned long long)published.source_moving,published.snapped,published_failed?"true":"false");
+        (unsigned long long)published.source_unmatched,(unsigned long long)published.source_ambiguous,(unsigned long long)published.source_moving,(unsigned long long)published.verified_appearance,(unsigned long long)published.unexplained,(unsigned long long)published.model_reconstructed,published.snapped,published_failed?"true":"false");
 }
 
 extern "C" void packet_interpolation_capture_request(void) {
@@ -284,3 +301,21 @@ extern "C" int packet_interpolation_capture_json(char *out,size_t capacity,int o
     }
     append("%s","]}");return used<capacity?(int)used:-1;
 }
+
+extern "C" void packet_interpolation_set_rate(unsigned hz) {output_rate.store(hz);}
+extern "C" unsigned packet_interpolation_rate(void) {unsigned rate=output_rate.load();return rate==UINT32_MAX?display_rate.load():rate;}
+extern "C" void packet_interpolation_display_rate(double hz) {if(hz>=1 && hz<=1000) display_rate.store(unsigned(hz+0.5));}
+extern "C" size_t packet_interpolation_stream_count(void) {return stream.older.size();}
+extern "C" int packet_interpolation_stream_sample(double t) {
+    try {stream.sampled.resize(stream.older.size());}
+    catch(...) {return 0;}
+    return packet_interpolation_sample(stream.pair,t,stream.sampled.data(),stream.sampled.size());
+}
+extern "C" const PacketInterpolationPrimitive *packet_interpolation_stream_vertex(size_t i) {
+    return i<stream.sampled.size()?&stream.sampled[i]:nullptr;
+}
+extern "C" const PacketInterpolationPrimitive *packet_interpolation_stream_endpoint(size_t i) {
+    return i<stream.older.size()?&stream.older[i]:nullptr;
+}
+
+extern "C" int packet_interpolation_stream_snapped(void) {return packet_interpolation_stats(stream.pair).snapped;}

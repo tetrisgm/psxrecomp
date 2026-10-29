@@ -146,7 +146,7 @@ extern "C" int frame_packet_acquire(FramePacketQueue *q,FramePacketView *view) {
     const auto *p=q->mailbox.acquire();
     if(!p) { *view={};return 0; }
     const auto &d=*p->data;
-    *view={p->sequence,p->epoch,d.initial.data(),d.initial_bytes,d.records.data(),d.record_bytes,d.attachment};
+    *view={p->sequence,p->epoch,d.initial.data(),d.initial_bytes,d.records.data(),d.record_bytes,d.attachment,&p->data};
     return 1;
 }
 extern "C" void frame_packet_release(FramePacketQueue *q) { q->mailbox.release(); }
@@ -188,3 +188,14 @@ extern "C" void frame_packet_history_branch(FramePacketQueue *q,uint64_t sequenc
         q->history_bytes-=q->history.back().data->cost()+sizeof(Packet);q->history.pop_back();
     }
 }
+
+struct FramePacketLease { std::shared_ptr<Storage> data; FramePacketView view; };
+extern "C" FramePacketLease *frame_packet_retain(const FramePacketView *view) {
+    if(!view || !view->lease) return nullptr;
+    try {
+        auto *lease=new FramePacketLease{*static_cast<const std::shared_ptr<Storage>*>(view->lease),*view};
+        lease->view.lease=&lease->data;return lease;
+    } catch(...) {return nullptr;}
+}
+extern "C" const FramePacketView *frame_packet_lease_view(const FramePacketLease *lease) {return lease?&lease->view:nullptr;}
+extern "C" void frame_packet_lease_release(FramePacketLease *lease) {delete lease;}

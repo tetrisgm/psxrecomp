@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -70,8 +71,13 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
             c->source_masks.assign(b->count,0);
             struct Entry { const PacketInterpolationTransform *value; bool ambiguous; };
             std::unordered_map<Key,Entry,Hash> table;
+            std::unordered_map<Key,Entry,Hash> models;
             for(size_t i=0;i<a->transform_count;++i) {
                 const auto& v=a->transforms[i];
+                auto model=models.emplace(Key{v.model.object,v.model.primitive},Entry{&v,false});
+                if(!model.second && v.affine_valid && model.first->second.value->affine_valid)
+                    for(unsigned d=0;d<12;++d)
+                        if(model.first->second.value->affine[d]!=v.affine[d]) model.first->second.ambiguous=true;
                 auto result=table.emplace(Key{v.source.object,v.source.primitive},Entry{&v,false});
                 if(!result.second) for(unsigned d=0;d<3;++d)
                     if(result.first->second.value->view[d]!=v.view[d]) result.first->second.ambiguous=true;
@@ -89,7 +95,31 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                         ++c->stats.invalid;++c->stats.source_unmatched;continue;
                     }
                     auto found=table.find({v.source.object,v.source.primitive});
-                    if(found==table.end()) {++c->stats.new_source;continue;}
+                    if(found==table.end()) {
+                        const auto model=models.find({v.model.object,v.model.primitive});
+                        if(model!=models.end() && !model->second.ambiguous && model->second.value->affine_valid) {
+                            // A streamed/generated vertex was not emitted last time, but
+                            // its model invocation was. Apply that invocation's exact
+                            // GTE matrix to this model-space point before interpolating.
+                            // No nearest-neighbour guess or false appearance exemption.
+                            const auto& m=*model->second.value;
+                            double distance=0;
+                            for(unsigned d=0;d<3;++d) {
+                                double value=m.affine[4*d+3];
+                                for(unsigned k=0;k<3;++k) value+=m.affine[4*d+k]*v.model_position[k];
+                                c->source_previous[i].vertex[j].view[d]=value;
+                                double delta=value-v.view[d];distance+=delta*delta;
+                            }
+                            c->source_masks[i]|=1u<<j;++c->stats.source_matched;++c->stats.model_reconstructed;
+                            if(distance>1e-12) ++c->stats.source_moving;
+                            if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) c->stats.snapped=1;
+                        } else {
+                            ++c->stats.new_source;
+                            if((v.model.object || v.model.primitive) && model==models.end()) ++c->stats.verified_appearance;
+                            else {++c->stats.unexplained;++c->stats.source_unmatched;}
+                        }
+                        continue;
+                    }
                     if(found->second.ambiguous) {++c->stats.source_ambiguous;++c->stats.source_unmatched;continue;}
                     const auto& old=*found->second.value;
                     double distance=0;
@@ -101,7 +131,7 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
                     if(!finite) {++c->stats.invalid;++c->stats.source_unmatched;continue;}
                     c->source_masks[i]|=1u<<j;++c->stats.source_matched;
                     if(distance>1e-12) ++c->stats.source_moving;
-                    if(max_motion>0 && std::sqrt(distance)>max_motion*std::max(1.0,std::abs(v.view[2]))) c->stats.snapped=1;
+                    if(max_motion>0 && std::sqrt(distance)>max_motion*std::max({1.0,std::abs(v.view[2]),v.h})) c->stats.snapped=1;
                 }
                 if(c->source_masks[i]==(1u<<p.vertices)-1) ++c->stats.matched;
             }

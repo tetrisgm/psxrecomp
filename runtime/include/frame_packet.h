@@ -21,7 +21,13 @@ typedef struct FramePacketView {
     const void *records;
     size_t record_bytes;
     const void *attachment;
+    const void *lease; /* opaque; retain only during the consumer callback */
 } FramePacketView;
+
+typedef struct FramePacketLease FramePacketLease;
+FramePacketLease *frame_packet_retain(const FramePacketView *view);
+const FramePacketView *frame_packet_lease_view(const FramePacketLease *lease);
+void frame_packet_lease_release(FramePacketLease *lease);
 
 /* Limits are per slot, with three slots total (writing, pending, reading).
  * Allocate/grow only on the producer. A failed append invalidates the whole

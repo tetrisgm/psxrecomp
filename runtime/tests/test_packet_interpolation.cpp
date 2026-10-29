@@ -27,6 +27,7 @@ int main() {
         PacketInterpolationTransform old[3]{};
         for(unsigned i=0;i<3;++i) {
             p.vertex[i].source={17,i+1};old[i].source=p.vertex[i].source;
+            p.vertex[i].model=old[i].model={9,1};
             old[i].view[0]=i;old[i].view[2]=-100;
         }
         PacketInterpolationPacket a{1,1,nullptr,0,0,old,3,1};
@@ -55,7 +56,24 @@ int main() {
         p.vertex[2].source={17,99};
         assert(packet_interpolation_pair(source,&a,&b,0));
         stats=packet_interpolation_stats(source);
-        assert(stats.source_matched==2 && stats.new_source==1 && !stats.unmatched);
+        assert(stats.source_matched==2 && stats.new_source==1 && stats.unmatched==1 && stats.unexplained==1);
+        // The invocation's retained GTE transform reconstructs a streamed
+        // point absent from its earlier vertex list, without declaring a spawn.
+        for(auto& v:old) {
+            v.affine_valid=1;v.affine[0]=v.affine[5]=v.affine[10]=1;v.affine[11]=-100;
+        }
+        p.vertex[2].model_position[0]=2;
+        assert(packet_interpolation_pair(source,&a,&b,0));
+        stats=packet_interpolation_stats(source);
+        assert(stats.model_reconstructed==1 && !stats.unexplained && !stats.new_source);
+        assert(packet_interpolation_sample(source,0.5,&result,1));
+        assert(result.vertex[2].view[0]==12 && result.vertex[2].view[2]==0);
+        p.vertex[2].model={9,2};
+        assert(packet_interpolation_pair(source,&a,&b,0));
+        stats=packet_interpolation_stats(source);
+        assert(stats.verified_appearance==1 && !stats.unexplained && !stats.unmatched);
+        assert(packet_interpolation_sample(source,0.25,&result,1));
+        assert(result.vertex[2].view[0]==p.vertex[2].view[0]);
         b.epoch=2;assert(packet_interpolation_pair(source,&a,&b,0));
         assert(packet_interpolation_stats(source).snapped);
         packet_interpolation_destroy(source);
