@@ -21,9 +21,6 @@ typedef struct FramePacketView {
     const void *records;
     size_t record_bytes;
     const void *attachment;
-    const struct FramePacketView *preroll;
-    size_t preroll_count;
-    int warmup;
 } FramePacketView;
 
 /* Limits are per slot, with three slots total (writing, pending, reading).

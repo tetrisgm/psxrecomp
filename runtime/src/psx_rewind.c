@@ -291,8 +291,11 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc) {
         psx_frontend_rewind_service(0);
         if(!wants_rewind()) break;
         uint64_t now=pt_clock_ns();
-        if(now>=next) {
-            if(rw_back(&history)) {
+        if(now>=next && rt_history_ready()) {
+            /* Stop at the common history boundary. Never restore a machine
+             * point whose enhanced packet has already left the byte budget. */
+            uint32_t target=history.count?history.edges[(history.first+history.count-1)%history.capacity].tick:0;
+            if(target && rt_history_available(target) && rw_back(&history)) {
                 if(!boot_state_load_buffer(history.image,history.size,bios,entry,cpu)) {
                     stats.failures++; held=debug_held=0; break;
                 }

@@ -21,13 +21,10 @@ struct Storage {
     ~Storage() { clear_attachment(); }
     size_t cost() const { return sizeof(Storage)+(initial.capacity()+records.capacity())*RT_ALIGN+attachment_bytes; }
 };
-struct Preroll;
 struct Packet {
     uint64_t sequence=0,epoch=0;
     std::shared_ptr<Storage> data;
-    std::shared_ptr<Preroll> preroll;
 };
-struct Preroll { std::vector<Packet> packets; };
 size_t blocks(size_t bytes) { return bytes/RT_ALIGN+(bytes%RT_ALIGN!=0); }
 }
 struct FramePacketQueue {
@@ -36,7 +33,6 @@ struct FramePacketQueue {
     bool open=false,valid=false;
     size_t history_limit=0,history_bytes=0,history_depth=0;
     std::deque<Packet> history;
-    std::vector<FramePacketView> leased_preroll;
     uint32_t command_sequence=0;
     std::atomic<uint64_t> epoch{1};
     FramePacketQueue(size_t initial,size_t records):initial_limit(initial),record_limit(records) {}
@@ -51,7 +47,7 @@ extern "C" int frame_packet_reserve_initial(FramePacketQueue *q,uint64_t sequenc
     *initial=nullptr;
     if(!q || q->open) return 0;
     q->open=true;q->valid=false;q->command_sequence=0;
-    auto &slot=q->mailbox.writing();slot.preroll.reset();
+    auto &slot=q->mailbox.writing();
     try { if(!slot.data || !slot.data.unique()) slot.data=std::make_shared<Storage>(); }
     catch(...) { return 0; }
     auto &p=*slot.data;
@@ -151,15 +147,6 @@ extern "C" int frame_packet_acquire(FramePacketQueue *q,FramePacketView *view) {
     if(!p) { *view={};return 0; }
     const auto &d=*p->data;
     *view={p->sequence,p->epoch,d.initial.data(),d.initial_bytes,d.records.data(),d.record_bytes,d.attachment};
-    q->leased_preroll.clear();
-    if(p->preroll) {
-        for(const auto &prior:p->preroll->packets) {
-            const auto &data=*prior.data;
-            q->leased_preroll.push_back({prior.sequence,p->epoch,data.initial.data(),data.initial_bytes,
-                data.records.data(),data.record_bytes,data.attachment,nullptr,0,1});
-        }
-        view->preroll=q->leased_preroll.data();view->preroll_count=q->leased_preroll.size();
-    }
     return 1;
 }
 extern "C" void frame_packet_release(FramePacketQueue *q) { q->mailbox.release(); }
@@ -190,14 +177,6 @@ extern "C" int frame_packet_history_replay(FramePacketQueue *q,uint64_t saved,ui
     if(!q || q->open)return 0;
     for(size_t i=0;i<q->history.size();i++) if(q->history[i].sequence==saved) {
         auto &slot=q->mailbox.writing();slot=q->history[i];
-        try {
-            slot.preroll=std::make_shared<Preroll>();
-            const size_t first=i>3?i-3:0;
-            for(size_t j=first;j<i;j++) {
-                auto prior=q->history[j];prior.sequence=sequence-(i-j);
-                slot.preroll->packets.push_back(prior);
-            }
-        } catch(...) { slot.preroll.reset();return 0; }
         slot.sequence=sequence;slot.epoch=q->epoch.load(std::memory_order_acquire);
         q->mailbox.publish();return 1;
     }

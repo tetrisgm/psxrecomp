@@ -99,6 +99,8 @@ void rt_history_configure(size_t depth,size_t budget);
 void rt_history_mark(uint64_t tick);
 void rt_history_reverse(int active);
 int rt_history_present(uint64_t tick);
+int rt_history_ready(void);
+int rt_history_available(uint64_t tick);
 void rt_history_branch(uint64_t tick);
 size_t rt_history_bytes(void);
 uint64_t rt_history_replays(void);

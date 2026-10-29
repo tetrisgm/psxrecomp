@@ -259,7 +259,7 @@ int rt_history_present(uint64_t tick) {
     uint64_t saved=history_sequence(tick);
     if(!owner || !saved || !frame_owner_history_has(owner,saved)) { replay_misses++;return 0; }
     rt_batch_discard();frame_owner_invalidate(owner);
-    sequence+=4;
+    ++sequence;
     int ok=frame_owner_history_replay(owner,saved,sequence);
     if(ok) { atomic_store(&published,sequence);replay_count++; }
     else replay_misses++;
@@ -278,3 +278,8 @@ uint64_t rt_history_replays(void) { return replay_count; }
 uint64_t rt_history_misses(void) { return replay_misses; }
 
 void rt_history_reverse(int active) { history_reversing=active!=0; }
+
+int rt_history_ready(void) { return !owner || atomic_load(&completed)>=atomic_load(&published); }
+int rt_history_available(uint64_t tick) {
+    return !owner || frame_owner_history_has(owner,history_sequence(tick));
+}

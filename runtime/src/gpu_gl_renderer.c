@@ -11759,7 +11759,7 @@ static void gl_swap_now(int generated);
 static int  fg_keep_real(void);      /* frame generation */
 static void fg_note_swap(uint64_t ns);
 static void gl_swap_with_osd(void) {
-    if(s_rth_packet_view && (s_rth_packet_view->warmup || !rt_packet_current(s_rth_packet_view))) return;
+    if(s_rth_packet_view && !rt_packet_current(s_rth_packet_view)) return;
     openxr_present_native(); /* Copy guest content before host-only overlays. */
     s_native_surface_pending=0; /* Hold-last/resim cannot reuse a native source. */
 #ifndef PSX_NO_DEBUG_TOOLS

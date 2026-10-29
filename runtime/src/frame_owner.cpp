@@ -105,8 +105,6 @@ struct FrameOwner {
             }
             if(has_packet) {
                 if(frame_packet_current(queue,&packet)) {
-                    for(size_t i=0;i<packet.preroll_count && frame_packet_current(queue,&packet);i++)
-                        config.execute(config.user,&packet.preroll[i]);
                     config.execute(config.user,&packet);
                     executed_epoch=packet.epoch;
                     executed_sequence=packet.sequence;

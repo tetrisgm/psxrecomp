@@ -213,6 +213,19 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- 2026-10-29, phase-5 enhanced rewind: integrate packet presenter through
+  27d6d167, preserving the ordered native checkpoint mailbox. Bound immutable
+  CPU packet history to 512 MiB and align it with native capture ticks; replay
+  each restored frame through the enhanced owner, stop at the common history
+  boundary and discard the future on release. Restore invalidates PGXP shadows
+  and derived presentation caches. Duplicated HUD cause: native-centered pixels
+  spliced into the enhanced wide image after reseeding. Revoke that equivalence
+  and use full mirroring. No guest timing or generated-code changes. Hidden GL
+  regression passes 111 checks, including retained texture provenance after
+  producer destruction and bad-splice/corrected-composite checks. R4 Release,
+  unchanged 50-shard regeneration and 31 permitted CTests pass. Live timing and
+  hold/release evidence: R4 docs/REWIND_PHASE5.md.
+
 - 2026-10-29, phase-5 latency follow-up: preallocated reverse-page pool and
   capture buffers, reusable native checkpoint tokens and partial-upload storage,
   fixed native job ring, and a CPU worker for delta comparison/eviction. The
