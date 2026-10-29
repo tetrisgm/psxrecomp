@@ -204,13 +204,15 @@ static void allocation_free_submission() {
     std::array<uint16_t,1024> upload{};
     NativeRasterCommand c{};c.op=NR_UPLOAD;c.args[2]=1024;c.args[3]=1;
     NativeRasterState state{};state.right=1023;state.bottom=511;
-    const uint32_t packet[]={0x600000ff,0,0x00010001};
+    const uint32_t packet[]={0x650000ff,100u|(100u<<16),0,0x00010001};
+    native_raster_inputs_enable(r,1);
     allocations=0;count_allocations=true;
     for(unsigned frame=0;frame<100;++frame) {
-        for(unsigned n=0;n<1000;++n)assert(native_raster_gp0(r,&state,packet,3));
+        for(unsigned n=0;n<1000;++n)assert(native_raster_gp0(r,&state,packet,4));
         upload.fill(uint16_t(frame));
         assert(native_raster_submit(r,&c,upload.data(),upload.size()));
         uint16_t result=0;native_raster_read(r,0,0,1,1,&result);assert(result==frame);
+        auto* inputs=native_raster_inputs_seal(r);assert(inputs);native_raster_inputs_destroy(inputs);
     }
     count_allocations=false;assert(allocations==0);
     native_raster_destroy(r);

@@ -9,6 +9,19 @@
 #include <cstring>
 #include <vector>
 #include <chrono>
+#include <cstdlib>
+#include <new>
+
+static thread_local bool count_allocations=false;
+static thread_local size_t allocations=0;
+void* operator new(size_t n) {
+    if(count_allocations)++allocations;
+    if(void* p=std::malloc(n?n:1))return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept {std::free(p);}
+void operator delete(void* p,size_t) noexcept {std::free(p);}
+
 
 struct Packet { uint64_t sequence=0; std::array<uint64_t,1024> words{}; };
 static void write(Packet &p,uint64_t sequence) {
@@ -176,7 +189,24 @@ static void rewind_packets() {
     frame_packet_destroy(q);assert(disposed==5);
 }
 
+static void pooled_frame_allocations() {
+    auto* q=frame_packet_create(256,4096);assert(q);
+    frame_packet_history_configure(q,8,1024*1024);
+    std::array<unsigned char,256> seed{};
+    for(unsigned n=0;n<2000;++n) {
+        if(n==100) {allocations=0;count_allocations=true;}
+        assert(frame_packet_begin(q,n,seed.data(),seed.size()));
+        auto* bytes=frame_packet_append(q,1,0,2048);assert(bytes);
+        std::memset(bytes,int(n&255),2048);
+        assert(frame_packet_publish(q));
+        FramePacketView view{};assert(frame_packet_acquire(q,&view));
+        assert(view.sequence==n);frame_packet_release(q);
+    }
+    count_allocations=false;assert(allocations==0);
+    frame_packet_destroy(q);
+}
 int main() {
+    pooled_frame_allocations();
     rewind_packets();
     test_attachments();
     test_optional_batches();

@@ -6,7 +6,6 @@
 #include <array>
 #include <atomic>
 #include "worker_event.h"
-#include <condition_variable>
 #include <cstring>
 #include <type_traits>
 #include <memory>
@@ -22,6 +21,7 @@ struct NativeInputTile {
     std::array<uint16_t,64*64> pixels;
 };
 struct NativeRasterInputs {
+    NativeRasterInputs* retired_next=nullptr;
     struct Sample {
         uint64_t source;
         std::vector<std::shared_ptr<const NativeInputTile>> tiles;
@@ -33,6 +33,50 @@ struct NativeRasterInputs {
     std::vector<Sample> samples;
     std::unordered_set<const void*> metadata_seen;
 };
+
+/* Inputs can outlive their raster and be released by presentation or guest.
+ * Reclaim nested sample/tile ownership off the guest, then reuse the envelope.
+ * The MPSC retirement stack uses embedded links: release never allocates. */
+class NativeInputPool {
+    std::atomic<NativeRasterInputs*> retired{nullptr};
+    std::mutex mutex;
+    std::vector<NativeRasterInputs*> free;
+    WorkerEvent available;
+    std::atomic<bool> stop{false};
+    std::thread worker;
+    void run() {
+        for(;;) {
+            available.wait();
+            auto* list=retired.exchange(nullptr);
+            while(list) {
+                auto* item=list;list=item->retired_next;
+                item->samples.clear();item->metadata_seen.clear();
+                item->valid=true;item->bytes=sizeof(NativeRasterInputs);item->counted.fill(0);
+                std::lock_guard<std::mutex> lock(mutex);
+                try {free.push_back(item);} catch(...) {delete item;}
+            }
+            if(stop.load())break;
+        }
+    }
+public:
+    NativeInputPool():worker(&NativeInputPool::run,this) {}
+    ~NativeInputPool() {
+        stop.store(true);available.notify();worker.join();
+        for(auto* item:free)delete item;
+    }
+    NativeRasterInputs* acquire() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(free.empty())return new NativeRasterInputs;
+        auto* item=free.back();free.pop_back();return item;
+    }
+    void release(NativeRasterInputs* item) {
+        auto* old=retired.load(std::memory_order_relaxed);
+        do {item->retired_next=old;} while(!retired.compare_exchange_weak(old,item,
+            std::memory_order_release,std::memory_order_relaxed));
+        available.notify();
+    }
+};
+static NativeInputPool& input_pool() {static NativeInputPool pool;return pool;}
 
 namespace {
 constexpr size_t vram_words = 1024 * 512;
@@ -288,6 +332,10 @@ struct NativeRaster {
             for(int x=bounds[0]/64;x<=bounds[2]/64;++x) input_tiles[y*16+x].reset();
     }
 
+    /* SC publication and parking form one order: either the consumer sees
+     * the new tail/checkpoint, or the producer sees its parked flag. Retained
+     * events cover notify-before-wait. The same protocol protects arena/slot
+     * backpressure; weakening just one side can lose a wake on weak CPUs. */
     void wake() {
         if(parked.load() && parked.exchange(false)) available.notify();
     }
@@ -304,7 +352,7 @@ struct NativeRaster {
         const uint64_t offset=arena_write%arena_words;
         const uint64_t start=offset+words>arena_words?arena_write+arena_words-offset:arena_write;
         const uint64_t end=start+words;
-        wait_space([&]{return end-arena_read.load(std::memory_order_acquire)<=arena_words;});
+        wait_space([&]{return end-arena_read.load()<=arena_words;});
         std::memcpy(arena.data()+start%arena_words,pixels,words*sizeof(uint16_t));
         job.borrowed_upload=arena.data()+start%arena_words;job.borrowed_words=words;
         job.arena_end=arena_write=end;
@@ -313,23 +361,36 @@ struct NativeRaster {
         if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore || job.borrowed_words)
             read_row_y=-1;
         const uint64_t write=tail.load(std::memory_order_relaxed);
-        wait_space([&]{return write-head.load(std::memory_order_acquire)<slots;});
+        wait_space([&]{return write-head.load()<slots;});
         job.sequence=submitted++;
         queue[write%slots]=job;
         tail.store(write+1);
         wake();
     }
+    uint64_t push_packet(const NativeRasterState& state,const uint32_t* words,size_t count) {
+        read_row_y=-1;
+        const uint64_t write=tail.load(std::memory_order_relaxed);
+        wait_space([&]{return write-head.load()<slots;});
+        auto& job=queue[write%slots];
+        job.kind=Kind::Packet;job.sequence=submitted++;
+        const uint64_t source=job.source=++next_source;
+        job.draw.state=state;
+        std::memcpy(job.draw.packet.data(),words,count*sizeof(uint32_t));
+        job.borrowed_upload=nullptr;job.borrowed_words=0;job.arena_end=0;
+        job.completion=nullptr;job.checkpoint_done=nullptr;
+        tail.store(write+1);wake();return source;
+    }
     /* The one outstanding rewind checkpoint never contends for the draw
-     * queue mutex/space. Its sequence is the boundary before the next draw.
+     * queue space. Its sequence is the boundary before the next draw.
      * Additional independent checkpoint clients retain ordinary backpressure. */
     void push_checkpoint(Job job) {
-        if(checkpoint_pending.load(std::memory_order_acquire)) {
+        if(checkpoint_pending.load()) {
             push(std::move(job));return;
         }
         if(job.borrowed_words)read_row_y=-1;
         job.sequence=submitted;
         checkpoint=std::move(job);
-        checkpoint_pending.store(true,std::memory_order_release);
+        checkpoint_pending.store(true);
         wake();
     }
     void execute(Job &job) {
@@ -380,9 +441,9 @@ struct NativeRaster {
         if (job.checkpoint_done) job.checkpoint_done->store(true,std::memory_order_release);
     }
     void service_checkpoint(uint64_t before) {
-        if(checkpoint_pending.load(std::memory_order_acquire) && checkpoint.sequence<=before) {
+        if(checkpoint_pending.load() && checkpoint.sequence<=before) {
             Job job=std::move(checkpoint);
-            checkpoint_pending.store(false,std::memory_order_release);
+            checkpoint_pending.store(false);
             execute(job);
         }
     }
@@ -396,7 +457,7 @@ struct NativeRaster {
             const uint64_t read=head.load(std::memory_order_relaxed);
             if(read==tail.load()) {
                 parked.store(true);
-                if(read!=tail.load() || checkpoint_pending.load(std::memory_order_acquire)) {
+                if(read!=tail.load() || checkpoint_pending.load()) {
                     parked.store(false);continue;
                 }
                 if(stop.load()) { parked.store(false);break; }
@@ -409,8 +470,8 @@ struct NativeRaster {
             service_checkpoint(job.sequence);
             execute(job);
             executed=job.sequence+1;
-            if(job.arena_end) arena_read.store(job.arena_end,std::memory_order_release);
-            head.store(read+1,std::memory_order_release);
+            if(job.arena_end) arena_read.store(job.arena_end);
+            head.store(read+1);
             if(producer_parked.exchange(false)) space.notify();
 
         }
@@ -459,14 +520,7 @@ extern "C" int native_raster_submit(NativeRaster *r, const NativeRasterCommand *
 extern "C" uint64_t native_raster_gp0_identified(NativeRaster *r,const NativeRasterState *state,
                                   const uint32_t *words,size_t count) {
     if(!r || !state || !words || !count || count!=packet_size(words[0]>>24)) return 0;
-    try {
-        Job job;
-        job.kind=Kind::Packet;job.draw.state=*state;
-        const uint64_t source=job.source=++r->next_source;
-        std::memcpy(job.draw.packet.data(),words,count*sizeof(uint32_t));
-        r->push(std::move(job));
-        return source;
-    } catch(...) { return 0; }
+    return r->push_packet(*state,words,count);
 }
 extern "C" int native_raster_gp0(NativeRaster *r,const NativeRasterState *state,
                                   const uint32_t *words,size_t count) {
@@ -504,17 +558,18 @@ extern "C" void native_raster_inputs_metadata_provider(NativeRaster *r,NativeRas
     },&request);
 }
 extern "C" NativeRasterInputs* native_raster_inputs_seal(NativeRaster *r) {
-    auto result=std::unique_ptr<NativeRasterInputs>(new(std::nothrow) NativeRasterInputs);
-    if(!result) return nullptr;
-    struct Request { NativeRaster* raster;NativeRasterInputs* result; } request{r,result.get()};
+    struct Request { NativeRaster* raster;NativeRasterInputs* result; } request{r,nullptr};
     native_raster_visit(r,[](void* data,const uint16_t*) {
         auto& request=*static_cast<Request*>(data);
+        try { request.result=input_pool().acquire(); } catch(...) {return;}
         std::swap(request.raster->inputs,*request.result);
         if(!request.raster->inputs_enabled) request.result->valid=false;
     },&request);
-    return result.release();
+    return request.result;
 }
-extern "C" void native_raster_inputs_destroy(NativeRasterInputs* inputs) { delete inputs; }
+extern "C" void native_raster_inputs_destroy(NativeRasterInputs* inputs) {
+    if(inputs)input_pool().release(inputs);
+}
 extern "C" int native_raster_inputs_valid(const NativeRasterInputs* inputs) { return inputs && inputs->valid; }
 extern "C" size_t native_raster_inputs_bytes(const NativeRasterInputs* inputs) { return inputs?inputs->bytes:0; }
 extern "C" int native_raster_inputs_get(const NativeRasterInputs* inputs,uint64_t source,

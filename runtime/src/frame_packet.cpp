@@ -8,7 +8,11 @@
 
 namespace {
 /* Match RtCmd's 16-byte payload alignment, including after vector growth. */
-struct alignas(RT_ALIGN) Block { unsigned char bytes[RT_ALIGN]; };
+struct alignas(RT_ALIGN) Block {
+    unsigned char bytes[RT_ALIGN];
+    /* Payload is written before publication; vector growth must not zero it. */
+    Block() noexcept {}
+};
 struct Storage {
     size_t attachment_bytes=0;
     size_t initial_bytes=0,record_bytes=0;
@@ -33,7 +37,8 @@ struct FramePacketQueue {
     size_t initial_limit,record_limit;
     bool open=false,valid=false;
     size_t history_limit=0,history_bytes=0,history_depth=0;
-    std::deque<Packet> history;
+    std::vector<Packet> history;
+    std::vector<std::shared_ptr<Storage>> storage_pool;
     uint32_t command_sequence=0;
     std::atomic<uint64_t> epoch{1};
     FramePacketQueue(size_t initial,size_t records):initial_limit(initial),record_limit(records) {}
@@ -50,7 +55,16 @@ extern "C" int frame_packet_reserve_initial(FramePacketQueue *q,uint64_t sequenc
     if(!q || q->open) return 0;
     q->open=true;q->valid=false;q->command_sequence=0;
     auto &slot=q->mailbox.writing();
-    try { if(!slot.data || !slot.data.unique()) slot.data=std::make_shared<Storage>(); }
+    try {
+        if(!slot.data || slot.data.use_count()!=2) {
+            slot.data.reset();
+            for(auto& candidate:q->storage_pool) if(candidate.unique()) {slot.data=candidate;break;}
+            if(!slot.data) {
+                slot.data=std::make_shared<Storage>();
+                q->storage_pool.push_back(slot.data);
+            }
+        }
+    }
     catch(...) { return 0; }
     auto &p=*slot.data;
     p.clear_attachment();p.attachment_bytes=0;
@@ -107,7 +121,7 @@ extern "C" int frame_packet_publish(FramePacketQueue *q) {
         const size_t cost=packet.data->cost()+sizeof(Packet);
         while(!q->history.empty() && (cost>q->history_limit-q->history_bytes || q->history.size()>=q->history_depth)) {
             q->history_bytes-=q->history.front().data->cost()+sizeof(Packet);
-            q->history.pop_front();
+            q->history.erase(q->history.begin());
         }
         if(cost<=q->history_limit) {
             try { q->history.push_back(packet);q->history_bytes+=cost; } catch(...) {}
@@ -141,7 +155,7 @@ extern "C" int frame_packet_append_records(FramePacketQueue *q,const void *recor
 extern "C" void frame_packet_cancel(FramePacketQueue *q) {
     if(!q || !q->open) return;
     q->valid=false;q->open=false;
-    if(q->mailbox.writing().data && q->mailbox.writing().data.unique()) q->mailbox.writing().data->clear_attachment();
+    if(q->mailbox.writing().data && q->mailbox.writing().data.use_count()==2) q->mailbox.writing().data->clear_attachment();
 }
 extern "C" int frame_packet_acquire(FramePacketQueue *q,FramePacketView *view) {
     if(!q || !view) return 0;
@@ -168,6 +182,8 @@ extern "C" int frame_packet_current(const FramePacketQueue *q,const FramePacketV
 extern "C" void frame_packet_history_configure(FramePacketQueue *q,size_t depth,size_t bytes) {
     if(!q)return;
     q->history.clear();q->history_bytes=0;q->history_depth=depth;q->history_limit=depth?bytes:0;
+    try {q->history.reserve(depth);q->storage_pool.reserve(depth+3);}
+    catch(...) {q->history_depth=0;q->history_limit=0;}
 }
 extern "C" size_t frame_packet_history_bytes(const FramePacketQueue *q) { return q?q->history_bytes:0; }
 extern "C" int frame_packet_history_has(const FramePacketQueue *q,uint64_t sequence) {
