@@ -85,3 +85,30 @@ The follow-up also leases the nine immutable transform blocks on the render
 consumer, removing a complete history copy per consumed packet. Iteration order
 and matching inputs are unchanged. The fixture releases both the source table
 and producer history before consumer matching to verify lease lifetime.
+
+### Final exclusive A/B disposition
+
+Code `014e2cb5`, Release/debug telemetry, hidden 18x, full PGXP, Car Effects and
+Rewind. Slot 9, three-second warmup, 60 seconds each, FPS off then on, same build.
+No other runtime observed; an earlier overlapping run was rejected.
+
+| Output / arm | Distinct images/s (lower bound) | Present completions/s | Guest VBlanks/s | Starved samples | Max VBlank ms | Unmatched |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 60-A | 29.54 | 29.54 | 59.093 | 35,092 | 53.338 | 0 |
+| 60-B | 51.34 | 52.92 | 57.768 | 98,416 | 57.629 | 0 |
+| 120-A | 29.08 | 29.08 | 58.168 | 79,276 | 55.382 | 0 |
+| 120-B | 94.02 | 95.93 | 58.129 | 86,642 | 54.573 | 0 |
+
+Timing acceptance FAILS: disabled baseline is already below 60 with starvation,
+and enabling interpolation still adds starvation. Allocation removal is tested,
+not a claim of recovered cadence. 2,982 timed geometry pairs have zero failures,
+unmatched or admission misses. Repeated frozen 7668x4320 endpoints are identical;
+one midpoint adds zero lower-image clear-colour pixels. Full visibility/cut and
+legacy equivalence gates remain open. The collector/lease and hidden GL tests
+pass; R4's 22 permitted tests pass; regeneration unchanged. Raw receipts and full
+profiles are in R4 analysis/interp-exclusive-final; committed summary/profile
+evidence is docs/evidence/frame-interpolation-ab-20261029.json in that repo.
+
+Storage tradeoff: 128 prepared 32,768-record blocks reserve about 448 MiB of
+uninitialized host capacity, with additional high-water blocks retained as
+needed for live/rewind leases. No CPU-memory reduction is claimed.
