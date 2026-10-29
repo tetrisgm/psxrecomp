@@ -148,6 +148,7 @@ static void reset_state(int in_place) {
     display_disabled = 0; display_area_x = 0; display_area_y = 0;
     h_display_x1 = 0x200; h_display_x2 = 0xC00;
     v_display_y1 = 0x010; v_display_y2 = 0x100;
+    gpu_display_info_changed();
     /* Projection-and-stretch path at 32:9: X squash 3/8, not native-wide. */
     ws_mode = 0;
     ws_cfg_num = 32; ws_cfg_den = 9;
@@ -185,6 +186,7 @@ static void run_fills(int *gouraud_min, int *gouraud_max,
 static void test_wall_behind_front_layer(int triangle) {
     reset_state(0);
     hres1 = 0; hres2 = 1; /* Ape's 384x240 display */
+    gpu_display_info_changed();
     ws_cfg_num = 16; ws_cfg_den = 9; ws_xnum = 3; ws_xden = 4;
     memset(test_ram, 0, sizeof(test_ram));
     const uint32_t wall[12] = {
@@ -221,6 +223,7 @@ static void test_explicit_projection_widget(void) {
     reset_state(0);
     hres1 = 0; hres2 = 1; /* Captured Ape display: 384x240. */
     h_display_x2 = h_display_x1 + 384u * 7u;
+    gpu_display_info_changed();
     ws_hud_sprt = 0;
     gpu_ws_set_auto_ui_squash(0); /* Explicit ownership is independent. */
     ws_hud_anchor_clear(ws_hud_anchor_tags, WS_HUD_ANCHOR_TABLE_SIZE);
@@ -295,6 +298,7 @@ static void test_explicit_projection_widget(void) {
 }
 
 int main(void) {
+    fixture_native_start();
     int gmin, gmax, fmin, fmax;
 
     test_wall_behind_front_layer(0);

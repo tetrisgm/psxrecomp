@@ -42,6 +42,10 @@ void     gpu_set_power_on_video_mode(int pal);
 
 /* Display presentation accessors (Phase 3). */
 const uint16_t* gpu_get_vram(void);    /* Pointer to 1024x512 16-bit VRAM */
+void gpu_native_vram_read(int x,int y,int w,int h,uint16_t *out);
+void gpu_native_vram_restore(const uint16_t *source);
+int gpu_snapshot_valid_size(uint32_t size);
+uint32_t gpu_snapshot_presentation_offset(void);
 
 typedef struct {
     uint32_t display_x, display_y;     /* VRAM start of display area (GP1(05h)) */

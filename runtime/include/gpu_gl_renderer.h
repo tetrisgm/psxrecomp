@@ -288,6 +288,11 @@ int gl_renderer_present_hold_last(void);
  * VRAM. Do NOT use before 24-bit (FMV) scanout — a full readback can clobber
  * packed RGB888 MDEC bytes in the CPU mirror (use flush_cpu_uploads instead). */
 void gl_renderer_sync_cpu(void);
+/* Queue a diagnostic on the GL owner with a copied request. Returns 1 when
+ * queued, 0 if no asynchronous owner exists. The callback publishes its own
+ * result; it must not read mutable guest state. No execution wait occurs. */
+int gl_renderer_queue_diagnostic(void (*callback)(const void *),
+                                 const void *request, uint32_t bytes);
 
 /* Land pending CPU→VRAM uploads into the FBO without reading the FBO back.
  * Safe before 24-bit (FMV) CPU scanout of the mirror. */
@@ -701,7 +706,6 @@ int  gl_renderer_render_thread_json(char *out, size_t cap);
 void gl_renderer_set_present_thread(int on, int slots);
 int  gl_renderer_present_thread_active(void);
 int  gl_renderer_present_thread_json(char *out, size_t cap);
-int  gl_renderer_fbo_peek_deferred(int x, int y, int w, int h, uint16_t *out);
 void gl_renderer_ring_capture(uint32_t frame, int wide, int base_x, int disp_y, int disp_h,
                               int cx, int cy, int cw, int ch);
 

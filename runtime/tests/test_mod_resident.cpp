@@ -3,6 +3,7 @@
  * derived blobs, relocation, pruning and the guest-range guard. */
 #include "mod_resident.h"
 #include "mod_runtime.h"
+#include "mod_policy_guest_fixture.inc"
 #include "mod_plugins.h"
 #include "psx_sha256.h"
 #include "psx_lobby_client.h"

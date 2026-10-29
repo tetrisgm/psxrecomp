@@ -213,6 +213,28 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-28 (`feat/frame-arch-1-native-authority`, in progress):** Separate
+  software-raster contexts and an independent CPU native queue now have fixture
+  coverage for ownership isolation, masks/CLUTs/wrapping, queue ordering,
+  snapshot/restore and partially received A0 uploads. The existing hidden GL
+  render-thread fixture passes all six configurations after the context refactor.
+  This is not yet the runtime authority: the GP0 capture point must precede
+  presentation transforms and RGB555 truncation. The existing SW raster still
+  lacks the dither input and uses reduced-precision colour interpolation
+  documented in `accuracy/axis5_gpu.md`; moving its calls alone does not prove
+  pixel-exact hardware authority. No phase acceptance or performance claim.
+  R4's amended design adds a PGXP audit before generic packet interpolation;
+  private guest-draw workers are no longer the phase-4 destination. The central
+  Beads path `F:/Software/beads/issues` is absent on this machine; no local
+  database was created.
+  Follow-up native polygon input retains RGB888 and uses integer attribute
+  planes plus the native dither matrix. Hand-known gradient and all 16 dither
+  phase checks pass in `native_raster_test`; full oracle parity and runtime
+  routing remain outstanding. Negative edge coordinates now use multiplication
+  rather than undefined signed left shifts. R4 build, 32/32 tests and hidden
+  smoke (zero dispatch/segment misses) passed for the earlier context refactor;
+  these do not certify the new native polygon path as the runtime authority.
+
 - **2026-10-28 (`fix/race-cadence-metrics`):** Added opt-in native debug TCP
   `main_cadence` counters for main-thread VBlank callback wall intervals and
   pre-offline-pacer deadline debt, with an explicit reset/start command.
@@ -2031,3 +2053,79 @@ Guest-frame lookup merged multiple extra presentations and could not verify
 HUD stability. Added duplicate-frame/freeze/eviction regression coverage and
 retained legacy frame lookup. Six focused framework checks and all 21 title
 checks pass on Windows and Linux, and both runtime builds link successfully.
+
+### 2026-10-28 — Native GP0 parity work (frame architecture phase 1, incomplete)
+
+Added immutable original-GP0 packet/state decoding on the CPU raster worker,
+RGB888 sprite/line rasterization, integer coordinate wrapping, texture and
+palette cache semantics, feedback traversal order, 128-halfword copy chunks,
+and cache-preserving native checkpoint APIs. Separate pinned Beetle GPU oracle
+with PGXP enabled matches 10000 mixed draw cases and 10000 coordinate-stress
+cases; retained 16 full-VRAM digests and native checkpoint regressions pass.
+Manifest/proof: runtime/tests/NATIVE_RASTER_ORACLE.md and
+runtime/tests/native_raster_oracle_fixtures.h. Production capture/read routing
+is not yet switched; no frame-architecture phase is accepted or merged.
+
+### 2026-10-28 - Native authority production integration (phase 1 ongoing)
+
+Original GP0 packets now enter the native worker before presentation transforms.
+Guest reads, machine VRAM snapshots and native 15/24-bit scanout use CPU-only
+completion. Snapshot wire state preserves native texture/palette caches and
+partial upload/polyline state. Fixed the odd GPUREAD final high halfword and
+interlaced fill gating against the pinned GPU oracle. A write-invalidated row
+cache avoids worker rendezvous per halfword. The 2000 field and 2000 fill/copy
+oracle comparisons pass, as do ten parser/native/scanout fixtures, the actual
+parser debug/production check, dev build, and 32 R4 tests. Hidden race smoke
+passed with zero dispatch misses. The integrated 18x all-on run remains below
+target at 39.716 VBlanks/s, max 77.948 ms, 224724 starved samples. Render queue
+backpressure and presentation work remain. No phase accepted or merged.
+
+### 2026-10-28 - Queued presentation ownership (phase 1 ongoing)
+
+Renderer settings and frequently queried diagnostics now use ordered controls
+and CPU-published results. CPU/depth24, blank and held images are queued with
+owned pixels, overlays and display state. Removed VRAM mirror publication on
+context handoffs. Large records fragment through the bounded transport rather
+than moving GL to the producer; hidden GL tests verify a >16 MiB CPU image.
+The transport test exposed stale release acknowledgements; the CPU ownership
+handshake now consumes each acknowledgement before another acquisition.
+Dev build and 32 R4 tests pass; all six hidden GL modes match direct/threaded
+hashes; transport tests pass five repeats (8860 checks each). Native authority
+commit is 066006db. Runtime context acquisitions measured zero in two all-on
+18x runs, but cadence varied from 9.643 to 43.031 VBlanks/s. Queue backpressure,
+legacy diagnostics/transaction paths and later architecture phases remain.
+No phase accepted or merged. Evidence: R4 analysis/perf-20261028/
+native-owner-large-gate/rth-qda5fuft and native-owner-memory18.json.
+
+### 2026-10-28 - Asynchronous renderer diagnostics (phase 1 ongoing)
+
+Pure-renderer TCP handlers now queue an owned request and publish their reply
+from the render owner; the emulation thread does not wait. IO_EXEC keeps one
+response owner even after a client timeout, and thread-local append ownership
+prevents unrelated emulation watchpoints from writing a renderer response.
+The completed-image history ring publishes CPU thumbnails under a short copy
+lock; conversion and GL capture happen outside it. Readers and freeze control
+no longer drain GL. A concurrent Windows writer/reader fixture passes across
+multiple ring wraps. Hidden runtime queries (coherency/present history,
+post-AA, shader, bloom, batch sites, interpolation, image-history stats) pass
+live and host-paused with zero acquisitions/releases. Hidden boot-to-race
+smoke reports zero dispatch/segment misses. All six GL ownership fixture modes
+match, including copied diagnostic callbacks. Repeated R4 ctest is 32/32.
+Framework-wide unit build is in progress, not yet a passed gate. Evidence:
+R4 analysis/perf-20261028/native-diagnostic-runtime/, native-diagnostic-expanded/,
+and native-owned-controls-gate/rth-6jr2ya5c/. Phase remains unaccepted.
+
+2026-10-28 frame architecture continuation: original GP0/native authority remains
+on phase-1 topic. Renderer diagnostics now execute owned copied requests on the
+render thread (including FBO peek/diff); native display history replaces the
+per-VBlank GPU readback and its reader drains. Deleted deferred raw-pointer peek
+transport. Completed thumbnail publication is CPU-synchronized, not GL-drained.
+Release configuration publication remains active separately from debug counters.
+Framework full build passed after repairing stale fixture links; non-hardware
+CTest: 297 listed, 2 disabled, 3 skipped, remaining 292 passed after three stale
+guards were repaired. R4 32/32 passed. Six hidden GL modes have exact matching
+hashes; live and paused TCP diagnostics have zero context acquisitions. Hidden
+smoke frame 8767 has zero dispatch/segment misses. Same-save 18x/all-on15s:
+53.075 VBlanks/s, max67.360ms,79173starved,53.16swap completions/s;
+scene/presentGPU3.670/12.813ms,zero acquisitions. Render queue backpressure still
+exists; neither real-time nor distinct-image acceptance is claimed.

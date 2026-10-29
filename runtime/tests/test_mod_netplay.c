@@ -1,6 +1,7 @@
 #include "mod_netplay.h"
 #include "netplay_state_digest.h"
 #include "crc32.h"
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,7 +33,12 @@ void timers_get_snapshot(uint16_t counter[3], uint32_t mode[3],
     uint32_t module##_snapshot_bytes(void) { return 0; } \
     void module##_snapshot_write(uint8_t* out) { (void)out; }
 EMPTY_SNAPSHOT(cdrom)
-EMPTY_SNAPSHOT(gpu)
+/* Presentation fields are inside the register section, before native cache
+ * data. Changes after that section must remain part of the AV digest. */
+static uint8_t gpu_state[32];
+uint32_t gpu_snapshot_bytes(void) { return sizeof gpu_state; }
+uint32_t gpu_snapshot_presentation_offset(void) { return 8; }
+void gpu_snapshot_write(uint8_t *out) { memcpy(out,gpu_state,sizeof gpu_state); }
 EMPTY_SNAPSHOT(spu)
 EMPTY_SNAPSHOT(mdec)
 EMPTY_SNAPSHOT(dma)
@@ -60,6 +66,12 @@ int main(int argc, char** argv) {
     memset(&cpu, 0, sizeof(cpu));
     cpu.pc = 0x80010000;
     netplay_core_digest_parts(&cpu, &baseline);
+    const uint32_t baseline_av=netplay_av_digest();
+    memset(gpu_state+8,0xa5,12);
+    assert(netplay_av_digest()==baseline_av);
+    gpu_state[31]=1;
+    assert(netplay_av_digest()!=baseline_av);
+    memset(gpu_state,0,sizeof gpu_state);
     assert(baseline.mod == 0);
     assert(psx_mod_netplay_rollback_supported());
     assert(!psx_mod_netplay_requires_texture_banks());

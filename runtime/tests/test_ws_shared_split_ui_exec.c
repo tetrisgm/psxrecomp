@@ -34,6 +34,7 @@ static void counter(int full_area, int tall) {
     display_depth = display_disabled = display_area_x = display_area_y = 0;
     h_display_x1 = 0x200; h_display_x2 = 0xC00;
     v_display_y1 = 0x10; v_display_y2 = 0x100;
+    gpu_display_info_changed();
     draw_offset_x = draw_offset_y = 0;
     draw_area_left = draw_area_top = 0;
     draw_area_right = 511; draw_area_bottom = 239;
@@ -90,6 +91,7 @@ static void width_sites(void) {
     counter(1,0);
     hres1=0; hres2=1; // 368 would not represent V82; use its 320 mode below.
     hres1=1; hres2=0;
+    gpu_display_info_changed();
     GpuDisplayInfo di; gpu_get_display_info(&di); assert(di.width==320);
     uint32_t sites[]={0x8001C248,0x8002E01C};
     gpu_ws_set_local_viewport_width_sites(sites,2);
@@ -110,12 +112,14 @@ static void width_sites(void) {
 static void native_wide_buffers(void) {
     counter(1, 0);
     hres1 = 1; hres2 = 0;
+    gpu_display_info_changed();
     ws_mode = 2; ws_cfg_num = 16; ws_cfg_den = 9;
     for (int slot = 0; slot < 2; ++slot) {
         ws_local_viewport_slot = slot;
         assert(gpu_ws_netplay_local_viewport_width() == 426);
         for (int band = 0; band < 2; ++band) {
             display_area_y = 240 * (1 - band);
+            gpu_display_info_changed();
             draw_area_top = draw_offset_y = 240 * band;
             draw_area_bottom = draw_area_top + 239;
             draw_area_left = slot ? 161 : 0;
@@ -140,6 +144,7 @@ static void native_wide_buffers(void) {
 }
 
 int main(void) {
+    fixture_native_start();
     native_wide_buffers();
     width_sites();
     counter(1, 0);

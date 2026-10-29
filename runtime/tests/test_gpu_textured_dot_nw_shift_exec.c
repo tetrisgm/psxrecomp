@@ -16,6 +16,7 @@ static uint32_t pack_vertex(int16_t x, int16_t y) {
 }
 
 static void reset_gpu_state_for_test(void) {
+    fixture_native_start();
     memset(test_ram, 0, sizeof(test_ram));
     memset(&last_textured_rect, 0, sizeof(last_textured_rect));
     memset(ws_hud_anchor_tags, 0, sizeof(ws_hud_anchor_tags));

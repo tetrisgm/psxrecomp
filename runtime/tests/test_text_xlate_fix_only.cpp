@@ -18,7 +18,7 @@ extern "C" {
 uint64_t s_frame_count;
 
 uint8_t* memory_get_ram_ptr(void) { return g_ram.data(); }
-uint16_t gr_vram_read(int x, int y) {
+uint16_t gpu_vram_peek(int x, int y) {
     return g_vram[static_cast<size_t>(y) * 1024u + static_cast<size_t>(x)];
 }
 void gr_vram_write(int x, int y, uint16_t pixel) {

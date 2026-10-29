@@ -35,6 +35,7 @@ void gpu_get_gp0_stats(uint64_t* nop, uint64_t* fill, uint64_t* draw,
                        uint64_t* env, uint64_t* copy);
 uint32_t gpu_snapshot_bytes(void);
 void gpu_snapshot_write(uint8_t *p);
+int gpu_snapshot_read(const uint8_t *p,uint32_t len);
 
 static uint32_t timeline_hash = 2166136261u;
 static int checkpoint_failed = 0;
@@ -59,8 +60,9 @@ static void checkpoint(void) {
     free(snap);
     for (int y = 0; y < 512; y++) {
         uint16_t row[1024];
+        gpu_native_vram_read(0,y,1024,1,row);
         for (int x = 0; x < 1024; x++) {
-            row[x] = gpu_vram_peek(x, y);
+
             timeline_hash = mix(timeline_hash, row[x]);
         }
         if (fwrite(row, sizeof(row), 1, trace_file) != 1) checkpoint_failed = 1;
@@ -196,7 +198,7 @@ int main(int argc, char **argv) {
         test_upload_rect[1]!=511 || test_upload_rect[2]!=4 || test_upload_rect[3]!=2) return 3;
     gpu_write_gp0(0x33332222u);
     gpu_write_gp1(0x01000000u);
-    if (test_upload_commits!=commits || gpu_vram_peek(1023,511)!=0x2222u ||
+    if (test_upload_commits!=commits+1 || gpu_vram_peek(1023,511)!=0x2222u ||
         gpu_vram_peek(0,511)!=0x3333u) return 4;
     gpu_write_gp0(0xE6000001u);
     gpu_write_gp0(0xA0000000u); gpu_write_gp0((100u<<16)|32u);
@@ -206,7 +208,41 @@ int main(int argc, char **argv) {
     gpu_write_gp0(0xA0000000u); gpu_write_gp0((100u<<16)|32u);
     gpu_write_gp0((1u<<16)|2u); gpu_write_gp0(0x12341234u);
     if (gpu_vram_peek(32,100)!=0x8001u || gpu_vram_peek(33,100)!=0x8002u ||
-        test_upload_commits!=commits+2 || test_upload_begins!=begins+3) return 6;
+        test_upload_commits!=commits+3 || test_upload_begins!=begins+3) return 6;
+    gpu_write_gp0(0xe3000000); gpu_write_gp0(0xe407ffff);
+    gpu_write_gp0(0xe5000000); gpu_write_gp0(0xe6000000);
+    gpu_write_gp0(0x30000000); gpu_write_gp0((10u<<16)|10u);
+    gpu_write_gp0(31); gpu_write_gp0((10u<<16)|42u);
+    gpu_write_gp0(0); gpu_write_gp0((42u<<16)|10u);
+    if(gpu_vram_peek(26,11)!=2) return 7;
+    // Save and resume after only the first GP0 payload word. The pending
+    // upload fragment is not yet a complete rectangle or a full queue batch.
+    gpu_write_gp0(0xa0000000); gpu_write_gp0((300u<<16)|100u);
+    gpu_write_gp0((2u<<16)|3u); gpu_write_gp0(0x12345678);
+    uint32_t bytes=gpu_snapshot_bytes();
+    uint8_t *registers=malloc(bytes);
+    uint16_t *pixels=malloc(1024*512*2);
+    if(!registers || !pixels) return 8;
+    gpu_snapshot_write(registers);
+    gpu_native_vram_read(0,0,1024,512,pixels);
+    if(pixels[300*1024+100]!=0x5678 || pixels[300*1024+101]!=0x1234) return 9;
+    gpu_write_gp0(0x11112222);gpu_write_gp0(0x33334444);
+    if(!gpu_snapshot_read(registers,bytes)) return 10;
+    gpu_native_vram_restore(pixels);
+    gpu_write_gp0(0x55556666);gpu_write_gp0(0x77778888);
+    if(gpu_vram_peek(102,300)!=0x6666 || gpu_vram_peek(100,301)!=0x5555 ||
+       gpu_vram_peek(101,301)!=0x8888 || gpu_vram_peek(102,301)!=0x7777) return 11;
+    free(registers);free(pixels);
+    // GPUREAD's final high halfword is adjacent VRAM, not zero padding.
+    gpu_write_gp0(0xc0000000);gpu_write_gp0((300u<<16)|100u);
+    gpu_write_gp0((1u<<16)|1u);
+    if(gpu_read_gpuread()!=0x12345678u) return 12;
+    // A write after a read must invalidate the native row cache.
+    gpu_write_gp0(0xa0000000);gpu_write_gp0((300u<<16)|100u);
+    gpu_write_gp0((1u<<16)|1u);gpu_write_gp0(0xdeadbeef);
+    gpu_write_gp0(0xc0000000);gpu_write_gp0((300u<<16)|100u);
+    gpu_write_gp0((1u<<16)|1u);
+    if(gpu_read_gpuread()!=0x1234beefu) return 13;
     return 0;
 }
 """
@@ -259,9 +295,9 @@ void event_ring_note_gpu_irq(uint32_t stat) { (void)stat; }
 int g_psx_vram_dirty_tracking = 0;
 int g_exec_phase = 0;
 int g_psx_render_pass_active = 0;
-int pgxp_enabled(void) { return 0; }
-int pgxp_cpu_mode(void) { return 0; }
-void pgxp_set_cpu_mode(int enabled) { if (enabled) abort(); }
+int pgxp_enabled(void) { return 1; }
+int pgxp_cpu_mode(void) { return 1; }
+void pgxp_set_cpu_mode(int enabled) { if (!enabled) abort(); }
 void psx_mod_counter_add(const char *name, uint32_t delta)
 { (void)name; (void)delta; abort(); }
 void gpu_vram_dirty_mark_all(void) {}
@@ -290,7 +326,7 @@ int gte_nclip_native_wide_previous_sign(int32_t mac0, int *sign)
 { (void)mac0; (void)sign; abort(); }
 int pgxp_projection_tracking(void) { return 0; }
 void pgxp_set_projection_tracking(int enabled)
-{ if (enabled) abort(); }
+{ if (!enabled) abort(); }
 int pgxp_projective_scope_begin(PGXPProjectiveScope *scope)
 { (void)scope; abort(); }
 void pgxp_projective_scope_end(PGXPProjectiveScope *scope)
@@ -304,14 +340,14 @@ void gl_renderer_draw_projected_triangle(const PSXProjectedVertex vertices[3],
     uint16_t texpage, uint16_t cx, uint16_t cy, int raw, int semi, int perspective)
 { (void)vertices; (void)texpage; (void)cx; (void)cy; (void)raw; (void)semi; (void)perspective; abort(); }
 void gl_renderer_note_wide_triangle_recovery(int enabled)
-{ if (enabled) abort(); }
+{ if (!enabled) abort(); }
 /* Smooth motion vertex sources are an OpenGL path: never reached here. */
 int gl_renderer_frame_generation(void) { return 0; }
 int gl_renderer_pgxp_render_wanted(void) { return 0; }
 void gl_renderer_fg_source(const uint32_t id[3], const int32_t pc[9], const int32_t h[3],
     const int32_t x[3], const int32_t y[3])
 { (void)id; (void)pc; (void)h; (void)x; (void)y; abort(); }
-void gte_fg_source_set(int enabled) { if (enabled) abort(); }
+void gte_fg_source_set(int enabled) { if (!enabled) abort(); }
 int gte_fg_source_enabled(void) { return 0; }
 int gte_fg_source_lookup(uint32_t packed, GteFgSrc out[2])
 { (void)packed; (void)out; abort(); }
@@ -353,7 +389,7 @@ int psx_ws_aspect_cone_contains(int32_t x, int32_t z, int32_t y,
                                 int32_t fx, int32_t fz, int32_t fy,
                                 uint32_t threshold, int extent_pixels)
 { (void)x; (void)z; (void)y; (void)fx; (void)fz; (void)fy; (void)threshold; (void)extent_pixels; return 0; }
-uint32_t sw_perspective_triangle_count(void) { return 0; }
+int g_ws_bd_stretch_on=0,g_ws_bd_stretch_pct=0;
 bool screen_kind_from_name(const char* name, ScreenKind* out)
 { (void)name; if (out) *out = SCREEN_RAW; return 0; }
 ColorLut* color_lut_create(const ColorSettings* settings)
@@ -522,18 +558,22 @@ def build(cc: str, work: pathlib.Path, name: str, prod: bool) -> pathlib.Path:
     ]
     if prod:
         cmd.append("-DPSX_NO_DEBUG_TOOLS")
-    cmd.extend([
-        str(work / "driver.c"),
-        str(GPU_C),
-        str(GPU_TIMELINE_C),
-        str(work / "stubs.c"),
-    ])
-    if platform.system() == "Darwin":
-        cmd.append("-Wl,-dead_strip")
-    else:
-        cmd.append("-Wl,--gc-sections")
-    cmd.extend(["-o", str(exe)])
-    subprocess.run(cmd, cwd=work, check=True)
+    sources=[work/'driver.c',GPU_C,GPU_TIMELINE_C,work/'stubs.c',
+             ROOT/'runtime/src/gpu_sw_renderer.c']
+    objects=[]
+    for i,source in enumerate(sources):
+        obj=work/f'{name}-{i}.o'
+        subprocess.run(cmd+['-c',str(source),'-o',str(obj)],cwd=work,check=True)
+        objects.append(str(obj))
+    compiler=pathlib.Path(cc)
+    cxx=compiler.with_name('clang++'+compiler.suffix if 'clang' in compiler.name else 'g++'+compiler.suffix)
+    obj=work/f'{name}-native.o'
+    subprocess.run([str(cxx),'-std=c++17','-O2','-I',str(ROOT/'runtime/include'),
+                    '-c',str(ROOT/'runtime/src/native_raster.cpp'),'-o',str(obj)],check=True)
+    objects.append(str(obj))
+    link=[str(cxx),*objects,'-pthread','-o',str(exe)]
+    link.append('-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections')
+    subprocess.run(link,cwd=work,check=True)
     return exe
 
 

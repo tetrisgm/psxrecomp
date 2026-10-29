@@ -36,8 +36,10 @@ int main(void) {
     assert(native_43() == 1); /* streamed FMV veto */
     fmv = 0;
     display_depth = 1;
+    gpu_display_info_changed();
     assert(native_43() == 1); /* 24-bit FMV veto */
     display_depth = 0;
+    gpu_display_info_changed();
     assert(native_43() == 0);
     gpu_ws_set_native_scene_predicate(native_scene);
     native_effect=1; assert(native_43()==1); /* Native attack overrides world. */

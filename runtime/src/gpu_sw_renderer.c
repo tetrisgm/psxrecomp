@@ -41,67 +41,143 @@
 #define VRAM_WIDTH  1024
 #define VRAM_HEIGHT 512
 
-/* ------------------------------------------------------------------ */
-/* State                                                              */
-/* ------------------------------------------------------------------ */
-
-static uint16_t *g_vram;
-
-/* Hi-res supersampling mirror (see file header). g_scale==1 => disabled. */
-static uint16_t *g_hr      = NULL;
-static int       g_scale   = 1;
-static int       g_hr_w    = VRAM_WIDTH;
-static int       g_hr_h    = VRAM_HEIGHT;
-static int       g_precise_valid = 0;
-static int32_t   g_precise_x16[3], g_precise_y16[3];
-static int       g_perspective_valid = 0;
-static float     g_perspective_q[3];
-static uint32_t  g_perspective_triangles = 0;
-
-/* ---- Native-wide compositor (separate present surfaces) ------------------
- * Canonical VRAM stays faithful. For an opted-in wide game we ADDITIONALLY
- * mirror each framebuffer-targeting primitive into an independent wide surface
- * keyed by the back buffer's VRAM x-origin (base_x), at local x = vram_x -
- * base_x + OFFSET. Independent surfaces ⇒ no cross-buffer bleed; margins clear
- * cleanly; present reads the surface for the displayed buffer. Each surface is
- * (g_wide_w * scale) × (VRAM_HEIGHT * scale) 16-bit; y is unshifted so the
- * buffer's native VRAM y-band is reused directly. */
 #define WIDE_MAX_SURF 4
-static uint16_t *g_wide_surf[WIDE_MAX_SURF];   /* lazily-allocated surfaces */
-static int       g_wide_base[WIDE_MAX_SURF];   /* base_x per surface (-1 = free) */
-static int       g_wide_w        = 0;          /* wide width (native px); 0 = disabled */
-static int       g_wide_off      = 0;          /* centering OFFSET (native px) */
-static uint16_t *g_wide_cur      = NULL;       /* active mirror surface (NULL = no mirror) */
-static int       g_wide_cur_base = 0;          /* base_x of g_wide_cur */
-static void      wide_free_all(void);          /* defined with the surface helpers below */
+/* Independent mutable raster state. The legacy default follows GL context
+ * ownership; the native worker binds its own context and never shares it. */
+struct SwRendererContext {
+    uint16_t *g_vram;
+    uint16_t *g_hr;
+    int       g_scale;
+    int       g_hr_w;
+    int       g_hr_h;
+    int       g_precise_valid;
+    int32_t   g_precise_x16[3], g_precise_y16[3];
+    int       g_perspective_valid;
+    float     g_perspective_q[3];
+    uint32_t  g_perspective_triangles;
+    uint16_t *g_wide_surf[WIDE_MAX_SURF];
+    int       g_wide_base[WIDE_MAX_SURF];
+    int       g_wide_w;
+    int       g_wide_off;
+    uint16_t *g_wide_cur;
+    int       g_wide_cur_base;
+    int g_clip_x1, g_clip_y1, g_clip_x2, g_clip_y2;
+    int g_offset_x, g_offset_y;
+    int g_semi_trans_enabled;
+    int g_semi_trans_mode;
+    int g_mask_set_bit;
+    int g_mask_check_bit;
+    uint8_t g_tw_mask_x, g_tw_mask_y;
+    uint8_t g_tw_off_x, g_tw_off_y;
+    uint8_t g_mod_r, g_mod_g, g_mod_b;
+    int g_raw_texture;
+    int g_texture_filter;
+    int g_texture_filter_req;
+    int g_faithful_authority;
+    int view_enabled, view_shift, view_pad_left, view_pad_right;
+    int g_uv_lim[4];
+    int private_dirty;
+    uint64_t dirty_rows[8];
+    struct { uint32_t tag; uint16_t words[4]; } native_texture[256];
+    uint16_t native_palette[256];
+    uint32_t native_palette_key, native_page;
+    unsigned native_skip_field;
+};
+static SwRendererContext s_default = {
+    .g_scale = 1, .g_hr_w = VRAM_WIDTH, .g_hr_h = VRAM_HEIGHT,
+    .g_uv_lim = {0, 0, 255, 255}
+};
+#if defined(_MSC_VER)
+static __declspec(thread) SwRendererContext *s_sw = &s_default;
+#else
+static _Thread_local SwRendererContext *s_sw = &s_default;
+#endif
 
-/* Draw area clipping rectangle (native coordinates) */
-static int g_clip_x1, g_clip_y1, g_clip_x2, g_clip_y2;
+SwRendererContext *sw_context_create(void) {
+    SwRendererContext *c = (SwRendererContext *)calloc(1, sizeof *c);
+    if (!c) return NULL;
+    c->g_scale = 1; c->g_hr_w = VRAM_WIDTH; c->g_hr_h = VRAM_HEIGHT;
+    c->g_uv_lim[2] = c->g_uv_lim[3] = 255;
+    c->private_dirty = 1;
+    memset(c->dirty_rows, 0xff, sizeof c->dirty_rows);
+    for(int i=0;i<256;++i) c->native_texture[i].tag=UINT32_MAX;
+    c->native_palette_key=c->native_page=UINT32_MAX;
+    return c;
+}
+SwRendererContext *sw_context_bind(SwRendererContext *c) {
+    SwRendererContext *previous = s_sw;
+    s_sw = c ? c : &s_default;
+    return previous == &s_default ? NULL : previous;
+}
+void sw_context_destroy(SwRendererContext *c) {
+    if (!c || c == &s_default) return;
+    free(c->g_hr);
+    for (int i = 0; i < WIDE_MAX_SURF; ++i) free(c->g_wide_surf[i]);
+    if (s_sw == c) s_sw = &s_default;
+    free(c);
+}
+void sw_context_take_dirty(uint64_t rows[8]) {
+    memcpy(rows, s_sw->dirty_rows, sizeof s_sw->dirty_rows);
+    memset(s_sw->dirty_rows, 0, sizeof s_sw->dirty_rows);
+}
+static void sw_dirty_row(uint32_t y) {
+    if (!s_sw->private_dirty) { gpu_vram_dirty_mark_row(y); return; }
+    y &= 511;
+    s_sw->dirty_rows[y >> 6] |= UINT64_C(1) << (y & 63);
+}
+static void sw_dirty_rect(int x, int y, int w, int h) {
+    if (!s_sw->private_dirty) { gpu_vram_dirty_mark_rect(x, y, w, h); return; }
+    if (w <= 0 || h <= 0) return;
+    for (int i = 0; i < h && i < 512; ++i) sw_dirty_row((uint32_t)(y+i));
+}
+static void sw_dirty_all(void) { sw_dirty_rect(0, 0, 1024, 512); }
+#define g_vram (s_sw->g_vram)
+#define g_hr (s_sw->g_hr)
+#define g_scale (s_sw->g_scale)
+#define g_hr_w (s_sw->g_hr_w)
+#define g_hr_h (s_sw->g_hr_h)
+#define g_precise_valid (s_sw->g_precise_valid)
+#define g_precise_x16 (s_sw->g_precise_x16)
+#define g_precise_y16 (s_sw->g_precise_y16)
+#define g_perspective_valid (s_sw->g_perspective_valid)
+#define g_perspective_q (s_sw->g_perspective_q)
+#define g_perspective_triangles (s_sw->g_perspective_triangles)
+#define g_wide_surf (s_sw->g_wide_surf)
+#define g_wide_base (s_sw->g_wide_base)
+#define g_wide_w (s_sw->g_wide_w)
+#define g_wide_off (s_sw->g_wide_off)
+#define g_wide_cur (s_sw->g_wide_cur)
+#define g_wide_cur_base (s_sw->g_wide_cur_base)
+#define g_clip_x1 (s_sw->g_clip_x1)
+#define g_clip_y1 (s_sw->g_clip_y1)
+#define g_clip_x2 (s_sw->g_clip_x2)
+#define g_clip_y2 (s_sw->g_clip_y2)
+#define g_offset_x (s_sw->g_offset_x)
+#define g_offset_y (s_sw->g_offset_y)
+#define g_semi_trans_enabled (s_sw->g_semi_trans_enabled)
+#define g_semi_trans_mode (s_sw->g_semi_trans_mode)
+#define g_mask_set_bit (s_sw->g_mask_set_bit)
+#define g_mask_check_bit (s_sw->g_mask_check_bit)
+#define g_tw_mask_x (s_sw->g_tw_mask_x)
+#define g_tw_mask_y (s_sw->g_tw_mask_y)
+#define g_tw_off_x (s_sw->g_tw_off_x)
+#define g_tw_off_y (s_sw->g_tw_off_y)
+#define g_mod_r (s_sw->g_mod_r)
+#define g_mod_g (s_sw->g_mod_g)
+#define g_mod_b (s_sw->g_mod_b)
+#define g_raw_texture (s_sw->g_raw_texture)
+#define g_texture_filter (s_sw->g_texture_filter)
+#define g_texture_filter_req (s_sw->g_texture_filter_req)
+#define g_faithful_authority (s_sw->g_faithful_authority)
+#define view_enabled (s_sw->view_enabled)
+#define view_shift (s_sw->view_shift)
+#define view_pad_left (s_sw->view_pad_left)
+#define view_pad_right (s_sw->view_pad_right)
+#define g_uv_lim (s_sw->g_uv_lim)
 
-/* Draw offset */
-static int g_offset_x, g_offset_y;
-
-/* Semi-transparency state */
-static int g_semi_trans_enabled;
-static int g_semi_trans_mode; /* 0=B/2+F/2, 1=B+F, 2=B-F, 3=B+F/4 */
-
-/* Mask bit state */
-static int g_mask_set_bit;   /* force bit 15 on written pixels */
-static int g_mask_check_bit; /* skip write if dest bit 15 is set */
-
-/* Texture window (from GP0(E2h)) */
-static uint8_t g_tw_mask_x, g_tw_mask_y;
-static uint8_t g_tw_off_x, g_tw_off_y;
-
-/* Color modulation for textured primitives */
-static uint8_t g_mod_r, g_mod_g, g_mod_b;
-static int g_raw_texture; /* 1 = skip modulation */
-
-/* Texture filtering: 0 = nearest (native PSX), 1 = bilinear. */
-static int g_texture_filter = 0;
-/* The player's filter request, applied unless faithful authority is on. */
-static int g_texture_filter_req = 0;
-static int g_faithful_authority = 0;   /* see sw_set_faithful_authority */
+/* Native-wide presentation remains a separate set of surfaces, keyed by
+ * buffer origin. Private native contexts never enable those surfaces. */
+static void wide_free_all(void);
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -166,7 +242,7 @@ static inline RTarget rt_hires(void) {
  * into the OTHER buffer's band in the shared wide surface and corrupt it
  * (top/bottom edge flicker as the buffers flip). Canonical VRAM never showed
  * this because its draw-area clip already confines it. Scale matches SSAA. */
-static int view_enabled, view_shift, view_pad_left, view_pad_right;
+
 static inline RTarget rt_wide(void) {
     int s = g_scale;
     RTarget t;
@@ -194,7 +270,7 @@ static inline WideBd wide_bd_get(void) {
     WideBd b; b.on = 0; b.scale = 1.0f; b.center = 0.0f;
     extern int psx_ws_prim_in_backdrop(void);
     extern int g_ws_bd_stretch_on, g_ws_bd_stretch_pct;
-    if (g_ws_bd_stretch_on && g_wide_w > 0 && g_wide_cur && psx_ws_prim_in_backdrop()) {
+    if (g_wide_w > 0 && g_wide_cur && g_ws_bd_stretch_on && psx_ws_prim_in_backdrop()) {
         int native_w = g_wide_w - 2 * g_wide_off;
         if (native_w > 0) {
             b.on = 1;
@@ -282,7 +358,7 @@ static inline void put_opaque(const RTarget *t, int x, int y, uint16_t color) {
     t->buf[idx] = color;
     /* Canonical VRAM only (hi-res / wide mirrors are present-side). */
     if (t->buf == g_vram)
-        gpu_vram_dirty_mark_row((uint32_t)y);
+        sw_dirty_row((uint32_t)y);
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
@@ -328,7 +404,7 @@ static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
 
     t->buf[idx] = color;
     if (t->buf == g_vram)
-        gpu_vram_dirty_mark_row((uint32_t)y);
+        sw_dirty_row((uint32_t)y);
 }
 
 /* ------------------------------------------------------------------ */
@@ -380,7 +456,280 @@ static uint16_t texel_fetch(int u, int v, uint16_t texpage,
  * texels from a neighbouring sprite/tile or empty VRAM. Set by every
  * textured prim entry point; ignored while a texture window is active
  * (texel_fetch applies the window instead, which wraps by design). */
-static int g_uv_lim[4] = { 0, 0, 255, 255 };
+
+
+void sw_native_cache_clear(int palette) {
+    for(int i=0;i<256;++i) s_sw->native_texture[i].tag=UINT32_MAX;
+    if(palette) s_sw->native_palette_key=UINT32_MAX;
+}
+void sw_native_set_skip_field(unsigned field) { s_sw->native_skip_field=field; }
+static int native_skip_row(int y) {
+    return s_sw->native_skip_field && (unsigned)(y&1)==s_sw->native_skip_field-1;
+}
+void sw_native_texture_save(SwNativeTextureState *state) {
+    for(int i=0;i<256;++i) {
+        state->tags[i]=s_sw->native_texture[i].tag;
+        if(state->tags[i]==UINT32_MAX) memset(state->words[i],0,8);
+        else memcpy(state->words[i],s_sw->native_texture[i].words,8);
+    }
+    memcpy(state->palette,s_sw->native_palette,sizeof state->palette);
+    state->palette_key=s_sw->native_palette_key;
+    if(state->palette_key==UINT32_MAX) memset(state->palette,0,sizeof state->palette);
+    state->page=s_sw->native_page;
+}
+void sw_native_texture_load(const SwNativeTextureState *state) {
+    for(int i=0;i<256;++i) {
+        s_sw->native_texture[i].tag=state->tags[i];
+        memcpy(s_sw->native_texture[i].words,state->words[i],8);
+    }
+    memcpy(s_sw->native_palette,state->palette,sizeof state->palette);
+    s_sw->native_palette_key=state->palette_key;
+    s_sw->native_page=state->page;
+}
+void sw_native_copy(int sx,int sy,int dx,int dy,int w,int h) {
+    sw_native_cache_clear(0);
+    for(int row=0;row<h;++row) {
+        int target_y=(dy+row)&511;
+        for(int block=0;block<w;block+=128) {
+            uint16_t pixels[128];
+            int count=min_i(128,w-block);
+            for(int i=0;i<count;++i) pixels[i]=vram_get(sx+block+i,sy+row);
+            for(int i=0;i<count;++i) {
+                uint16_t *dst=g_vram+target_y*1024+((dx+block+i)&1023);
+                if(!g_mask_check_bit || !(*dst&0x8000))
+                    *dst=pixels[i]|(g_mask_set_bit?0x8000:0);
+            }
+        }
+        sw_dirty_row((uint32_t)target_y);
+    }
+}
+static void native_texture_begin(uint16_t page,uint16_t cx,uint16_t cy) {
+    unsigned mode=(page>>7)&3;
+    uint32_t key=(page&31)|((mode!=0)?32:0);
+    if(key!=s_sw->native_page) {
+        sw_native_cache_clear(0);
+        s_sw->native_page=key;
+    }
+    if(mode<2) {
+        key=(cx/16)|(cy<<6)|(mode<<16);
+        if(key!=s_sw->native_palette_key) {
+            for(unsigned i=0;i<(mode?256u:16u);++i)
+                s_sw->native_palette[i]=vram_get(cx+i,cy);
+            s_sw->native_palette_key=key;
+        }
+    }
+}
+static uint16_t native_texel(int u,int v,uint16_t page) {
+    unsigned mode=(page>>7)&3;
+    if(mode>2) mode=2;
+    u=(u&255&~(g_tw_mask_x*8))|((g_tw_off_x&g_tw_mask_x)*8);
+    v=(v&255&~(g_tw_mask_y*8))|((g_tw_off_y&g_tw_mask_y)*8);
+    unsigned x=(((page&15)*64)+(unsigned)(u>>(2-mode)))&1023;
+    unsigned y=(((page>>4)&1)*256+(unsigned)v)&511;
+    unsigned address=y*1024+x,line=address&~3u;
+    unsigned slot=mode?((x/4)&7)|((y&31)<<3):((x/4)&3)|((y&63)<<2);
+    if(s_sw->native_texture[slot].tag!=line) {
+        memcpy(s_sw->native_texture[slot].words,g_vram+line,8);
+        s_sw->native_texture[slot].tag=line;
+    }
+    uint16_t word=s_sw->native_texture[slot].words[x&3];
+    if(mode==2) return word;
+    unsigned index=mode?((word>>((u&1)*8))&255):((word>>((u&3)*4))&15);
+    return s_sw->native_palette[index];
+}
+
+/* Native attribute planes use 12-bit truncated derivatives with a half-unit
+ * seed, accumulated modulo 32 bits at 24 fractional bits. This preserves
+ * RGB888 until pixel quantization; the presentation raster remains separate.
+ * Reference contract: accuracy/axis5_gpu.md D1/D3 and Mednafen's native
+ * attribute precision (COORD_FBS=12, COORD_POST_PADDING=12). */
+typedef struct NativePlane { uint32_t origin, dx, dy; } NativePlane;
+static NativePlane native_plane(const SwNativeVertex v[3], const int value[3],
+                                 int core, int64_t area) {
+    int64_t ex1=v[1].x-v[0].x, ey1=v[1].y-v[0].y;
+    int64_t ex2=v[2].x-v[0].x, ey2=v[2].y-v[0].y;
+    int64_t d1=value[1]-value[0], d2=value[2]-value[0];
+    NativePlane p;
+    p.dx=(uint32_t)(((d1*ey2-d2*ey1)*4096)/area)*4096u;
+    p.dy=(uint32_t)(((ex1*d2-ex2*d1)*4096)/area)*4096u;
+    p.origin=((uint32_t)value[core]<<24)+0x00800000u
+        -p.dx*(uint32_t)v[core].x-p.dy*(uint32_t)v[core].y;
+    return p;
+}
+static unsigned native_plane_at(NativePlane p,int x,int y) {
+    return (p.origin+p.dx*(uint32_t)x+p.dy*(uint32_t)y)>>24;
+}
+static uint16_t native_quantize(int r,int g,int b,int dither) {
+    r=clamp_i(r+dither,0,255)>>3;
+    g=clamp_i(g+dither,0,255)>>3;
+    b=clamp_i(b+dither,0,255)>>3;
+    return (uint16_t)(r|(g<<5)|(b<<10));
+}
+void sw_draw_native_triangle(const SwNativeVertex input[3],uint16_t cx,uint16_t cy,
+                             uint16_t page,unsigned flags) {
+    SwNativeVertex v[3];
+    memcpy(v,input,sizeof v);
+    int core=0;
+    if (v[1].x<=v[0].x) core=1;
+    if (v[2].x<v[core].x || (core==1 && v[2].x==v[core].x)) core=2;
+    const int64_t area=(int64_t)(v[1].x-v[0].x)*(v[2].y-v[0].y)
+                     -(int64_t)(v[2].x-v[0].x)*(v[1].y-v[0].y);
+    if (!area) return;
+    int xmin=v[0].x,xmax=xmin,ymin=v[0].y,ymax=ymin;
+    for(int i=1;i<3;++i) {
+        xmin=min_i(xmin,v[i].x); xmax=max_i(xmax,v[i].x);
+        ymin=min_i(ymin,v[i].y); ymax=max_i(ymax,v[i].y);
+    }
+    if (xmax-xmin>=1024 || ymax-ymin>=512) return;
+    NativePlane plane[5];
+    for(int channel=0;channel<5;++channel) {
+        int value[3];
+        for(int i=0;i<3;++i) {
+            if(channel<3) value[i]=(int)(((flags&4)?v[i].rgb:v[0].rgb)>>(channel*8))&255;
+            else value[i]=(channel==3?v[i].u:v[i].v)&255;
+        }
+        plane[channel]=native_plane(v,value,core,area);
+    }
+    // Sorting is solely for coverage; planes retain the original core seed.
+    int order[3]={0,1,2};
+    for(int i=1;i<3;++i) {
+        SwNativeVertex current=v[i]; int original=order[i],j=i;
+        while(j>0 && v[j-1].y>current.y) { v[j]=v[j-1];order[j]=order[j-1]; --j; }
+        v[j]=current;
+        order[j]=original;
+    }
+    int sorted_core=0;
+    while(order[sorted_core]!=core) ++sorted_core;
+    static const int8_t matrix[4][4]={
+        {-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},{3,-1,2,-2}
+    };
+    const int textured=(flags&1)!=0, raw=(flags&2)!=0;
+    if(textured) native_texture_begin(page,cx,cy);
+    const int dither=(flags&8) && (textured?!raw:(flags&4)!=0);
+    const int top=v[0].y,bottom=v[2].y;
+    /* Feedback observes traversal order: start at the core's half, moving
+     * away from its Y. Each horizontal span still runs left to right. */
+    for(int part=0;part<2;++part) {
+      int lower=sorted_core?(part==0):(part==1);
+      int lo=max_i(top,lower?v[1].y:v[0].y);
+      int hi=min_i(bottom,lower?v[2].y:v[1].y);
+      int descending=lower?(sorted_core==2):(sorted_core!=0);
+      for(int row=0;row<hi-lo;++row) {
+        int y=descending?hi-1-row:lo+row;
+        const int py=(y&1023)-(y&1024);
+        if(native_skip_row(py)) continue;
+        if(py<0 || py>=512 || py<g_clip_y1 || py>g_clip_y2) continue;
+        int a,b;
+        psx_triangle_edges_at_y(v[0].x,v[0].y,v[1].x,v[1].y,v[2].x,v[2].y,y,&a,&b);
+        const int start=min_i(a,b),wrapped=(start&1023)-(start&1024);
+        const int translation=start-wrapped;
+        int left=max_i(max_i(wrapped,g_clip_x1),0);
+        int right=min_i(min_i(wrapped+abs(a-b),g_clip_x2+1),1024);
+        int wrote=0;
+        for(int px=left;px<right;++px) {
+            const int x=px+translation;
+            uint16_t *dst=g_vram+py*1024+px;
+            int r=(int)native_plane_at(plane[0],x,y);
+            int g=(int)native_plane_at(plane[1],x,y);
+            int bcol=(int)native_plane_at(plane[2],x,y);
+            uint16_t color,stp=0;
+            if(textured) {
+                uint16_t texel=native_texel((int)native_plane_at(plane[3],x,y),
+                                            (int)native_plane_at(plane[4],x,y),page);
+                if(!texel) continue;
+                stp=texel&0x8000;
+                if(raw) color=texel&0x7fff;
+                else {
+                    r=((texel&31)*r)>>4;
+                    g=(((texel>>5)&31)*g)>>4;
+                    bcol=(((texel>>10)&31)*bcol)>>4;
+                    color=native_quantize(r,g,bcol,dither?matrix[y&3][x&3]:0);
+                }
+            } else color=native_quantize(r,g,bcol,dither?matrix[y&3][x&3]:0);
+            if(g_mask_check_bit && (*dst&0x8000)) continue;
+            if(g_semi_trans_enabled && (!textured || stp))
+                color=blend_pixels(*dst,color,g_semi_trans_mode);
+            *dst=color|stp|(g_mask_set_bit?0x8000:0);
+            wrote=1;
+        }
+        if(wrote) sw_dirty_row((uint32_t)py);
+      }
+    }
+}
+
+/* Native line coordinates use a dominant-axis DDA, not Bresenham. Keep
+ * colour at 12 fractional bits until quantization, including flat dithering.
+ * The endpoint is inclusive; the subpixel bias resolves half-pixel ties. */
+void sw_draw_native_line(const SwNativeVertex input[2],unsigned flags) {
+    SwNativeVertex a=input[0],b=input[1];
+    int dx=abs(b.x-a.x),dy=abs(b.y-a.y),steps=max_i(dx,dy);
+    if(dx>=1024 || dy>=512) return;
+    if(a.x>b.x) { SwNativeVertex swap=a;a=b;b=swap; }
+    int64_t sx=(int64_t)(b.x-a.x)*INT64_C(4294967296);
+    int64_t sy=(int64_t)(b.y-a.y)*INT64_C(4294967296);
+    if(steps) {
+        sx=(sx+(sx>0?steps-1:sx<0?1-steps:0))/steps;
+        sy=(sy+(sy>0?steps-1:sy<0?1-steps:0))/steps;
+    }
+    int64_t x=(int64_t)a.x*INT64_C(4294967296)+INT64_C(2147483648)-1024;
+    int64_t y=(int64_t)a.y*INT64_C(4294967296)+INT64_C(2147483648)-(sy<0?1024:0);
+    int color[3],delta[3];
+    for(int c=0;c<3;++c) {
+        int first=(int)((a.rgb>>(8*c))&255);
+        int last=(int)((b.rgb>>(8*c))&255);
+        color[c]=first*4096+2048;
+        delta[c]=(steps && (flags&4))?(last-first)*4096/steps:0;
+    }
+    static const int8_t matrix[4][4]={{-4,0,-3,1},{2,-2,3,-1},{-3,1,-4,0},{3,-1,2,-2}};
+    for(int i=0;i<=steps;++i,x+=sx,y+=sy) {
+        int px=(int)(((uint64_t)x>>32)&2047),py=(int)(((uint64_t)y>>32)&2047);
+        if(!native_skip_row(py) && px>=g_clip_x1 && px<=g_clip_x2 && px<1024 &&
+           py>=g_clip_y1 && py<=g_clip_y2 && py<512) {
+            uint16_t *dst=g_vram+py*1024+px;
+            if(!g_mask_check_bit || !(*dst&0x8000)) {
+                uint16_t value=native_quantize(color[0]/4096,color[1]/4096,color[2]/4096,
+                                               (flags&8)?matrix[py&3][px&3]:0);
+                if(g_semi_trans_enabled) value=blend_pixels(*dst,value,g_semi_trans_mode);
+                *dst=value|(g_mask_set_bit?0x8000:0);
+                sw_dirty_row((uint32_t)py);
+            }
+        }
+        for(int c=0;c<3;++c) color[c]+=delta[c];
+    }
+}
+
+void sw_draw_native_rect(int x,int y,int w,int h,uint32_t rgb,int u,int v,
+                         uint16_t cx,uint16_t cy,uint16_t page,unsigned flags) {
+    /* Horizontal sprite reversal starts on the odd texel of its pair. */
+    if(flags&16) u|=1;
+    if(flags&1) native_texture_begin(page,cx,cy);
+    const int left=max_i(max_i(x,g_clip_x1),0),top=max_i(max_i(y,g_clip_y1),0);
+    const int right=min_i(min_i(x+w,g_clip_x2+1),1024);
+    const int bottom=min_i(min_i(y+h,g_clip_y2+1),512);
+    for(int py=top;py<bottom;++py) {
+        if(native_skip_row(py)) continue;
+        int wrote=0;
+        for(int px=left;px<right;++px) {
+            uint16_t *dst=g_vram+py*1024+px,stp=0,color;
+            int r=rgb&255,g=(rgb>>8)&255,b=(rgb>>16)&255;
+            if(flags&1) {
+                uint16_t texel=native_texel(u+((flags&16)?x-px:px-x),
+                                           v+((flags&32)?y-py:py-y),page);
+                if(!texel) continue;
+                stp=texel&0x8000;
+                if(flags&2) color=texel&0x7fff;
+                else color=native_quantize(((texel&31)*r)>>4,
+                    (((texel>>5)&31)*g)>>4,(((texel>>10)&31)*b)>>4,0);
+            } else color=native_quantize(r,g,b,0);
+            if(g_mask_check_bit && (*dst&0x8000)) continue;
+            if(g_semi_trans_enabled && (!(flags&1) || stp))
+                color=blend_pixels(*dst,color,g_semi_trans_mode);
+            *dst=color|stp|(g_mask_set_bit?0x8000:0);
+            wrote=1;
+        }
+        if(wrote) sw_dirty_row((uint32_t)py);
+    }
+}
 
 static uint16_t bl_fetch(int u, int v, uint16_t texpage,
                          uint16_t clut_x, uint16_t clut_y) {
@@ -671,12 +1020,13 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
 
     for (int row = 0; row < h; row++) {
         int py = (y0 + row) & (VRAM_HEIGHT - 1);
+        if (native_skip_row(py)) continue;
         for (int col = 0; col < w; col++) {
             int px = (x0 + col) & (VRAM_WIDTH - 1);
             g_vram[py * VRAM_WIDTH + px] = color;
         }
     }
-    gpu_vram_dirty_mark_rect(x0, y0, w, h);
+    sw_dirty_rect(x0, y0, w, h);
 
     if (g_hr) hr_fill_block(x, y, w, h, color);
 }
@@ -742,7 +1092,7 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
                 }
             }
         }
-        gpu_vram_dirty_mark_row((uint32_t)dy);
+        sw_dirty_row((uint32_t)dy);
     }
 
     if (hr_rows) free(hr_rows);
@@ -1580,7 +1930,7 @@ void sw_vram_write(int x, int y, uint16_t pixel) {
     x &= (VRAM_WIDTH - 1);
     y &= (VRAM_HEIGHT - 1);
     g_vram[y * VRAM_WIDTH + x] = pixel;
-    gpu_vram_dirty_mark_row((uint32_t)y);
+    sw_dirty_row((uint32_t)y);
 
     if (g_hr) {
         int s = g_scale;
@@ -1647,7 +1997,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
      * does s² stores per guest texel — multi-second hitches on 2×/4×. */
     if (x == 0 && y == 0 && w == VRAM_WIDTH && h == VRAM_HEIGHT) {
         memcpy(g_vram, data, (size_t)VRAM_WIDTH * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
-        gpu_vram_dirty_mark_all();
+        sw_dirty_all();
         if (g_hr) hr_rebuild_from_vram();
         return;
     }
@@ -1661,7 +2011,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
                    data + (size_t)row * (size_t)w,
                    (size_t)w * sizeof(uint16_t));
         }
-        gpu_vram_dirty_mark_rect(x, y, w, h);
+        sw_dirty_rect(x, y, w, h);
         return;
     }
 
@@ -1683,7 +2033,7 @@ void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
                 }
             }
         }
-        gpu_vram_dirty_mark_row((uint32_t)py);
+        sw_dirty_row((uint32_t)py);
     }
 }
 

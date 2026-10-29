@@ -103,6 +103,21 @@ extern "C" int gte_geometry_correction_lookup_probe(uint32_t, int32_t*, int32_t*
 /* ---- the runtime surface mod_runtime.cpp links against ------------------- */
 
 static std::array<uint8_t, 2 * 1024 * 1024> ram;
+/* Real package override registration is linked, but this session fixture
+ * never executes guest overrides. Fail loudly if that contract changes. */
+extern "C" {
+uint64_t psx_cycle_count,psx_next_service_cycle;
+int psx_in_device_service,g_event_step_conservative,g_ls_replay_active;
+uint32_t g_psx_cyc_batch,g_psx_cyc_batch_limit;
+void psx_devices_service_to_now(void) { std::abort(); }
+void psx_advance_cycles_slow(uint32_t) { std::abort(); }
+void psx_dispatch_call(CPUState*,uint32_t,uint32_t) { std::abort(); }
+uint32_t psx_peek_word_untraced(uint32_t a) {
+    const uint32_t o=a&0x1fffffu;
+    return uint32_t(ram[o]) | (uint32_t(ram[(o+1)&0x1fffffu])<<8) |
+        (uint32_t(ram[(o+2)&0x1fffffu])<<16) | (uint32_t(ram[(o+3)&0x1fffffu])<<24);
+}
+}
 extern "C" uint8_t psx_read_byte(uint32_t a) { return ram[a & 0x1fffffu]; }
 extern "C" void psx_write_byte(uint32_t a, uint8_t v) { ram[a & 0x1fffffu] = v; }
 extern "C" uint16_t psx_read_half(uint32_t a) {

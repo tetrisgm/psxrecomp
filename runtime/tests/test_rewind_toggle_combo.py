@@ -2,6 +2,7 @@
 """Guard PSX host controller shortcuts against single-button defaults."""
 
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +48,7 @@ assert "g_frame_period_ms / (double)mult" in MAIN
 assert "static int           g_hotkey_pad_fast_forward = 1528;" in MAIN
 assert "PSX_HOTKEY_PAD_SELECT_L1" in MAIN
 assert "PSX_ASSIST_BIND_FAST_FORWARD" in MAIN
-assert "hotkey_shortcut_down(PSX_ASSIST_BIND_FAST_FORWARD, g_hotkey_pad_fast_forward)) {" in MAIN
+assert re.search(r"hotkey_shortcut_down\(PSX_ASSIST_BIND_FAST_FORWARD,\s*g_hotkey_pad_fast_forward\)", MAIN)
 assert MAIN.count("ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD]") == \
     MAIN.count("ls.assist_pad_bind[PSX_ASSIST_BIND_SAVE_STATE_MENU]")
 assert '"Fast-forward",' in MAIN
@@ -64,7 +65,7 @@ assert "static int g_manual_turbo_latched = 0;" in MAIN
 assert "static void fast_forward_toggle_flip(void)" in MAIN
 assert "fast_forward_toggle_poll_buttons();" in MAIN
 assert "host_keymap_match_event(HOST_KEYMAP_TURBO_TOGGLE," in MAIN
-assert "if (kb_turbo || g_manual_turbo_latched ||" in MAIN
+assert "manual_turbo_requested = g_manual_turbo_latched || kb_turbo ||" in MAIN
 assert MAIN.count("ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD_TOGGLE]") == \
     MAIN.count("ls.assist_pad_bind[PSX_ASSIST_BIND_FAST_FORWARD]")
 assert '"Fast-forward toggle",' in MAIN

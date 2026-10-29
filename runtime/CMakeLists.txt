@@ -1062,6 +1062,7 @@ if(BUILD_TESTING)
     foreach(_pgxp_session_test IN ITEMS pgxp_session_test pgxp_session_hooks_test)
         add_executable(${_pgxp_session_test} tests/test_pgxp_session.cpp
             src/pgxp_session.cpp src/mod_builtin_pgxp.c src/pgxp.cpp
+            src/func_override.c src/host_overlay.c
             src/mod_immediate.c
             src/psx_ram_geometry.c
             src/mod_runtime.cpp
@@ -1603,6 +1604,7 @@ if(BUILD_TESTING)
     target_compile_features(resident_sector_test PRIVATE cxx_std_17)
     add_test(NAME resident_sector_test COMMAND resident_sector_test)
     add_executable(netplay_view_mods_test
+        src/func_override.c src/host_overlay.c
         tests/test_netplay_view_mods.cpp
         src/mod_immediate.c
         src/iso_reader_c.cpp
@@ -1649,6 +1651,7 @@ if(BUILD_TESTING)
     add_test(NAME mod_runtime_cache_test COMMAND mod_runtime_cache_test)
 
     add_executable(mod_resident_test
+        src/func_override.c src/host_overlay.c
         tests/test_mod_resident.cpp
         src/mod_immediate.c
         src/mod_resident.cpp
@@ -1809,6 +1812,34 @@ if(BUILD_TESTING)
                    src/stereo_shed_policy.c)
     target_include_directories(stereo_shed_policy_test PRIVATE include)
     add_test(NAME stereo_shed_policy_test COMMAND stereo_shed_policy_test)
+    add_executable(native_raster_test tests/test_native_raster.cpp
+                   src/native_raster.cpp src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
+    target_include_directories(native_raster_test PRIVATE include)
+    target_compile_features(native_raster_test PRIVATE cxx_std_17)
+    find_package(Threads REQUIRED)
+    target_link_libraries(native_raster_test PRIVATE Threads::Threads)
+    if(NOT MSVC)
+        target_compile_options(native_raster_test PRIVATE -UNDEBUG)
+    else()
+        target_compile_options(native_raster_test PRIVATE /UNDEBUG)
+    endif()
+    add_test(NAME native_raster_test COMMAND native_raster_test)
+    set_tests_properties(native_raster_test PROPERTIES TIMEOUT 30)
+
+    # Parser fixtures use the real native authority, not a fake VRAM reader.
+    add_library(gpu_fixture_native STATIC src/native_raster.cpp src/gpu_sw_renderer.c
+                src/gpu_vram_dirty.c)
+    target_include_directories(gpu_fixture_native PRIVATE include)
+    target_compile_features(gpu_fixture_native PRIVATE cxx_std_17)
+    target_link_libraries(gpu_fixture_native PUBLIC Threads::Threads)
+    foreach(fixture gpu_display_cache_test gpu_textured_dot_nw_shift_exec_test
+            ws_auto_ui_untextured_exec_test ws_shared_split_ui_exec_test
+            ws_local_view_margin_test depth24_present_hold_exec_test
+            ws_view_anchor_gpu_test native_wide_projection_test
+            gpu_render_pass_provenance_test)
+        target_link_libraries(${fixture} PRIVATE gpu_fixture_native)
+    endforeach()
+
     # Render thread core ([video] render_thread, docs/RENDER_THREAD.md):
     # ordering across ring wraps, the frame bound, stale-frame detection and
     # the drain + context hand-off sync point, against a fake executor.
@@ -2315,6 +2346,10 @@ if(BUILD_TESTING)
         add_test(NAME bios_registry_zero_entry_guard_test
                  COMMAND ${Python3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bios_registry_zero_entry.py)
+        add_test(NAME render_diagnostics_test COMMAND ${Python3_EXECUTABLE}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_render_diagnostics.py)
+        set_tests_properties(render_diagnostics_test PROPERTIES SKIP_RETURN_CODE 77
+                             LABELS "integration;external-runtime" TIMEOUT 180)
         # Exercises runtime/psx_check_mod_catalog.cmake -- the build-time guard
         # that fails a build when a title's mod packages land in the legacy
         # mods/packages layout instead of mods/bundled (bead beads-eio.3.101).

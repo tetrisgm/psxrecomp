@@ -148,7 +148,7 @@ static int  s_recv_len = 0;
  * request slot suffices. A lock-free `ping` fast-path on the I/O thread answers
  * even while the emu thread is buried (freeze liveness). See debug_server_poll /
  * io_thread_main. */
-enum { IO_IDLE = 0, IO_REQ = 1, IO_RESP = 2 };
+enum { IO_IDLE = 0, IO_REQ = 1, IO_RESP = 2, IO_EXEC = 3 };
 static SDL_Thread *s_io_thread   = NULL;
 static SDL_mutex  *s_io_mutex    = NULL;
 static SDL_cond   *s_io_req_cv   = NULL;   /* emu waits on this for a request   */
@@ -167,7 +167,7 @@ static char  s_io_req[RECV_BUF_SIZE];      /* request line (I/O -> emu)         
 static char *s_resp_buf = NULL;            /* response bytes (emu -> I/O)       */
 static size_t s_resp_len = 0, s_resp_cap = 0;
 static int    s_resp_overflow = 0;
-static int    s_in_command = 0;            /* 1 while emu runs process_command  */
+static _Thread_local int s_in_command = 0; /* only the response owner may append */
 static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
 static volatile int s_fmv_quiet = 0;
 
@@ -10389,28 +10389,11 @@ static void handle_get_snapshots(int id, const char *json)
  * the old "screenshot" inline-hex-row variant streamed h+1 response lines
  * per request, which violated the one-request/one-response protocol and
  * poisoned every client connection that used it. */
-/* ---- Always-on display ring ----------------------------------------------
- * The last DISP_RING_CAP vblanks' display areas, raw 15-bit VRAM halfwords,
- * captured in debug_server_record_frame (ring-buffer rule: continuous
- * capture, observers query a window after the fact). Purpose: FRAME-EXACT
- * screenshots. `screenshot_file` returns whatever is displayed when the
- * command lands — 1-3 frames after the `frame` query that named it — which
- * makes cross-renderer same-frame diffing impossible. With this ring, two
- * deterministic runs (GL vs software) can each serve the display for the
- * SAME frame number, giving a pixel-exact renderer-divergence census.
- * GL reads GPU-side truth via the fbo peek; software reads CPU VRAM (its
- * authoritative surface). Each entry is the full 1024x512 VRAM plus the
- * display geometry of that frame, and the PNG is decoded from it with the
- * same scanout decode as screenshot_file — so 480-line interlaced displays
- * and depth24 (FMV) frames are served whole, not cropped or refused. */
-#define DISP_RING_CAP   64    /* full-VRAM entries are 1MB each; ~1s of
-                               * lookback for exact-frame forensics */
-/* The entire 1024x512 raw VRAM as the renderer sees it at this frame (GL: FBO
- * truth; SW and depth24: CPU truth), so an offline client can micro-cosim ANY
- * prim of the frame — rasterize it from the GP0 ring against the exact
- * same-frame texels/CLUTs — and attribute a bad pixel to sampling vs content.
- * Streamed texture pages and palette cycling make later peeks worthless; only
- * a same-frame capture is evidence. */
+/* Native display history, debug builds only. Each entry is the exact
+ * 1024x512 guest VRAM plus display configuration at a VBlank. This is the
+ * canonical pixel-parity source; present_image_ring records enhanced output.
+ * Both GL and software presentation use the same native authority here. */
+#define DISP_RING_CAP 64
 typedef struct {
     uint32_t frame;
     uint8_t  valid;
@@ -10428,10 +10411,8 @@ static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 
 static void disp_ring_capture(void)
 {
-    /* Full-VRAM GL readback is intentionally expensive and can perturb the
-     * performance issue being measured. Keep the forensic ring default-on, but
-     * allow a controlled acceptance run to disable continuous capture while
-     * retaining the TCP server and one-shot screenshot command. */
+    /* Native snapshots never depend on the presentation queue. The opt-out
+     * remains useful when measuring the cost of debug instrumentation. */
     static int enabled = -1;
     if (enabled < 0) {
         const char *e = getenv("PSX_DISPLAY_RING");
@@ -10453,17 +10434,9 @@ static void disp_ring_capture(void)
     if (di.disabled || di.width == 0 || di.height == 0) return;
     gpu_timeline_note(GTL_DISP_CAPTURE, 0, di.display_x | (di.display_y << 16));
     e->di = di;
-    /* GPU-side truth when the GL raster pipeline is live; CPU VRAM otherwise
-     * (the software backend's authoritative surface). depth24 always reads
-     * the CPU mirror: packed RGB888 MDEC bytes live there, not in the FBO
-     * (see screenshot_file). Runs on the present thread, where the GL context
-     * is current. Deferred: with the render thread on, the readback is
-     * recorded at this point of the command stream and filled in by the
-     * render thread (ring readers sync first). */
-    if (di.depth24 || !gl_renderer_fbo_peek_deferred(0, 0, 1024, 512, e->vram)) {
-        const uint16_t *v = gpu_get_vram();
-        memcpy(e->vram, v, (size_t)1024 * 512 * sizeof(uint16_t));
-    }
+    /* Exact guest output at this boundary, independent of presentation
+     * latency, PGXP and scale. Enhanced output has its own present ring. */
+    gpu_native_vram_read(0,0,1024,512,e->vram);
     e->valid = 1;
 }
 
@@ -10471,7 +10444,6 @@ static void disp_ring_capture(void)
  * (1024x512 row-major). */
 static void handle_display_ring_aux(int id, const char *json)
 {
-    gl_renderer_render_thread_sync("display_ring");
     int f = json_get_int(json, "frame", -1);
     if (f < 0) { send_err(id, "missing frame"); return; }
     char path[512];
@@ -10493,7 +10465,6 @@ static void handle_display_ring_aux(int id, const char *json)
 
 static void handle_display_ring_stats(int id, const char *json)
 {
-    gl_renderer_render_thread_sync("display_ring");
     (void)json;
     uint32_t oldest = 0, newest = 0;
     int n = 0;
@@ -10511,7 +10482,6 @@ static void handle_display_ring_stats(int id, const char *json)
 
 static void handle_display_ring_get(int id, const char *json)
 {
-    gl_renderer_render_thread_sync("display_ring");
     int f = json_get_int(json, "frame", -1);
     if (f < 0) { send_err(id, "missing frame"); return; }
     char path[512];
@@ -10552,16 +10522,8 @@ static void handle_screenshot_file(int id, const char *json)
     if (di.disabled || di.width == 0 || di.height == 0) {
         send_err(id, "display disabled"); return;
     }
-    /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
-     * the freshest frame and is presented without a readback). Sync it down so
-     * the capture reflects what's on screen. NEVER sync on depth24: FBO
-     * readback clobbers packed RGB888 MDEC bytes in the CPU mirror. */
-    if (!di.depth24) {
-        extern void gl_renderer_sync_cpu(void);
-        gl_renderer_sync_cpu();
-        extern void vk_renderer_sync_cpu(void);
-        vk_renderer_sync_cpu();
-    }
+    /* This command captures native guest scanout. Presented-image captures
+     * use the renderer's separate output surface. */
 
     uint32_t w = di.width;  if (w > 640) w = 640;
     uint32_t h = di.height; if (h > 512) h = 512;
@@ -10787,9 +10749,8 @@ static void handle_dynres_force(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"level\":%d,\"forced\":%d}", id, l, s > 0);
 }
 
-/* FNV-1a over the guest-visible VRAM (the CPU array after a GL sync). */
+/* FNV-1a over native guest-visible VRAM, independent of presentation. */
 static uint64_t dynres_vram_hash(void) {
-    gl_renderer_sync_cpu();
     uint64_t h = 1469598103934665603ull;
     for (int y = 0; y < 512; y++)
         for (int x = 0; x < 1024; x++) {
@@ -11053,10 +11014,6 @@ static void handle_host_osd_shot(int id, const char *json)
  * strobing character is present in one buffer only. */
 static void handle_dump_buffer(int id, const char *json)
 {
-    extern void gl_renderer_sync_cpu(void);
-    gl_renderer_sync_cpu();
-    extern void vk_renderer_sync_cpu(void);
-    vk_renderer_sync_cpu();
 
     int y0 = json_get_int(json, "y", 0);
     char path[512];
@@ -11101,8 +11058,6 @@ static const char *write_wide_png(const char *path, int *out_w, int *out_h)
     extern int gr_scale(void);
     extern int gr_render_wide_display(uint32_t *out, int pitch, int base_x,
                                       int disp_y, int disp_h);
-    extern void gl_renderer_sync_cpu(void);
-    gl_renderer_sync_cpu();   /* no-op on SW / when no GL frame pending */
 
     if (!gr_wide_supported()) return "active backend has no wide compositor";
     int extra = ws_nw_extra();
@@ -11176,7 +11131,6 @@ void debug_server_capture_mark(void)
     s_capture_wide_ok = write_wide_png(s_capture_wide_path, NULL, NULL) == NULL;
     s_capture_frozen = 1;
     gpu_gp0_ring_set_frozen(1);
-    gl_renderer_render_thread_sync("capture_mark");
     present_image_ring_set_frozen(1);
     gpu_timeline_set_frozen(1);
 }
@@ -11212,7 +11166,6 @@ static void handle_frame_gen(int id, const char *json)
 static void handle_present_image_ring_stats(int id, const char *json)
 {
     (void)json;
-    gl_renderer_render_thread_sync("present_image_ring");  /* render thread writes it */
     uint32_t lo = 0, hi = 0, seq_lo = 0, seq_hi = 0; int n = 0;
     present_image_ring_span(&lo, &hi, &n);
     present_image_ring_sequence_span(&seq_lo, &seq_hi);
@@ -11223,7 +11176,6 @@ static void handle_present_image_ring_stats(int id, const char *json)
 }
 static void handle_present_image_ring_get(int id, const char *json)
 {
-    gl_renderer_render_thread_sync("present_image_ring");
     int f = json_get_int(json, "frame", -1);
     int seq = json_get_int(json, "sequence", -1);
     char path[512];
@@ -11265,7 +11217,6 @@ static void handle_capture_mark(int id, const char *json)
     } else if (strcmp(op, "status")) { send_err(id, "op must be status|mark|release"); return; }
     uint32_t oldest = 0, newest = 0;
     gpu_gp0_ring_frame_span(&oldest, &newest);
-    gl_renderer_render_thread_sync("display_ring");
     uint32_t d_old = UINT32_MAX, d_new = 0;
     for (int i = 0; i < DISP_RING_CAP; i++) {
         if (!s_disp_ring[i].valid) continue;
@@ -11308,8 +11259,6 @@ static void handle_wide_full(int id, const char *json)
      * wide-surface dump (SW: sw_wide_dump_full; GL: glb_wide_dump_full), so the
      * whole compositor surface can be inspected on either backend over TCP. */
     extern int gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
-    extern void gl_renderer_sync_cpu(void);
-    gl_renderer_sync_cpu();   /* no-op on SW; ensures pending GL frame is flushed */
     int base_x = json_get_int(json, "base_x", 0);
     /* "alpha":1 writes bit 15 (GL: the surface alpha) as white/black. */
     int show_alpha = json_get_int(json, "alpha", 0);
@@ -17521,6 +17470,13 @@ static int io_thread_main(void *arg)
 
         /* Hand the request to the emu thread and wait (bounded) for its reply. */
         SDL_LockMutex(s_io_mutex);
+        if(s_io_state==IO_EXEC) {
+            /* A timed-out request may still be executing on either owner.
+             * Never overwrite its response storage with a new request. */
+            SDL_UnlockMutex(s_io_mutex);
+            const char *busy="{\"ok\":false,\"err\":\"previous request still executing\"}\n";
+            send_all_blocking(c,busy,strlen(busy)); sock_close(c); continue;
+        }
         strncpy(s_io_req, req, sizeof(s_io_req) - 1);
         s_io_req[sizeof(s_io_req) - 1] = '\0';
         s_io_state = IO_REQ;
@@ -17554,6 +17510,49 @@ void debug_server_get_status(int *listening, int *port, int *error)
     if (error)     *error     = s_listen_err;
 }
 
+static void complete_debug_response(void) {
+    SDL_LockMutex(s_io_mutex);
+    if(s_io_state==IO_EXEC) {
+        s_io_state=IO_RESP;
+        SDL_CondSignal(s_io_resp_cv);
+    }
+    SDL_UnlockMutex(s_io_mutex);
+}
+typedef struct RenderDebugRequest {
+    void (*handler)(int,const char *);
+    int id;
+    char json[RECV_BUF_SIZE];
+} RenderDebugRequest;
+static void execute_render_debug_request(const void *data) {
+    const RenderDebugRequest *request=data;
+    s_in_command=1;
+    request->handler(request->id,request->json);
+    s_in_command=0;
+    complete_debug_response();
+}
+static int queue_render_debug_request(const char *json) {
+    char name[64];
+    if(!json_get_str(json,"cmd",name,sizeof name)) return 0;
+    RenderDebugRequest request={0};
+    /* These handlers access only renderer-owned state, never guest memory or
+     * the guest lockstep recorder. Other handlers still run at the CPU safe
+     * point until their mixed inputs have an explicit immutable snapshot. */
+    if(!strcmp(name,"gl_coh_ring")) request.handler=handle_gl_coh_ring;
+    else if(!strcmp(name,"gl_present_ring")) request.handler=handle_gl_present_ring;
+    else if(!strcmp(name,"post_aa")) request.handler=handle_post_aa;
+    else if(!strcmp(name,"post_shader")) request.handler=handle_post_shader;
+    else if(!strcmp(name,"bloom")) request.handler=handle_bloom;
+    else if(!strcmp(name,"batch_sites")) request.handler=handle_batch_sites;
+    else if(!strcmp(name,"gl_interp")) request.handler=handle_gl_interp;
+    else if(!strcmp(name,"gl_ws_ablate")) request.handler=handle_gl_ws_ablate;
+      else if(!strcmp(name,"gl_fbo_peek")) request.handler=handle_gl_fbo_peek;
+      else if(!strcmp(name,"gl_vram_diff")) request.handler=handle_gl_vram_diff;
+    else return 0;
+    request.id=json_get_int(json,"id",0);
+    snprintf(request.json,sizeof request.json,"%s",json);
+    return gl_renderer_queue_diagnostic(execute_render_debug_request,&request,sizeof request);
+}
+
 void debug_server_poll(void)
 {
     /* Phase 1.0e-e2 starvation watchdog heartbeat. Refreshes the
@@ -17569,23 +17568,18 @@ void debug_server_poll(void)
     char req[RECV_BUF_SIZE];
     strncpy(req, s_io_req, sizeof(req) - 1);
     req[sizeof(req) - 1] = '\0';
+    s_io_state=IO_EXEC;
     SDL_UnlockMutex(s_io_mutex);
 
     /* Execute on the emu thread (safe point). send_line appends to s_resp_buf. */
     s_resp_len = 0;
     s_resp_overflow = 0;
+    if(queue_render_debug_request(req)) return;
     s_in_command = 1;
     if (req[0]) process_command(req);
     s_in_command = 0;
 
-    SDL_LockMutex(s_io_mutex);
-    /* Only deliver if the I/O thread is still waiting (it may have timed out and
-     * moved on, in which case the response is discarded). */
-    if (s_io_state == IO_REQ) {
-        s_io_state = IO_RESP;
-        SDL_CondSignal(s_io_resp_cv);
-    }
-    SDL_UnlockMutex(s_io_mutex);
+    complete_debug_response();
 }
 
 void debug_server_record_frame(void)

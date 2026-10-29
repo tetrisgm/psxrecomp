@@ -1,4 +1,5 @@
 #include "mod_runtime.h"
+#include "mod_policy_guest_fixture.inc"
 #include "mod_packages.h"
 #include "mod_plugins.h"
 #include "sio.h"

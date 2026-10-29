@@ -7,6 +7,38 @@
 extern "C" {
 #endif
 
+/* Explicit contexts are exclusively owned by one thread at a time. Binding
+ * NULL restores the existing default renderer. Private contexts track dirty
+ * rows independently of the legacy global checkpoint tracker. */
+typedef struct SwRendererContext SwRendererContext;
+SwRendererContext *sw_context_create(void);
+SwRendererContext *sw_context_bind(SwRendererContext *context);
+void sw_context_destroy(SwRendererContext *context);
+void sw_context_take_dirty(uint64_t rows[8]);
+
+/* Guest-native polygon input, before presentation transforms or RGB555
+ * truncation. x/y already include the guest drawing offset. Flags select
+ * texture (1), raw texture (2), Gouraud (4), and guest dithering (8).
+ * This writes only native VRAM, never enhanced mirrors. */
+typedef struct SwNativeVertex { int x, y; uint32_t rgb; int u, v; } SwNativeVertex;
+void sw_draw_native_triangle(const SwNativeVertex vertices[3],
+                             uint16_t clut_x, uint16_t clut_y,
+                             uint16_t texpage, unsigned flags);
+void sw_draw_native_line(const SwNativeVertex vertices[2], unsigned flags);
+void sw_native_cache_clear(int palette);
+void sw_native_set_skip_field(unsigned field);
+void sw_native_copy(int sx,int sy,int dx,int dy,int w,int h);
+/* Guest-observable cache contents: serialize fields explicitly, not padding. */
+typedef struct SwNativeTextureState {
+    uint32_t tags[256];
+    uint16_t words[256][4],palette[256];
+    uint32_t palette_key,page;
+} SwNativeTextureState;
+void sw_native_texture_save(SwNativeTextureState *state);
+void sw_native_texture_load(const SwNativeTextureState *state);
+void sw_draw_native_rect(int x,int y,int w,int h,uint32_t rgb,int u,int v,
+                         uint16_t clut_x,uint16_t clut_y,uint16_t page,unsigned flags);
+
 /* Maximum internal-resolution supersampling factor (linear, per axis). */
 #define SW_MAX_INTERNAL_SCALE 4
 

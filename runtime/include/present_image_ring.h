@@ -16,7 +16,9 @@ extern "C" {
  * (PSX_PRESENT_IMAGE_RING=0 disables); frozen by the capture mark.
  *
  * Entries are RGB565, PRESENT_IMAGE_RING_H rows tall, width following the
- * window aspect (capped at PRESENT_IMAGE_RING_MAX_W). */
+ * window aspect (capped at PRESENT_IMAGE_RING_MAX_W). Producers publish only
+ * completed CPU thumbnails. Readers copy a published entry without waiting
+ * for GL or draining the render queue; an in-flight capture is not visible. */
 #define PRESENT_IMAGE_RING_CAP   600
 #define PRESENT_IMAGE_RING_H     120
 #define PRESENT_IMAGE_RING_MAX_W 720

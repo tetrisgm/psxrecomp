@@ -60,6 +60,7 @@ static void gpu_display_info_changed(void) {
 #include <stdlib.h>
 #include <string.h>
 #include "gpu_timeline.h"
+#include "native_raster.h"
 
 /* Packet identity of a primitive/OT address: main RAM through the live
  * geometry (retail: the DMAC's 0x1FFFFC fold), the enhancement aperture by its
@@ -95,6 +96,31 @@ static uint8_t gpu_input_read_byte(uint32_t a) {
 
 /* ---- VRAM ---- */
 static uint16_t vram[1024 * 512];
+static NativeRaster *s_native_raster;
+static uint16_t s_native_readback[1024 * 512];
+static NativeRasterCommand s_native_upload;
+static uint16_t s_native_upload_pixels[1024];
+static size_t s_native_upload_count;
+extern int g_psx_render_pass_active;
+static int native_guest_work(void) { return !s_replay && !g_psx_render_pass_active; }
+static void native_submit(const NativeRasterCommand *command,const uint16_t *data,size_t words) {
+    if(native_guest_work() && !native_raster_submit(s_native_raster,command,data,words))
+        psx_fatal_halt("Native GPU command allocation or validation failed");
+}
+static void native_cache_clear(int palette) {
+    NativeRasterCommand command={NR_CACHE_CLEAR,{0}};
+    command.args[0]=palette;
+    native_submit(&command,NULL,0);
+}
+static void native_flush_upload(void) {
+    if(!s_native_upload_count) return;
+    native_submit(&s_native_upload,s_native_upload_pixels,s_native_upload_count);
+    s_native_upload_count=0;
+}
+static void native_shutdown(void) {
+    native_raster_destroy(s_native_raster);
+    s_native_raster=NULL;
+}
 
 /* ---- GP0 state machine ---- */
 
@@ -3604,6 +3630,8 @@ static int32_t  polyline_prev_x, polyline_prev_y;  /* previous vertex */
 static uint16_t polyline_prev_c;      /* shaded polyline: previous color */
 static int      polyline_semi_trans;  /* semi-transparency flag from command word */
 static int      polyline_has_prev;    /* have we seen at least one vertex? */
+static uint32_t native_polyline_color,native_polyline_previous;
+static uint32_t native_sprite_flip;
 
 /* VRAM write transfer state (CPU→VRAM, command 0xA0) */
 static uint16_t vram_write_x, vram_write_y;   /* start coords */
@@ -3632,7 +3660,11 @@ static uint32_t s_d24_prev_disp_h = 0;  /* last GP1(07h) band height */
 static void depth24_note_upload(uint32_t x, uint32_t w);
 
 static void gp0_commit_cpu_to_vram(void) {
-    for (uint32_t row = 0; row < vram_write_h; row++)
+    native_flush_upload();
+    if(native_guest_work())
+        native_raster_read(s_native_raster,vram_write_x,vram_write_y,
+                           vram_write_w,vram_write_h,vram_write_pixels);
+    else for (uint32_t row = 0; row < vram_write_h; row++)
         for (uint32_t col = 0; col < vram_write_w; col++)
             vram_write_pixels[row * vram_write_w + col] =
                 vram[((vram_write_y + row) & 511u) * 1024u +
@@ -4009,12 +4041,16 @@ uint64_t g_pollhack_vblank_count = 0;  /* instrumentation: poll-fallback VBlank 
 /* ---- Initialization ---- */
 
 static void gpu_reset_state(int clear_vram) {
+    native_flush_upload();
     gpu_display_info_changed();
     ws_reset_scene_history();
     if (clear_vram) {
         memset(vram, 0, sizeof(vram));
         gpu_vram_dirty_mark_all();
-    }
+        native_raster_restore(s_native_raster,vram);
+    } else if(native_guest_work()) native_raster_read(s_native_raster,0,0,1024,512,vram);
+    native_cache_clear(1);
+    native_polyline_color=native_polyline_previous=native_sprite_flip=0;
     gr_init(vram);
 
     /* Reset GP0 state machine (+ leftover cmd/xfer crumbs that survive in
@@ -4109,6 +4145,11 @@ static void gpu_reset_state(int clear_vram) {
 }
 
 void gpu_init(void) {
+    if(!s_native_raster) {
+        s_native_raster=native_raster_create(NULL);
+        if(!s_native_raster) psx_fatal_halt("Cannot create native GPU worker");
+        atexit(native_shutdown);
+    }
     gpu_display_info_changed();
     gpu_reset_state(1);
     video_mode = s_power_on_video_mode;
@@ -4232,22 +4273,23 @@ uint32_t gpu_read_gpuread(void) {
     if (!vram_read_active)
         return gpuread_latch;
 
-    /* Read two 16-bit pixels from VRAM and pack into one 32-bit word.
-     * Routed through the renderer facade: under the GL backend the GPU-side
-     * framebuffer is authoritative and must be synced down before the CPU
-     * array is read (no-op cost on the software backend). */
+    /* Native-only reads. Even an odd-sized transfer returns two halfwords:
+     * the final high half is the pixel immediately right of the rectangle's
+     * last pixel (Beetle GPU_ReadData, PS1 GPUREAD transfer semantics). */
     uint32_t value = 0;
     for (int i = 0; i < 2; i++) {
         uint16_t rx = (vram_read_x + vram_read_col) % 1024;
         uint16_t ry = (vram_read_y + vram_read_row) % 512;
-        value |= (uint32_t)gr_vram_read((int)rx, (int)ry) << (i * 16);
+        uint16_t pixel;
+        gpu_native_vram_read((int)rx,(int)ry,1,1,&pixel);
+        value |= (uint32_t)pixel << (i * 16);
 
         if (++vram_read_col == vram_read_w) {
-            vram_read_col = 0;
-            if (++vram_read_row == vram_read_h) {
-                /* Transfer complete */
+            if (vram_read_row + 1 == vram_read_h) {
                 vram_read_active = 0;
-                break;
+            } else {
+                vram_read_col = 0;
+                ++vram_read_row;
             }
         }
     }
@@ -4434,7 +4476,26 @@ void gpu_vblank_tick(void) {
 }
 
 const uint16_t* gpu_get_vram(void) {
-    return vram;
+    native_flush_upload();
+    uint64_t rows[8];
+    native_raster_snapshot(s_native_raster,s_native_readback,rows);
+    for(unsigned y=0;y<512;++y)
+        if(rows[y/64]&(UINT64_C(1)<<(y%64))) gpu_vram_dirty_mark_row(y);
+    return s_native_readback;
+}
+void gpu_native_vram_read(int x,int y,int w,int h,uint16_t *out) {
+    native_flush_upload();
+    native_raster_read(s_native_raster,x,y,w,h,out);
+}
+void gpu_native_vram_restore(const uint16_t *source) {
+    native_flush_upload();
+    /* The GPU register section restores cache contents before the VRAM
+     * section. Preserve those entries even when they differ from VRAM. */
+    SwNativeTextureState texture;
+    uint64_t rows[8];
+    native_raster_checkpoint(s_native_raster,s_native_readback,rows,&texture);
+    native_raster_restore_checkpoint(s_native_raster,source,&texture);
+    gpu_vram_dirty_mark_all();
 }
 
 /* Depth24: note/query/reset the CPU→VRAM upload span tracked above. Used to
@@ -4571,7 +4632,19 @@ void gpu_display_pixel_rgb_in(const uint16_t* image, const GpuDisplayInfo* di,
 
 void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
                            uint8_t* r, uint8_t* g, uint8_t* b) {
-    gpu_display_pixel_rgb_in(vram, di, x, y, r, g, b);
+    uint16_t pixels[2];
+    uint32_t vy=(di->display_y+y)&511u;
+    if(!di->depth24) {
+        gpu_native_vram_read((di->display_x+x)&1023u,vy,1,1,pixels);
+        gpu_rgb555_to_rgb888(pixels[0],r,g,b);
+        return;
+    }
+    uint32_t bx=(di->display_x&1023u)*2u+x*3u;
+    if(bx+2u>=2048u) { *r=*g=*b=0;return; }
+    gpu_native_vram_read(bx/2,vy,2,1,pixels);
+    uint32_t packed=(uint32_t)pixels[0]|((uint32_t)pixels[1]<<16);
+    packed>>=(bx&1u)*8u;
+    *r=(uint8_t)packed;*g=(uint8_t)(packed>>8);*b=(uint8_t)(packed>>16);
 }
 
 uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y) {
@@ -4594,7 +4667,8 @@ void gpu_depth24_present_row(const GpuDisplayInfo* di, uint32_t y, uint32_t* out
                              uint32_t count) {
     uint32_t vy = (di->display_y + y) & 511u;
     uint32_t base_byte_x = (di->display_x & 1023u) * 2u;
-    const uint16_t* row = vram + (size_t)vy * 1024u;
+    uint16_t row[1024];
+    gpu_native_vram_read(0,vy,1024,1,row);
     uint32_t valid = 0u;
     uint32_t x;
 
@@ -5157,19 +5231,7 @@ static void prepare_texture_triangle(int i0, int i1, int i2) {
     gr_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
 }
 
-/* Write a single pixel to VRAM with draw area clipping and mask bit handling */
-static void raster_pixel(int32_t x, int32_t y, uint16_t color) {
-    if (x < (int32_t)draw_area_left || x > (int32_t)draw_area_right) return;
-    if (y < (int32_t)draw_area_top  || y > (int32_t)draw_area_bottom) return;
-    uint32_t vx = (uint32_t)x & 1023u;
-    uint32_t vy = (uint32_t)y & 511u;
-    uint32_t idx = vy * 1024 + vx;
-    if (check_mask_bit && (vram[idx] & 0x8000u)) return;
-    vram[idx] = color | (set_mask_bit ? 0x8000u : 0u);
-    gpu_vram_dirty_mark_row(vy);
-}
-
-/* Inclusive draw-area reject (same predicate as raster_pixel / hardware clip).
+/* Inclusive draw-area reject (hardware clipping predicate).
  *
  * MotK inter-movie / title / char-select OT drains often set GP0(E3/E4) to
  * (0,0)-(0,0) then submit thousands of 1x1 dots and shaded quads. Real GPU
@@ -5247,88 +5309,6 @@ static inline int draw_area_out_rect(int32_t x, int32_t y, int w, int h) {
         || x > right
         || (y + h - 1) < (int32_t)draw_area_top
         || y > (int32_t)draw_area_bottom;
-}
-
-/* Rasterize a flat-shaded triangle using DDA scanline fill.
- * Vertices are in screen coordinates (draw offset already applied). */
-static void raster_triangle(int32_t x0, int32_t y0,
-                            int32_t x1, int32_t y1,
-                            int32_t x2, int32_t y2,
-                            uint16_t color)
-{
-    /* Sort vertices by Y (ascending). */
-    int32_t tx, ty;
-    if (y0 > y1) { tx=x0; ty=y0; x0=x1; y0=y1; x1=tx; y1=ty; }
-    if (y1 > y2) { tx=x1; ty=y1; x1=x2; y1=y2; x2=tx; y2=ty; }
-    if (y0 > y1) { tx=x0; ty=y0; x0=x1; y0=y1; x1=tx; y1=ty; }
-
-    /* Reject degenerate (zero-height) or oversized triangles. */
-    if (y0 == y2) return;
-    if ((x2 - x0) > 1023 || (x0 - x2) > 1023) return;
-    if ((y2 - y0) > 511) return;
-
-    /* 64-bit fixed-point DDA (32.32) matching PS1 hardware behavior.
-     * Reference: DuckStation gpu_sw_rasterizer.inl makefp_xy / makestep_xy */
-    #define FP_ONE  (1LL << 32)
-    #define MAKE_FP(v) (((int64_t)(v) << 32) + (FP_ONE - (1 << 11)))
-    #define MAKE_STEP(dx, dy) \
-        ((((int64_t)(dx) << 32) + ((dx) < 0 ? -((dy)-1) : (((dx) > 0) ? ((dy)-1) : 0))) / (dy))
-    #define UNFP(fp) ((int32_t)((uint64_t)(fp) >> 32))
-
-    /* Upper half: y0 to y1 */
-    if (y1 > y0) {
-        int32_t dy_long  = y2 - y0;
-        int32_t dy_short = y1 - y0;
-        int64_t base   = MAKE_FP(x0);
-        int64_t step_long  = MAKE_STEP(x2 - x0, dy_long);
-        int64_t step_short = MAKE_STEP(x1 - x0, dy_short);
-        /* Determine which edge is left vs right */
-        int64_t lx, rx, ls, rs;
-        if (step_long < step_short) {
-            lx = base; ls = step_long; rx = base; rs = step_short;
-        } else {
-            lx = base; ls = step_short; rx = base; rs = step_long;
-        }
-        for (int32_t y = y0; y < y1; y++) {
-            int32_t xl = UNFP(lx);
-            int32_t xr = UNFP(rx);
-            for (int32_t x = xl; x < xr; x++)
-                raster_pixel(x, y, color);
-            lx += ls; rx += rs;
-        }
-    }
-
-    /* Lower half: y1 to y2 */
-    if (y2 > y1) {
-        int32_t dy_long  = y2 - y0;
-        int32_t dy_short = y2 - y1;
-        /* Long edge continues from y0 to y2 */
-        int64_t step_long  = MAKE_STEP(x2 - x0, dy_long);
-        int64_t long_at_y1 = MAKE_FP(x0) + step_long * (y1 - y0);
-        int64_t short_start = MAKE_FP(x1);
-        int64_t step_short = MAKE_STEP(x2 - x1, dy_short);
-        /* Determine left/right from the upper half's orientation */
-        int64_t lx, rx, ls, rs;
-        int64_t full_step_short_upper = (y1 > y0) ? MAKE_STEP(x1 - x0, y1 - y0) : 0;
-        if (step_long < full_step_short_upper ||
-            (y1 == y0 && long_at_y1 <= short_start)) {
-            lx = long_at_y1; ls = step_long; rx = short_start; rs = step_short;
-        } else {
-            lx = short_start; ls = step_short; rx = long_at_y1; rs = step_long;
-        }
-        for (int32_t y = y1; y < y2; y++) {
-            int32_t xl = UNFP(lx);
-            int32_t xr = UNFP(rx);
-            for (int32_t x = xl; x < xr; x++)
-                raster_pixel(x, y, color);
-            lx += ls; rx += rs;
-        }
-    }
-
-    #undef FP_ONE
-    #undef MAKE_FP
-    #undef MAKE_STEP
-    #undef UNFP
 }
 
 /* Execute mono triangle (GP0 0x20-0x23) */
@@ -7499,8 +7479,46 @@ uint64_t gpu_ws_census_seq(void) { return ws_census_seq; }
 /* Execute a fully-collected GP0 command */
 static void gp0_dispatch_command(uint8_t opcode);
 
+static NativeRasterState native_draw_state(void) {
+    NativeRasterState state={
+        (int32_t)draw_area_left,(int32_t)draw_area_top,
+        (int32_t)draw_area_right,(int32_t)draw_area_bottom,draw_offset_x,draw_offset_y,
+        texpage_x|(texpage_y<<4)|(semi_transparency<<5)|(texpage_colors<<7)|
+        (dither_enabled<<9)|native_sprite_flip,texture_window_value,set_mask_bit,check_mask_bit,
+        (vres && vertical_interlace && !draw_to_display)?1u+((display_area_y+interlace_field)&1u):0u};
+    return state;
+}
+static void native_packet(const uint32_t *words,size_t count) {
+    if(!native_guest_work()) return;
+    NativeRasterState state=native_draw_state();
+    if(!native_raster_gp0(s_native_raster,&state,words,count))
+        psx_fatal_halt("Native GPU packet allocation or validation failed");
+}
+static void native_polyline_segment(uint32_t vertex,int shaded) {
+    uint32_t words[4];
+    words[0]=((shaded?0x50u:0x40u)|(polyline_semi_trans?2u:0u))<<24;
+    words[0]|=native_polyline_previous&0xffffff;
+    words[1]=((uint32_t)(polyline_prev_x-draw_offset_x)&0xffff)|
+             ((uint32_t)(polyline_prev_y-draw_offset_y)<<16);
+    if(shaded) { words[2]=native_polyline_color;words[3]=vertex; }
+    else words[2]=vertex;
+    native_packet(words,shaded?4:3);
+}
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
+    /* Authoritative input is captured before title transforms, RGB555
+     * conversion, shared-UI duplication or precision presentation work. */
+    if(opcode==2 || (opcode>=0x20 && opcode<0xa0))
+        native_packet(gp0_cmd_buf,(size_t)gp0_words_needed);
+    else if(opcode==1) native_cache_clear(1);
+    else if(opcode>=0xa0 && opcode<0xe0) native_cache_clear(0);
+    else if(opcode==0xe1 && native_guest_work()) {
+        uint32_t oldpage=texpage_x|(texpage_y<<4);
+        uint32_t newpage=gp0_cmd_buf[0]&31;
+        if(oldpage!=newpage || (!texpage_colors)!=!((gp0_cmd_buf[0]>>7)&3))
+            native_cache_clear(0);
+        native_sprite_flip=gp0_cmd_buf[0]&0x3000;
+    }
     gp0_opcode_count[opcode]++;
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
     extern void ws_bg_phase_note(uint32_t op);
@@ -7754,8 +7772,9 @@ void gpu_get_draw_area(GpuDrawArea* out) {
 
 uint16_t gpu_vram_peek(int x, int y) {
     if (x < 0 || x >= 1024 || y < 0 || y >= 512) return 0;
-    /* Through the facade so the GL backend syncs its FBO down first. */
-    return gr_vram_read(x, y);
+    uint16_t pixel;
+    gpu_native_vram_read(x,y,1,1,&pixel);
+    return pixel;
 }
 
 static void gpu_write_gp0_body(uint32_t val) {
@@ -7763,6 +7782,17 @@ static void gpu_write_gp0_body(uint32_t val) {
 
     /* State: consuming pixel data for CPU→VRAM transfer */
     if (gp0_state == GP0_VRAM_WRITE) {
+        if(native_guest_work()) {
+            const uint32_t offset=(uint32_t)vram_write_row*vram_write_w+vram_write_col;
+            const uint32_t remaining=(uint32_t)vram_write_w*vram_write_h-offset;
+            const uint16_t pixels[2]={(uint16_t)val,(uint16_t)(val>>16)};
+            NativeRasterCommand command={NR_CPU_UPLOAD,{vram_write_x,vram_write_y,
+                vram_write_w,vram_write_h,(int32_t)offset,(int32_t)set_mask_bit,(int32_t)check_mask_bit}};
+            if(!s_native_upload_count) s_native_upload=command;
+            s_native_upload_pixels[s_native_upload_count++]=pixels[0];
+            if(remaining>1) s_native_upload_pixels[s_native_upload_count++]=pixels[1];
+            if(s_native_upload_count==1024) native_flush_upload();
+        }
         /* Capture first few data words for debug */
         if (a0_capture_slot >= 0 && a0_capture_slot < A0_HISTORY_CAP) {
             int wc = a0_history[a0_capture_slot].word_count++;
@@ -7774,6 +7804,7 @@ static void gpu_write_gp0_body(uint32_t val) {
             uint16_t pixel = (uint16_t)(val >> (i * 16));
             uint16_t wx = (vram_write_x + vram_write_col) % 1024;
             uint16_t wy = (vram_write_y + vram_write_row) % 512;
+            if(native_guest_work()) goto next_pixel;
 
             /* Respect mask bit settings. The check reads through the facade:
              * under the GL backend GPU-drawn mask bits live in the FBO, not
@@ -7843,6 +7874,7 @@ static void gpu_write_gp0_body(uint32_t val) {
         x += draw_offset_x; y += draw_offset_y;
         if (polyline_has_prev &&
             !psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y)) {
+            native_polyline_segment(val,0);
             gr_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
         }
         polyline_prev_x = x; polyline_prev_y = y;
@@ -7867,6 +7899,7 @@ static void gpu_write_gp0_body(uint32_t val) {
             x += draw_offset_x; y += draw_offset_y;
             polyline_prev_x = x; polyline_prev_y = y;
             polyline_prev_c = polyline_color;
+            if(native_guest_work()) native_polyline_previous=native_polyline_color;
             polyline_has_prev = 1;
             return;
         }
@@ -7878,6 +7911,7 @@ static void gpu_write_gp0_body(uint32_t val) {
                 return;
             }
             polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
+            if(native_guest_work()) native_polyline_color=val&0xffffff;
             polyline_has_prev = 2;
             return;
         }
@@ -7886,11 +7920,14 @@ static void gpu_write_gp0_body(uint32_t val) {
             int32_t x, y;
             parse_vertex(val, &x, &y);
             x += draw_offset_x; y += draw_offset_y;
-            if (!psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y))
+            if (!psx_gpu_line_oversize(polyline_prev_x, polyline_prev_y, x, y)) {
+                native_polyline_segment(val,1);
                 gr_draw_shaded_line(polyline_prev_x, polyline_prev_y,
                                     polyline_prev_c, x, y, polyline_color);
+            }
             polyline_prev_x = x; polyline_prev_y = y;
             polyline_prev_c = polyline_color;
+            if(native_guest_work()) native_polyline_previous=native_polyline_color;
             polyline_has_prev = 3;
         }
         return;
@@ -7927,6 +7964,7 @@ static void gpu_write_gp0_body(uint32_t val) {
         int shaded = (opcode & 0x10) != 0;  /* 0x58+ = shaded, 0x48+ = mono */
         polyline_semi_trans = (val >> 25) & 1;
         polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
+        if(native_guest_work()) native_polyline_previous=native_polyline_color=val&0xffffff;
         polyline_prev_c = polyline_color;
         polyline_has_prev = 0;
         gr_set_semi_transparency(polyline_semi_trans, (int)semi_transparency);
@@ -7981,6 +8019,8 @@ static void gp1_reset(void) {
 
 static void gp1_reset_command_buffer(void) {
     /* GP1(01h): Reset command buffer — clears FIFO, aborts current command */
+    native_flush_upload();
+    if(gp0_state==GP0_VRAM_WRITE && native_guest_work()) gp0_commit_cpu_to_vram();
     if (gp0_state == GP0_VRAM_WRITE) gr_vram_upload_set_open(0);
     gp0_state = GP0_IDLE;
     gp0_words_collected = 0;
@@ -8266,15 +8306,35 @@ static int gpu_snap_parse(PstR *r) {
     return 1;
 }
 
-uint32_t gpu_snapshot_bytes(void) {
+static uint32_t gpu_register_snapshot_bytes(void) {
     PstW w; pst_w_init(&w, NULL, 0);
     (void)gpu_snap_emit(&w);
     return (uint32_t)w.written;
 }
+#define NATIVE_GPU_WIRE_BYTES (12u+256u*4u+1024u*2u+256u*2u+8u)
+uint32_t gpu_snapshot_bytes(void) {
+    return gpu_register_snapshot_bytes()+NATIVE_GPU_WIRE_BYTES;
+}
+int gpu_snapshot_valid_size(uint32_t size) {
+    return size==gpu_register_snapshot_bytes() || size==gpu_snapshot_bytes();
+}
+uint32_t gpu_snapshot_presentation_offset(void) { return gpu_register_snapshot_bytes()-12u; }
 void gpu_snapshot_write(uint8_t *p) {
+    native_flush_upload();
     PstW w; uint32_t n = gpu_snapshot_bytes();
     pst_w_init(&w, p, n);
     (void)gpu_snap_emit(&w);
+    SwNativeTextureState texture;
+    uint64_t rows[8];
+    native_raster_checkpoint(s_native_raster,s_native_readback,rows,&texture);
+    for(unsigned y=0;y<512;++y)
+        if(rows[y/64]&(UINT64_C(1)<<(y%64))) gpu_vram_dirty_mark_row(y);
+    pst_w_u32(&w,native_polyline_color);pst_w_u32(&w,native_polyline_previous);
+    pst_w_u32(&w,native_sprite_flip);
+    pst_w_pod(&w,texture.tags,sizeof texture.tags,4);
+    pst_w_pod(&w,texture.words,sizeof texture.words,2);
+    pst_w_pod(&w,texture.palette,sizeof texture.palette,2);
+    pst_w_u32(&w,texture.palette_key);pst_w_u32(&w,texture.page);
 }
 uint32_t gpu_cosim_snapshot_bytes(void) { return gpu_snapshot_bytes(); }
 void gpu_cosim_snapshot_write(uint8_t *p) { gpu_snapshot_write(p); }
@@ -8318,10 +8378,27 @@ void gpu_cosim_dump(char *out, int cap) {
 #undef APPEND
 }
 int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
+    native_flush_upload();
     PstR r;
-    if (len != gpu_snapshot_bytes()) return 0;
+    if (!gpu_snapshot_valid_size(len)) return 0;
     pst_r_init(&r, p, len);
     if (!gpu_snap_parse(&r)) return 0;
+    if(len==gpu_snapshot_bytes()) {
+        SwNativeTextureState texture;
+        if(!pst_r_u32(&r,&native_polyline_color) || !pst_r_u32(&r,&native_polyline_previous) ||
+           !pst_r_u32(&r,&native_sprite_flip) ||
+           !pst_r_pod(&r,texture.tags,sizeof texture.tags,4) ||
+           !pst_r_pod(&r,texture.words,sizeof texture.words,2) ||
+           !pst_r_pod(&r,texture.palette,sizeof texture.palette,2) ||
+           !pst_r_u32(&r,&texture.palette_key) || !pst_r_u32(&r,&texture.page)) return 0;
+        native_raster_read(s_native_raster,0,0,1024,512,s_native_readback);
+        native_raster_restore_checkpoint(s_native_raster,s_native_readback,&texture);
+    } else {
+        native_polyline_color=((polyline_color&31)<<3)|((polyline_color&992)<<6)|((polyline_color&31744)<<9);
+        native_polyline_previous=((polyline_prev_c&31)<<3)|((polyline_prev_c&992)<<6)|((polyline_prev_c&31744)<<9);
+        native_sprite_flip=0;
+        native_cache_clear(1);
+    }
     (void)psx_video_timing_set_pal((int)video_mode);
     ws_reset_scene_history();
     ws_scene_hold_reset(&s_ws_scene_hold);
@@ -8470,7 +8547,7 @@ static GpuVerticalSplitTrace s_pass_split_this;
 
 int gpu_pass_checkpoint_save(void) {
     PstW w;
-    uint32_t n = gpu_snapshot_bytes();
+    uint32_t n = gpu_register_snapshot_bytes();
     if (n > sizeof s_pass_regs) return 0;
     pst_w_init(&w, s_pass_regs, n);
     if (!gpu_snap_emit(&w)) return 0;
@@ -8515,7 +8592,7 @@ uint64_t gpu_pass_state_hash(void) {
     uint8_t buf[512];
     PstW w;
     uint64_t h = 1469598103934665603ULL;
-    uint32_t n = gpu_snapshot_bytes();
+    uint32_t n = gpu_register_snapshot_bytes();
     if (n > sizeof buf) return 0;
     pst_w_init(&w, buf, n);
     if (!gpu_snap_emit(&w)) return 0;
@@ -8523,9 +8600,6 @@ uint64_t gpu_pass_state_hash(void) {
     h = (h ^ gpustat_poll_count) * 1099511628211ULL;
     return h;
 }
-
-uint16_t* gpu_get_vram_ptr(void){ return vram; }
-uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }
 
 int gpu_replay_list_begin(uint32_t root) {
     if(!s_replay) return 0;
@@ -8556,7 +8630,7 @@ GpuReplayState *gpu_replay_capture(void) {
     if (s_replay || gp0_state != GP0_IDLE || gl_renderer_frame_generation()) return NULL;
     GpuReplayState *state = calloc(1, sizeof(*state));
     if (!state) return NULL;
-    state->regs_len = gpu_snapshot_bytes();
+    state->regs_len = gpu_register_snapshot_bytes();
     if (state->regs_len > sizeof state->regs) { free(state); return NULL; }
     PstW w; pst_w_init(&w, state->regs, state->regs_len);
     if (!gpu_snap_emit(&w)) { free(state); return NULL; }

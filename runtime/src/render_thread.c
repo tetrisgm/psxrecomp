@@ -81,6 +81,8 @@ static void cpu_relax(void) {
 
 #define OP_PAD   0u      /* filler to the ring end; consumer skips it  */
 #define F_FRAME  0x8000u /* op 0 with this flag: frame marker          */
+#define OP_CHUNK UINT16_MAX /* transport-only fragment of one large record */
+typedef struct RtChunk { RtCmd command; uint32_t offset; } RtChunk;
 
 /* Producer-side wake batching: a sleeping render thread is woken once this
  * much unread work is queued (frame ends, drains and acquires always wake). */
@@ -140,6 +142,7 @@ static struct {
     uint16_t pend_op, pend_flags;
     uint32_t pend_payload;
     int      pending;
+    RtCmd   *large_pending;   /* producer owns until commit fragments it */
     uint8_t *batch;
     uint64_t batch_used, batch_records;
     int batch_active, batch_failed;
@@ -214,6 +217,7 @@ static void serve_release_locked(void) {
     cnd_bcast(&R.cv_emu);
     while (R.release_req && !R.stop) cnd_wait(&R.cv_work, &R.mtx);
     atomic_store(&R.released, 0);
+    cnd_bcast(&R.cv_emu);
     if (R.stop) return;              /* the stopper owns the context now */
     mtx_unlock(&R.mtx);
     R.ctx(R.user, 1);
@@ -232,6 +236,8 @@ static void *render_main(void *arg)
     uint64_t r = atomic_load(&R.rpos);
     int have_ctx = 1;
     uint64_t burst_t0 = 0, burst_n = 0;   /* busy time of the current burst */
+    RtCmd *large = NULL;
+    uint32_t large_received = 0;
     for (;;) {
         run_tick();
         uint64_t w = atomic_load_explicit(&R.wpos, memory_order_acquire);
@@ -275,7 +281,30 @@ static void *render_main(void *arg)
         if (c->op == OP_PAD) {
             if (c->flags & F_FRAME)
                 atomic_fetch_add(&R.frames_consumed, 1);
+        } else if (c->op == OP_CHUNK) {
+            RtChunk chunk;
+            if(c->payload < sizeof chunk) abort();
+            memcpy(&chunk,(const uint8_t *)c+sizeof *c,sizeof chunk);
+            const uint32_t bytes=c->payload-sizeof chunk;
+            if(!chunk.offset) {
+                if(large || chunk.command.op==OP_PAD || chunk.command.op==OP_CHUNK ||
+                   (uint64_t)chunk.command.payload+sizeof(RtCmd)>chunk.command.size) abort();
+                large=malloc(chunk.command.size);
+                if(!large) abort();
+                *large=chunk.command; large_received=0;
+            }
+            if(!large || chunk.offset!=large_received ||
+               memcmp(large,&chunk.command,sizeof *large) ||
+               bytes>large->payload-large_received) abort();
+            memcpy((uint8_t *)(large+1)+large_received,
+                   (const uint8_t *)(c+1)+sizeof chunk,bytes);
+            large_received+=bytes;
+            if(large_received==large->payload) {
+                R.exec(R.user,large,large+1);
+                free(large); large=NULL;
+            }
         } else {
+            if(large) abort(); /* fragments must be contiguous in the stream */
             R.exec(R.user, c, (const uint8_t *)c + sizeof(RtCmd));
         }
         r += c->size;
@@ -320,6 +349,8 @@ static void wake_render(int force) {
     }
 }
 
+void rt_flush(void) { if(rt_running()) wake_render(1); }
+
 /* Block until pred() holds; the render thread wakes us after every record. */
 typedef int (*Pred)(uint64_t arg);
 static void emu_wait(Pred pred, uint64_t arg) {
@@ -346,7 +377,16 @@ static int pred_released(uint64_t unused) { (void)unused; return atomic_load(&R.
 void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes) {
     if (!rt_running() || R.pending || op == OP_PAD) return NULL;
     uint64_t size = align_up(sizeof(RtCmd) + (uint64_t)payload_bytes);
-    if (size > R.cap / 2) { R.oversize++; if (R.batch_active) R.batch_failed = 1; return NULL; }
+    if (size > R.cap / 2) {
+        R.oversize++;
+        if(R.batch_active) { R.batch_failed=1; return NULL; }
+        if(size>UINT32_MAX) return NULL;
+        R.large_pending=malloc((size_t)size);
+        if(!R.large_pending) return NULL;
+        *R.large_pending=(RtCmd){(uint32_t)size,op,flags,payload_bytes,R.seq++};
+        R.pending=1;
+        return R.large_pending+1;
+    }
     if (R.batch_active) {
         if (R.batch_failed || size > R.cap / 2 - R.batch_used) {
             R.batch_failed = 1; return NULL;
@@ -388,6 +428,27 @@ void *rt_cmd_begin(uint16_t op, uint16_t flags, uint32_t payload_bytes) {
 void rt_cmd_commit(void) {
     if (!R.pending) return;
     R.pending = 0;
+    if(R.large_pending) {
+        RtCmd *large=R.large_pending;
+        R.large_pending=NULL;
+        /* Only one producer staging allocation and one consumer assembly may
+         * exist here. Fragments use the bounded ring, preserve ordering, and
+         * never transfer the graphics context to the producer. */
+        const uint32_t max=(uint32_t)(R.cap/2)-sizeof(RtCmd)-sizeof(RtChunk)-RT_ALIGN;
+        for(uint32_t at=0;at<large->payload;) {
+            uint32_t bytes=large->payload-at;
+            if(bytes>max) bytes=max;
+            RtChunk chunk={*large,at};
+            uint8_t *p=rt_cmd_begin(OP_CHUNK,0,sizeof chunk+bytes);
+            if(!p) abort();
+            memcpy(p,&chunk,sizeof chunk);
+            memcpy(p+sizeof chunk,(const uint8_t *)(large+1)+at,bytes);
+            rt_cmd_commit();
+            at+=bytes;
+        }
+        free(large);
+        return;
+    }
     if (R.batch_active) { R.batch_used += R.pend_size; R.batch_records++; return; }
     uint64_t end = R.pend_start + R.pend_size;
     R.unpub_bytes += end - R.wlocal;   /* includes a pad record before it */
@@ -510,6 +571,9 @@ void rt_release(void) {
     mtx_lock(&R.mtx);
     R.release_req = 0;
     cnd_bcast(&R.cv_work);
+    /* A following acquire must not consume the preceding release's ack.
+     * Wait only for the CPU ownership handshake, not graphics completion. */
+    while(atomic_load(&R.released)) cnd_wait(&R.cv_emu,&R.mtx);
     mtx_unlock(&R.mtx);
     R.held = 0;
     R.releases++;
