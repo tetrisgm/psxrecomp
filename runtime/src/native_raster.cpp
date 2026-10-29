@@ -22,6 +22,8 @@ struct NativeInputTile {
 };
 struct NativeRasterInputs {
     NativeRasterInputs* retired_next=nullptr;
+    void (*retire_callback)(void*)=nullptr;
+    void* retire_user=nullptr;
     struct Sample {
         uint64_t source;
         std::vector<std::shared_ptr<const NativeInputTile>> tiles;
@@ -42,15 +44,22 @@ class NativeInputPool {
     std::mutex mutex;
     std::vector<NativeRasterInputs*> free;
     WorkerEvent available;
-    std::atomic<bool> stop{false};
+    std::atomic<bool> stop{false}, parked{false};
     std::thread worker;
     void run() {
         for(;;) {
-            available.wait();
             auto* list=retired.exchange(nullptr);
+            if(!list && !stop.load()) {
+                parked.store(true);
+                if(!retired.load() && !stop.load())available.wait();
+                parked.store(false);
+                continue;
+            }
             while(list) {
                 auto* item=list;list=item->retired_next;
                 item->samples.clear();item->metadata_seen.clear();
+                if(item->retire_callback)item->retire_callback(item->retire_user);
+                item->retire_callback=nullptr;item->retire_user=nullptr;
                 item->valid=true;item->bytes=sizeof(NativeRasterInputs);item->counted.fill(0);
                 std::lock_guard<std::mutex> lock(mutex);
                 try {free.push_back(item);} catch(...) {delete item;}
@@ -72,8 +81,8 @@ public:
     void release(NativeRasterInputs* item) {
         auto* old=retired.load(std::memory_order_relaxed);
         do {item->retired_next=old;} while(!retired.compare_exchange_weak(old,item,
-            std::memory_order_release,std::memory_order_relaxed));
-        available.notify();
+            std::memory_order_seq_cst,std::memory_order_relaxed));
+        if(parked.load() && parked.exchange(false))available.notify();
     }
 };
 static NativeInputPool& input_pool() {static NativeInputPool pool;return pool;}
@@ -247,6 +256,8 @@ struct NativeRaster {
     std::atomic<uint64_t> arena_read{0};
     uint64_t arena_write=0;
     std::atomic<bool> parked{false}, producer_parked{false};
+    uint64_t write_index=0,published=0,cached_head=0,completed_count=0;
+    unsigned batch_depth=0;
     uint64_t submitted=0,executed=0; /* producer / consumer owned */
     Job checkpoint;
     std::atomic<bool> checkpoint_pending{false};
@@ -339,6 +350,12 @@ struct NativeRaster {
     void wake() {
         if(parked.load() && parked.exchange(false)) available.notify();
     }
+    void publish() {tail.store(published=write_index);wake();}
+    void reserve_slot(uint64_t write) {
+        if(write-cached_head<slots)return;
+        publish();
+        wait_space([&]{cached_head=head.load();return write-cached_head<slots;});
+    }
     template<class Ready> void wait_space(Ready ready) {
         if(ready()) return;
         guest_wait_trace::Scope trace(guest_wait_trace::NativeSpace);
@@ -360,17 +377,16 @@ struct NativeRaster {
     void push(Job job) {
         if(job.kind==Kind::Draw || job.kind==Kind::Packet || job.kind==Kind::Restore || job.borrowed_words)
             read_row_y=-1;
-        const uint64_t write=tail.load(std::memory_order_relaxed);
-        wait_space([&]{return write-head.load()<slots;});
+        const uint64_t write=write_index;
+        reserve_slot(write);
         job.sequence=submitted++;
         queue[write%slots]=job;
-        tail.store(write+1);
-        wake();
+        write_index=write+1;publish();
     }
     uint64_t push_packet(const NativeRasterState& state,const uint32_t* words,size_t count) {
         read_row_y=-1;
-        const uint64_t write=tail.load(std::memory_order_relaxed);
-        wait_space([&]{return write-head.load()<slots;});
+        const uint64_t write=write_index;
+        reserve_slot(write);
         auto& job=queue[write%slots];
         job.kind=Kind::Packet;job.sequence=submitted++;
         const uint64_t source=job.source=++next_source;
@@ -378,12 +394,15 @@ struct NativeRaster {
         std::memcpy(job.draw.packet.data(),words,count*sizeof(uint32_t));
         job.borrowed_upload=nullptr;job.borrowed_words=0;job.arena_end=0;
         job.completion=nullptr;job.checkpoint_done=nullptr;
-        tail.store(write+1);wake();return source;
+        write_index=write+1;
+        if(!batch_depth || write_index-published>=32 || parked.load())publish();
+        return source;
     }
     /* The one outstanding rewind checkpoint never contends for the draw
      * queue space. Its sequence is the boundary before the next draw.
      * Additional independent checkpoint clients retain ordinary backpressure. */
     void push_checkpoint(Job job) {
+        publish();
         if(checkpoint_pending.load()) {
             push(std::move(job));return;
         }
@@ -436,7 +455,7 @@ struct NativeRaster {
                 if(inputs_enabled && event.has_writes) invalidate_inputs(event.written_bounds);
                 if(observer) observer(observer_user,&event);
             }
-            completed.fetch_add(1, std::memory_order_release);
+            completed.store(++completed_count,std::memory_order_release);
             if (job.completion) job.completion->notify();
         if (job.checkpoint_done) job.checkpoint_done->store(true,std::memory_order_release);
     }
@@ -472,7 +491,7 @@ struct NativeRaster {
             executed=job.sequence+1;
             if(job.arena_end) arena_read.store(job.arena_end);
             head.store(read+1);
-            if(producer_parked.exchange(false)) space.notify();
+            if(producer_parked.load() && producer_parked.exchange(false)) space.notify();
 
         }
         sw_context_bind(nullptr);
@@ -492,6 +511,7 @@ extern "C" NativeRaster *native_raster_create(const uint16_t *initial) {
 }
 extern "C" void native_raster_destroy(NativeRaster *r) {
     if (!r) return;
+    r->publish();
     r->stop.store(true);
     r->wake();
     r->thread.join();
@@ -676,4 +696,16 @@ extern "C" void native_raster_checkpoint_release(NativeRasterCheckpoint *c) {
         while(!c->done.load(std::memory_order_acquire))std::this_thread::yield();
         delete c;
     }
+}
+
+extern "C" void native_raster_inputs_retire(NativeRasterInputs* inputs,void (*cleanup)(void*),void* user) {
+    if(!inputs) {if(cleanup)cleanup(user);return;}
+    inputs->retire_callback=cleanup;inputs->retire_user=user;
+    input_pool().release(inputs);
+}
+
+extern "C" void native_raster_batch(NativeRaster* r,int begin) {
+    if(!r)return;
+    if(begin)++r->batch_depth;
+    else {if(r->batch_depth)--r->batch_depth;r->publish();}
 }

@@ -10555,18 +10555,12 @@ static uint64_t s_capture_mark_count = 0;
 static char     s_capture_wide_path[512];
 static _Atomic uint64_t s_capture_completion = 0;
 static _Atomic uint64_t s_capture_generation = 0;
+static int s_display_ring_enabled;
 static uint16_t     *s_disp_ring_px = NULL;   /* one block for all entries */
 
 static void disp_ring_capture(void)
 {
-    /* Native snapshots never depend on the presentation queue. The opt-out
-     * remains useful when measuring the cost of debug instrumentation. */
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("PSX_DISPLAY_RING");
-        enabled = (!e || !*e || *e != '0') ? 1 : 0;
-    }
-    if (!enabled || s_capture_frozen) return;
+    if (s_capture_frozen) return;
     if (!s_disp_ring_px) {
         size_t vram = (size_t)1024 * 512;
         s_disp_ring_px = (uint16_t *)malloc(DISP_RING_CAP * vram * sizeof(uint16_t));
@@ -10613,7 +10607,7 @@ static void handle_display_ring_aux(int id, const char *json)
 
 static void handle_display_ring_stats(int id, const char *json)
 {
-    (void)json;
+    s_display_ring_enabled=json_get_int(json,"enabled",1)!=0;
     uint32_t oldest = 0, newest = 0;
     int n = 0;
     for (int i = 0; i < DISP_RING_CAP; i++) {
@@ -10623,9 +10617,9 @@ static void handle_display_ring_stats(int id, const char *json)
         if (n == 0 || f > newest) newest = f;
         n++;
     }
-    send_fmt("{\"id\":%d,\"ok\":true,\"capacity\":%d,\"valid\":%d,"
+    send_fmt("{\"id\":%d,\"ok\":true,\"capacity\":%d,\"enabled\":%d,\"valid\":%d,"
              "\"oldest_frame\":%u,\"newest_frame\":%u}",
-             id, DISP_RING_CAP, n, oldest, newest);
+             id, DISP_RING_CAP, s_display_ring_enabled, n, oldest, newest);
 }
 
 static void handle_display_ring_get(int id, const char *json)
@@ -17159,6 +17153,7 @@ malformed:
 void debug_server_init(int port)
 {
     if (port > 0) s_port = port;
+    {const char* enabled=getenv("PSX_DISPLAY_RING");s_display_ring_enabled=enabled && *enabled && *enabled!='0';}
     if(getenv("PSX_WTRACE_BOOT_RANGES") || getenv("PSX_RECORD_FRAME"))g_debug_write_hooks|=1u;
 
     /* Deterministic cold-boot controller probe. Unlike a TCP set_input command,
@@ -17897,7 +17892,7 @@ void debug_server_record_frame(void)
 
     /* Always-on display ring: raw display-area pixels for THIS frame number
      * (pre-increment, matching what the `frame` command reports right now). */
-    disp_ring_capture();
+    if(s_display_ring_enabled)disp_ring_capture();
 
     pgxp_frame_audit_capture(s_frame_count);
 

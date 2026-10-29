@@ -7,16 +7,86 @@
 #include <deque>
 
 namespace {
+std::atomic<uint64_t> allocation_events{0};
 /* Match RtCmd's 16-byte payload alignment, including after vector growth. */
 struct alignas(RT_ALIGN) Block {
     unsigned char bytes[RT_ALIGN];
     /* Payload is written before publication; vector growth must not zero it. */
     Block() noexcept {}
 };
+/* Producer-owned arena. Metadata and backing bytes are allocated only when
+ * creating/configuring the queue. Frame growth splits/coalesces free spans;
+ * it never enters the host allocator. Leases keep the backing arena alive. */
+struct Arena {
+    struct Span {size_t at=0,count=0;int next=-1;};
+    std::vector<Block> backing;
+    std::vector<Span> spans;
+    int head=0,spare=1;
+    Arena(size_t bytes,size_t slots):backing(bytes/RT_ALIGN+(bytes%RT_ALIGN!=0)),spans(slots*4+32) {
+        spans[0]={0,backing.size(),-1};
+        for(size_t i=1;i<spans.size();++i)spans[i].next=i+1<spans.size()?int(i+1):-1;
+        allocation_events+=2;
+    }
+    Block* take(size_t count) {
+        if(!count)return nullptr;
+        int previous=-1;
+        for(int i=head;i!=-1;previous=i,i=spans[i].next) {
+            auto& s=spans[i];if(s.count<count)continue;
+            Block* result=backing.data()+s.at;s.at+=count;s.count-=count;
+            if(!s.count) {if(previous<0)head=s.next;else spans[previous].next=s.next;s.next=spare;spare=i;}
+            return result;
+        }
+        return nullptr;
+    }
+    void put(Block* data,size_t count) {
+        if(!data || !count)return;
+        const size_t at=size_t(data-backing.data());
+        int previous=-1,next=head;
+        while(next!=-1 && spans[next].at<at) {previous=next;next=spans[next].next;}
+        if(previous!=-1 && spans[previous].at+spans[previous].count==at) {
+            spans[previous].count+=count;
+        } else {
+            if(spare==-1)std::terminate(); /* At most two allocations per slot. */
+            int node=spare;spare=spans[node].next;spans[node]={at,count,next};
+            if(previous<0)head=node;else spans[previous].next=node;
+            previous=node;
+        }
+        if(next!=-1 && spans[previous].at+spans[previous].count==spans[next].at) {
+            spans[previous].count+=spans[next].count;spans[previous].next=spans[next].next;
+            spans[next].next=spare;spare=next;
+        }
+    }
+};
+struct Buffer {
+    std::shared_ptr<Arena> arena,target;
+    Block* pointer=nullptr;
+    size_t length=0,room=0;
+    Block* data() const {return pointer;}
+    size_t size() const {return length;}
+    size_t capacity() const {return room;}
+    bool resize(size_t n) {
+        if(n>room) {
+            size_t capacity=std::max(n,room*2);
+            Block* next=target->take(capacity);
+            if(!next && capacity!=n) {capacity=n;next=target->take(n);}
+            if(!next)return false;
+            if(length)std::memcpy(next,pointer,length*RT_ALIGN);
+            if(pointer)arena->put(pointer,room);
+            pointer=next;room=capacity;arena=target;
+        }
+        length=n;return true;
+    }
+    void clear() {
+        if(pointer)arena->put(pointer,room);
+        pointer=nullptr;length=room=0;arena.reset();
+    }
+    /* No free-list mutation on destruction: a queue owns all slot envelopes
+     * until shutdown; later lease destruction only drops arena references. */
+};
 struct Storage {
     size_t attachment_bytes=0;
     size_t initial_bytes=0,record_bytes=0;
-    std::vector<Block> initial,records;
+    Buffer initial,records;
     void *attachment=nullptr;
     void (*dispose)(void*)=nullptr;
     void clear_attachment() {
@@ -39,9 +109,26 @@ struct FramePacketQueue {
     size_t history_limit=0,history_bytes=0,history_depth=0;
     std::vector<Packet> history;
     std::vector<std::shared_ptr<Storage>> storage_pool;
+    std::shared_ptr<Arena> arena;
+    std::vector<std::shared_ptr<Arena>> arenas;
     uint32_t command_sequence=0;
     std::atomic<uint64_t> epoch{1};
-    FramePacketQueue(size_t initial,size_t records):initial_limit(initial),record_limit(records) {}
+    void reclaim_spares() {
+        for(auto& item:storage_pool)if(item.use_count()==1) {
+            item->clear_attachment();item->attachment_bytes=0;
+            item->initial.clear();item->records.clear();
+        }
+    }
+    void prepare(size_t slots,size_t history) {
+        if(initial_limit>SIZE_MAX-record_limit || initial_limit+record_limit>(SIZE_MAX-history)/4)throw std::bad_alloc();
+        const size_t bytes=history+4*(initial_limit+record_limit);
+        if(!arena || bytes/RT_ALIGN>arena->backing.size() || slots*4+32>arena->spans.size()) {
+            arena=std::make_shared<Arena>(bytes,slots);arenas.push_back(arena);
+        }
+        storage_pool.reserve(slots);
+        while(storage_pool.size()<slots) {++allocation_events;storage_pool.push_back(std::make_shared<Storage>());}
+    }
+    FramePacketQueue(size_t initial,size_t records):initial_limit(initial),record_limit(records) {prepare(16,0);}
 };
 extern "C" FramePacketQueue *frame_packet_create(size_t initial,size_t records) {
     if(initial>SIZE_MAX-RT_ALIGN || records>UINT32_MAX-RT_ALIGN) return nullptr;
@@ -59,17 +146,17 @@ extern "C" int frame_packet_reserve_initial(FramePacketQueue *q,uint64_t sequenc
         if(!slot.data || slot.data.use_count()!=2) {
             slot.data.reset();
             for(auto& candidate:q->storage_pool) if(candidate.unique()) {slot.data=candidate;break;}
-            if(!slot.data) {
-                slot.data=std::make_shared<Storage>();
-                q->storage_pool.push_back(slot.data);
-            }
+            if(!slot.data)return 0;
         }
     }
     catch(...) { return 0; }
     auto &p=*slot.data;
+    p.initial.target=p.records.target=q->arena;
     p.clear_attachment();p.attachment_bytes=0;
     if(bytes>q->initial_limit) return 0;
-    try { p.initial.resize(blocks(bytes)); } catch(...) { return 0; }
+    if(!p.initial.resize(blocks(bytes))) {
+        q->reclaim_spares();if(!p.initial.resize(blocks(bytes)))return 0;
+    }
     slot.sequence=sequence;slot.epoch=q->epoch.load(std::memory_order_relaxed);
     p.initial_bytes=bytes;p.record_bytes=0;
     q->valid=true;
@@ -102,7 +189,9 @@ extern "C" void *frame_packet_append(FramePacketQueue *q,uint16_t op,uint16_t fl
     }
     const size_t offset=p.record_bytes/RT_ALIGN;
     const size_t needed=offset+size/RT_ALIGN;
-    try { if(p.records.size()<needed) p.records.resize(needed); } catch(...) { q->valid=false;return nullptr; }
+    if(p.records.size()<needed && !p.records.resize(needed)) {
+        q->reclaim_spares();if(!p.records.resize(needed)) {q->valid=false;return nullptr;}
+    }
     auto *cmd=reinterpret_cast<RtCmd *>(p.records.data()+offset);
     *cmd=RtCmd{uint32_t(size),op,flags,bytes,q->command_sequence++};
     /* Retain allocated storage between frames; only alignment padding needs
@@ -143,7 +232,9 @@ extern "C" int frame_packet_append_records(FramePacketQueue *q,const void *recor
         at+=command.size;
     }
     const size_t offset=p.record_bytes/RT_ALIGN,needed=offset+bytes/RT_ALIGN;
-    try { if(p.records.size()<needed) p.records.resize(needed); } catch(...) { return 0; }
+    if(p.records.size()<needed && !p.records.resize(needed)) {
+        q->reclaim_spares();if(!p.records.resize(needed))return 0;
+    }
     if(bytes) std::memcpy(p.records.data()+offset,source,bytes);
     for(size_t at=offset;at<needed;) {
         auto* command=reinterpret_cast<RtCmd*>(p.records.data()+at);
@@ -182,7 +273,7 @@ extern "C" int frame_packet_current(const FramePacketQueue *q,const FramePacketV
 extern "C" void frame_packet_history_configure(FramePacketQueue *q,size_t depth,size_t bytes) {
     if(!q)return;
     q->history.clear();q->history_bytes=0;q->history_depth=depth;q->history_limit=depth?bytes:0;
-    try {q->history.reserve(depth);q->storage_pool.reserve(depth+3);}
+    try {q->history.reserve(depth);q->prepare(std::max<size_t>(16,depth+16),depth?bytes:0);}
     catch(...) {q->history_depth=0;q->history_limit=0;}
 }
 extern "C" size_t frame_packet_history_bytes(const FramePacketQueue *q) { return q?q->history_bytes:0; }
@@ -217,3 +308,5 @@ extern "C" FramePacketLease *frame_packet_retain(const FramePacketView *view) {
 }
 extern "C" const FramePacketView *frame_packet_lease_view(const FramePacketLease *lease) {return lease?&lease->view:nullptr;}
 extern "C" void frame_packet_lease_release(FramePacketLease *lease) {delete lease;}
+
+extern "C" uint64_t frame_packet_allocation_events(void) {return allocation_events.load(std::memory_order_relaxed);}

@@ -8801,3 +8801,5 @@ int gpu_replay_execute(const GpuReplayState *state, const GpuReplayProvider *pro
 #undef pgxp_load_projection
 #undef gte_precision_load_word
 #undef s_frame_count
+
+void gpu_native_batch(int begin) {native_raster_batch(s_native_raster,begin);}

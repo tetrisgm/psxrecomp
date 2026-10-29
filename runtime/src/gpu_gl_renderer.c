@@ -13252,13 +13252,33 @@ typedef struct RthPacketSeed {
     uint16_t pixels[VRAM_W*VRAM_H];
 } RthPacketSeed;
 typedef struct RthPacketInputs {
+    struct RthPacketInputs *next;
+    int trace_timing;
     NativeRasterInputs *draws;
     GpuHdTextureTracking *tracking;
     PacketTransformTable *transforms;
     PacketMetadata *metadata;
 } RthPacketInputs;
 static RthPacketInputs *s_rth_packet_build;
+static RthPacketInputs s_rth_inputs_pool[4096], *s_rth_inputs_ready;
+static _Atomic(RthPacketInputs*) s_rth_inputs_returned;
+static int s_rth_inputs_initialized;
+static RthPacketInputs *rth_inputs_acquire(void) {
+    if(!s_rth_inputs_initialized) {
+        for(size_t i=0;i<4096;++i) {s_rth_inputs_pool[i].next=s_rth_inputs_ready;s_rth_inputs_ready=&s_rth_inputs_pool[i];}
+        s_rth_inputs_initialized=1;
+    }
+    if(!s_rth_inputs_ready)s_rth_inputs_ready=atomic_exchange(&s_rth_inputs_returned,NULL);
+    RthPacketInputs *result=s_rth_inputs_ready;
+    if(result) {s_rth_inputs_ready=result->next;memset(result,0,sizeof *result);}
+    return result;
+}
+static void rth_inputs_release(RthPacketInputs *inputs) {
+    RthPacketInputs *head=atomic_load(&s_rth_inputs_returned);
+    do {inputs->next=head;} while(!atomic_compare_exchange_weak(&s_rth_inputs_returned,&head,inputs));
+}
 static uint64_t s_rth_packet_last_sequence,s_rth_packet_last_epoch;
+static int s_rth_packet_trace_timing; /* Armed by the explicit render-thread stats query. */
 static _Atomic uint64_t s_rth_packet_seed_ns,s_rth_packet_seal_ns,s_rth_packet_dispose_ns;
 static RthFrameState s_rth_frame_state={.area={0,0,VRAM_W-1,VRAM_H-1}};
 static RthFrameState s_rth_frame_saved;
@@ -17177,53 +17197,57 @@ static void gl_rth_ctx(void *user, int current) {
     }
 }
 
-static void rth_packet_dispose(void *data) {
+static void rth_packet_cleanup(void *data) {
     RthPacketInputs *inputs=data;
-    if(!inputs) return;
-    uint64_t begin=pt_clock_ns();
-    native_raster_inputs_destroy(inputs->draws);
+    const uint64_t start=inputs->trace_timing?pt_clock_ns():0;
     gpu_hd_textures_free_tracking(inputs->tracking);
     packet_interpolation_transform_free(inputs->transforms);
     packet_metadata_free(inputs->metadata);
-    free(inputs);
-    atomic_fetch_add(&s_rth_packet_dispose_ns,pt_clock_ns()-begin);
+    if(inputs->trace_timing)atomic_fetch_add(&s_rth_packet_dispose_ns,pt_clock_ns()-start);
+    rth_inputs_release(inputs);
+}
+static void rth_packet_dispose(void *data) {
+    RthPacketInputs *inputs=data;
+    if(inputs)native_raster_inputs_retire(inputs->draws,rth_packet_cleanup,inputs);
 }
 /* Internal producer demand; it does not change the guest execution ABI. */
 extern void gpu_pgxp_update_projection_tracking(void);
 static int rth_packet_begin(void *user,FrameOwner *owner,uint64_t sequence) {
     (void)user;
     gpu_pgxp_update_projection_tracking();
-    uint64_t begin=pt_clock_ns();
+    const uint64_t start=s_rth_packet_trace_timing?pt_clock_ns():0;
     rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
     RthPacketSeed *seed=NULL;
     if(!frame_owner_reserve_initial(owner,sequence,sizeof *seed,(void **)&seed)) return 0;
     NativeRaster *native=gr_native_raster();
     if(!native) { frame_owner_cancel(owner);return 0; }
     gr_flush_native_upload();
-    RthPacketInputs *inputs=calloc(1,sizeof *inputs);
+    RthPacketInputs *inputs=rth_inputs_acquire();
     if(!inputs) { frame_owner_cancel(owner);return 0; }
     if(gpu_hd_textures_active()) {
         inputs->tracking=gpu_hd_textures_capture_native(seed->pixels,&seed->cache);
-        if(!inputs->tracking) { free(inputs);frame_owner_cancel(owner);return 0; }
+        if(!inputs->tracking) { rth_inputs_release(inputs);frame_owner_cancel(owner);return 0; }
     } else native_raster_checkpoint(native,seed->pixels,NULL,&seed->cache);
     seed->draw=s_rth_frame_state;
     seed->draw.stream[0]=gpu_ws_nw_flat_backdrop_enabled()?1:0;
     seed->draw.stream[1]=gpu_ws_netplay_local_viewport_width();
     seed->draw.stream[2]=gpu_ws_background_requires_full_composite()?1:0;
     gpu_get_display_info(&seed->draw.display);
+    inputs->trace_timing=s_rth_packet_trace_timing;
     s_rth_packet_build=inputs;
     /* First primitive must carry its source even if the previous packet
      * ended on the same host-only source identity. */
     s_rthe_native_source=UINT64_MAX;
-    atomic_fetch_add(&s_rth_packet_seed_ns,pt_clock_ns()-begin);
+    if(s_rth_packet_trace_timing)atomic_fetch_add(&s_rth_packet_seed_ns,pt_clock_ns()-start);
     return 1;
 }
 static int rth_packet_seal(void *user,FrameOwner *owner) {
     (void)user;
-    uint64_t begin=pt_clock_ns();
+    const uint64_t start=s_rth_packet_trace_timing?pt_clock_ns():0;
     gr_flush_native_upload();
     NativeRasterInputs *draws=native_raster_inputs_seal(gr_native_raster());
-    atomic_fetch_add(&s_rth_packet_seal_ns,pt_clock_ns()-begin);
+    if(s_rth_packet_trace_timing)atomic_fetch_add(&s_rth_packet_seal_ns,pt_clock_ns()-start);
+
     RthPacketInputs *inputs=s_rth_packet_build;s_rth_packet_build=NULL;
     if(!inputs || !native_raster_inputs_valid(draws)) {
         native_raster_inputs_destroy(draws);rth_packet_dispose(inputs);return 0;
@@ -17711,6 +17735,9 @@ void gl_renderer_render_thread_frame_boundary(void) {
 void gl_renderer_render_thread_sync(const char *reason) { GL_RT_SYNC(reason); }
 
 int gl_renderer_render_thread_json(char *out, size_t cap) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    s_rth_packet_trace_timing=1;
+#endif
     RtStats st;
     rt_get_stats(&st);
     RtAcquireEvent ev[16];

@@ -68,15 +68,67 @@ static void note_current_stack(void) {
  * wait, C library) is unwound to its innermost caller inside it, so time in
  * nvoglv64.dll or a kernel wait is charged to the exe function that made the
  * call. PSX_HOST_SAMPLER_CALLERS=2 records every sample's caller: the first
- * exe frame above the sampled function (who calls a hot helper). Opt-in: the
- * unwinder takes the process's function-table lock while the target is
- * suspended, which could deadlock if the target held it. */
+ * exe frame above the sampled function (who calls a hot helper). Module
+ * discovery runs only after ResumeThread. While suspended, unwind lookup uses
+ * retained PE exception directories, never the process function-table lock. */
 #if defined(_M_X64) || defined(__x86_64__)
+/* RtlLookupFunctionEntry can acquire a lock owned by the suspended target.
+ * Cache PE unwind directories with a module reference while the target runs.
+ * Unknown modules lose only caller attribution for their first sample. Dynamic
+ * function tables are deliberately not queried while the target is suspended. */
+struct UnwindImage {
+    HMODULE handle;
+    uintptr_t base, end;
+    const RUNTIME_FUNCTION *functions;
+    size_t count;
+};
+static struct UnwindImage s_unwind_images[256];
+static size_t s_unwind_count;
+static uintptr_t s_unwind_missing;
+static void cache_unwind_image(uintptr_t pc) {
+    HMODULE module = NULL;
+    if (!pc || s_unwind_count == 256 ||
+        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (LPCWSTR)pc, &module)) return;
+    for (size_t i=0; i<s_unwind_count; ++i) if(s_unwind_images[i].handle==module) {
+        FreeLibrary(module); return;
+    }
+    uintptr_t base=(uintptr_t)module;
+    const IMAGE_DOS_HEADER *dos=(const IMAGE_DOS_HEADER*)base;
+    const IMAGE_NT_HEADERS *nt=(const IMAGE_NT_HEADERS*)(base+dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    struct UnwindImage *image=&s_unwind_images[s_unwind_count++];
+    image->handle=module; image->base=base; image->end=base+nt->OptionalHeader.SizeOfImage;
+    image->functions=(const RUNTIME_FUNCTION*)(base+dir.VirtualAddress);
+    image->count=dir.VirtualAddress?dir.Size/sizeof(RUNTIME_FUNCTION):0;
+}
+static PRUNTIME_FUNCTION cached_unwind_entry(uintptr_t pc,DWORD64 *base,int *known) {
+    *known=0;
+    for(size_t i=0;i<s_unwind_count;++i) {
+        const struct UnwindImage *image=&s_unwind_images[i];
+        if(pc<image->base || pc>=image->end)continue;
+        *known=1; *base=image->base;
+        DWORD rva=(DWORD)(pc-image->base);
+        size_t lo=0,hi=image->count;
+        while(lo<hi) {
+            size_t mid=lo+(hi-lo)/2;
+            const RUNTIME_FUNCTION *entry=&image->functions[mid];
+            if(rva<entry->BeginAddress)hi=mid;
+            else if(rva>=entry->EndAddress)lo=mid+1;
+            else return (PRUNTIME_FUNCTION)entry;
+        }
+        return NULL; /* A known image's leaf function has no unwind entry. */
+    }
+    s_unwind_missing=pc;
+    return NULL;
+}
 static uintptr_t exe_caller(const CONTEXT *start) {
     CONTEXT c = *start;
     for (int k = 0; k < 64; k++) {
         DWORD64 ib = 0;
-        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &ib, NULL);
+        int known=0;
+        PRUNTIME_FUNCTION fe = cached_unwind_entry(c.Rip, &ib, &known);
+        if(!known)return 0;
         if (fe) {
             PVOID hd = NULL; DWORD64 est = 0;
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, c.Rip, fe, &c, &hd, &est, NULL);
@@ -131,6 +183,12 @@ static DWORD WINAPI sampler_main(LPVOID arg) {
 #endif
         }
         ResumeThread(target);
+#if defined(_M_X64) || defined(__x86_64__)
+        if(s_unwind_missing) {
+            uintptr_t missing=s_unwind_missing;s_unwind_missing=0;
+            cache_unwind_image(missing);
+        }
+#endif
     }
     return 0;
 }

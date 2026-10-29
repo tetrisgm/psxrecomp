@@ -11,6 +11,8 @@ typedef void (*PacketMetadataBlend)(const void *older,const void *newer,double t
 /* Register at startup. Capture runs on the producer; blend and read run on
  * the presentation owner. Payloads must contain values, never guest pointers. */
 int packet_metadata_register(uint64_t key,size_t bytes,PacketMetadataCapture,PacketMetadataBlend);
+/* Startup registration reserves 4096 immutable snapshots (rewind is capped
+ * at 3600). Capture/release allocate nothing; exhaustion returns NULL. */
 PacketMetadata *packet_metadata_capture(void);
 void packet_metadata_free(PacketMetadata *);
 size_t packet_metadata_bytes(const PacketMetadata *);

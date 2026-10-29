@@ -194,3 +194,5 @@ int main(void) {
     puts("PASS: the GPU linked-list kick holds the CPU until the walk ends");
     return 0;
 }
+
+void gpu_native_batch(int begin) {(void)begin;}

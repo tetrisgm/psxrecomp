@@ -825,6 +825,7 @@ static void start_async_gpu_linked_list(void) {
 extern int psx_get_in_exception(void);
 static DMAGpuHoldEntry s_hold_ring[DMA_GPU_HOLD_RING_CAP];
 static DMAGpuHoldStats s_hold_stats;
+static int s_hold_timing_enabled;
 
 static uint64_t hold_host_ticks(void) {
 #ifdef _WIN32
@@ -847,7 +848,8 @@ static void hold_cpu_for_gpu_linked_list(void) {
     if (psx_in_device_service || g_ls_replay_active || g_psx_guest_time_frozen)
         return;
     const uint64_t cyc0 = psx_cycle_count;
-    const uint64_t host0 = hold_host_ticks();
+    const uint64_t host0 = s_hold_timing_enabled?hold_host_ticks():0;
+    gpu_native_batch(1);
     const uint32_t words0 = gpu_linked_list.total_words;
     uint32_t steps = 0;
     while (gpu_linked_list.active && ((channels[2].chcr >> 24) & 1u) &&
@@ -858,8 +860,9 @@ static void hold_cpu_for_gpu_linked_list(void) {
         steps++;
         if (gpu_linked_list.active && gpu_linked_list.total_words == moved) break;
     }
-    const uint64_t host_us = (hold_host_ticks() - host0) * 1000000ull /
-                             hold_host_ticks_per_sec();
+    gpu_native_batch(0);
+    const uint64_t host_us = s_hold_timing_enabled?(hold_host_ticks() - host0) * 1000000ull /
+                             hold_host_ticks_per_sec():0;
     const int in_exc = psx_get_in_exception() != 0;
     DMAGpuHoldEntry *e = &s_hold_ring[s_hold_stats.count & (DMA_GPU_HOLD_RING_CAP - 1u)];
     e->seq = s_hold_stats.count;
@@ -887,6 +890,9 @@ static void hold_cpu_for_gpu_linked_list(void) {
 
 void dma_debug_get_gpu_hold(DMAGpuHoldStats *out_stats,
                             const DMAGpuHoldEntry **out_ring) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    s_hold_timing_enabled=1;
+#endif
     if (out_stats) *out_stats = s_hold_stats;
     if (out_ring) *out_ring = s_hold_ring;
 }
@@ -918,6 +924,8 @@ static uint32_t execute_ch2_gpu(void) {
         return actual_words;
     }
 
+    if(sync_mode==2)return 0;
+    gpu_native_batch(1);
     /* direction == 1: RAM → GPU */
     if (sync_mode == 1) {
         /* Block mode: BCR bits 0-15 = block size (words), bits 16-31 = block count */
@@ -956,6 +964,7 @@ static uint32_t execute_ch2_gpu(void) {
         actual_words = word_count;
     }
 
+    gpu_native_batch(0);
     return actual_words;
 }
 

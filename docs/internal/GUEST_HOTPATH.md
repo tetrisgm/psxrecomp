@@ -118,3 +118,48 @@ CTest was rerun on the restored candidate and passed 23/23. The Windows sampler
 source explicitly warns that opt-in caller unwinding while suspending the target
 can deadlock on the process function-table lock; this is a plausible explanation
 for startup stalls, not a verified diagnosis or a change made by this branch.
+
+## G1 continuation under Frame Architecture Part 2
+
+The owner supplied Part 2 (R4 commit 2d322b5). G1 requires grid 60.0/zero
+starvation and removal of hooks/allocations; the final G4 budget is average
+CPU <8 ms and heaviest <12 ms. G2-G4 remain gated behind G1 integration.
+
+The first completed G1 continuation gate failed: 58.46 VBlanks/s, 30184 starved,
+55.552 ms max, 23093.75 ms quantized CPU over 1757 intervals, and **35 packet
+allocation events**. Receipt: analysis/guest-execution-G1.{txt,json}. This was
+not an exploratory benchmark; the new counter found an acceptance defect.
+
+Corrections after that gate:
+- Packet buffers now split/coalesce a preallocated arena; slot envelopes are
+  prepared at queue/history setup. Arena capacity covers the history budget,
+  three maximum live packets and a growth scratch packet. Unused slot buffers
+  are reclaimed before reporting bounded exhaustion. Leases retain their arena.
+  No per-frame host allocation or exception is needed for buffer growth.
+- Metadata registration prepares 4096 snapshots, covering the runtime's 3600
+  rewind cap plus presentation. Frame capture/release allocate nothing; false
+  captures remain absent. Registration-before-main initialization is tested.
+- Presentation-input envelopes are pooled. Nested native/HD/metadata cleanup
+  retires with immutable native inputs onto the cleanup worker.
+- DMA scopes batch native publication, publishing partial batches for reads,
+  checkpoints and end-of-transfer. Producer indices cache the consumer head;
+  no per-command queue-tail exchange is needed inside a burst. Native counter
+  publication no longer uses an unnecessary read-modify-write.
+- Packet and DMA timing reads require an explicit diagnostic query. Native
+  display history defaults off; display_ring_stats enabled=1 or startup
+  PSX_DISPLAY_RING=1 enables it. enabled=0 stops capture. Main cadence reports
+  packet_allocation_events for its measured window.
+- Windows caller sampling caches retained PE unwind directories while the guest
+  runs, rather than acquiring the process function-table lock while suspended.
+  Raw samples remain available when a new module's caller is not yet cached.
+
+Validation: 2000 varying-size history frames allocate zero from frame zero;
+4096 retained metadata snapshots plus 10000 reuse cycles allocate zero; native
+raster recorded Beetle fixtures, nested batches/read barriers, ordering, queue
+wrap and off-guest retirement pass. DMA CPU hold passes O0/O2; GP0 history,
+memory guards and render-pass guards pass. Hidden GL complete-frame fixture:
+111 checks, zero failures. CTest: 23/23. Corrected smoke verifies all 40 PNGs,
+zero dispatch/segment misses, and display-history enable/disable. The original
+smoke script ignored failed screenshot responses; tools/smoke.py now saves each
+response and fails on capture errors. No phase is marked accepted by these
+correctness checks alone; the next completed-phase grid gate is pending.

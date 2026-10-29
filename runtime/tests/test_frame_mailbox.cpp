@@ -193,16 +193,19 @@ static void pooled_frame_allocations() {
     auto* q=frame_packet_create(256,4096);assert(q);
     frame_packet_history_configure(q,8,1024*1024);
     std::array<unsigned char,256> seed{};
+    uint64_t warmed_allocations=0;
     for(unsigned n=0;n<2000;++n) {
-        if(n==100) {allocations=0;count_allocations=true;}
+        if(n==0) {allocations=0;count_allocations=true;warmed_allocations=frame_packet_allocation_events();}
         assert(frame_packet_begin(q,n,seed.data(),seed.size()));
-        auto* bytes=frame_packet_append(q,1,0,2048);assert(bytes);
-        std::memset(bytes,int(n&255),2048);
+        const size_t payload=1+(n*97)%4000;
+        auto* bytes=frame_packet_append(q,1,0,uint32_t(payload));assert(bytes);
+        std::memset(bytes,int(n&255),payload);
         assert(frame_packet_publish(q));
         FramePacketView view{};assert(frame_packet_acquire(q,&view));
         assert(view.sequence==n);frame_packet_release(q);
     }
     count_allocations=false;assert(allocations==0);
+    assert(warmed_allocations && frame_packet_allocation_events()==warmed_allocations);
     frame_packet_destroy(q);
 }
 int main() {

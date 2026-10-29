@@ -249,7 +249,38 @@ static void bounded_queue_wrap() {
     assert(pixel(raster,0,0)== (50000 & 65535) && state.seen==50000);
     native_raster_destroy(raster);
 }
+static void test_batched_packets() {
+    auto* r=native_raster_create(nullptr);assert(r);
+    NativeRasterState state{};state.right=1023;state.bottom=511;
+    native_raster_batch(r,1);
+    native_raster_batch(r,1);
+    for(unsigned n=0;n<1000;++n) {
+        uint32_t packet[]={0x680000ffu,(n%1024)|((n/1024)<<16)};
+        assert(native_raster_gp0(r,&state,packet,2));
+        if(n==501)assert(pixel(r,501,0)==31); /* read publishes a partial batch */
+    }
+    native_raster_batch(r,0);native_raster_batch(r,0);
+    assert(pixel(r,999,0)==31);
+    native_raster_destroy(r);
+}
+static void test_attachment_retirement() {
+    auto* r=native_raster_create(nullptr);assert(r);native_raster_inputs_enable(r,1);
+    struct Cleanup {std::thread::id guest;std::atomic<bool> done{false};} state;
+    state.guest=std::this_thread::get_id();
+    auto* inputs=native_raster_inputs_seal(r);assert(inputs);
+    allocations=0;count_allocations=true;
+    native_raster_inputs_retire(inputs,[](void* p) {
+        auto* state=static_cast<Cleanup*>(p);
+        assert(std::this_thread::get_id()!=state->guest);
+        state->done.store(true,std::memory_order_release);
+    },&state);
+    count_allocations=false;assert(allocations==0);
+    while(!state.done.load(std::memory_order_acquire))std::this_thread::yield();
+    native_raster_destroy(r);
+}
 int main() {
+    test_batched_packets();
+    test_attachment_retirement();
     allocation_free_submission();
     bounded_queue_wrap();
     immutable_texture_inputs();

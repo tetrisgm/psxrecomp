@@ -2272,3 +2272,5 @@ A/B acceptance results are tracked in R4 FRAME_INTERPOLATION_STATUS.md.
 SPSC native raster submission and upload arena implemented on fix/guest-hotpath.
 Native fixture suite and producer allocation check pass. Runtime acceptance is
 still pending; see [GUEST_HOTPATH.md](GUEST_HOTPATH.md) for measurements and gates.
+
+2026-10-29 guest execution G1 continuation: preallocated frame arenas, pooled metadata/input envelopes, batched DMA publication, opt-in display history and lock-safe caller sampling. Native/GL/allocation/CPU-hold tests and verified hidden smoke pass. First completed-phase grid gate failed 58.46/30184 with 35 packet allocations; corrected-phase gate pending. G2-G4 not started or merged. See GUEST_HOTPATH.md.

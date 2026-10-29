@@ -32,6 +32,8 @@ void frame_packet_lease_release(FramePacketLease *lease);
 /* Limits are per slot, with three slots total (writing, pending, reading).
  * Allocate/grow only on the producer. A failed append invalidates the whole
  * packet; it can never publish a truncated draw list. */
+/* Producer storage growth events, for allocation-free steady-state audits. */
+uint64_t frame_packet_allocation_events(void);
 FramePacketQueue *frame_packet_create(size_t initial_limit,size_t record_limit);
 void frame_packet_destroy(FramePacketQueue *queue); /* stopped owners only */
 int frame_packet_begin(FramePacketQueue *queue,uint64_t sequence,

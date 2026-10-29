@@ -1,4 +1,5 @@
 ﻿#include "guest_wait_trace.h"
+#include "frame_packet.h"
 #include "audio_sync.h"
 #include "audio_catchup.h"
 /* main.cpp — Phase 3 runtime entry point.
@@ -4662,7 +4663,7 @@ struct MainCadenceStats {
     std::array<Interval,20> worst{};
     uint64_t pacer=0, overshoot=0;
     bool enabled = false;
-    uint64_t previous_cpu=0, cpu=0;
+    uint64_t previous_cpu=0, cpu=0, packet_allocations=0;
     uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
 };
@@ -4702,6 +4703,7 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
     if (reset) {
         s_main_cadence = MainCadenceStats{};
         s_main_cadence.enabled = true;
+        s_main_cadence.packet_allocations=frame_packet_allocation_events();
         guest_wait_trace::enabled=true;guest_wait_trace::ns={};
     }
     const auto &s = s_main_cadence;
@@ -4722,6 +4724,7 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         int n=std::snprintf(out+used,cap-used,format,args...);
         if(n>0) used+=size_t(n);
     };
+    append(",\"packet_allocation_events\":%llu",(unsigned long long)(frame_packet_allocation_events()-s.packet_allocations));
     append(",\"cpu_ms\":%.6f,\"worst\":[",s.cpu/1e4);
     bool first=true;
     for(const auto &r:s.worst) if(r.ticks) {
