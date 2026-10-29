@@ -255,6 +255,51 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_lds(cpu);
 }
 
+/* Static straight-line segments never cross an observation or a cache line.
+ * Leave a strict margin before the next device deadline: a callback can inspect
+ * registers, so moving a charge over that boundary would be observably wrong.
+ * Diagnostic/replay builds retain instruction-by-instruction sequencing. */
+static inline int psx_cyc_segment_ready(uint32_t count) {
+#if defined(PSX_OVERLAY_DLL_BUILD) || defined(PSX_COSIM)
+    (void)count; return 0;
+#else
+    extern int g_debug_cycle_hooks;
+    if (g_ls_replay_active || g_event_step_conservative || psx_in_device_service ||
+        g_debug_cycle_hooks || g_psx_cyc_local_acc) return 0;
+    uint64_t now = psx_cycle_count + g_psx_cyc_batch;
+    return psx_next_service_cycle > now && psx_next_service_cycle - now > count;
+#endif
+}
+
+/* Closed-form composition of 2..4 non-load interlocks. The first commit may
+ * change the active give-back slot; thereafter LDWhich is the dummy slot and
+ * the first dependency on the active register ends its overlap. Each mask is
+ * a compile-time constant supplied by the emitter. */
+static inline void psx_cyc_segment(CPUState *cpu, uint32_t count,
+                                  uint32_t m0, uint32_t m1,
+                                  uint32_t m2, uint32_t m3) {
+    uint8_t w = cpu->read_absorb_which;
+    uint32_t cost = cpu->read_absorb[w] ? 0u : 1u;
+    if (cpu->read_absorb[w]) --cpu->read_absorb[w];
+    psx_cyc_deps(cpu, m0);
+    psx_cyc_lds(cpu);
+    w = cpu->read_absorb_which;
+    uint32_t rest = count - 1u;
+    uint32_t bit = w ? (1u << w) : 0u;
+    uint32_t stop = (m1 & bit) ? 1u :
+        (count > 2u && (m2 & bit)) ? 2u :
+        (count > 3u && (m3 & bit)) ? 3u : rest;
+    uint32_t overlap = cpu->read_absorb[w];
+    if (overlap > stop) overlap = stop;
+    cost += rest - overlap;
+    cpu->read_absorb[w] = cpu->read_absorb[w] > rest ?
+        (uint8_t)(cpu->read_absorb[w] - rest) : 0u;
+    psx_cyc_deps(cpu, m1 | (count > 2u ? m2 : 0u) | (count > 3u ? m3 : 0u));
+    cpu->read_absorb[32] = (uint8_t)cpu->ld_absorb;
+    cpu->read_fudge = 32u;
+    psx_cyc_charge(cost);
+}
+
 /* The GPR dep+res bitmask used by psx_cyc_step lives in psx_instr_cost.h
  * (psx_cyc_dep_res_mask) — a standalone pure function shared by the emitters
  * (gen-time literal) and the interpreter (runtime), with no CPUState dependency. */

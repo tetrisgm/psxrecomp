@@ -20,6 +20,17 @@
 _Static_assert(PSX_OVERLAY_TEST_CANDIDATE_CAP == 4,
                "pair-dedup harness must exercise the exact four-slot cap");
 
+/* Disabled host instrumentation and unregistered mod groups in this loader fixture. */
+#include "host_span_ring.h"
+uint64_t host_span_begin(void) { return 0; }
+void host_span_end(HostSpanKind kind, uint64_t start, uint32_t arg) {
+    (void)kind; (void)start; (void)arg;
+}
+uint32_t psx_mod_immediate_select(uint32_t group) { (void)group; return 0; }
+uint32_t psx_mod_memory_address(const CPUState *cpu, uint32_t pc, uint32_t instr, uint32_t address) {
+    (void)cpu; (void)pc; (void)instr; return address;
+}
+
 static uint8_t s_ram[RAM_SIZE];
 static uint8_t s_scratch[1024];
 

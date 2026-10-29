@@ -481,13 +481,13 @@ def check_demands(recompiler, compiler, data, labels, tmp):
         code, log = run_compile(recompiler, compiler, [cap], out,
                                 ("--force-interior", f"0x{after:08X}"))
         d = leaf_dir(out)
-        outs[name] = (code, "built OK : 1" in log, sorted(os.listdir(d)),
+        outs[name] = (code, bool(re.search(r"built OK\s*:\s*[1-9]", log)), sorted(os.listdir(d)),
                       {n: open(os.path.join(d, n), "rb").read()
                        for n in os.listdir(d)
                        if n.endswith((".ranges", "_patched.c"))})
     check(outs["v2"][0] == 0 and outs["v2"][1] and outs["v2"][2] and
           outs["v3"] == outs["v2"],
-          "a dispatch-less v3 record compiles byte-identically to its v2 reading")
+          "a dispatch-less v3 record compiles byte-identically to its v2 reading: " + repr([(k, v[:3]) for k,v in outs.items()]))
     # A KUSEG-only record: --force-interior (a KSEG0 PC) still builds its
     # KSEG0 fragment next to the KUSEG shard.
     out = os.path.join(tmp, "forced-kuseg")

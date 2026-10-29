@@ -654,6 +654,11 @@ if(BUILD_TESTING)
     add_test(NAME cause_ip2_combinational_test
              COMMAND cause_ip2_combinational_test)
 
+    add_executable(psx_static_timing_test tests/test_psx_static_timing.c)
+    target_include_directories(psx_static_timing_test PRIVATE include)
+    target_compile_definitions(psx_static_timing_test PRIVATE PSX_ENABLE_BLOCK_CYCLES=1)
+    add_test(NAME psx_static_timing_test COMMAND psx_static_timing_test)
+
     add_executable(psx_cyc_batch_test tests/test_psx_cyc_batch.c)
     target_include_directories(psx_cyc_batch_test PRIVATE include)
     target_compile_definitions(psx_cyc_batch_test PRIVATE

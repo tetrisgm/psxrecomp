@@ -266,7 +266,7 @@ def parse_functions(out_dir, pattern):
 
 PC_SITES = {
     "link-segment": r"cpu->gpr\[31\] = 0x([0-9A-F]{8})u;\s*/\* (?:jal|jalr|branch-and-link) ",
-    "fetch-tag-segment": r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)",
+    "fetch-tag-segment": r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)",
     "irq-resume-segment": r"psx_check_interrupts_at\(cpu, 0x([0-9A-F]{8})u\)",
     "resume-pc-segment": r"cpu->pc = 0x([0-9A-F]{8})u;|case 0x([0-9A-F]{8})u: goto",
     # Not a debug-only breadcrumb: memory.c's RAM 0x0-0xF store filters compare
@@ -285,7 +285,7 @@ def block_fetches(body, block_va):
     m = re.search(r"^block_%08X:(.*?)(?=^block_[0-9A-F]{8}:|\Z)" % block_va, body, re.M | re.S)
     if not m:
         return None
-    return [int(x, 16) for x in re.findall(r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)", m.group(1))]
+    return [int(x, 16) for x in re.findall(r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)", m.group(1))]
 
 
 def bios_uncharged_kseg1(bios_c):
@@ -294,7 +294,7 @@ def bios_uncharged_kseg1(bios_c):
     A fetch call names the runtime PC of the next emitted instruction. Its
     followers run at that PC plus their compile-address distance.
     """
-    fetch = re.compile(r"psx_icache_fetch\(cpu, 0x([0-9A-F]{8})u\)")
+    fetch = re.compile(r"psx_icache_fetch(?:_compiled)?\(cpu, 0x([0-9A-F]{8})u\)")
     insn = re.compile(r"/\* 0x([0-9A-F]{8}): [0-9A-F]{8} ")
     func = re.compile(r"^(?:static )?void \w+\(CPUState")
     total = uncharged = 0
