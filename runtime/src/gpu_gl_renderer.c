@@ -1245,6 +1245,7 @@ uint64_t gl_renderer_wide_triangle_recovery_count(void) {
  * surface: local_x = vram_x - base_x + OFFSET. Same as SW wide_dx(). */
 static int view_enabled, view_shift, view_pad_left, view_pad_right;
 static inline int wide_dx(void) { return g_wide_off + view_shift - g_wide_cur_base; }
+static int direct_wide_target(void) { return g_wide_cur && g_wide_cur==s_hr_fbo; }
 
 /* Wide-surface mask stencil: the rect (wide-local native px, [x0,x1) x
  * [y0,y1)) where a surface's stencil may differ from its alpha (bit 15), per
@@ -2108,9 +2109,9 @@ static const char *GEO_VS =
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
     "  } else if(u_xscale != 1.0) xb = (xb - xc)*u_xscale + xc;\n"
     "  zn -= 2.0*u_depth_probe;\n"
-    "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
+    "  vec2 rp = vec2(xb+u_shift,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
     "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
-    "  gl_Position = vec4(rp/vec2(u_xhalf,u_yhalf)-1.0, zn, 1.0); }\n";
+    "  rp.x += u_xoff; gl_Position = vec4(rp/vec2(u_xhalf,u_yhalf)-1.0, zn, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; noperspective in float v_iw; noperspective in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
@@ -2207,15 +2208,15 @@ static const char *TEX_VS =
     "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz, 1.0) + 256.0); if (a_q <= 0.0 && cp > 0.5) w = sz / 1024.0; }\n"
     "  g_uv_p = a_uv/w; g_col_p = a_col.rgb/w; g_iw = 1.0/w; g_cp = int(cp); g_b3d = sz > 0.5 ? 1.0 : 0.0; g_npos += sz > 0.5 ? u_origin : vec2(0.0);\n"
     "  zn -= 2.0*u_depth_probe;\n"
-    "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
+    "  vec2 rp = vec2(xb+u_shift,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
     "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
-    "  g_raster=rp*(u_raster_grid/256.0); vec2 ndc = rp/vec2(u_xhalf,u_yhalf)-1.0;\n"
+    "  g_raster=rp*(u_raster_grid/256.0); rp.x += u_xoff; vec2 ndc = rp/vec2(u_xhalf,u_yhalf)-1.0;\n"
     "  gl_Position = vec4(ndc, zn, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
     "flat in vec2 t_pos[3]; flat in vec3 t_uvq[3]; flat in vec4 t_colq[3];\n"
-    "uniform vec2 u_origin; uniform float u_raster_grid; uniform vec2 u_viewport_origin;\n"
-    "vec3 local_weights(){ vec2 p=gl_FragCoord.xy-u_viewport_origin-t_pos[0];\n"
+    "uniform vec2 u_origin; uniform float u_raster_grid; uniform vec2 u_viewport_origin; uniform float u_xoff;\n"
+    "vec3 local_weights(){ vec2 p=gl_FragCoord.xy-u_viewport_origin-vec2(u_xoff*(u_raster_grid/256.0),0.0)-t_pos[0];\n"
     " vec2 a=t_pos[1]-t_pos[0],b=t_pos[2]-t_pos[0];float d=a.x*b.y-a.y*b.x;\n"
     " float y=(p.x*b.y-p.y*b.x)/d,z=(a.x*p.y-a.y*p.x)/d;return vec3(1.0-y-z,y,z); }\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
@@ -2716,14 +2717,15 @@ static void pgxp_raster_origin(int x,int y,int width,int scale) {
 }
 static void hr_begin(int clip_to_draw_area) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+    const int direct=clip_to_draw_area && direct_wide_target();
     pgxp_raster_target(clip_to_draw_area?s_area_x1:0,clip_to_draw_area?s_area_y1:0,
-        s_hr_width,s_hr_height,s_hr_scale,s_hr_origin_x,s_hr_origin_y);
-    if(s_hr_width!=VRAM_W) {
+        s_hr_width,s_hr_height,s_hr_scale,direct?s_area_x1:s_hr_origin_x,s_hr_origin_y);
+    if(s_hr_width!=VRAM_W || direct) {
         p_glUseProgram(s_geo_prog);
-        p_glUniform1f(s_geo_uXoff,0);
+        p_glUniform1f(s_geo_uXoff,direct?s_area_x1-s_hr_origin_x:0);
         p_glUniform1f(s_geo_uXhalf,s_hr_width*.5f);
         p_glUseProgram(s_tex_prog);
-        p_glUniform1f(s_tex_uXoff,0);
+        p_glUniform1f(s_tex_uXoff,direct?s_area_x1-s_hr_origin_x:0);
         p_glUniform1f(s_tex_uXhalf,s_hr_width*.5f);
     }
     if(!clip_to_draw_area) {
@@ -2741,6 +2743,10 @@ static void hr_begin(int clip_to_draw_area) {
             if (ax2 > s_pass_x + s_pass_w - 1) ax2 = s_pass_x + s_pass_w - 1;
             if (ay2 > s_pass_y + s_pass_h - 1) ay2 = s_pass_y + s_pass_h - 1;
         }
+        if(direct_wide_target()) {
+            ax1=s_hr_origin_x+view_pad_left;
+            ax2=s_hr_origin_x+s_hr_width-view_pad_right-1;
+        }
         int sw = ax2 - ax1 + 1, sh = ay2 - ay1 + 1;
         if (sw < 0) sw = 0; if (sh < 0) sh = 0;
         glScissor((ax1-s_hr_origin_x) * s_hr_scale, (ay1-s_hr_origin_y) * s_hr_scale,
@@ -2748,9 +2754,9 @@ static void hr_begin(int clip_to_draw_area) {
     }
 }
 static void hr_end(void) {
-    if(s_hr_width!=VRAM_W) {
-        p_glUseProgram(s_geo_prog);p_glUniform1f(s_geo_uXhalf,VRAM_W*.5f);
-        p_glUseProgram(s_tex_prog);p_glUniform1f(s_tex_uXhalf,VRAM_W*.5f);
+    if(s_hr_width!=VRAM_W || direct_wide_target()) {
+        p_glUseProgram(s_geo_prog);p_glUniform1f(s_geo_uXhalf,VRAM_W*.5f);p_glUniform1f(s_geo_uXoff,0);
+        p_glUseProgram(s_tex_prog);p_glUniform1f(s_tex_uXhalf,VRAM_W*.5f);p_glUniform1f(s_tex_uXoff,0);
     }
     pgxp_raster_origin(0, 0, VRAM_W, s_hr_scale);
     glDisable(GL_BLEND);
@@ -3031,13 +3037,13 @@ static void rebuild_target_stencil_tiled(GLuint target_fbo, int target_w, int ta
 static void rebuild_mask_stencils(void) {
     if (s_stencil_valid || !s_raster_ok) return;
     hiw_flush_queue();
-    int hw = VRAM_W * s_hr_scale, hh = VRAM_H * s_hr_scale;
+    int hw = s_hr_width * s_hr_scale, hh = s_hr_height * s_hr_scale;
     if (s_out_scale <= 1) {
         /* Native: the historical whole-surface rebuild, unchanged. */
         rebuild_target_stencil(s_hr_fbo, hw, hh);
         for (int i = 0; i < WIDE_MAX_SURF; i++) {
             if (s_wide_fbo[i])
-                rebuild_target_stencil(s_wide_fbo[i], g_wide_w * s_out_scale, hh);
+                rebuild_target_stencil(s_wide_fbo[i], g_wide_w * s_out_scale, VRAM_H*s_out_scale);
             wst_clear(i);
         }
     } else {
@@ -3048,7 +3054,7 @@ static void rebuild_mask_stencils(void) {
         if (s_stencil_stale.set) {
             int S = s_hr_scale;
             rebuild_target_stencil_tiled(s_hr_fbo, hw, hh,
-                s_stencil_stale.x0 * S, s_stencil_stale.y0 * S,
+                (s_stencil_stale.x0-s_hr_origin_x)*S, (s_stencil_stale.y0-s_hr_origin_y)*S,
                 (s_stencil_stale.x1 - s_stencil_stale.x0 + 1) * S,
                 (s_stencil_stale.y1 - s_stencil_stale.y0 + 1) * S);
             for (int t = 0; hiw_on() && t < s_hiw_n; t++) {
@@ -3651,7 +3657,8 @@ static void wide_band_scissor_x(int x, int w) {
     int sy, sh;
     wide_band_rows(&sy, &sh);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(x * s_out_scale, sy * s_out_scale, w * s_out_scale, sh * s_out_scale);
+    glScissor(x*s_out_scale,(sy-(direct_wide_target()?s_hr_origin_y:0))*s_out_scale,
+        w*s_out_scale,sh*s_out_scale);
 }
 static void wide_band_scissor(void) { wide_band_scissor_x(0, g_wide_w); }
 static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
@@ -3663,12 +3670,12 @@ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
      * the canonical pass ran at 1x, so they take the S sample-grid shift. */
     if (s_hiw)
         p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hi);
-    glViewport(s_area_x1 * s_out_scale, s_area_y1 * s_out_scale, g_wide_w*s_out_scale, VRAM_H*s_out_scale);
+    glViewport(0, s_area_y1 * s_out_scale, g_wide_w*s_out_scale, VRAM_H*s_out_scale);
     p_glUniform2f(uXoff == s_tex_uXoff ? s_tex_uOrigin : s_geo_uOrigin, (float)s_area_x1, (float)s_area_y1);
-    if(uXoff==s_tex_uXoff)p_glUniform2f(s_tex_uViewportOrigin,(float)(s_area_x1*s_out_scale),(float)(s_area_y1*s_out_scale));
+    if(uXoff==s_tex_uXoff)p_glUniform2f(s_tex_uViewportOrigin,0,(float)(s_area_y1*s_out_scale));
     p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uRasterGrid : s_geo_uRasterGrid,(float)(s_out_scale*256));
     wide_band_scissor_x(view_pad_left, g_wide_w - view_pad_left - view_pad_right);
-    p_glUniform1f(uXoff, (float)dx);
+    p_glUniform1f(uXoff, (float)(dx+s_area_x1));
     p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);
 }
 static void wide_target_end(GLint uXoff, GLint uXhalf) {
@@ -4422,7 +4429,7 @@ static void hiw_replay_wide(void) {
             bound = c->wfbo;
             cur = 0;
         }
-        pgxp_raster_origin(c->ax0, c->ay0, g_wide_w, S);
+        pgxp_raster_target(c->ax0,c->ay0,g_wide_w,VRAM_H,S,c->ax0,0);
         cur = 0;
         glScissor(c->wsx * S, c->wsy * S, c->wsw * S, c->wsh * S);
         if (c->kind == HQ_TEX) {
@@ -4432,7 +4439,7 @@ static void hiw_replay_wide(void) {
                 p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
                 cur = HQ_TEX;
             }
-            p_glUniform1f(s_tex_uXoff, (float)c->wdx);
+            p_glUniform1f(s_tex_uXoff, (float)(c->wdx+c->ax0));
             p_glUniform1f(s_tex_uXscale, c->wscale);
             p_glUniform1f(s_tex_uXcenter, c->wcenter);
             bind_textured_resources(c->tex, c->palette, c->hd_tex);
@@ -4448,7 +4455,7 @@ static void hiw_replay_wide(void) {
                 p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
                 cur = HQ_GEO;
             }
-            p_glUniform1f(s_geo_uXoff, (float)c->wdx);
+            p_glUniform1f(s_geo_uXoff, (float)(c->wdx+c->ax0));
             p_glUniform1f(s_geo_uXscale, c->wscale);
             p_glUniform1f(s_geo_uXcenter, c->wcenter);
             if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);
@@ -4583,15 +4590,17 @@ static void flush_tex_batch_impl(void) {
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     vertex_stream_upload(1, s_tb, (ptrdiff_t)(nverts * TEXV * sizeof(float)));
 
+    if(direct_wide_target()){s_bd_gate=s_tb_gate;wide_set_bd_scale(s_tex_uXscale,s_tex_uXcenter);}
     depth_apply_ex(dmode, 1);
     tex_batch_draw_passes(nverts, semi);
     depth_restore_ex(dmode, 1, nverts);
+    if(direct_wide_target())wide_clear_bd_scale(s_tex_uXscale,s_tex_uXcenter);
 
     /* Native-wide mirror — skipped for a batch fully inside the 4:3 frame (its
      * centre content comes from the present-time canonical blit; nothing to add
      * to the margins). A backdrop-stretched batch (s_tb_gate) widens past the
      * frame, so it is never treated as centre-only. */
-    int mirror = g_wide_cur && s_ws_ablate != 1 &&
+    int mirror = g_wide_cur && !direct_wide_target() && s_ws_ablate != 1 &&
                  !(s_tb_gate == 0 && mirror_batch_center_only(nverts));
     if (mirror) {   /* the stencil it may leave behind alpha */
         float sc, ce;
@@ -4731,11 +4740,13 @@ static void flush_flat_batch_impl(void) {
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
     if (nl) memcpy(&s_fb[nverts * 6], s_fbl, (size_t)nl * 2 * 6 * sizeof(float));
     vertex_stream_upload(0, s_fb, (ptrdiff_t)((nverts + 2 * nl) * 6 * sizeof(float)));
+    if(direct_wide_target()){s_bd_gate=s_fb_gate;wide_set_bd_scale(s_geo_uXscale,s_geo_uXcenter);}
     depth_apply_ex(dmode, 0);
     BCLS_DRAW(semi, dmode, mask, s_mask_check, b3d, if (nl) flat_batch_draw_hr_lines(nverts, nl);
                        else glDrawArrays(fmode, 0, nverts));
     depth_restore_ex(dmode, 0, nverts);
-    int mirror = g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+    if(direct_wide_target())wide_clear_bd_scale(s_geo_uXscale,s_geo_uXcenter);
+    int mirror = g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate != 1 &&
                  !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts));
     if (mirror) {
         float sc, ce;
@@ -4901,7 +4912,7 @@ static void depth_clear_now(void) {
                   (x1-x0)*s_out_scale,h*s_out_scale);
         glClear(GL_DEPTH_BUFFER_BIT);
     }
-    if(g_wide_cur && !s_wide_suppress && s_ws_ablate!=1) {
+    if(g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate!=1) {
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER,g_wide_cur);
         wide_band_scissor_x(view_pad_left,g_wide_w-view_pad_left-view_pad_right);
         glClear(GL_DEPTH_BUFFER_BIT);
@@ -5365,13 +5376,17 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         p_glBindVertexArray(s_geo_vao);
         p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
         vertex_stream_upload(0, draw_verts, (ptrdiff_t)(draw_n * 6 * sizeof(float)));
+        if(direct_wide_target()) {
+            s_bd_gate=bd_prim_gate(xs,n,0);wide_set_bd_scale(s_geo_uXscale,s_geo_uXcenter);
+        }
         BCLS_DRAW(semi, 0, (int)s_mask_set, s_mask_check, -1, glDrawArrays(draw_mode, 0, draw_n));
+        if(direct_wide_target())wide_clear_bd_scale(s_geo_uXscale,s_geo_uXcenter);
         if (is_line && s_out_scale > 1 && draw_mode == GL_LINES) {
             /* windowed: hr drew a 1x line; the S surfaces take the quad */
             vertex_stream_upload(0, quad, (ptrdiff_t)(6 * 6 * sizeof(float)));
             draw_mode = GL_TRIANGLES; draw_n = 6;
         }
-        int mirror = g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+        int mirror = g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate != 1 &&
                      !(!g_ws_bd_stretch_on && mirror_geo_center_only(xs, n));
         if (mirror) {
             float sc, ce;
@@ -5729,13 +5744,15 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
      * overlay-width rect that canonically clips at a vertical double-buffer
      * band boundary paint the OTHER band's rows; u_xhalf = g_wide_w/2. */
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
-    glViewport(0, 0, g_wide_w * s_out_scale, VRAM_H * s_out_scale);
+    if(direct_wide_target())
+        pgxp_raster_target(0,s_area_y1,g_wide_w,s_hr_height,s_out_scale,0,s_hr_origin_y);
+    else glViewport(0,0,g_wide_w*s_out_scale,VRAM_H*s_out_scale);
     wide_band_scissor();
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(s_mask_set);
     p_glUseProgram(s_geo_prog);
     if (s_hiw) p_glUniform1f(s_geo_uShift, s_shift_hi);
-    p_glUniform1f(s_geo_uYhalf,VRAM_H*.5f);
+    p_glUniform1f(s_geo_uYhalf,(direct_wide_target()?s_hr_height:VRAM_H)*.5f);
     p_glUniform1f(s_geo_uXoff, 0.0f);
     p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
     p_glBindVertexArray(s_geo_vao);
@@ -5775,8 +5792,10 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
         flush_tex_batch();
         s_wide_suppress = 1;
     }
-    gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
-    gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
+    if(!overlay || !direct_wide_target()) {
+        gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
+        gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
+    }
     if (overlay) {
         /* gpu_triangle queues flat geometry. Finish these two triangles while
          * their mirror remains suppressed, before the direct wide overlay. */
@@ -6405,8 +6424,8 @@ static void depth24_clear_skipped_fb(void) {
     glDisable(GL_BLEND);
     glDisable(GL_STENCIL_TEST);
     glEnable(GL_SCISSOR_TEST);
-    glViewport(0, 0, VRAM_W * S, VRAM_H * S);
-    glScissor(x0 * S, y0 * S, rw * S, rh * S);
+    glViewport(0, 0, s_hr_width * S, s_hr_height * S);
+    glScissor((x0-s_hr_origin_x)*S,(y0-s_hr_origin_y)*S,rw*S,rh*S);
     glClearColor(0.f, 0.f, 0.f, 0.f);
     glClearStencil(0);
     glStencilMask(0xFF);
@@ -7180,7 +7199,7 @@ static int gl_read_display_argb(int x, int y, int w, int h, uint32_t *out,
     flush_tex_batch();
     flush_cpu_upload();
     GLuint fbo = s_hr_fbo;
-    int rx = x;
+    int rx = x-s_hr_origin_x,ry=y-s_hr_origin_y;
     if (s_hiw) {
         /* Windowed: the S-scaled pixels exist only inside the tiles. */
         hiw_flush_queue();
@@ -7188,6 +7207,9 @@ static int gl_read_display_argb(int x, int y, int w, int h, uint32_t *out,
         if (!T) return 0;
         fbo = T->fbo;
         rx = x - T->x0;
+        ry = y;
+    } else if(rx<0 || ry<0 || rx+w>s_hr_width || ry+h>s_hr_height) {
+        return 0;
     }
     if (!fbo) return 0;
     GLint read_fbo = 0, pack_buffer = 0, pack_row = 0, pack_align = 4;
@@ -7199,7 +7221,7 @@ static int gl_read_display_argb(int x, int y, int w, int h, uint32_t *out,
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
     glPixelStorei(PSXGL_PACK_ROW_LENGTH, pitch_bytes / 4);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(rx * S, y * S, W, H, GL_BGRA, GL_UNSIGNED_BYTE, out);
+    glReadPixels(rx * S, ry * S, W, H, GL_BGRA, GL_UNSIGNED_BYTE, out);
     glPixelStorei(PSXGL_PACK_ROW_LENGTH, pack_row);
     glPixelStorei(GL_PACK_ALIGNMENT, pack_align);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, (GLuint)read_fbo);
@@ -9849,6 +9871,8 @@ size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
 static void pass_blit(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
                       int w, int h, GLbitfield mask) {
     hiw_flush_queue();   /* queued wide mirrors land before a copy reads or writes */
+    if(src==s_hr_fbo){sx-=s_hr_origin_x*s_hr_scale;sy-=s_hr_origin_y*s_hr_scale;}
+    if(dst==s_hr_fbo){dx-=s_hr_origin_x*s_hr_scale;dy-=s_hr_origin_y*s_hr_scale;}
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, dst);
     glDisable(GL_SCISSOR_TEST);
@@ -9868,7 +9892,7 @@ static void pass_verify_read(uint8_t **hr, size_t *hr_cap, uint8_t **raw,
     if (*raw_cap < rn) { free(*raw); *raw = (uint8_t *)malloc(rn); *raw_cap = *raw ? rn : 0; }
     if (!*hr || !*raw) return;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
-    glReadPixels(s_pass_x * S, s_pass_y * S, s_pass_w * S, s_pass_h * S,
+    glReadPixels((s_pass_x-s_hr_origin_x)*S,(s_pass_y-s_hr_origin_y)*S,s_pass_w*S,s_pass_h*S,
                  GL_RGBA, GL_UNSIGNED_BYTE, *hr);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
     glReadPixels(s_pass_x, s_pass_y, s_pass_w, s_pass_h, PSXGL_RED_INTEGER,
@@ -12396,8 +12420,10 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
      * window cannot hold presents from the 1x surface without temporal
      * blending (whose captures assume the S-scaled source). */
     GLuint src_fbo = s_hr_fbo, src_tex = s_hr_tex, interp_fbo = s_hr_fbo;
-    int src_tw = VRAM_W, src_x = disp_x, src_scale = s_out_scale;
+    int src_tw=s_hr_width,src_th=s_hr_height,src_x=disp_x-s_hr_origin_x,
+        src_y=disp_y-s_hr_origin_y,src_scale=s_out_scale;
     if (s_hiw) {
+        src_x=disp_x;src_y=disp_y;src_tw=VRAM_W;src_th=VRAM_H;
         const HiwTile *T = hiw_ensure(disp_x, disp_x + w);
         s_hiw_last_x0 = disp_x; s_hiw_last_x1 = disp_x + w;
         if (T) {
@@ -12417,22 +12443,22 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
     }
     uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
-        interp_fbo, src_x, disp_y, w, h, linear, force_4_3, GL_PRES_VRAM,
+        interp_fbo, src_x, src_y, w, h, linear, force_4_3, GL_PRES_VRAM,
         disp_x, disp_y,
         present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1));
     if (interp_pair) {
         if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
-            float tw = (float)src_tw, th = (float)VRAM_H;
+            float tw = (float)src_tw, th = (float)src_th;
             if (src_tex == s_hr_tex) {
                 tw = present_alloc_extent(src_tw, s_hr_scale);
-                th = present_alloc_extent(VRAM_H, s_hr_scale);
+                th = present_alloc_extent(src_th, s_hr_scale);
             }
-            postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
+            postfx_note_source(src_fbo, src_tex, tw, th, src_x, src_y, w, h);
             postfx_capture_temporal_source(lx, ly, lw, lh);
         }
         /* Temporal blending owns this stock frame interval. Capture hold-last
          * before pacing; every blend and Swap remains on this context/thread. */
-        hold_capture_native_fbo(src_fbo, src_x, disp_y, w, h, force_4_3, linear);
+        hold_capture_native_fbo(src_fbo, src_x, src_y, w, h, force_4_3, linear);
         interp_present_source_interval();
         gl_perf_present_exit(0);
         present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
@@ -12445,14 +12471,14 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
     {
         /* The hr surface may be allocated above the level it renders at
          * (dynamic resolution); window tiles never are. */
-        float tw = (float)src_tw, th = (float)VRAM_H;
+        float tw = (float)src_tw, th = (float)src_th;
         if (src_tex == s_hr_tex) {
             tw = present_alloc_extent(src_tw, s_hr_scale);
-            th = present_alloc_extent(VRAM_H, s_hr_scale);
+            th = present_alloc_extent(src_th, s_hr_scale);
         }
         present_target_quad(src_tex, tw, th,
-                            src_x, disp_y, w, h, linear, lx, ly, lw, lh, 1, 1, src_scale);
-        postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
+                            src_x, src_y, w, h, linear, lx, ly, lw, lh, 1, 1, src_scale);
+        postfx_note_source(src_fbo, src_tex, tw, th, src_x, src_y, w, h);
     }
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     gpu_timeline_note(GTL_PRESENT, GTL_PATH_VRAM_FBO,
@@ -12482,7 +12508,9 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
     int native_w = g_wide_w - 2 * g_wide_off;
     if (native_w <= 0) return;
     int S = s_out_scale;
-    (void)disp_y; (void)disp_h;
+    int y0=disp_y<0?0:disp_y;
+    int y1=disp_h>VRAM_H-y0?VRAM_H:disp_y+disp_h;
+    if(y1<=y0)return;
     /* The mask's bits (stencil bit 1) of the centre are not copied (a
      * depth-stencil blit costs the CPU milliseconds on macOS): the mask takes
      * them from the hr surface itself (postfx_note_center). The windowed
@@ -12490,15 +12518,10 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
      * tiles and the bits travel with it. */
     const GLbitfield bits = GL_COLOR_BUFFER_BIT | (s_bcls_on && s_hiw ? GL_STENCIL_BUFFER_BIT : 0);
     /* Colour only: the centre's stencil is left behind (see s_wst_*). */
-    wst_add(wide_index(wide_fbo), g_wide_off, 0, g_wide_off + native_w, VRAM_H);
-    /* Copy the canonical framebuffer column into the wide surface CENTRE over the
-     * FULL VRAM height, not just the current display band [disp_y, disp_y+disp_h].
-     * The wide surface holds BOTH vertical double-buffer bands (Ape flips
-     * display_y 0<->256), and the game's draw area / display band can differ per
-     * scene (the cityscape intro exposed rows outside disp_h). Copying the whole
-     * column makes the wide CENTRE bit-identical to what the full mirror would
-     * have drawn there for every band, so nothing the present reads is ever left
-     * black. The margins (x outside the centre) are untouched. */
+    wst_add(wide_index(wide_fbo),g_wide_off,y0,g_wide_off+native_w,y1);
+    /* Every reader names the band it consumes, including full-height debug
+     * captures. Other bands remain untouched and refresh on their own read.
+     * This avoids copying the unused double-buffer band at every present. */
     if (s_hiw) {
         /* Windowed high-resolution mode: the centre comes from a tile at S
          * (grown to it on first sight). Columns no tile holds are the 1x
@@ -12510,8 +12533,8 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
         p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
         if (!in) {
             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
-            p_glBlitFramebuffer(cx0 * R, 0, cx1 * R, VRAM_H * R,
-                                g_wide_off * S, 0, (g_wide_off + native_w) * S, VRAM_H * S,
+            p_glBlitFramebuffer(cx0 * R, y0 * R, cx1 * R, y1 * R,
+                                g_wide_off * S, y0 * S, (g_wide_off + native_w) * S, y1 * S,
                                 bits, GL_NEAREST);
         }
         for (int t = 0; t < s_hiw_n; t++) {
@@ -12519,9 +12542,9 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
             int h0 = cx0 > T->x0 ? cx0 : T->x0, h1 = cx1 < T->x1 ? cx1 : T->x1;
             if (h1 > h0) {
                 p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, T->fbo);
-                p_glBlitFramebuffer((h0 - T->x0) * S, 0, (h1 - T->x0) * S, VRAM_H * S,
-                                    (g_wide_off + h0 - cx0) * S, 0,
-                                    (g_wide_off + h1 - cx0) * S, VRAM_H * S,
+                p_glBlitFramebuffer((h0 - T->x0) * S, y0 * S, (h1 - T->x0) * S, y1 * S,
+                                    (g_wide_off + h0 - cx0) * S, y0 * S,
+                                    (g_wide_off + h1 - cx0) * S, y1 * S,
                                     bits, GL_NEAREST);
             }
             if (in) break;
@@ -12533,11 +12556,15 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(base_x * S, 0,
-                        (base_x + native_w) * S, VRAM_H * S,
-                        g_wide_off * S, 0,
-                        (g_wide_off + native_w) * S, VRAM_H * S,
-                        bits, GL_NEAREST);
+    int x0=base_x>s_hr_origin_x?base_x:s_hr_origin_x;
+    int x1=base_x+native_w<s_hr_origin_x+s_hr_width?base_x+native_w:s_hr_origin_x+s_hr_width;
+    if(y0<s_hr_origin_y)y0=s_hr_origin_y;
+    if(y1>s_hr_origin_y+s_hr_height)y1=s_hr_origin_y+s_hr_height;
+    if(x1>x0 && y1>y0)
+        p_glBlitFramebuffer((x0-s_hr_origin_x)*S,(y0-s_hr_origin_y)*S,
+                            (x1-s_hr_origin_x)*S,(y1-s_hr_origin_y)*S,
+                            (g_wide_off+x0-base_x)*S,y0*S,
+                            (g_wide_off+x1-base_x)*S,y1*S,bits,GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 }
@@ -12619,8 +12646,8 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
             postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
                                0, disp_y, g_wide_w, disp_h);
             if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
-                postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
-                                   present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,
+                postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(s_hr_width, s_hr_scale),
+                                   present_alloc_extent(s_hr_height, s_hr_scale), disp_x-s_hr_origin_x, disp_y-s_hr_origin_y,
                                    g_wide_w - 2 * g_wide_off, disp_h, g_wide_off, g_wide_w);
             postfx_capture_temporal_source(lx, ly, lw, lh);
         }
@@ -12642,8 +12669,8 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
                       0, disp_y, g_wide_w, disp_h);
     if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
-        postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
-                           present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,
+        postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(s_hr_width, s_hr_scale),
+                           present_alloc_extent(s_hr_height, s_hr_scale), disp_x-s_hr_origin_x, disp_y-s_hr_origin_y,
                            g_wide_w - 2 * g_wide_off, disp_h, g_wide_off, g_wide_w);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     gpu_timeline_note(GTL_PRESENT, GTL_PATH_WIDE_FBO,

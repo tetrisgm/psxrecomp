@@ -2212,3 +2212,13 @@ ring backpressure remains. No phase-2 acceptance, merge or performance claim.
 2026-10-29 phase3 surface groundwork: cross-target enhanced copies and cropped-to-wide translucent overlays pass colour/depth parity at1x/4x/9x, including72copy mask combinations. Dev build and R4 32tests pass. Receipt phase3-cross-target-overlay/rth-68qop30w. Full-VRAM allocation and duplicate depth remain; no phase acceptance.
 
 2026-10-29 phase3 continued WIP: merged fork d2185504 (completed rewind/audit) in87c415a5. Production PGXP colour/depth one pass; masked depth writes fixed; opt-in audit probes retained. Cropped/analytic/mask/packet hidden fixtures pass, R4 32/32. Async fenced32x18 present receipt proves1800distinct samples/30s, no missing. Recovered SPSC native draw transport while retaining ordered checkpoint mailbox:20 repeated native tests pass; worst submission .533->.245ms, no overall pacing gain. Release debug-tools-off built;30s59.997Hz,entry33.358ms,return18.519ms,zero starved. Entry includes prior pacer sleep; no ten-minute gate or surface cutover acceptance. Full allocation/duplicate wide remain; no promotion. All runs dummy audio.
+
+2026-10-29 phase3 direct-output groundwork: cropped readers, display-band blits,
+transaction coordinates and one-pass wide projection now tested through18x.
+Hidden fixture phase3-direct-wide-18x/rth-nq_cv7nr covers ordinary/backdrop
+flat/textured geometry, lines, uploads, fills, enhanced cross-target copies,
+mask semantics, captures and backup/restore. Textured output byte exact;
+flat Gouraud differences bounded to one RGB code (362pixels at18x), alpha
+exact, all page positions byte-identical. Production still uses full-VRAM
+allocation: no acceptance or promotion. Dev build/R4 32tests passed. Ghidra
+MCP available with OpenBIOS and game analyzed. All runs dummy audio.
