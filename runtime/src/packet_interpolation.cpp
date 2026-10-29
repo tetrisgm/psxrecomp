@@ -42,6 +42,9 @@ bool same_geometry(const PacketInterpolationPrimitive& a,const PacketInterpolati
 struct PacketInterpolation {
     std::vector<PacketInterpolationPrimitive> a,b;
     std::vector<size_t> matches;
+    std::vector<PacketInterpolationPrimitive> source_previous;
+    std::vector<unsigned> source_masks;
+    bool source_mode=false;
     PacketInterpolationStats stats{};
     bool ready=false;
 };
@@ -60,6 +63,49 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
         if(b->count) c->b.assign(b->primitives,b->primitives+b->count);
         const size_t missing=std::numeric_limits<size_t>::max();
         c->matches.assign(b->count,missing);
+        if(b->source_mode) {
+            if((a->transform_count && !a->transforms) || (b->transform_count && !b->transforms)) return 0;
+            c->source_mode=true;
+            c->source_previous=c->b;
+            c->source_masks.assign(b->count,0);
+            struct Entry { const PacketInterpolationTransform *value; bool ambiguous; };
+            std::unordered_map<Key,Entry,Hash> table;
+            for(size_t i=0;i<a->transform_count;++i) {
+                const auto& v=a->transforms[i];
+                auto result=table.emplace(Key{v.source.object,v.source.primitive},Entry{&v,false});
+                if(!result.second) for(unsigned d=0;d<3;++d)
+                    if(result.first->second.value->view[d]!=v.view[d]) result.first->second.ambiguous=true;
+            }
+            c->stats.snapped=a->epoch!=b->epoch || b->sequence<=a->sequence || a->discontinuity || b->discontinuity;
+            for(size_t i=0;i<c->b.size();++i) {
+                const auto& p=c->b[i]; if(!p.spatial) continue;
+                if(p.vertices<3 || p.vertices>4) {++c->stats.invalid;continue;}
+                for(unsigned j=0;j<p.vertices;++j) {
+                    const auto& v=p.vertex[j];
+                    bool finite=true;for(double x:v.view) finite=finite&&std::isfinite(x);
+                    if(!finite || (!v.source.object && !v.source.primitive)) {
+                        ++c->stats.invalid;++c->stats.source_unmatched;continue;
+                    }
+                    auto found=table.find({v.source.object,v.source.primitive});
+                    if(found==table.end()) {++c->stats.new_source;continue;}
+                    if(found->second.ambiguous) {++c->stats.source_ambiguous;++c->stats.source_unmatched;continue;}
+                    const auto& old=*found->second.value;
+                    double distance=0;
+                    for(unsigned d=0;d<3;++d) {
+                        if(!std::isfinite(old.view[d])) finite=false;
+                        double delta=v.view[d]-old.view[d];distance+=delta*delta;
+                        c->source_previous[i].vertex[j].view[d]=old.view[d];
+                    }
+                    if(!finite) {++c->stats.invalid;++c->stats.source_unmatched;continue;}
+                    c->source_masks[i]|=1u<<j;++c->stats.source_matched;
+                    if(max_motion>0 && std::sqrt(distance)>max_motion*std::max(1.0,std::abs(v.view[2]))) c->stats.snapped=1;
+                }
+                if(c->source_masks[i]==(1u<<p.vertices)-1) ++c->stats.matched;
+            }
+            c->stats.unmatched=c->stats.source_unmatched;
+            c->stats.ambiguous=c->stats.source_ambiguous;
+            c->ready=true;return 1;
+        }
         using Group=std::vector<size_t>;
         std::unordered_map<Key,Group,Hash> old_groups,new_groups;
         std::vector<bool> used(a->count,false);
@@ -167,6 +213,24 @@ extern "C" int packet_interpolation_sample(const PacketInterpolation *c,double t
     t=std::clamp(t,0.0,1.0);
     for(size_t i=0;i<c->b.size();++i) {
         out[i]=c->b[i];
+        if(c->source_mode) {
+            if(!out[i].spatial) continue;
+            for(unsigned v=0;v<out[i].vertices && v<4;++v) {
+                auto& p=out[i].vertex[v];
+                if(!c->stats.snapped && t!=1 && (c->source_masks[i]&(1u<<v)))
+                    for(unsigned d=0;d<3;++d) p.view[d]=c->source_previous[i].vertex[v].view[d]+t*(p.view[d]-c->source_previous[i].vertex[v].view[d]);
+                p.homogeneous[0]=p.ofx*p.view[2]+p.h*p.x_scale*p.view[0];
+                p.homogeneous[1]=p.ofy*p.view[2]+p.h*p.view[1];
+                p.homogeneous[2]=p.view[2];
+                // Nonpositive depth is valid geometry. The renderer clips
+                // homogeneous coordinates before performing the divide.
+                if(p.view[2]>0 && t!=1 && !c->stats.snapped && (c->source_masks[i]&(1u<<v))) {
+                    p.screen[0]=p.homogeneous[0]/p.view[2];
+                    p.screen[1]=p.homogeneous[1]/p.view[2];
+                }
+            }
+            continue;
+        }
         if(c->stats.snapped || t==1 || c->matches[i]==std::numeric_limits<size_t>::max()) continue;
         const auto& a=c->a[c->matches[i]];
         const auto& b=c->b[i];

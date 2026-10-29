@@ -54,6 +54,9 @@ extern "C" int gte_geometry_correction_lookup_probe(uint32_t packed,
 
 #include "pgxp_engine_types.h"
 
+#define PGXP_TRANSFORM_RECORD(p) do { if(s_transform_recorder) s_transform_recorder(p); } while(0)
+static PGXPTransformRecorder s_transform_recorder;
+extern "C" void pgxp_set_transform_recorder(PGXPTransformRecorder recorder) { s_transform_recorder=recorder; }
 #define PGXP_S static
 #define PGXP_API extern "C"
 #include "pgxp_engine.inc"

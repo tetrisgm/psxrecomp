@@ -1534,6 +1534,9 @@ PGXP_API void pgxp_gte_set_projection(const PGXPProjection *projection) {
         s_gte[14].projection.source_vertex=input->gen==s_gen?input->source_address:0;
         s_gte[14].projection.source_matrix=s_gtc[0].gen==s_gen?s_gtc[0].source_address:0;
     }
+    #ifdef PGXP_TRANSFORM_RECORD
+    PGXP_TRANSFORM_RECORD(&s_gte[14].projection);
+    #endif
     s_gte[14].flags |= PGXP_F_PROJECTION;
     s_gte[15] = s_gte[14];
 }

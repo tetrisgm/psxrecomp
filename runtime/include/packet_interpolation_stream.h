@@ -8,6 +8,7 @@ extern "C" {
 /* Candidate provenance audit on the presenter. These are packet-owned
  * values, never pointers into the guest's PGXP engine. */
 typedef struct PacketInterpolationSource {
+    uint32_t transform_only; /* pre-cull RTPS/RTPT source, projection[0] */
     PGXPProjection projection[3];
     int32_t x[3],y[3];
     uint32_t primitive_type, texpage, clut;
@@ -15,6 +16,13 @@ typedef struct PacketInterpolationSource {
     uint32_t spatial_mask; /* depth evidence, including missing provenance */
 } PacketInterpolationSource;
 int packet_interpolation_stream_enabled(void);
+typedef struct PacketTransformTable PacketTransformTable;
+void packet_interpolation_transform(const PGXPProjection *projection);
+PacketTransformTable *packet_interpolation_transform_seal(void);
+void packet_interpolation_transform_free(PacketTransformTable *table);
+size_t packet_interpolation_transform_bytes(const PacketTransformTable *table);
+void packet_interpolation_stream_table(const PacketTransformTable *table);
+
 typedef void (*PacketInterpolationRecorder)(const PacketInterpolationSource *source);
 /* Install during presenter startup; callbacks synchronously copy the source
  * into an owned record. No presenter means this optional audit is inactive. */

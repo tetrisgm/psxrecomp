@@ -13252,6 +13252,7 @@ typedef struct RthPacketSeed {
 typedef struct RthPacketInputs {
     NativeRasterInputs *draws;
     GpuHdTextureTracking *tracking;
+    PacketTransformTable *transforms;
 } RthPacketInputs;
 static RthPacketInputs *s_rth_packet_build;
 static uint64_t s_rth_packet_last_sequence,s_rth_packet_last_epoch;
@@ -16281,6 +16282,10 @@ int gl_renderer_frame_generation_method(void) {
     return s_fg_reproject ? GL_FG_METHOD_REPROJECTION : GL_FG_METHOD_REDRAW;
 }
 
+static void rth_packet_transform_record(const PGXPProjection *projection) {
+    if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
+    packet_interpolation_transform(projection);
+}
 static void rth_packet_interpolation_record(const PacketInterpolationSource *source) {
     if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
     if(!rth_group_flush()) return;
@@ -17149,6 +17154,7 @@ static void rth_packet_dispose(void *data) {
     uint64_t begin=pt_clock_ns();
     native_raster_inputs_destroy(inputs->draws);
     gpu_hd_textures_free_tracking(inputs->tracking);
+    packet_interpolation_transform_free(inputs->transforms);
     free(inputs);
     atomic_fetch_add(&s_rth_packet_dispose_ns,pt_clock_ns()-begin);
 }
@@ -17190,8 +17196,12 @@ static int rth_packet_seal(void *user,FrameOwner *owner) {
         native_raster_inputs_destroy(draws);rth_packet_dispose(inputs);return 0;
     }
     inputs->draws=draws;
+    if(packet_interpolation_stream_enabled()) {
+        inputs->transforms=packet_interpolation_transform_seal();
+        if(!inputs->transforms) {rth_packet_dispose(inputs);return 0;}
+    }
     size_t bytes=sizeof *inputs+native_raster_inputs_bytes(draws)+
-                 gpu_hd_textures_tracking_bytes(inputs->tracking);
+                 gpu_hd_textures_tracking_bytes(inputs->tracking)+packet_interpolation_transform_bytes(inputs->transforms);
     if(!frame_owner_attach(owner,inputs,bytes,rth_packet_dispose)) {
         rth_packet_dispose(inputs);return 0;
     }
@@ -17248,6 +17258,7 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
     s_rth_packet_replaying=1;s_rth_packet_view=packet;
     if(packet_interpolation_stream_enabled())
         packet_interpolation_stream_begin(packet->epoch,packet->sequence);
+    if(packet_interpolation_stream_enabled()) packet_interpolation_stream_table(inputs->transforms);
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();
     memcpy(s_rth_vram_priv,seed->pixels,sizeof seed->pixels);
     rth_rebind_vram(s_rth_vram_priv);
@@ -17313,6 +17324,7 @@ int gl_renderer_render_thread_start(int max_frames) {
     cfg.execute_frame=rth_packet_execute;
     cfg.reset_frame=rth_packet_reset;
     packet_interpolation_set_recorder(rth_packet_interpolation_record);
+    pgxp_set_transform_recorder(rth_packet_transform_record);
     native_raster_inputs_enable(gr_native_raster(),1);
     fg_invalidate();
     (void)pt_begin();   /* [video] present_thread; falls back to direct swaps */

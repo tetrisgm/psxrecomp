@@ -20,6 +20,38 @@ static PacketInterpolationPrimitive primitive(uint64_t id,double x,double z) {
     return p;
 }
 int main() {
+    // Pre-cull sources exist even when no older primitive was submitted.
+    {
+        auto *source=packet_interpolation_create();
+        auto p=primitive(99,20,100);
+        PacketInterpolationTransform old[3]{};
+        for(unsigned i=0;i<3;++i) {
+            p.vertex[i].source={17,i+1};old[i].source=p.vertex[i].source;
+            old[i].view[0]=i;old[i].view[2]=-100;
+        }
+        PacketInterpolationPacket a{1,1,nullptr,0,0,old,3,1};
+        PacketInterpolationPacket b{1,2,&p,1,0,nullptr,0,1};
+        assert(packet_interpolation_pair(source,&a,&b,0));
+        auto stats=packet_interpolation_stats(source);
+        assert(stats.source_matched==3 && !stats.unmatched && !stats.invalid);
+        PacketInterpolationPrimitive result{};
+        assert(packet_interpolation_sample(source,0.5,&result,1));
+        assert(result.vertex[0].view[2]==0);
+        assert(result.vertex[0].homogeneous[2]==0);
+        assert(std::isfinite(result.vertex[0].homogeneous[0]));
+        assert(result.vertex[0].colour==p.vertex[0].colour);
+        assert(result.vertex[0].uv[0]==p.vertex[0].uv[0]);
+        assert(packet_interpolation_sample(source,0.75,&result,1));
+        assert(result.vertex[0].view[2]==50);
+        assert(result.vertex[0].screen[0]==247);
+        p.vertex[2].source={17,99};
+        assert(packet_interpolation_pair(source,&a,&b,0));
+        stats=packet_interpolation_stats(source);
+        assert(stats.source_matched==2 && stats.new_source==1 && !stats.unmatched);
+        b.epoch=2;assert(packet_interpolation_pair(source,&a,&b,0));
+        assert(packet_interpolation_stats(source).snapped);
+        packet_interpolation_destroy(source);
+    }
     auto *ctx=packet_interpolation_create(); assert(ctx);
     assert(!packet_interpolation_sample(ctx,0.5,nullptr,0));
     std::vector<PacketInterpolationPrimitive> a,b,out(4);

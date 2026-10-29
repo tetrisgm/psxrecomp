@@ -12,11 +12,13 @@ extern "C" {
  * gated minimum-cost centroid assignment resolves the group. */
 typedef struct FramePrimitiveIdentity { uint64_t object, primitive; } FramePrimitiveIdentity;
 typedef struct PacketInterpolationVertex {
+    FramePrimitiveIdentity source; /* model invocation + source vertex */
     double view[3];
     double h, ofx, ofy, x_scale;
     double screen[2]; /* precise packet N endpoint, including GPU transforms */
     double uv[2];
     uint32_t colour;
+    double homogeneous[3]; /* x numerator, y numerator, signed depth; clip before divide */
 } PacketInterpolationVertex;
 typedef struct PacketInterpolationPrimitive {
     FramePrimitiveIdentity identity;
@@ -24,16 +26,24 @@ typedef struct PacketInterpolationPrimitive {
     uint32_t spatial;  /* 0: HUD/2D, takes packet N verbatim */
     PacketInterpolationVertex vertex[4];
 } PacketInterpolationPrimitive;
+typedef struct PacketInterpolationTransform {
+    FramePrimitiveIdentity source;
+    double view[3];
+} PacketInterpolationTransform;
 typedef struct PacketInterpolationPacket {
     uint64_t epoch, sequence;
     const PacketInterpolationPrimitive *primitives;
     size_t count;
     int discontinuity; /* explicit cut, respawn or timeline reset */
+    const PacketInterpolationTransform *transforms;
+    size_t transform_count;
+    int source_mode; /* never silently fall back to primitive matching */
 } PacketInterpolationPacket;
 typedef struct PacketInterpolationStats {
     uint64_t matched, unmatched, disappeared, ambiguous, invalid;
     uint64_t duplicate_equal;
     uint64_t resolved_occurrence, resolved_assignment, appeared_candidates;
+    uint64_t source_matched, new_source, source_unmatched, source_ambiguous;
     int snapped;
 } PacketInterpolationStats;
 typedef struct PacketInterpolation PacketInterpolation;

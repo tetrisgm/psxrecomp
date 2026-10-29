@@ -197,6 +197,9 @@ typedef struct PGXPProjection {
     uint32_t source_vertex, source_matrix; /* canonical RAM origins, zero if unknown */
     uint64_t transform; /* value fingerprint: invocation evidence, not temporal identity */
 } PGXPProjection;
+typedef void (*PGXPTransformRecorder)(const PGXPProjection *projection);
+/* Producer-only observer, before guest culling. Private contexts never publish. */
+void pgxp_set_transform_recorder(PGXPTransformRecorder recorder);
 void pgxp_set_projection_tracking(int enabled);
 int pgxp_projection_tracking(void);
 /* source_vertex 1..6 requests the corresponding GTE input register origin;
