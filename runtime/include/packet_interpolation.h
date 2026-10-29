@@ -25,6 +25,7 @@ typedef struct PacketInterpolationVertex {
 typedef struct PacketInterpolationPrimitive {
     FramePrimitiveIdentity identity;
     uint32_t vertices; /* 3 or 4 */
+    uint32_t interpolated; /* geometry sampled, not a held endpoint */
     uint32_t spatial;  /* 0: HUD/2D, takes packet N verbatim */
     PacketInterpolationVertex vertex[4];
 } PacketInterpolationPrimitive;

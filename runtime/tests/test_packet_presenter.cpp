@@ -31,7 +31,7 @@ int main() {
         packet_presenter_reset();packet_interpolation_set_rate(rate);phases.clear();
         auto *q=frame_packet_create(128,128);assert(q);
         submit(q,1,100);assert(phases.back()==1);
-        submit(q,3,33333433);assert(phases.back()==0);
+        submit(q,3,33333433);assert(phases.back()==-1);
         // The queue may die while the presenter still holds its immutable lease.
         frame_packet_destroy(q);
         uint64_t due=packet_presenter_tick(33333433,draw);

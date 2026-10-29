@@ -6,7 +6,8 @@ extern "C" {
 #endif
 /* Consumer-owned retained packet and display clock. prepare builds the pair
  * without drawing; draw consumes only immutable packet inputs and sampled
- * vertices. Neither callback may execute guest code. */
+ * vertices. t=-1 requests the retained left endpoint verbatim; t=1 is
+ * the current endpoint. Neither callback may execute guest code. */
 typedef void (*PacketPresenterDraw)(const FramePacketView *, double);
 void packet_presenter_reset(void);
 int packet_presenter_active(void);

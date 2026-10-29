@@ -15,6 +15,7 @@ namespace {
 thread_local PacketMetadata old,current,sampled;
 thread_local uint64_t epoch=0;
 thread_local bool active=false;
+thread_local const PacketMetadata *endpoint=nullptr;
 }
 extern "C" int packet_metadata_register(uint64_t key,size_t bytes,PacketMetadataCapture capture,PacketMetadataBlend blend) {
     if(!key || !bytes || bytes>65536 || !capture || !blend) return 0;
@@ -44,6 +45,7 @@ extern "C" void packet_metadata_pair(const PacketMetadata *p,uint64_t next_epoch
     catch(...) {packet_metadata_reset();}
 }
 extern "C" void packet_metadata_sample(double t) {
+    endpoint=nullptr;
     t=std::clamp(t,0.0,1.0);
     for(size_t i=0;i<current.entries.size();++i) {
         const auto& n=current.entries[i];auto& out=sampled.entries[i];
@@ -55,11 +57,12 @@ extern "C" void packet_metadata_sample(double t) {
     }
     active=true;
 }
-extern "C" void packet_metadata_end(void) {active=false;}
+extern "C" void packet_metadata_endpoint(const PacketMetadata *p) {endpoint=p;active=true;}
+extern "C" void packet_metadata_end(void) {active=false;endpoint=nullptr;}
 extern "C" void packet_metadata_reset(void) {old={};current={};sampled={};epoch=0;active=false;}
 extern "C" int packet_metadata_read(uint64_t key,void *out,size_t bytes) {
     if(!active || !out) return 0;
-    for(const auto& e:sampled.entries) if(e.provider.key==key && e.provider.bytes==bytes) {
+    for(const auto& e:(endpoint?endpoint->entries:sampled.entries)) if(e.provider.key==key && e.provider.bytes==bytes) {
         std::memcpy(out,e.data.data(),bytes);return 1;
     }
     return 0;

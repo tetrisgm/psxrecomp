@@ -9,14 +9,38 @@
 #include <algorithm>
 #include <unordered_set>
 #include <array>
+#include <memory>
 
 struct TransformRecord {PGXPProjection projection;PGXPAffineTransform affine;bool valid;};
-struct PacketTransformTable { std::vector<TransformRecord> values; };
+// Fixed producer storage: one bounded append per GTE point, no allocation or
+// history scan. Packet sealing shares immutable blocks; the render consumer
+// performs all history traversal. Sixteen blocks cover nine history ticks plus
+// the mailbox and retained presenter leases without waiting for the GPU.
+struct TransformBlock {
+    std::array<TransformRecord,32768> values;
+    size_t count=0;
+};
+struct PacketTransformTable {
+    std::array<std::shared_ptr<TransformBlock>,9> blocks;
+};
 namespace {
-struct ProducerTransform {TransformRecord value; uint64_t generation;};
-std::vector<ProducerTransform> producer_transforms;
-uint64_t producer_generation=0;
+std::array<std::shared_ptr<TransformBlock>,16> transform_pool=[] {
+    std::array<std::shared_ptr<TransformBlock>,16> result;
+    for(auto& block:result) block=std::make_shared<TransformBlock>();
+    return result;
+}();
+std::array<std::shared_ptr<TransformBlock>,9> producer_history;
+std::shared_ptr<TransformBlock> producer_block=transform_pool[0];
 bool producer_failed=false;
+void acquire_transform_block() {
+    for(auto& block:transform_pool) if(block.use_count()==1) {
+        producer_block=block;producer_block->count=0;return;
+    }
+    // Rewind may retain blocks longer than the live mailbox. Allocate one
+    // uninitialized, fixed-capacity block at the packet boundary, never in
+    // the per-vertex append. Packet accounting bounds retained history.
+    try {producer_block.reset(new TransformBlock);} catch(...) {producer_failed=true;}
+}
 
 struct Stream {
     PacketInterpolation *pair=packet_interpolation_create();
@@ -93,38 +117,35 @@ FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
 }
 }
 extern "C" void packet_interpolation_transform(const PGXPProjection *p,const PGXPAffineTransform *affine) {
-    if(!p) {producer_transforms.clear();producer_generation=0;producer_failed=false;return;}
+    if(!p) {producer_history={};producer_block.reset();producer_failed=false;acquire_transform_block();return;}
     if(!p->interpolation_valid || producer_failed) return;
-    try {
-        if(producer_transforms.size()>=262144) {producer_failed=true;return;}
-        producer_transforms.push_back({{*p,affine?*affine:PGXPAffineTransform{},affine!=nullptr},producer_generation});
-    } catch(...) {producer_failed=true;}
+    if(!producer_block) {producer_failed=true;return;}
+    if(!producer_block || producer_block->count==producer_block->values.size()) {producer_failed=true;return;}
+    producer_block->values[producer_block->count++]={*p,affine?*affine:PGXPAffineTransform{},affine!=nullptr};
 }
 extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
     PacketTransformTable *result=nullptr;
-    try {
-        if(!producer_failed) {
-            result=new PacketTransformTable;
-            result->values.reserve(producer_transforms.size());
-            for(const auto& p:producer_transforms) result->values.push_back(p.value);
-        }
-    } catch(...) {delete result;result=nullptr;}
-    ++producer_generation;
-    producer_transforms.erase(std::remove_if(producer_transforms.begin(),producer_transforms.end(),[](const ProducerTransform& p) {
-        return producer_generation-p.generation>8;
-    }),producer_transforms.end());
-    producer_failed=false;
+    for(size_t i=0;i+1<producer_history.size();++i) producer_history[i]=std::move(producer_history[i+1]);
+    producer_history.back()=std::move(producer_block);
+    try {if(!producer_failed) result=new PacketTransformTable{producer_history};}
+    catch(...) {}
+    producer_failed=false;acquire_transform_block();
     return result;
 }
 extern "C" void packet_interpolation_transform_free(PacketTransformTable *p) {delete p;}
 extern "C" size_t packet_interpolation_transform_bytes(const PacketTransformTable *p) {
-    return p?sizeof(*p)+p->values.capacity()*sizeof(TransformRecord):0;
+    if(!p) return 0;
+    size_t bytes=sizeof(*p);
+    for(const auto& block:p->blocks) if(block) bytes+=block->count*sizeof(TransformRecord);
+    return bytes;
 }
 extern "C" void packet_interpolation_stream_table(const PacketTransformTable *p) {
     stream.source_mode=true;stream.history.clear();
     if(!p) {stream.failed=true;return;}
-    try { for(const auto& v:p->values) stream.history.push_back({v.projection,stream.sequence,v.affine,v.valid}); }
-    catch(...) {stream.failed=true;}
+    try {for(const auto& block:p->blocks) if(block) for(size_t i=0;i<block->count;++i) {
+        const auto& v=block->values[i];
+        stream.history.push_back({v.projection,stream.sequence,v.affine,v.valid});
+    }} catch(...) {stream.failed=true;}
 }
 extern "C" void packet_interpolation_set_recorder(PacketInterpolationRecorder callback) {
     recorder.store(callback,std::memory_order_release);

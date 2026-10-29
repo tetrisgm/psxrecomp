@@ -45,6 +45,11 @@ struct PacketInterpolation {
     std::vector<size_t> matches;
     std::vector<PacketInterpolationPrimitive> source_previous;
     std::vector<unsigned> source_masks;
+    // Render-owned source slots. Sampling writes each slot once, then every
+    // face reads exactly those bits; material attributes remain per face.
+    std::vector<size_t> source_slots;
+    std::vector<std::pair<size_t,unsigned>> source_owners;
+    mutable std::vector<PacketInterpolationVertex> source_samples;
     bool source_mode=false;
     PacketInterpolationStats stats{};
     bool ready=false;
@@ -175,6 +180,42 @@ extern "C" int packet_interpolation_pair(PacketInterpolation *c,
             // Local discontinuities (respawns, changing procedural geometry)
             // take N. A scene-wide discontinuity snaps metadata and all geometry.
             if(local_cuts && local_cuts*2>c->stats.source_matched) c->stats.snapped=1;
+            std::unordered_map<Key,size_t,Hash> slots;
+            c->source_slots.assign(c->b.size()*4,missing);
+            std::vector<size_t> parent(c->b.size());
+            std::unordered_map<Key,size_t,Hash> edges;
+            for(size_t i=0;i<parent.size();++i) parent[i]=i;
+            auto root=[&](size_t i) {while(parent[i]!=i) {parent[i]=parent[parent[i]];i=parent[i];} return i;};
+            for(size_t i=0;i<c->b.size();++i) {
+                const auto& p=c->b[i];
+                // Integer screen-edge adjacency includes GTE-less neighbours.
+                // Do not move one side of such an edge while holding the other.
+                auto screen_key=[](const PacketInterpolationVertex& v) {
+                    return (uint64_t(uint32_t(int32_t(v.screen[0])))<<32)|uint32_t(int32_t(v.screen[1]));
+                };
+                for(unsigned j=0;j<p.vertices && j<4;++j) {
+                    uint64_t a=screen_key(p.vertex[j]),b=screen_key(p.vertex[(j+1)%p.vertices]);
+                    if(a==b) continue;
+                    auto edge=edges.emplace(Key{std::min(a,b),std::max(a,b)},i);
+                    if(!edge.second) parent[root(i)]=root(edge.first->second);
+                }
+                if(!p.spatial) continue;
+                for(unsigned j=0;j<p.vertices && j<4;++j) {
+                    const auto& v=p.vertex[j];
+                    if(!v.source.object && !v.source.primitive) continue;
+                    auto entry=slots.emplace(Key{v.source.object,v.source.primitive},c->source_owners.size());
+                    if(entry.second) c->source_owners.emplace_back(i,j);
+                    else parent[root(i)]=root(c->source_owners[entry.first->second].first);
+                    c->source_slots[i*4+j]=entry.first->second;
+                }
+            }
+            // A cut or unsupported point holds the entire connected mesh.
+            // Mixing N and N-1 within an edge is never a valid fallback.
+            std::vector<bool> hold(c->b.size(),false);
+            for(size_t i=0;i<c->b.size();++i)
+                if(!c->b[i].spatial || c->source_masks[i]!=(1u<<c->b[i].vertices)-1) hold[root(i)]=true;
+            for(size_t i=0;i<c->b.size();++i) if(hold[root(i)]) c->source_masks[i]=0;
+            c->source_samples.resize(c->source_owners.size());
             c->stats.unmatched=c->stats.source_unmatched;
             c->stats.ambiguous=c->stats.source_ambiguous;
             c->ready=true;return 1;
@@ -284,12 +325,37 @@ extern "C" int packet_interpolation_sample(const PacketInterpolation *c,double t
     PacketInterpolationPrimitive *out,size_t capacity) {
     if(!c || !c->ready || capacity<c->b.size() || (!out && !c->b.empty()) || !std::isfinite(t)) return 0;
     t=std::clamp(t,0.0,1.0);
+    if(c->source_mode && t!=1 && !c->stats.snapped) {
+        for(size_t slot=0;slot<c->source_owners.size();++slot) {
+            const auto [i,v]=c->source_owners[slot];
+            auto& p=c->source_samples[slot];p=c->b[i].vertex[v];
+            if(c->source_masks[i]&(1u<<v)) {
+                const auto& old=c->source_previous[i].vertex[v];
+                for(unsigned d=0;d<3;++d) p.view[d]=old.view[d]+t*(p.view[d]-old.view[d]);
+                p.h=old.h+t*(p.h-old.h);p.ofx=old.ofx+t*(p.ofx-old.ofx);
+                p.ofy=old.ofy+t*(p.ofy-old.ofy);p.x_scale=old.x_scale+t*(p.x_scale-old.x_scale);
+            }
+            p.homogeneous[0]=p.ofx*p.view[2]+p.h*p.x_scale*p.view[0];
+            p.homogeneous[1]=p.ofy*p.view[2]+p.h*p.view[1];p.homogeneous[2]=p.view[2];
+            if(p.view[2]>0) {p.screen[0]=p.homogeneous[0]/p.view[2];p.screen[1]=p.homogeneous[1]/p.view[2];}
+        }
+    }
     for(size_t i=0;i<c->b.size();++i) {
         out[i]=c->b[i];
         if(c->source_mode) {
             if(!out[i].spatial) continue;
+            if(t==1 || c->stats.snapped || !c->source_masks[i]) continue;
+            out[i].interpolated=1;
             for(unsigned v=0;v<out[i].vertices && v<4;++v) {
                 auto& p=out[i].vertex[v];
+                const size_t slot=c->source_slots[i*4+v];
+                if(slot!=std::numeric_limits<size_t>::max()) {
+                    const auto& value=c->source_samples[slot];
+                    for(unsigned d=0;d<3;++d) {p.view[d]=value.view[d];p.homogeneous[d]=value.homogeneous[d];}
+                    p.h=value.h;p.ofx=value.ofx;p.ofy=value.ofy;p.x_scale=value.x_scale;
+                    p.screen[0]=value.screen[0];p.screen[1]=value.screen[1];
+                    continue;
+                }
                 if(!c->stats.snapped && t!=1 && (c->source_masks[i]&(1u<<v))) {
                     for(unsigned d=0;d<3;++d) p.view[d]=c->source_previous[i].vertex[v].view[d]+t*(p.view[d]-c->source_previous[i].vertex[v].view[d]);
                     const auto& old=c->source_previous[i].vertex[v];

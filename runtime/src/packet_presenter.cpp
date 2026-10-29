@@ -26,10 +26,14 @@ extern "C" int packet_presenter_submit(const FramePacketView *packet,uint64_t no
     const uint64_t frames=packet->epoch==last_epoch && packet->sequence>last_sequence?
         packet->sequence-last_sequence:0;
     period=frames && frames<=8?uint64_t(double(frames)*1e9/guest_hz):0;
+    // Exact left endpoint uses the real retained packet, including topology,
+    // uploads and materials. Reprojecting N's topology at t=0 is not N-1.
+    if(period && current && !packet_interpolation_stream_snapped())
+        draw(frame_packet_lease_view(current),-1.0);
+    else draw(frame_packet_lease_view(next),1.0);
     frame_packet_lease_release(current);current=next;
     last_sequence=packet->sequence;last_epoch=packet->epoch;
     start=now;index=1;rate=hz;
-    draw(frame_packet_lease_view(current),period?0.0:1.0);
     ++submitted;
     return 1;
 }

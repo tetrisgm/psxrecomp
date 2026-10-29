@@ -57,6 +57,13 @@ extern "C" int gte_geometry_correction_lookup_probe(uint32_t packed,
 #define PGXP_TRANSFORM_RECORD(p,m) do { if(s_transform_recorder) s_transform_recorder(p,m); } while(0)
 static PGXPTransformRecorder s_transform_recorder;
 extern "C" void pgxp_set_transform_recorder(PGXPTransformRecorder recorder) { s_transform_recorder=recorder; }
+static int s_interpolation_tracking;
+#define PGXP_INTERPOLATION_TRACKING s_interpolation_tracking
+extern "C" void pgxp_set_interpolation_tracking(int enabled) {
+    if(s_interpolation_tracking==!!enabled) return;
+    s_interpolation_tracking=!!enabled;
+    pgxp_invalidate_all();
+}
 #define PGXP_S static
 #define PGXP_API extern "C"
 #include "pgxp_engine.inc"

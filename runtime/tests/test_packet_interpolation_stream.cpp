@@ -2,8 +2,22 @@
 #undef NDEBUG
 #include <cassert>
 #include <cstring>
+#include <vector>
 
 int main() {
+    // Rewind leases outlive the live mailbox. Holding more than the warm pool
+    // must not exhaust capture or silently stop presentation.
+    std::vector<PacketTransformTable*> retained;
+    packet_interpolation_transform(nullptr,nullptr);
+    PGXPProjection point{};point.interpolation_valid=1;
+    for(unsigned i=0;i<64;++i) {
+        point.transform=i+1;packet_interpolation_transform(&point,nullptr);
+        auto* table=packet_interpolation_transform_seal();assert(table);
+        assert(packet_interpolation_transform_bytes(table)>0);retained.push_back(table);
+    }
+    for(auto* table:retained) packet_interpolation_transform_free(table);
+    packet_interpolation_transform(nullptr,nullptr);
+
     PacketInterpolationSource source{};
     source.valid_mask=7;
     for(unsigned i=0;i<3;++i) {

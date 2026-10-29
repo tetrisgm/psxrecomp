@@ -13564,6 +13564,7 @@ static int rth_record_cpu_present(const uint32_t *pixels,const RthCpuPresent *cp
 }
 
 static int s_packet_display_target=-1,s_packet_display_y,s_packet_drawing;
+static int s_packet_previous_target=-1,s_packet_previous_y;
 static void rth_present_payload(uint16_t op, const uint8_t *p);
 static void rth_replay_present(const RtCmd *c, const uint8_t *p) {
     static int skipped_last = 0;
@@ -17182,6 +17183,7 @@ static void rth_packet_dispose(void *data) {
 }
 static int rth_packet_begin(void *user,FrameOwner *owner,uint64_t sequence) {
     (void)user;
+    pgxp_set_interpolation_tracking(packet_interpolation_stream_enabled());
     uint64_t begin=pt_clock_ns();
     rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;
     RthPacketSeed *seed=NULL;
@@ -17278,8 +17280,8 @@ static void rth_packet_geometry(void) {
         const PacketInterpolationVertex *v=&p->vertex[i],*n0=&n->vertex[i];
         const double nx=n0->ofx+n0->h*n0->x_scale*n0->view[0]/n0->view[2];
         const double ny=n0->ofy+n0->h*n0->view[1]/n0->view[2];
-        if(s_pc_valid) {s_pc_x[i]+=v->homogeneous[0]/v->view[2]-nx;
-                       s_pc_y[i]+=v->homogeneous[1]/v->view[2]-ny;}
+        if(s_pc_valid) {s_pc_x[i]=v->screen[0]+s_off_x;
+                       s_pc_y[i]=v->screen[1]+s_off_y;}
         if(s_pq_valid) s_pq[i]*=(float)(n0->view[2]/v->view[2]);
         if(s_pz_valid) s_pz[i]=(float)v->view[2];
     }
@@ -17391,7 +17393,7 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
         // The presenter emits exactly once, after the sampled draw completes.
         s_packet_present_op=command->op;s_packet_present_payload=payload;return 1;
     }
-    if(s_packet_sample && s_packet_vertex && s_packet_vertex->spatial) {
+    if(s_packet_sample && s_packet_vertex && s_packet_vertex->interpolated) {
         if(command->op==RTH_PROJ_TRI) {
             unsigned char adjusted[sizeof(PSXProjectedVertex)*3+6*sizeof(int32_t)];
             if(command->payload!=sizeof adjusted) return 0;
@@ -17427,12 +17429,15 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     if(!packet || !rt_packet_current(packet)) return;
     const RthPacketSeed *seed=packet->initial;
     const RthPacketInputs *inputs=packet->attachment;
+    const int saved_target=s_packet_display_target,saved_y=s_packet_display_y;
+    if(t<0) {s_packet_display_target=s_packet_previous_target;s_packet_display_y=s_packet_previous_y;}
     s_rth_packet_replaying=1;s_rth_packet_view=packet;
     s_packet_drawing=packet_interpolation_rate()!=0;
     s_packet_present_payload=NULL;
     s_packet_vertex_index=0;s_packet_vertex=s_packet_endpoint=NULL;
-    s_packet_sample=t<1.0 && !packet_interpolation_stream_snapped() && packet_interpolation_rate() && packet_interpolation_stream_sample(t);
-    packet_metadata_sample(packet_interpolation_stream_snapped()?1.0:t);
+    s_packet_sample=t>=0 && t<1.0 && !packet_interpolation_stream_snapped() && packet_interpolation_rate() && packet_interpolation_stream_sample(t);
+    if(t<0 || t==1) packet_metadata_endpoint(inputs->metadata);
+    else packet_metadata_sample(packet_interpolation_stream_snapped()?1.0:t);
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();
     memcpy(s_rth_vram_priv,seed->pixels,sizeof seed->pixels);
     rth_rebind_vram(s_rth_vram_priv);
@@ -17454,6 +17459,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
         s_rth_packet_last_sequence=packet->sequence;
     s_rth_packet_last_epoch=packet->epoch;
  done:
+    s_packet_display_target=saved_target;s_packet_display_y=saved_y;
     packet_metadata_end();
     s_packet_drawing=0;
     s_packet_sample=0;s_packet_vertex=s_packet_endpoint=NULL;
@@ -17491,6 +17497,7 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
     }
     if(!s_packet_vertex_count && s_packet_content) {packet_presenter_reset();s_packet_display_target=-1;}
     if(s_packet_vertex_count) {
+        s_packet_previous_target=s_packet_display_target;s_packet_previous_y=s_packet_display_y;
         unsigned best=0;s_packet_display_target=-1;
         for(unsigned i=0;i<s_packet_target_count;++i) if(s_packet_targets[i].count>best) {
             best=s_packet_targets[i].count;s_packet_display_target=s_packet_targets[i].x;

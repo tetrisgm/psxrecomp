@@ -74,6 +74,9 @@ int main() {
         assert(stats.verified_appearance==1 && !stats.unexplained && !stats.unmatched);
         assert(packet_interpolation_sample(source,0.25,&result,1));
         assert(result.vertex[2].view[0]==p.vertex[2].view[0]);
+        // An appearance holds the whole connected face, never a single corner.
+        assert(std::memcmp(&result,&p,sizeof p)==0);
+        p.vertex[2].model={9,1};
         // Projection constants belong to the retained source as well.
         old[0].h=200;old[0].ofx=100;old[0].ofy=80;old[0].x_scale=0.5;
         assert(packet_interpolation_pair(source,&a,&b,0));
@@ -83,6 +86,36 @@ int main() {
         b.epoch=2;assert(packet_interpolation_pair(source,&a,&b,0));
         assert(packet_interpolation_stats(source).snapped);
         packet_interpolation_destroy(source);
+    }
+    {
+        auto *context=packet_interpolation_create();
+        PacketInterpolationPrimitive mesh[2]={primitive(1,10,100),primitive(2,10,100)},out[2];
+        PacketInterpolationTransform old[3]{};
+        for(unsigned v=0;v<3;++v) {
+            mesh[0].vertex[v].source=mesh[1].vertex[v].source={7,v+1};
+            old[v].source={7,v+1};old[v].view[0]=v;old[v].view[2]=100;
+        }
+        mesh[1].vertex[0].colour=0xabcdef;
+        PacketInterpolationPacket a{1,1,nullptr,0,0,old,3,1};
+        PacketInterpolationPacket b{1,2,mesh,2,0,nullptr,0,1};
+        assert(packet_interpolation_pair(context,&a,&b,0));
+        for(double t:{0.0,0.25,0.5,0.75}) {
+            assert(packet_interpolation_sample(context,t,out,2));
+            for(unsigned v=0;v<3;++v) {
+                assert(std::memcmp(out[0].vertex[v].view,out[1].vertex[v].view,sizeof out[0].vertex[v].view)==0);
+                assert(std::memcmp(out[0].vertex[v].screen,out[1].vertex[v].screen,sizeof out[0].vertex[v].screen)==0);
+                assert(std::memcmp(out[0].vertex[v].homogeneous,out[1].vertex[v].homogeneous,sizeof out[0].vertex[v].homogeneous)==0);
+            }
+            assert(out[1].vertex[0].colour==0xabcdef);
+        }
+        assert(packet_interpolation_sample(context,1,out,2));
+        assert(std::memcmp(out,mesh,sizeof mesh)==0);
+        // A new point on the second face holds BOTH faces through their shared edge.
+        mesh[1].vertex[2].source={7,99};
+        assert(packet_interpolation_pair(context,&a,&b,0));
+        assert(packet_interpolation_sample(context,0.5,out,2));
+        assert(std::memcmp(out,mesh,sizeof mesh)==0);
+        packet_interpolation_destroy(context);
     }
     auto *ctx=packet_interpolation_create(); assert(ctx);
     assert(!packet_interpolation_sample(ctx,0.5,nullptr,0));
