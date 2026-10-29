@@ -946,6 +946,10 @@ static int s_selected_bank_failed;
 
 /* Authoritative VRAM: hr color texture + stencil (mask bit) FBO. */
 static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
+/* Native-coordinate bounds of the current draw surface. Whole-VRAM users
+ * currently initialize these to the native extent; cropped targets need no
+ * coordinate rebasing in guest vertices or PGXP precision caches. */
+static int s_hr_origin_x=0,s_hr_origin_y=0,s_hr_width=VRAM_W,s_hr_height=VRAM_H;
 /* The scale s_hr_tex/s_hr_rb are allocated at (dynamic resolution
  * reallocates them at every step; see s_alloc_scale). */
 static int           s_hr_alloc = 0;
@@ -1049,6 +1053,8 @@ static GLint s_uLimits = -1;
 static GLint s_geo_uXoff = -1, s_geo_uXhalf = -1;
 static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
 static GLint s_geo_uOrigin = -1, s_tex_uOrigin = -1;
+static GLint s_geo_uYhalf=-1,s_tex_uYhalf=-1,s_tex_uViewportOrigin=-1;
+static int s_raster_height=0;
 static GLint s_geo_uRasterGrid = -1, s_tex_uRasterGrid = -1;
 static GLint s_geo_uDepthProbe = -1, s_tex_uDepthProbe = -1;
 /* Native-wide 2D-backdrop x-stretch uniforms. The far 2D backdrop layer is a
@@ -1086,7 +1092,7 @@ static PrimRec s_ptrace[PTRACE_CAP]; static int s_ptrace_n = 0;
 PrimRec g_ptrace[PTRACE_CAP]; int g_ptrace_n = 0;   /* snapshot (extern) */
 /* BLIT program uniforms. */
 static GLint s_uBlitSrc = -1, s_uBlitPass = -1, s_uBlitMaskset = -1;
-static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1;
+static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1,s_uBlitTarget=-1;
 /* PACK program uniforms. */
 static GLint s_uPackHr = -1, s_uPackScale = -1;
 static GLint s_uStencilSrc = -1, s_uStencilOff = -1;
@@ -2071,6 +2077,7 @@ static const char *GEO_VS =
     "uniform float u_depth_probe;\n"
     "uniform float u_raster_grid;\n"
     "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
+    "uniform float u_yhalf; /* target clip half-height */\n"
     "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
     "noperspective out vec4 v_col;\n"
     "noperspective out float v_iw; noperspective out vec3 v_col_p;   /* perspective-correct colour (PGXP, G1.14) */\n"
@@ -2103,7 +2110,7 @@ static const char *GEO_VS =
     "  zn -= 2.0*u_depth_probe;\n"
     "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
     "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
-    "  gl_Position = vec4(rp/vec2(u_xhalf,256.0)-1.0, zn, 1.0); }\n";
+    "  gl_Position = vec4(rp/vec2(u_xhalf,u_yhalf)-1.0, zn, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; noperspective in float v_iw; noperspective in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
@@ -2155,6 +2162,7 @@ static const char *TEX_VS =
     "uniform float u_depth_probe;\n"
     "uniform float u_raster_grid;\n"
     "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
+    "uniform float u_yhalf; /* target clip half-height */\n"
     "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
     "noperspective out vec2 g_uv; noperspective out vec4 g_col;\n"
     "noperspective out vec2 g_uv_p;  /* perspective-correct UV (used when g_persp!=0) */\n"
@@ -2202,13 +2210,13 @@ static const char *TEX_VS =
     "  zn -= 2.0*u_depth_probe;\n"
     "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
     "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
-    "  g_raster=rp*(u_raster_grid/256.0); vec2 ndc = rp/vec2(u_xhalf,256.0)-1.0;\n"
+    "  g_raster=rp*(u_raster_grid/256.0); vec2 ndc = rp/vec2(u_xhalf,u_yhalf)-1.0;\n"
     "  gl_Position = vec4(ndc, zn, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
     "flat in vec2 t_pos[3]; flat in vec3 t_uvq[3]; flat in vec4 t_colq[3];\n"
-    "uniform vec2 u_origin; uniform float u_raster_grid;\n"
-    "vec3 local_weights(){ vec2 p=gl_FragCoord.xy-(u_origin*u_raster_grid/256.0)-t_pos[0];\n"
+    "uniform vec2 u_origin; uniform float u_raster_grid; uniform vec2 u_viewport_origin;\n"
+    "vec3 local_weights(){ vec2 p=gl_FragCoord.xy-u_viewport_origin-t_pos[0];\n"
     " vec2 a=t_pos[1]-t_pos[0],b=t_pos[2]-t_pos[0];float d=a.x*b.y-a.y*b.x;\n"
     " float y=(p.x*b.y-p.y*b.x)/d,z=(a.x*p.y-a.y*p.x)/d;return vec3(1.0-y-z,y,z); }\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
@@ -2516,9 +2524,9 @@ static const char *TEX_FS =
 static const char *BLIT_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;   /* native VRAM px */\n"
-    "uniform float u_shift;\n"
+    "uniform float u_shift; uniform vec4 u_target;\n"
     "void main(){\n"
-    "  gl_Position = vec4((a_pos.x+u_shift)/512.0 - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  gl_Position = vec4((a_pos+vec2(u_shift)-u_target.xy)/u_target.zw-1.0,0.0,1.0); }\n";
 /* The same blit into the windowed high-resolution surface: its viewport is the
  * window (W*S px), so x is translated by u_xoff and clipped at u_xhalf like
  * the native-wide passes. A separate program keeps BLIT_VS (the canonical
@@ -2690,18 +2698,41 @@ static void apply_psx_blend(int mode) {
  * precision reduction); the textured shader evaluates interpolation locally.
  * Blits/uploads use origin zero and retain their existing VRAM coordinates. */
 /* ---- hr FBO render-state bracket ---------------------------------------- */
-static void pgxp_raster_origin(int x, int y, int width, int scale) {
-    glViewport(x * scale, y * scale, width * scale, VRAM_H * scale);
+static void pgxp_raster_target(int x,int y,int width,int height,int scale,int target_x,int target_y) {
+    glViewport((x-target_x)*scale,(y-target_y)*scale,width*scale,height*scale);
+    const int changed=height!=s_raster_height;
+    s_raster_height=height;
     p_glUseProgram(s_geo_prog);
+    if(changed)p_glUniform1f(s_geo_uYhalf,height*.5f);
     p_glUniform2f(s_geo_uOrigin, (float)x, (float)y);
     p_glUniform1f(s_geo_uRasterGrid, (float)(scale*256));
     p_glUseProgram(s_tex_prog);
+    if(changed)p_glUniform1f(s_tex_uYhalf,height*.5f);
+    p_glUniform2f(s_tex_uViewportOrigin,(float)((x-target_x)*scale),(float)((y-target_y)*scale));
     p_glUniform2f(s_tex_uOrigin, (float)x, (float)y);
     p_glUniform1f(s_tex_uRasterGrid, (float)(scale*256));
 }
+static void pgxp_raster_origin(int x,int y,int width,int scale) {
+    pgxp_raster_target(x,y,width,VRAM_H,scale,0,0);
+}
 static void hr_begin(int clip_to_draw_area) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
-    pgxp_raster_origin(clip_to_draw_area ? s_area_x1 : 0, clip_to_draw_area ? s_area_y1 : 0, VRAM_W, s_hr_scale);
+    pgxp_raster_target(clip_to_draw_area?s_area_x1:0,clip_to_draw_area?s_area_y1:0,
+        s_hr_width,s_hr_height,s_hr_scale,s_hr_origin_x,s_hr_origin_y);
+    if(s_hr_width!=VRAM_W) {
+        p_glUseProgram(s_geo_prog);
+        p_glUniform1f(s_geo_uXoff,0);
+        p_glUniform1f(s_geo_uXhalf,s_hr_width*.5f);
+        p_glUseProgram(s_tex_prog);
+        p_glUniform1f(s_tex_uXoff,0);
+        p_glUniform1f(s_tex_uXhalf,s_hr_width*.5f);
+    }
+    if(!clip_to_draw_area) {
+        glViewport(0,0,s_hr_width*s_hr_scale,s_hr_height*s_hr_scale);
+        p_glUseProgram(s_blit_prog);
+        p_glUniform4f(s_uBlitTarget,(float)s_hr_origin_x,(float)s_hr_origin_y,
+            s_hr_width*.5f,s_hr_height*.5f);
+    }
     glEnable(GL_SCISSOR_TEST);
     if (clip_to_draw_area) {
         int ax1 = s_area_x1, ay1 = s_area_y1, ax2 = s_area_x2, ay2 = s_area_y2;
@@ -2713,11 +2744,15 @@ static void hr_begin(int clip_to_draw_area) {
         }
         int sw = ax2 - ax1 + 1, sh = ay2 - ay1 + 1;
         if (sw < 0) sw = 0; if (sh < 0) sh = 0;
-        glScissor(ax1 * s_hr_scale, ay1 * s_hr_scale,
+        glScissor((ax1-s_hr_origin_x) * s_hr_scale, (ay1-s_hr_origin_y) * s_hr_scale,
                   sw * s_hr_scale, sh * s_hr_scale);
     }
 }
 static void hr_end(void) {
+    if(s_hr_width!=VRAM_W) {
+        p_glUseProgram(s_geo_prog);p_glUniform1f(s_geo_uXhalf,VRAM_W*.5f);
+        p_glUseProgram(s_tex_prog);p_glUniform1f(s_tex_uXhalf,VRAM_W*.5f);
+    }
     pgxp_raster_origin(0, 0, VRAM_W, s_hr_scale);
     glDisable(GL_BLEND);
     /* apply_psx_blend mode 2 leaves REVERSE_SUBTRACT armed; reset so later
@@ -2863,14 +2898,14 @@ static void flush_cpu_upload(void) {
     p_glUniform1i(s_uBlitSrc, 0);
     p_glUniform1i(s_uBlitMaskset, 0);
     p_glUniform1i(s_uBlitSrcDiv, s_hr_scale);
-    p_glUniform2i(s_uBlitSrcOff, 0, 0);
+    p_glUniform2i(s_uBlitSrcOff, s_hr_origin_x, s_hr_origin_y);
     p_glBindVertexArray(s_blit_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
     for (int i = 0; i < nrects; i++) {
         int x = rects[i].x0, y = rects[i].y0;
         int w = rects[i].x1 - rects[i].x0 + 1;
         int h = rects[i].y1 - rects[i].y0 + 1;
-        glScissor(x * s_hr_scale, y * s_hr_scale, w * s_hr_scale, h * s_hr_scale);
+        glScissor((x-s_hr_origin_x)*s_hr_scale,(y-s_hr_origin_y)*s_hr_scale,w*s_hr_scale,h*s_hr_scale);
         float fx0 = (float)x, fy0 = (float)y, fx1 = (float)(x + w), fy1 = (float)(y + h);
         float verts[6 * 2] = {
             fx0, fy0,  fx1, fy0,  fx0, fy1,
@@ -3652,6 +3687,8 @@ static void wide_band_scissor_x(int x, int w) {
 }
 static void wide_band_scissor(void) { wide_band_scissor_x(0, g_wide_w); }
 static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
+    /* Wide targets span all native rows even after a cropped target. */
+    p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uYhalf : s_geo_uYhalf, VRAM_H*.5f);
     if (s_ws_ablate != 3)   /* ablate 3: no FBO rebind (draws land in hr — perf probe) */
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
     /* Windowed high-resolution mode: the wide surfaces are at s_out_scale while
@@ -3660,12 +3697,14 @@ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
         p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hi);
     glViewport(s_area_x1 * s_out_scale, s_area_y1 * s_out_scale, g_wide_w*s_out_scale, VRAM_H*s_out_scale);
     p_glUniform2f(uXoff == s_tex_uXoff ? s_tex_uOrigin : s_geo_uOrigin, (float)s_area_x1, (float)s_area_y1);
+    if(uXoff==s_tex_uXoff)p_glUniform2f(s_tex_uViewportOrigin,(float)(s_area_x1*s_out_scale),(float)(s_area_y1*s_out_scale));
     p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uRasterGrid : s_geo_uRasterGrid,(float)(s_out_scale*256));
     wide_band_scissor_x(view_pad_left, g_wide_w - view_pad_left - view_pad_right);
     p_glUniform1f(uXoff, (float)dx);
     p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);
 }
 static void wide_target_end(GLint uXoff, GLint uXhalf) {
+    p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uYhalf : s_geo_uYhalf, s_raster_height*.5f);
     if (s_hiw)
         p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hr);
     p_glUniform1f(uXoff, 0.0f);
@@ -5811,7 +5850,7 @@ static void gpu_textured_rect(int x,int y,int w,int h,
  * segment is exactly this. */
 static void fill_segment(int x, int y, int w, int h, float r, float g, float b) {
     if (w <= 0 || h <= 0) return;
-    glScissor(x * s_hr_scale, y * s_hr_scale, w * s_hr_scale, h * s_hr_scale);
+    glScissor((x-s_hr_origin_x)*s_hr_scale,(y-s_hr_origin_y)*s_hr_scale,w*s_hr_scale,h*s_hr_scale);
     glClearColor(r, g, b, 0.0f);
     glClearStencil(0);
     glStencilMask(0xFF);
@@ -5883,14 +5922,15 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
+    p_glBlitFramebuffer((sx-s_hr_origin_x)*S,(sy-s_hr_origin_y)*S,
+                        (sx+w-s_hr_origin_x)*S,(sy+h-s_hr_origin_y)*S,
                         0, 0, w*S, h*S,
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 
     hr_begin(0);   /* copies ignore the draw area */
-    glScissor(dx*S, dy*S, w*S, h*S);
+    glScissor((dx-s_hr_origin_x)*S,(dy-s_hr_origin_y)*S,w*S,h*S);
     glDisable(GL_BLEND);
     p_glUseProgram(s_blit_prog);
     p_glActiveTexture(PSXGL_TEXTURE0);
@@ -5899,7 +5939,7 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     p_glUniform1i(s_uBlitMaskset, s_mask_set);
     /* Scratch holds the source at its origin: texel = frag - dst*S. */
     p_glUniform1i(s_uBlitSrcDiv, 1);
-    p_glUniform2i(s_uBlitSrcOff, -dx * S, -dy * S);
+    p_glUniform2i(s_uBlitSrcOff,(s_hr_origin_x-dx)*S,(s_hr_origin_y-dy)*S);
     float fx0 = (float)dx, fy0 = (float)dy, fx1 = (float)(dx + w), fy1 = (float)(dy + h);
     float verts[6 * 2] = {
         fx0, fy0,  fx1, fy0,  fx0, fy1,
@@ -6922,6 +6962,7 @@ static int init_gpu_raster(void) {
     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
     s_uBlitSrcDiv  = p_glGetUniformLocation(s_blit_prog, "u_src_div");
     s_uBlitSrcOff  = p_glGetUniformLocation(s_blit_prog, "u_src_off");
+    s_uBlitTarget=p_glGetUniformLocation(s_blit_prog,"u_target");
     s_uPackHr    = p_glGetUniformLocation(s_pack_prog, "u_hr");
     s_uPackScale = p_glGetUniformLocation(s_pack_prog, "u_scale");
     s_uStencilSrc = p_glGetUniformLocation(s_stencil_prog, "u_src");
@@ -6938,8 +6979,14 @@ static int init_gpu_raster(void) {
     s_tex_uDepthProbe=p_glGetUniformLocation(s_tex_prog,"u_depth_probe");
     s_geo_uRasterGrid=p_glGetUniformLocation(s_geo_prog,"u_raster_grid");
     s_tex_uRasterGrid=p_glGetUniformLocation(s_tex_prog,"u_raster_grid");
+    s_hr_origin_x=s_hr_origin_y=0;s_hr_width=VRAM_W;s_hr_height=VRAM_H;
+    s_raster_height=0;
+    s_geo_uYhalf=p_glGetUniformLocation(s_geo_prog,"u_yhalf");
+    s_tex_uYhalf=p_glGetUniformLocation(s_tex_prog,"u_yhalf");
+    s_tex_uViewportOrigin=p_glGetUniformLocation(s_tex_prog,"u_viewport_origin");
     s_geo_uOrigin = p_glGetUniformLocation(s_geo_prog, "u_origin");
     s_tex_uOrigin = p_glGetUniformLocation(s_tex_prog, "u_origin");
+    pgxp_raster_target(0,0,VRAM_W,VRAM_H,s_hr_scale,0,0);
     s_geo_uXoff  = p_glGetUniformLocation(s_geo_prog, "u_xoff");
     s_geo_uXhalf = p_glGetUniformLocation(s_geo_prog, "u_xhalf");
     s_tex_uXoff  = p_glGetUniformLocation(s_tex_prog, "u_xoff");
@@ -17181,7 +17228,12 @@ static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source
     int count=native_raster_inputs_get(inputs->draws,source,tiles,128);
     if(count<0) return 0;
     if(!count) return 1;
-    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+    /* A native input replaces CPU-side key/coherence bytes, not a GPU
+     * texture or render target. Pending actual uploads must consume their
+     * old CPU bytes first; an otherwise compatible primitive batch remains
+     * open. Texture mutation and render-to-texture hazards flush at their
+     * own ordered GPU operations. */
+    flush_cpu_upload();
     for(int t=0;t<count;++t)
         for(unsigned row=0;row<64;++row)
             memcpy(s_rth_vram_priv+(tiles[t].y+row)*VRAM_W+tiles[t].x,

@@ -35,6 +35,7 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
     s_rth_packet_replaying=1;
     const PacketSeed *seed=packet->initial;
     memcpy(packet_private,seed->pixels,sizeof packet_private);
+    s_rth_vram_priv=packet_private;
     glb_init(packet_private);
     gl_renderer_restage_vram_after_savestate();
     /* Poison owner state as if a discarded frame's predecessor left it.
@@ -51,6 +52,10 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
         const RtCmd *command=(const RtCmd *)(record+at);
         if(command->op==RTH_NATIVE_SOURCE) {
             uint64_t source;memcpy(&source,command+1,sizeof source);
+            RthPacketInputs native_inputs={0};native_inputs.draws=packet->attachment;
+            const int queued=s_tb_n;
+            check(rth_packet_native_input(&native_inputs,source),"production native input application");
+            check(s_tb_n==queued,"CPU-only native inputs preserve GPU batches");
             NativeRasterTile tiles[128];
             int count=native_raster_inputs_get(packet->attachment,source,tiles,128);
             if(count<=0) abort();
@@ -166,6 +171,7 @@ int main(void) {
     check(timing[1]>0 && timing[3]>0 && timing[3]<=timing[1],"packet timestamp totals");
     check(timing[2]<=timing[1] && timing[4]==0,"bounded nonblocking packet telemetry");
     printf("checks=%d failures=%d\n",checks,failures);
+    s_rth_vram_priv=NULL;
     gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();
     return failures?1:0;
 }
