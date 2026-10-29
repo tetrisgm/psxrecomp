@@ -4644,14 +4644,25 @@ static RuntimePerfState g_runtime_perf;
 /* Opt-in main-thread wall cadence. TCP commands execute on this thread.
  * Intervals include guest work, presentation and pacing, not just CPU work.
  * Reset after loading/unpausing: debugger pauses are deliberately not hidden. */
+static uint64_t main_cadence_cpu_100ns() {
+#ifdef _WIN32
+    FILETIME created,exited,kernel,user;
+    if(!GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user)) return 0;
+    return (uint64_t(kernel.dwHighDateTime)<<32)+kernel.dwLowDateTime+
+           (uint64_t(user.dwHighDateTime)<<32)+user.dwLowDateTime;
+#else
+    return 0;
+#endif
+}
 struct MainCadenceStats {
     struct Interval {
-        uint64_t number=0, ticks=0, pacer=0, overshoot=0, sleep=0, sleep_overshoot=0;
+        uint64_t number=0, ticks=0, pacer=0, overshoot=0, sleep=0, sleep_overshoot=0, cpu=0;
         std::array<uint64_t,guest_wait_trace::Count> waits{};
     };
     std::array<Interval,20> worst{};
     uint64_t pacer=0, overshoot=0;
     bool enabled = false;
+    uint64_t previous_cpu=0, cpu=0;
     uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
 };
@@ -4659,17 +4670,20 @@ static MainCadenceStats s_main_cadence;
 static void main_cadence_frame() {
     if (!s_main_cadence.enabled) return;
     const uint64_t now = SDL_GetPerformanceCounter();
+    const uint64_t cpu = main_cadence_cpu_100ns();
     if (s_main_cadence.previous && now >= s_main_cadence.previous) {
         const uint64_t elapsed = now - s_main_cadence.previous;
         ++s_main_cadence.intervals;
         s_main_cadence.ticks += elapsed;
+        s_main_cadence.cpu += cpu-s_main_cadence.previous_cpu;
         if (elapsed > s_main_cadence.max_ticks) s_main_cadence.max_ticks = elapsed;
         MainCadenceStats::Interval row{s_main_cadence.intervals,elapsed,
             s_main_cadence.pacer,s_main_cadence.overshoot,s_frame_pacer.sleep_ticks,
-            s_frame_pacer.sleep_overshoot_ticks,guest_wait_trace::ns};
+            s_frame_pacer.sleep_overshoot_ticks,cpu-s_main_cadence.previous_cpu,guest_wait_trace::ns};
         for(auto &entry:s_main_cadence.worst) if(row.ticks>entry.ticks) std::swap(row,entry);
     }
     s_main_cadence.previous = now;
+    s_main_cadence.previous_cpu = cpu;
     s_main_cadence.pacer=s_main_cadence.overshoot=0;
     guest_wait_trace::ns={};
     s_frame_pacer.sleep_ticks=s_frame_pacer.sleep_overshoot_ticks=0;
@@ -4708,13 +4722,13 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         int n=std::snprintf(out+used,cap-used,format,args...);
         if(n>0) used+=size_t(n);
     };
-    append("%s",",\"worst\":[");
+    append(",\"cpu_ms\":%.6f,\"worst\":[",s.cpu/1e4);
     bool first=true;
     for(const auto &r:s.worst) if(r.ticks) {
         append("%s{\"interval\":%llu,\"ms\":%.6f,\"pacer_ms\":%.6f,\"overshoot_ms\":%.6f,"
-               "\"sleep_ms\":%.6f,\"sleep_overshoot_ms\":%.6f,\"publish_ms\":%.6f,\"reserve_ms\":%.6f,\"native_lock_ms\":%.6f,"
+               "\"cpu_ms\":%.6f,\"sleep_ms\":%.6f,\"sleep_overshoot_ms\":%.6f,\"publish_ms\":%.6f,\"reserve_ms\":%.6f,\"native_lock_ms\":%.6f,"
                "\"native_space_ms\":%.6f,\"history_ms\":%.6f,\"native_completion_ms\":%.6f}",
-               first?"":",",(unsigned long long)r.number,r.ticks*ms,r.pacer*ms,r.overshoot*ms,r.sleep*ms,r.sleep_overshoot*ms,
+               first?"":",",(unsigned long long)r.number,r.ticks*ms,r.pacer*ms,r.overshoot*ms,r.cpu/1e4,r.sleep*ms,r.sleep_overshoot*ms,
                r.waits[0]/1e6,r.waits[1]/1e6,r.waits[2]/1e6,r.waits[3]/1e6,r.waits[4]/1e6,r.waits[5]/1e6);
         first=false;
     }
