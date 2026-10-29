@@ -2236,3 +2236,46 @@ zero-fill; opt-in timings show .079ms allocation/.036ms cleanup in worst
 contended with a non-owned runtime. Latest distinct receipt31.766/s despite
 60swaps/s, zero missing receipts/starved/misses. Absolute worst-frame marker
 and existing span/frame/sampler probes support continued hitch attribution.
+
+2026-10-29 phase3 continued: direct-wide copy valid coverage excludes reveal
+margins; hidden1/4/9/18x fixture phase3-wide-copy-coverage/rth-vyyoz6kq passes.
+Release held-pad harness now connects explicit P1 and supports NeGcon analog
+pressure without changing device type. Read-only owned-process monitoring
+confirmed driving in phase3-release-connected18:59.996Hz,entry33.946ms,
+return20.160ms(one over20),zero starved. Earlier release-upload18 had no
+throttle and is not driving proof. No ten-minute acceptance; full HR region
+selection/cutover still open, no promotion. Full framework build in progress.
+2026-10-29 phase3 integration: full framework build passes after adding the
+native snapshot API doubles to the RAM-map fixture. Non-hardware ctest ran
+301 enabled tests: one stale rewind source guard failed because the same two
+safety predicates changed order; guard repaired and rerun passed. Three
+external/platform tests skipped, two disabled. Dev build and R4 32/32 passed;
+hidden smoke phase3-copy-gates ended with zero dispatch and segment misses.
+Copy clipping and canonical wide coverage pass through18x in
+phase3-copy-clip18/rth-nwrp_hgz; scratch never grows to full scaled VRAM for a
+cropped destination. Packet texture sampling now consumes captured native
+inputs without GPU-to-native packing, independent of HD replacement mode.
+Updated packet fixture removes its synthetic texture-page framebuffer uploads
+and checks actual enhanced output:900 checks pass, zero GPU pack draws,
+phase3-native-packet-textures/rth-a3xp02_l. Production surface cutover still
+open; no phase acceptance or mainline promotion.
+
+2026-10-29 phase3 texture coherence: the first native-route race exposed117025
+uploads/102.77GB in30s. Reusing captured tile versions per packet and separating
+enhanced draw dirt from native sampling dirt reduced this to9531 uploads/
+4.53GB; GPU packet span20.681->16.567ms, zero pack draws/starved/misses. Distinct
+images remain30/s, entry35.958ms/return27.627ms, no acceptance. Dense row staging
+passes4628 checks in persistent and portable storage, with16384 narrow uploads
+per mode to force ring reuse. Removed CPU1555->RGBA upload conversion, the
+full native RGBA staging texture and upload vertex batches: native R16UI now
+seeds enhanced regions directly, including cropped/direct-wide regions and
+legacy high-resolution tiles. Replaced optional HD dummy binding with1x1 RGBA.
+Cropped1/4/9/18x fixture phase3-native-region-seed/rth-94m_pwqm and packet/history
+fixture phase3-native-seed-packet/rth-5038v24r (909checks) pass. Full-VRAM HR
+colour/depth allocation still exists; production pool/cutover remains open.
+2026-10-29 latest: native region seed/bank PGXP gates pass, odd-width upload
+stress4630checks passes. Race phase3-native-seed18:60.019Hz,entry37.227ms,
+return34.424ms,zero starved/misses,29.998distinct/s,GPU packet16.628ms,
+1.44GB native staged bytes/30s. No cadence acceptance. Present-slot GPU server
+wait timestamps added separately without changing inclusive packet span;
+914 packet/history/timer checks pass in phase3-slot-wait-timer/rth-a54ztt2_.

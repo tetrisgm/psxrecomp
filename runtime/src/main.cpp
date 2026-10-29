@@ -4756,14 +4756,17 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         "\"worst_epilogue_ms\":%.3f,\"worst_pacer_ms\":%.3f,"
         "\"return_max_ms\":%.3f,\"return_over20\":%llu,"
         "\"worst_native_submit_ms\":%.3f,\"worst_native_sync_ms\":%.3f,\"worst_end_ns\":%llu,"
-        "\"worst_alloc_ms\":%.3f,\"worst_cleanup_ms\":%.3f,\"worst_alloc_count\":%llu,\"worst_alloc_bytes\":%llu,\"worst_frame\":%llu",
+        "\"worst_alloc_ms\":%.3f,\"worst_cleanup_ms\":%.3f,\"worst_alloc_count\":%llu,\"worst_alloc_bytes\":%llu,\"worst_frame\":%llu,"
+        "\"window_start_ns\":%llu,\"window_end_ns\":%llu",
         (unsigned long long)s.over20,(unsigned long long)s.worst_index,s.worst_cpu*.0001,
         s.worst_ticks[0]*ms,s.worst_ticks[1]*ms,s.worst_ticks[2]*ms,
         s.worst_ticks[3]*ms,s.worst_ticks[4]*ms,s.return_max*ms,(unsigned long long)s.return_over20,
         s.worst_submit*1e-6,s.worst_sync*1e-6,(unsigned long long)(s.worst_end*(1e9/freq)),
         s.worst_packet_timing.growth_ns*1e-6,s.worst_packet_timing.cleanup_ns*1e-6,
         (unsigned long long)s.worst_packet_timing.growth_count,(unsigned long long)s.worst_packet_timing.growth_bytes,
-        (unsigned long long)s.worst_frame);
+        (unsigned long long)s.worst_frame,
+        (unsigned long long)((s.previous-s.ticks)*(1e9/freq)),
+        (unsigned long long)(s.previous*(1e9/freq)));
 }
 
 static bool runtime_perf_parse_window(const char *text, uint64_t *start,
@@ -8044,10 +8047,14 @@ static void sample_pad_into_sio(int override) {
 /* Measurement aid, release builds included: PSX_HOLD_PADS="p1[,p2]" holds
  * those raw pad words (active low, e.g. 0xBFFF = Cross) on ports 1 and 2
  * after every live sample, so a headless timing run can drive a race
- * without the debug server. Unset: one cached branch per sample. */
+ * without the debug server. PSX_HOLD_NEGCON="I,II,L" additionally supplies
+ * decimal analog button pressures for P1 without changing its pad type.
+ * Unset: cached branches per sample. */
 static void env_pad_hold_apply(void) {
     static int parsed = 0, n = 0;
     static uint16_t w[2] = {0xFFFFu, 0xFFFFu};
+    static bool negcon=false;
+    static unsigned ng[3]={};
     if (!parsed) {
         parsed = 1;
         if (const char *e = std::getenv("PSX_HOLD_PADS")) {
@@ -8057,10 +8064,19 @@ static void env_pad_hold_apply(void) {
             w[0] = (uint16_t)a; w[1] = (uint16_t)b;
             if (n) std::fprintf(stdout, "psxrecomp: PSX_HOLD_PADS %d port(s)\n", n);
         }
+        if(const char *e=std::getenv("PSX_HOLD_NEGCON")) {
+            char tail;
+            negcon=std::sscanf(e,"%u,%u,%u%c",&ng[0],&ng[1],&ng[2],&tail)==3 &&
+                ng[0]<=255 && ng[1]<=255 && ng[2]<=255;
+        }
     }
     for (int i = 0; i < n && i < 2; i++) {
-        if (i == 1) sio_set_pad_connected(1, 1);
+        sio_set_pad_connected(i, 1);
         sio_set_pad_state_slot(i, w[i]);
+    }
+    if(negcon) {
+        sio_set_pad_connected(0,1);
+        sio_set_pad_negcon(0,(uint8_t)ng[0],(uint8_t)ng[1],(uint8_t)ng[2]);
     }
 }
 

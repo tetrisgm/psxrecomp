@@ -45,25 +45,36 @@ static int stream_case(int portable) {
         check(s_vertex_stream[kind].rotations>=VERTEX_STREAM_SEGMENTS,"stream wraps fenced segments");
         check((s_vertex_stream[kind].mapped!=NULL)==!!s_stream_persistent,"requested storage contract used");
     }
-    /* Queue enough disjoint native texture updates to wrap the PBO ring.
+    /* Queue enough native texture updates to wrap the PBO ring twice.
      * Read once at the end: a reused range must not alter an earlier upload.
      * Nonzero x and VRAM row pitch also exercise offset/stride arithmetic. */
     s_hd_native_authority=1;
-    for(unsigned i=0;i<256;++i) {
-        int x=(i%64)*16,y=(i/64)*32;
+    const unsigned native_updates=16384;
+    const uint64_t native_bytes_before=s_pack_native_bytes;
+    for(unsigned i=0;i<native_updates;++i) {
+        int x=(i%64)*16,y=((i%256)/64)*32;
         for(int row=0;row<32;++row)for(int col=0;col<16;++col)
             s_vram[(y+row)*VRAM_W+x+col]=(uint16_t)(0x8000u+i*97u+row*17u+col);
         rect_clear(&s_pack_dirty);rect_add(&s_pack_dirty,x,y,x+15,y+31);
         pack_flush();
     }
+    check(s_pack_native_bytes-native_bytes_before==(uint64_t)native_updates*16*32*2,
+          "native upload staging copies only rectangle bytes, no row padding");
+    for(int row=0;row<13;++row)for(int col=0;col<17;++col)
+        s_vram[(401+row)*VRAM_W+997+col]=(uint16_t)(0x8000u+row*31u+col);
+    rect_add(&s_pack_dirty,997,401,1013,413);pack_flush();
     uint16_t *raw=malloc(VRAM_W*VRAM_H*sizeof(uint16_t));
     p_glActiveTexture(PSXGL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,s_raw_tex);
     glGetTexImage(GL_TEXTURE_2D,0,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,raw);
+    int odd_exact=1;
+    for(int row=0;row<13;++row)for(int col=0;col<17;++col)
+        odd_exact&=raw[(401+row)*VRAM_W+997+col]==(uint16_t)(0x8000u+row*31u+col);
+    check(odd_exact,"odd-width native upload has exact packed row alignment");
     for(unsigned i=0;i<256;++i) {
         int x=(i%64)*16,y=(i/64)*32;
         int exact=1;
         for(int row=0;row<32;++row)for(int col=0;col<16;++col)
-            exact&=raw[(y+row)*VRAM_W+x+col]==(uint16_t)(0x8000u+i*97u+row*17u+col);
+            exact&=raw[(y+row)*VRAM_W+x+col]==(uint16_t)(0x8000u+(native_updates-256+i)*97u+row*17u+col);
         check(exact,"native texture upload survives ring reuse with row pitch");
     }
     check(s_unpack_stream.rotations>=VERTEX_STREAM_SEGMENTS,"native upload ring wraps fenced segments");

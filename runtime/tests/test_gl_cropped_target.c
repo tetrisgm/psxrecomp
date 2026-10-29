@@ -211,6 +211,34 @@ static int run_scale(int scale) {
         glReadPixels(100*scale,180*scale,32*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
         check(!memcmp(reference,cropped,(size_t)32*16*scale*scale*4),
             "copy gathers adjacent enhanced RT tiles without losing subpixel colour");
+        /* Canonical pixels in a wide allocation start after its reveal
+         * margin. The margin must never masquerade as neighbouring VRAM. */
+        const GlCopyRegion layered[2]={{full_fbo,0,0,1024,512,scale,0,0},
+            {direct_fbo,x,y,320,240,scale,53,0}};
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,full_fbo);
+        glReadPixels((x+312)*scale,(y+60)*scale,16*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,reference);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,direct_fbo);
+        glReadPixels((53+312)*scale,60*scale,8*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+        for(int row=0;row<16*scale;++row)
+            memcpy(reference+(size_t)row*16*scale*4,cropped+(size_t)row*8*scale*4,(size_t)8*scale*4);
+        gpu_copy_rect_regions(layered,2,x+312,y+60,x+100,y+150,16,16);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+        glReadPixels(100*scale,150*scale,16*scale,16*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+        check(!memcmp(reference,cropped,(size_t)16*16*scale*scale*4),
+            "enhanced copy excludes wide reveal margins from guest VRAM coverage");
+        /* A full native copy into a cropped destination only stages the
+         * intersection. Both axes have a nonzero origin on the second page. */
+        int old_scratch_w=s_scratch_w,old_scratch_h=s_scratch_h;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,full_fbo);
+        glReadPixels(x*scale,y*scale,320*scale,240*scale,GL_RGBA,GL_UNSIGNED_BYTE,reference);
+        gpu_copy_rect_from(full_fbo,0,0,0,0,0,0,1024,512);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,fbo);
+        glReadPixels(0,0,320*scale,240*scale,GL_RGBA,GL_UNSIGNED_BYTE,cropped);
+        check(!memcmp(reference,cropped,(size_t)320*240*scale*scale*4),
+            "copy clipping translates source and destination together");
+        check(s_scratch_w<=(old_scratch_w>320*scale?old_scratch_w:320*scale) &&
+              s_scratch_h<=(old_scratch_h>240*scale?old_scratch_h:240*scale),
+            "cropped destination never stages full scaled VRAM");
         /* Display extraction consumes only its requested rows, and translates
          * a cropped source without touching another framebuffer band. */
         s_hr_fbo=fbo;s_hr_tex=tex;s_hr_rb=rb;

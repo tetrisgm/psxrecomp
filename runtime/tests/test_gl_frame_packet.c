@@ -33,9 +33,11 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
     packet_timer_begin();
     if(packet->initial_bytes!=sizeof(PacketSeed)) abort();
     s_rth_packet_replaying=1;
+    const uint64_t gpu_packs=s_pack_gpu_draws,native_uploads=s_pack_native_uploads;
     const PacketSeed *seed=packet->initial;
     memcpy(packet_private,seed->pixels,sizeof packet_private);
     s_rth_vram_priv=packet_private;
+    rth_packet_native_inputs_reset();
     glb_init(packet_private);
     gl_renderer_restage_vram_after_savestate();
     /* Poison owner state as if a discarded frame's predecessor left it.
@@ -48,35 +50,45 @@ static void packet_execute(void *unused,const FramePacketView *packet) {
     rth_frame_state_apply(&seed->state);
     check(s_off_x==seed->state.offset[0] && s_off_y==0,"packet draw-offset environment");
     const uint8_t *record=packet->records;
+    uint64_t last_source=0;
     for(size_t at=0;at<packet->record_bytes;) {
         const RtCmd *command=(const RtCmd *)(record+at);
         if(command->op==RTH_NATIVE_SOURCE) {
             uint64_t source;memcpy(&source,command+1,sizeof source);
+            last_source=source;
             RthPacketInputs native_inputs={0};native_inputs.draws=packet->attachment;
             const int queued=s_tb_n;
             check(rth_packet_native_input(&native_inputs,source),"production native input application");
             check(s_tb_n==queued,"CPU-only native inputs preserve GPU batches");
-            NativeRasterTile tiles[128];
-            int count=native_raster_inputs_get(packet->attachment,source,tiles,128);
-            if(count<=0) abort();
-            for(int t=0;t<count;++t)
-                glb_vram_transfer_in(tiles[t].x,tiles[t].y,64,64,tiles[t].pixels);
         }
         gl_rth_exec(NULL,command,command+1);
         at+=command->size;
     }
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();pack_flush();
+    RthPacketInputs repeat={0};repeat.draws=packet->attachment;
+    const uint64_t uploads_before_repeat=s_pack_native_uploads;
+    check(rth_packet_native_input(&repeat,last_source),"repeated native input version accepted");
+    check(!s_pack_dirty.set,"unchanged native input versions do not dirty texture sampling");
+    pack_flush();
+    check(s_pack_native_uploads==uploads_before_repeat,"unchanged native inputs do not reupload");
+    void *reuse=p_glFenceSync(0x9117,0);
+    check(reuse!=NULL,"packet reuse fence created");
+    packet_timer_wait_begin();p_glWaitSync(reuse,0,UINT64_MAX);packet_timer_wait_end();
+    p_glDeleteSync(reuse);
     packet_timer_end();
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_raw_fbo);
+    check(s_pack_gpu_draws==gpu_packs,"packet texture coherence never packs enhanced VRAM");
+    check(s_pack_native_uploads>native_uploads,"packet texture sampling consumes native inputs");
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,s_hr_fbo);
     for(unsigned draw=0;draw<2;++draw) {
-        uint16_t pixels[16];
-        /* Inspect the GPU on its owner. The backend's native read accessor
-         * deliberately never reads GL during replay; it returns the seed. */
-        glReadPixels(16+draw*16,16,4,4,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,pixels);
+        uint8_t pixels[12*12*4];
+        /* Inspect enhanced output, not the native texture mirror. Captured
+         * inputs must work without synthetic uploads of the texture page
+         * into the enhanced framebuffer. */
+        glReadPixels((16+draw*16)*3,16*3,12,12,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
         uint16_t expected=(uint16_t)(1+(seed->tick+draw)%30);
-        if(pixels[0]!=expected) fprintf(stderr,"packet=%llu draw=%u got=%04x expected=%04x bank_failed=%d depth24=%d\n",
-            (unsigned long long)packet->sequence,draw,pixels[0],expected,s_selected_bank_failed,ctx_depth24());
-        for(unsigned i=0;i<16;++i) check(pixels[i]==expected,"packet pre-draw texture version");
+        for(unsigned i=0;i<12*12;++i)
+            check((pixels[i*4]>>3)==expected && pixels[i*4+1]==0 && pixels[i*4+2]==0,
+                  "packet pre-draw texture version");
     }
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,0);
     check(glGetError()==GL_NO_ERROR,"packet owner GL error");
@@ -203,6 +215,10 @@ int main(void) {
     check(timing[0]==3,"two forward packets and one historical replay timed");
     check(timing[1]>0 && timing[3]>0 && timing[3]<=timing[1],"packet timestamp totals");
     check(timing[2]<=timing[1] && timing[4]==0,"bounded nonblocking packet telemetry");
+    check(s_pkt_wait_ns<=timing[1] && !s_pkt_wait_dropped,
+          "reuse fence telemetry is bounded by the inclusive packet span");
+    check(s_pkt_time[0].waits==1 && s_pkt_time[1].waits==1 && s_pkt_time[2].waits==1,
+          "each packet resolves its server-wait query pair");
     printf("checks=%d failures=%d\n",checks,failures);
     s_rth_vram_priv=NULL;
     gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();
