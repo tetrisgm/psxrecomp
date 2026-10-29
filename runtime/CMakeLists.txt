@@ -467,6 +467,16 @@ if(BUILD_TESTING)
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-output-timing-results")
         set_tests_properties(gl_output_timing_test PROPERTIES
             LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_test(NAME gl_shared_contexts_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
+                --single --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_shared_contexts.c"
+                --cc "${CMAKE_C_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-shared-contexts-results")
+        set_tests_properties(gl_shared_contexts_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 30 SKIP_RETURN_CODE 77)
         add_test(NAME gl_pass_debug_capture_test
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
