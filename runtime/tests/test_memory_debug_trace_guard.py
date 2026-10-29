@@ -102,6 +102,9 @@ void overlay_loader_resync_validation_after_restore(void);
 """
 
 STUBS_C = r"""
+#include <stdint.h>
+uint32_t g_parity_trace_armed = 1;
+volatile int g_card_data_write_armed = 1;
 #include "harness_common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -359,13 +362,13 @@ def source_text(path: pathlib.Path) -> str:
 
 
 def assert_guarded(memory: str) -> None:
-    if memory.count(TRACE_CALL) != 8:
-        fail("memory.c should contain one extern plus seven trace write call sites")
+    if memory.count(TRACE_CALL) != 9:
+        fail("memory.c should contain one extern plus eight trace write call sites")
     extern = memory.find("extern void " + TRACE_CALL)
     if extern < 0:
         fail("missing trace write extern")
     cursor = extern + len("extern void " + TRACE_CALL)
-    for index in range(7):
+    for index in range(8):
         pos = memory.find(TRACE_CALL + "(", cursor)
         if pos < 0:
             fail(f"missing trace write call site {index + 1}")

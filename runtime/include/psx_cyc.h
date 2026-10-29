@@ -337,70 +337,94 @@ uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
 uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
                            uint32_t rt, uint32_t reg_mask);
 #else
-/* CPU data load value+timing. Full Beetle sequence for main RAM is inlined;
- * MMIO / lockstep / data-shard fall through to *_slow in memory.c. */
-static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
-                                          uint32_t rt, uint32_t reg_mask) {
+/* Compiled data loads share the exact pipeline update, then read contiguous
+ * storage directly. RAM word/half retain their established batched charge;
+ * bytes and ROM use the original publishing charge. Scratchpad has no wait. */
+static inline void psx_cyc_direct_load_timing(CPUState *cpu, uint32_t phys,
+                                             uint32_t rt, uint32_t mask, int batch_ram) {
+    if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+    if (!g_psx_load_delay) return;
+    psx_cyc_base(cpu);
+    psx_cyc_deps(cpu, mask);
+    if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+    psx_cyc_lds(cpu);
+    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb_which = 0u;
+    if (phys >= 0x1F800000u && phys < 0x1F800400u) cpu->ld_absorb = 0u;
+    else {
+        uint32_t cost = phys < PSX_MAIN_RAM_WINDOW_BYTES ? 5u : 2u;
+        uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
+        cpu->ld_absorb = cost;
+        if (batch_ram && phys < PSX_MAIN_RAM_WINDOW_BYTES) psx_cyc_charge(fudge + cost);
+        else psx_cpu_charge(fudge + cost);
+    }
+    cpu->ld_which_t = (uint8_t)rt;
+}
+extern uint8_t psx_cyc_load_byte_slow(CPUState*, uint32_t, uint32_t, uint32_t);
+PSX_MEM_INLINE uint32_t psx_cyc_load_word(CPUState *cpu, uint32_t addr,
+                                            uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-    uint32_t phys = addr & 0x1FFFFFFFu;
-    if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
-        if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
-        if (g_psx_load_delay) {
-            psx_cyc_base(cpu);
-            psx_cyc_deps(cpu, reg_mask);
-            if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
-            psx_cyc_lds(cpu);
-            cpu->read_absorb[cpu->read_absorb_which] = 0u;
-            cpu->read_absorb_which = 0u;
-            uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
-            cpu->ld_absorb = 5u; /* main-RAM wait 3 + completion 2 */
-            psx_cyc_charge(fudge + 5u);
-            cpu->ld_which_t = (uint8_t)rt;
+    if (!g_ls_mode && !g_ds_recording) {
+        uint8_t *p = psx_mem_pointer(addr, 4u);
+        if (p) {
+            uint32_t phys = addr & 0x1FFFFFFFu;
+            psx_cyc_direct_load_timing(cpu, phys, rt, reg_mask, 1);
+            uint32_t value; memcpy(&value, p, sizeof(value));
+            if (phys < PSX_MAIN_RAM_WINDOW_BYTES && g_ram_read_watch_active)
+                debug_server_trace_ram_read_watch(phys & g_psx_ram_mask, value);
+            return value;
         }
-        uint32_t value;
-        memcpy(&value, g_psx_ram + (phys & g_psx_ram_mask), sizeof(value));
-        return value;
     }
     return psx_cyc_load_word_slow(cpu, addr, rt, reg_mask);
 #else
-    (void)cpu; (void)rt; (void)reg_mask;
-    extern uint32_t psx_read_word(uint32_t a);
-    return psx_read_word(addr);
+    (void)rt; (void)reg_mask;
+    return psx_mem_read_word(cpu, addr);
 #endif
 }
-
-static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
-                                          uint32_t rt, uint32_t reg_mask) {
+PSX_MEM_INLINE uint16_t psx_cyc_load_half(CPUState *cpu, uint32_t addr,
+                                            uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-    uint32_t phys = addr & 0x1FFFFFFFu;
-    if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
-        if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
-        if (g_psx_load_delay) {
-            psx_cyc_base(cpu);
-            psx_cyc_deps(cpu, reg_mask);
-            if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
-            psx_cyc_lds(cpu);
-            cpu->read_absorb[cpu->read_absorb_which] = 0u;
-            cpu->read_absorb_which = 0u;
-            uint32_t fudge = (uint32_t)((cpu->read_fudge >> 4) & 2u);
-            cpu->ld_absorb = 5u;
-            psx_cyc_charge(fudge + 5u);
-            cpu->ld_which_t = (uint8_t)rt;
+    if (!g_ls_mode && !g_ds_recording) {
+        uint8_t *p = psx_mem_pointer(addr, 2u);
+        if (p) {
+            uint32_t phys = addr & 0x1FFFFFFFu;
+            psx_cyc_direct_load_timing(cpu, phys, rt, reg_mask, 1);
+            uint16_t value; memcpy(&value, p, sizeof(value));
+            return value;
         }
-        uint16_t value;
-        memcpy(&value, g_psx_ram + (phys & g_psx_ram_mask), sizeof(value));
-        return value;
     }
     return psx_cyc_load_half_slow(cpu, addr, rt, reg_mask);
 #else
-    (void)cpu; (void)rt; (void)reg_mask;
-    extern uint16_t psx_read_half(uint32_t a);
-    return psx_read_half(addr);
+    (void)rt; (void)reg_mask;
+    return psx_mem_read_half(cpu, addr);
+#endif
+}
+PSX_MEM_INLINE uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t addr,
+                                            uint32_t rt, uint32_t reg_mask) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    if (!g_ls_mode && !g_ds_recording) {
+        uint8_t *p = psx_mem_pointer(addr, 1u);
+        if (p) {
+            uint32_t phys = addr & 0x1FFFFFFFu;
+            psx_cyc_direct_load_timing(cpu, phys, rt, reg_mask, 0);
+            uint8_t value; memcpy(&value, p, sizeof(value));
+            return value;
+        }
+    }
+    return psx_cyc_load_byte_slow(cpu, addr, rt, reg_mask);
+#else
+    (void)rt; (void)reg_mask;
+    return psx_mem_read_byte(cpu, addr);
 #endif
 }
 #endif
-
-extern uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+#if defined(PSX_OVERLAY_DLL_BUILD)
+extern uint8_t psx_cyc_load_byte(CPUState*, uint32_t, uint32_t, uint32_t);
+#elif defined(PSX_DRAW_CTX_BUILD)
+static inline uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t mask) {
+    (void)rt; (void)mask; return psx_dctx_lb(cpu, addr);
+}
+#endif
 
 /* Charge the exact timing/pipeline effects of a 32-bit CPU load without
  * invoking the memory handler.  Enhancement HLE may use this only when static
@@ -411,7 +435,35 @@ extern void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
 /* LWC2 (GTE load) ReadMemory timing only (completion +1, NO LDWhich arm — the dest
  * is a GTE register). Call AFTER psx_cyc_step(cpu,0) (§1+DO_LDS) and psx_gte_stall.
  * Returns the raw 32-bit value. */
+#if defined(PSX_OVERLAY_DLL_BUILD) || defined(PSX_DRAW_CTX_BUILD)
 extern uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr);
+#else
+extern uint32_t psx_cyc_lwc2_read_slow(CPUState* cpu, uint32_t addr);
+PSX_MEM_INLINE uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t addr) {
+    if (!g_ls_mode && !g_ds_recording) {
+        uint8_t *p = psx_mem_pointer(addr, 4u);
+        if (p) {
+            uint32_t phys = addr & 0x1FFFFFFFu;
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            cpu->read_absorb[cpu->read_absorb_which] = 0u;
+            cpu->read_absorb_which = 0u;
+            if (phys >= 0x1F800000u && phys < 0x1F800400u) cpu->ld_absorb = 0u;
+            else {
+                uint32_t cost = phys < PSX_MAIN_RAM_WINDOW_BYTES ? 4u : 1u;
+                cpu->ld_absorb = cost;
+                psx_cpu_charge(((cpu->read_fudge >> 4) & 2u) + cost);
+            }
+            cpu->ld_which_t = 32u;
+#endif
+            uint32_t value; memcpy(&value, p, sizeof(value));
+            if (phys < PSX_MAIN_RAM_WINDOW_BYTES && g_ram_read_watch_active)
+                debug_server_trace_ram_read_watch(phys & g_psx_ram_mask, value);
+            return value;
+        }
+    }
+    return psx_cyc_lwc2_read_slow(cpu, addr);
+}
+#endif
 
 #ifdef __cplusplus
 }

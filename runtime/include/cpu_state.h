@@ -369,6 +369,7 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
  * fully defined first; psx_cyc.h's own #include "cpu_state.h" is a guarded no-op.
  * This makes the per-instruction timing API visible to EVERY generated file and
  * runtime TU that includes cpu_state.h. */
+#include "psx_mem_inline.h"
 #include "psx_cyc.h"
 
 /* Release call-entry stamp — inlined into every generated BIOS/game TU that

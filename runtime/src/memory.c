@@ -177,6 +177,9 @@ uint32_t psx_gpu_packet_key(uint32_t address) {
 
 /* Exposed for inlined main-RAM load helpers in psx_cyc.h (VLC/decode hot path). */
 uint8_t *g_psx_ram = ram;
+uint8_t *g_psx_scratchpad = scratchpad;
+uint8_t *g_psx_bios_rom = bios_rom;
+int g_psx_memory_tomb_protect = 0;
 /* PSX_LOAD_DELAY gate (default on). −1 = unread; 0/1 after first resolve. */
 int g_psx_load_delay = -1;
 
@@ -251,7 +254,7 @@ void memory_clear_low_boot_scratch(void) {
 #define RAM_LIVE                (g_psx_ram_size)
 #define DIRTY_RAM_LIVE_BITMAP_WORDS \
     (((RAM_LIVE >> DIRTY_RAM_PAGE_SHIFT) + 31u) / 32u)
-static uint32_t dirty_ram_bitmap[DIRTY_RAM_BITMAP_WORDS];
+uint32_t g_psx_dirty_ram_bitmap[DIRTY_RAM_BITMAP_WORDS];
 
 /* Monotonic generation for RAM-resident CODE changes (kernel install-stub
  * writes + DMA/EXE loads that mark executable ranges). Consumers that cache
@@ -268,8 +271,8 @@ static inline void dirty_ram_mark_page(uint32_t phys) {
      * writes land here on every guest store, and bumping per write would
      * invalidate the per-PC site caches continuously. Overlay (re)loads always
      * bump via dirty_ram_mark_executable_range. */
-    if (!(dirty_ram_bitmap[page >> 5] & bit)) g_dirty_ram_code_gen++;
-    dirty_ram_bitmap[page >> 5] |= bit;
+    if (!(g_psx_dirty_ram_bitmap[page >> 5] & bit)) g_dirty_ram_code_gen++;
+    g_psx_dirty_ram_bitmap[page >> 5] |= bit;
 }
 
 /* ---- Kernel-image bless -------------------------------------------------
@@ -534,7 +537,7 @@ void dirty_ram_clear_image_baseline(void) {
     uint32_t first_page = base >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t last_page  = (floor - 1u) >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t page = first_page; page <= last_page; page++)
-        dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
+        g_psx_dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
 }
 
 /* Text-image divergence guard.
@@ -554,9 +557,9 @@ void dirty_ram_clear_image_baseline(void) {
  * never frees it). Intentional data patches by the translation layer are blessed
  * into it via dirty_ram_text_bless so they are not mistaken for self-modifying
  * code — see dirty_ram_text_native_ok / dirty_ram_text_bless. */
-static uint8_t *text_ref_image = NULL;
-static uint32_t text_ref_lo = 0, text_ref_hi = 0;
-static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
+uint8_t *g_psx_text_ref_image = NULL;
+uint32_t g_psx_text_ref_lo = 0, g_psx_text_ref_hi = 0;
+uint32_t g_psx_text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint64_t g_text_native_blocked = 0;
 static uint32_t g_text_diverged_pages = 0;
@@ -571,10 +574,10 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
     if (!bytes || len == 0 || phys_lo >= RAM_LIVE) return;
     if (len > RAM_LIVE - phys_lo) len = RAM_LIVE - phys_lo;
-    text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
-    text_ref_lo = phys_lo;
-    text_ref_hi = phys_lo + len;
-    memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+    g_psx_text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
+    g_psx_text_ref_lo = phys_lo;
+    g_psx_text_ref_hi = phys_lo + len;
+    memset(g_psx_text_modified_bitmap, 0, sizeof(g_psx_text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_native_blocked = 0;
     g_text_diverged_pages = 0;
@@ -586,17 +589,17 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
     g_text_exact_last_ref = 0;
 }
 
-int dirty_ram_text_image_registered(void) { return text_ref_image != NULL; }
+int dirty_ram_text_image_registered(void) { return g_psx_text_ref_image != NULL; }
 
 static inline void text_guard_note_write(uint32_t phys, uint32_t val, int size) {
-    if (!text_ref_image) return;
-    if (phys < text_ref_lo || phys + (uint32_t)size > text_ref_hi) return;
-    const uint8_t *ref = text_ref_image + (phys - text_ref_lo);
+    if (!g_psx_text_ref_image) return;
+    if (phys < g_psx_text_ref_lo || phys + (uint32_t)size > g_psx_text_ref_hi) return;
+    const uint8_t *ref = g_psx_text_ref_image + (phys - g_psx_text_ref_lo);
     uint8_t buf[4] = { (uint8_t)val, (uint8_t)(val >> 8),
                        (uint8_t)(val >> 16), (uint8_t)(val >> 24) };
     if (memcmp(ref, buf, (size_t)size) != 0) {
         uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
-        text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
+        g_psx_text_modified_bitmap[page >> 5] |= (1u << (page & 31u));
     }
 }
 
@@ -608,7 +611,7 @@ static int dirty_ram_force_interp(void);
 
 int dirty_ram_text_native_ok(uint32_t phys) {
     if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 0;
-    if (!text_ref_image || phys < text_ref_lo || phys >= text_ref_hi)
+    if (!g_psx_text_ref_image || phys < g_psx_text_ref_lo || phys >= g_psx_text_ref_hi)
         return !dirty_ram_is_dirty(phys);
 
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
@@ -619,7 +622,7 @@ int dirty_ram_text_native_ok(uint32_t phys) {
     }
     /* Fast path: a page never touched by a guarded write AND not runtime-dirty
      * still holds the pristine compiled image — native is safe with no compare. */
-    if (!(text_modified_bitmap[page >> 5] & bit) && !dirty_ram_is_dirty(phys))
+    if (!(g_psx_text_modified_bitmap[page >> 5] & bit) && !dirty_ram_is_dirty(phys))
         return 1;
 
     /* Flagged (a guarded write that differed, an overlay-dirty page, or an
@@ -630,8 +633,8 @@ int dirty_ram_text_native_ok(uint32_t phys) {
      * dirty_ram_text_bless) does not needlessly block a still-valid function and
      * route it to psx_unknown_dispatch. A genuine code overwrite still diverges. */
     uint32_t n = 256;
-    if (n > text_ref_hi - phys) n = text_ref_hi - phys;
-    if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), n) == 0)
+    if (n > g_psx_text_ref_hi - phys) n = g_psx_text_ref_hi - phys;
+    if (memcmp(ram + phys, g_psx_text_ref_image + (phys - g_psx_text_ref_lo), n) == 0)
         return 1;
 
     text_diverged_bitmap[page >> 5] |= bit;
@@ -657,15 +660,15 @@ int dirty_ram_text_native_ok(uint32_t phys) {
 int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
                                          uint32_t count,
                                          uint32_t exec_pc) {
-    if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
+    if (!g_psx_text_ref_image || !lo_len_pairs || count == 0) return 0;
     if (dirty_ram_force_interp()) return 0;
     (void)exec_pc;
     int any = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        if (len == 0 || phys < text_ref_lo || phys >= text_ref_hi ||
-            len > text_ref_hi - phys) {
+        if (len == 0 || phys < g_psx_text_ref_lo || phys >= g_psx_text_ref_hi ||
+            len > g_psx_text_ref_hi - phys) {
             g_text_native_blocked++;
             return 0;
         }
@@ -681,7 +684,7 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
             uint32_t p;
             int clean = 1;
             for (p = p0; p <= p1; p++) {
-                if ((text_modified_bitmap[p >> 5] & (1u << (p & 31u))) ||
+                if ((g_psx_text_modified_bitmap[p >> 5] & (1u << (p & 31u))) ||
                     dirty_ram_is_dirty(p << DIRTY_RAM_PAGE_SHIFT)) {
                     clean = 0;
                     break;
@@ -689,10 +692,10 @@ int dirty_ram_text_native_ok_ranges_from(const uint32_t *lo_len_pairs,
             }
             if (clean) continue;
         }
-        if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0) {
+        if (memcmp(ram + phys, g_psx_text_ref_image + (phys - g_psx_text_ref_lo), len) != 0) {
             uint32_t off = 0;
             const uint8_t *live = ram + phys;
-            const uint8_t *ref = text_ref_image + (phys - text_ref_lo);
+            const uint8_t *ref = g_psx_text_ref_image + (phys - g_psx_text_ref_lo);
             while (off < len && live[off] == ref[off]) off++;
             g_text_exact_mismatches++;
             g_text_exact_last_range_lo = phys;
@@ -727,15 +730,15 @@ int dirty_ram_text_native_ok_ranges(const uint32_t *lo_len_pairs,
  * context runs. */
 int psx_text_ref_ranges_match(const uint8_t *ctx_ram, uint32_t ram_mask,
                               const uint32_t *lo_len_pairs, uint32_t count) {
-    if (!text_ref_image || !lo_len_pairs || count == 0) return 0;
+    if (!g_psx_text_ref_image || !lo_len_pairs || count == 0) return 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t phys = lo_len_pairs[i * 2u] & 0x1FFFFFFFu;
         uint32_t len = lo_len_pairs[i * 2u + 1u];
-        if (len == 0 || phys < text_ref_lo || phys >= text_ref_hi ||
-            len > text_ref_hi - phys || (phys & ~ram_mask) ||
+        if (len == 0 || phys < g_psx_text_ref_lo || phys >= g_psx_text_ref_hi ||
+            len > g_psx_text_ref_hi - phys || (phys & ~ram_mask) ||
             ((phys + len - 1u) & ~ram_mask))
             return 0;
-        if (memcmp(ctx_ram + phys, text_ref_image + (phys - text_ref_lo), len) != 0)
+        if (memcmp(ctx_ram + phys, g_psx_text_ref_image + (phys - g_psx_text_ref_lo), len) != 0)
             return 0;
     }
     return 1;
@@ -760,18 +763,18 @@ void dirty_ram_text_exact_mismatch_stats(uint64_t *count,
  * pages — and the guard's 256-byte compare window — with real compiled functions.
  * Without this, patching a data table diverges the page and blocks native
  * dispatch of every function in it (a real function fatally routes to
- * psx_unknown_dispatch). By updating text_ref_image to match the patched bytes,
+ * psx_unknown_dispatch). By updating g_psx_text_ref_image to match the patched bytes,
  * the compare passes for the intentional change while a genuine game write of
  * DIFFERENT bytes still diverges and is still caught. Clears the sticky diverged
  * bit for affected pages so the guard re-evaluates against the updated reference.
  * Byte-for-byte identical writes are a no-op. */
 void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
-    if (!text_ref_image || !bytes || len == 0) return;
-    if (phys >= text_ref_hi || phys + len <= text_ref_lo) return;   /* out of range */
-    uint32_t lo = phys < text_ref_lo ? text_ref_lo : phys;
-    uint32_t hi = phys + len > text_ref_hi ? text_ref_hi : phys + len;
+    if (!g_psx_text_ref_image || !bytes || len == 0) return;
+    if (phys >= g_psx_text_ref_hi || phys + len <= g_psx_text_ref_lo) return;   /* out of range */
+    uint32_t lo = phys < g_psx_text_ref_lo ? g_psx_text_ref_lo : phys;
+    uint32_t hi = phys + len > g_psx_text_ref_hi ? g_psx_text_ref_hi : phys + len;
     if (hi <= lo) return;
-    uint8_t *ref = text_ref_image + (lo - text_ref_lo);
+    uint8_t *ref = g_psx_text_ref_image + (lo - g_psx_text_ref_lo);
     const uint8_t *src = bytes + (lo - phys);
     if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
     memcpy(ref, src, hi - lo);
@@ -787,7 +790,7 @@ uint64_t dirty_ram_text_native_blocked(void) { return g_text_native_blocked; }
 uint32_t dirty_ram_text_diverged_pages(void) { return g_text_diverged_pages; }
 uint32_t dirty_ram_text_modified_bitmap_word(uint32_t word_index) {
     if (word_index >= DIRTY_RAM_BITMAP_WORDS) return 0;
-    return text_modified_bitmap[word_index];
+    return g_psx_text_modified_bitmap[word_index];
 }
 uint32_t dirty_ram_text_diverged_bitmap_word(uint32_t word_index) {
     if (word_index >= DIRTY_RAM_BITMAP_WORDS) return 0;
@@ -803,7 +806,7 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     uint32_t first_page = phys >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t last_page = end >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t page = first_page; page <= last_page; page++) {
-        dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
+        g_psx_dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
     }
     g_dirty_ram_code_gen++;
 }
@@ -857,14 +860,14 @@ int dirty_ram_is_dirty(uint32_t phys) {
      * those pages unreachable by the interpreter. See dirty_ram_interp.h. */
     if (phys_is_overlay_region(phys)) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
-    return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
+    return (g_psx_dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
 
-uint32_t dirty_ram_get_bitmap(void) { return dirty_ram_bitmap[0]; }
+uint32_t dirty_ram_get_bitmap(void) { return g_psx_dirty_ram_bitmap[0]; }
 
 uint32_t dirty_ram_get_bitmap_word(uint32_t word_index) {
     if (word_index >= DIRTY_RAM_BITMAP_WORDS) return 0;
-    return dirty_ram_bitmap[word_index];
+    return g_psx_dirty_ram_bitmap[word_index];
 }
 
 /* Serialized (savestate / netplay digest) extent: the LIVE RAM's pages only,
@@ -875,10 +878,10 @@ uint32_t dirty_ram_get_bitmap_word_count(void) {
 }
 
 void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
-    memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
+    memset(g_psx_dirty_ram_bitmap, 0, sizeof(g_psx_dirty_ram_bitmap));
     if (count > DIRTY_RAM_LIVE_BITMAP_WORDS) count = DIRTY_RAM_LIVE_BITMAP_WORDS;
     for (uint32_t i = 0; i < count; i++)
-        dirty_ram_bitmap[i] = words[i];
+        g_psx_dirty_ram_bitmap[i] = words[i];
     /* Bitmap replace bypasses clean→dirty transitions; bump so interpreter
      * site caches keyed on g_dirty_ram_code_gen cannot survive a restore. */
     g_dirty_ram_code_gen++;
@@ -898,15 +901,15 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
  * The bitmap is almost always empty, so the per-store cost on the common path
  * is a single bitmap lookup.
  */
-static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
+uint32_t g_psx_overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
 void dirty_ram_reset_for_boot(void) {
-    memset(dirty_ram_bitmap, 0, sizeof(dirty_ram_bitmap));
-    memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+    memset(g_psx_dirty_ram_bitmap, 0, sizeof(g_psx_dirty_ram_bitmap));
+    memset(g_psx_text_modified_bitmap, 0, sizeof(g_psx_text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
-    memset(overlay_watch_bitmap, 0, sizeof(overlay_watch_bitmap));
+    memset(g_psx_overlay_watch_bitmap, 0, sizeof(g_psx_overlay_watch_bitmap));
     memset(overlay_page_gen, 0, sizeof(overlay_page_gen));
     memset(g_dirty_ram_exec_page_bitmap, 0, sizeof(g_dirty_ram_exec_page_bitmap));
     memset(g_dirty_ram_exec_pc_bitmap, 0, sizeof(g_dirty_ram_exec_pc_bitmap));
@@ -921,7 +924,7 @@ void overlay_watch_set_range(uint32_t phys, uint32_t len) {
     uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t pg = fp; pg <= lp; pg++)
-        overlay_watch_bitmap[pg >> 5] |= (1u << (pg & 31u));
+        g_psx_overlay_watch_bitmap[pg >> 5] |= (1u << (pg & 31u));
 }
 
 void overlay_watch_clear_range(uint32_t phys, uint32_t len) {
@@ -931,7 +934,7 @@ void overlay_watch_clear_range(uint32_t phys, uint32_t len) {
     uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
     uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
     for (uint32_t pg = fp; pg <= lp; pg++)
-        overlay_watch_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+        g_psx_overlay_watch_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
 }
 
 /* Sum of generation counters over the pages spanning [phys, phys+len). The
@@ -971,21 +974,21 @@ void dirty_ram_text_guard_resync_after_restore(void) {
      * and the writes happened in the process that produced it. One pass
      * over the reference range (at most 2 MB, once per restore) puts every
      * mismatching page back under the exact compare. */
-    memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
+    memset(g_psx_text_modified_bitmap, 0, sizeof(g_psx_text_modified_bitmap));
     memset(text_diverged_bitmap, 0, sizeof(text_diverged_bitmap));
     g_text_diverged_pages = 0;
-    if (text_ref_image && text_ref_hi > text_ref_lo) {
-        uint32_t p0 = text_ref_lo >> DIRTY_RAM_PAGE_SHIFT;
-        uint32_t p1 = (text_ref_hi - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+    if (g_psx_text_ref_image && g_psx_text_ref_hi > g_psx_text_ref_lo) {
+        uint32_t p0 = g_psx_text_ref_lo >> DIRTY_RAM_PAGE_SHIFT;
+        uint32_t p1 = (g_psx_text_ref_hi - 1u) >> DIRTY_RAM_PAGE_SHIFT;
         for (uint32_t p = p0; p <= p1; p++) {
             uint32_t lo = p << DIRTY_RAM_PAGE_SHIFT;
             uint32_t hi = lo + (1u << DIRTY_RAM_PAGE_SHIFT);
-            if (lo < text_ref_lo) lo = text_ref_lo;
-            if (hi > text_ref_hi) hi = text_ref_hi;
+            if (lo < g_psx_text_ref_lo) lo = g_psx_text_ref_lo;
+            if (hi > g_psx_text_ref_hi) hi = g_psx_text_ref_hi;
             if (hi > RAM_LIVE) hi = RAM_LIVE;
             if (hi <= lo) continue;
-            if (memcmp(ram + lo, text_ref_image + (lo - text_ref_lo), hi - lo) != 0)
-                text_modified_bitmap[p >> 5] |= (1u << (p & 31u));
+            if (memcmp(ram + lo, g_psx_text_ref_image + (lo - g_psx_text_ref_lo), hi - lo) != 0)
+                g_psx_text_modified_bitmap[p >> 5] |= (1u << (p & 31u));
         }
     }
 }
@@ -1016,7 +1019,7 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
         dirty_ram_dispatch_evidence_clear(bitmap_word, 4096u / 4u / 32u);
         g_dirty_ram_exec_page_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
     }
-    if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
+    if ((g_psx_overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
         overlay_page_gen[pg]++;
         /* Also invalidate generation-aware negative overlay lookups: bytes in
          * a manifested code page may now match a previously absent variant.
@@ -1031,6 +1034,12 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
         extern void overlay_loader_active_write_check(uint32_t phys, uint32_t size);
         overlay_loader_active_write_check(phys, size);
     }
+}
+
+void psx_memory_kernel_write(uint32_t phys) { kbless_note_write(phys); }
+
+void psx_memory_code_write(uint32_t phys, uint32_t width) {
+    overlay_watch_note_write(phys, width);
 }
 
 /* Memory control registers: 0x1F801000..0x1F80103F (16 words) + 0x1F801060 (RAM size).
@@ -1243,6 +1252,9 @@ static uint32_t s_bios_checksum = 0;
 uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
 
 void memory_init(const char* bios_path) {
+    { const char *e = getenv("PSX_TOMB_CARD_EVCB_PROTECT");
+      g_psx_memory_tomb_protect = e && e[0] == '1'; }
+
     psx_ram_apply_size_request();
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
@@ -1826,6 +1838,7 @@ static uint32_t psx_read_word_raw(uint32_t addr) {
  * so the real corrupting writer (and, if DMA, its channel + madr) is captured even
  * though the per-instruction store-PC tracker can't see it. Dump via `d44_ring`. */
 #define D44_PHYS 0x00079D44u
+uint32_t g_psx_memory_word_probe = D44_PHYS;
 #define D44_RING_CAP 32u
 typedef struct {
     uint64_t seq;
@@ -2555,7 +2568,7 @@ void psx_cyc_load_word_timing_only(CPUState* cpu, uint32_t addr,
                                    uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
 }
-uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+uint8_t psx_cyc_load_byte_slow(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
     psx_cyc_load_timing(cpu, addr, 1u, rt, reg_mask);
 #if defined(PSX_NO_DEBUG_TOOLS) && !defined(PSX_COSIM)
     uint32_t phys;
@@ -2567,7 +2580,7 @@ uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t re
 /* LWC2 (GTE load): §1/DO_LDS done by psx_cyc_step(cpu,0); the GTE deadline stall by
  * psx_gte_stall — both emitted before this call. 32-bit access, completion +1, no
  * LDWhich arm. */
-uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
+uint32_t psx_cyc_lwc2_read_slow(CPUState* cpu, uint32_t addr) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u);
 #else
@@ -2680,3 +2693,24 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     }
     unmapped_fatal(addr, phys, "WRITE");
 }
+
+/* Exceptional observers stay out of each generated store's instruction body. */
+void psx_memory_store_observers(uint32_t addr, uint32_t phys, const uint8_t *p,
+                                uint32_t value, uint32_t width) {
+    if (g_psx_track_last_store) {
+        g_guest_last_store_addr = addr; g_guest_last_store_val = value;
+    }
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (g_debug_write_hooks) {
+        uint32_t old = 0; memcpy(&old, p, width);
+        debug_server_trace_write_check(phys, old, value, (uint8_t)width);
+    }
+#endif
+    if (phys < PSX_MAIN_RAM_WINDOW_BYTES) {
+        if (g_parity_trace_armed)
+            parity_trace_note_write(phys, width, g_debug_last_store_pc);
+        if (g_card_data_write_armed)
+            card_data_writes_check(phys, value, (uint8_t)width);
+    }
+}
+
