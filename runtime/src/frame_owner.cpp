@@ -105,6 +105,8 @@ struct FrameOwner {
             }
             if(has_packet) {
                 if(frame_packet_current(queue,&packet)) {
+                    for(size_t i=0;i<packet.preroll_count && frame_packet_current(queue,&packet);i++)
+                        config.execute(config.user,&packet.preroll[i]);
                     config.execute(config.user,&packet);
                     executed_epoch=packet.epoch;
                     executed_sequence=packet.sequence;
@@ -225,3 +227,11 @@ extern "C" void frame_owner_tick_at(FrameOwner *owner,uint64_t deadline) {
     if(current_owner!=owner || !owner->config.tick) std::abort();
     if(deadline && (!owner->deadline || deadline<owner->deadline)) owner->deadline=deadline;
 }
+
+extern "C" void frame_owner_history_configure(FrameOwner *o,size_t depth,size_t bytes) { frame_packet_history_configure(o->queue,depth,bytes); }
+extern "C" size_t frame_owner_history_bytes(const FrameOwner *o) { return frame_packet_history_bytes(o->queue); }
+extern "C" int frame_owner_history_has(const FrameOwner *o,uint64_t seq) { return frame_packet_history_has(o->queue,seq); }
+extern "C" int frame_owner_history_replay(FrameOwner *o,uint64_t saved,uint64_t seq) {
+    int ok=frame_packet_history_replay(o->queue,saved,seq);if(ok)o->wake();return ok;
+}
+extern "C" void frame_owner_history_branch(FrameOwner *o,uint64_t seq) { frame_packet_history_branch(o->queue,seq); }

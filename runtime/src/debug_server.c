@@ -1,4 +1,4 @@
-/*
+﻿/*
  * debug_server.c -- TCP debug server for PSX recomp v4
  *
  * Single-threaded, non-blocking TCP server polled once per vblank.
@@ -42,6 +42,7 @@
 #include "dma.h"
 #include "gpu.h"
 #include "gpu_hd_textures.h"
+#include "render_thread.h"
 #include "gpu_render.h"   /* gr_scale + gr_render_display_hires (screenshot_hires) */
 #include "present_ring.h"
 #include "gpu_timeline.h"
@@ -8372,10 +8373,12 @@ static void handle_rewind_status(int id, const char *json)
     double prof[6]; boot_state_native_capture_profile(prof);
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"open\":%s,"
              "\"title_blocked\":%s,\"snaps\":%u,\"frame\":%u,"
+             "\"packet_bytes\":%llu,\"packet_replays\":%llu,\"packet_misses\":%llu,"
              "\"captures\":%llu,\"restores\":%llu,\"failures\":%llu,"
              "\"bytes\":%llu,\"capture_ms\":%.6f,\"max_ms\":%.6f,\"p50_ms\":%.6f,\"p99_ms\":%.6f,\"begin_max_ms\":%.6f,\"finish_max_ms\":%.6f,\"poll_max_ms\":%.6f,\"worker_ms\":%.6f,\"worker_max_ms\":%.6f,\"serialize_ms\":%.6f,\"delta_ms\":%.6f,\"verified\":%llu,\"verify_failures\":%llu,\"first_difference\":%u,\"profile_ms\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f],\"worst_begin_profile_ms\":[%.6f,%.6f,%.6f,%.6f,%.6f,%.6f],\"begin_thread_cycles\":%llu,\"max_begin_thread_cycles\":%llu,\"worst_begin_thread_cycles\":%llu}\n",
              id,psx_rewind_enabled()?"true":"false",psx_rewind_is_open()?"true":"false",
              psx_rewind_title_blocked()?"true":"false",psx_rewind_snap_count(),st.frame,
+             (unsigned long long)rt_history_bytes(),(unsigned long long)rt_history_replays(),(unsigned long long)rt_history_misses(),
              (unsigned long long)st.captures,(unsigned long long)st.restores,
              (unsigned long long)st.failures,(unsigned long long)st.bytes,
              st.capture_ms,st.max_ms,st.p50_ms,st.p99_ms,st.begin_max_ms,st.finish_max_ms,st.poll_max_ms,st.worker_ms,st.worker_max_ms,st.serialize_ms,st.delta_ms,(unsigned long long)st.verified,

@@ -1,4 +1,4 @@
-/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
+﻿/* gpu.c — PS1 GPU hardware simulation (Phase 3, Step 1).
  *
  * Implements:
  *   - GPUSTAT register with correct bit semantics
@@ -8456,6 +8456,7 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     ws_reset_scene_history();
     ws_scene_hold_reset(&s_ws_scene_hold);
     ws_world_scale_reset(&ws_world_scale, (uint32_t)s_frame_count);
+    ws_ui_prepass_invalidate_stale();
     ws_hud_anchor_clear(ws_hud_anchor_tags, WS_HUD_ANCHOR_TABLE_SIZE);
     ws_hud_anchor_clear(ws_background_tags, WS_HUD_ANCHOR_TABLE_SIZE);
     ws_background_tags_used = 0;
@@ -8466,6 +8467,9 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     ws_repeat_rect_tag_clear(ws_feedback_rect_tags);
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
      * on a stale draw area after savestate load. */
+    gr_set_texture_window(texture_window_value);
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
+    gr_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
     /* GP0(E1h) bit 9 is restored with the registers; the renderer only

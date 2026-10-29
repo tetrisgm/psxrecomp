@@ -10,6 +10,10 @@ int rewind_worker_submit(RewindWorker *w){w->run(w->context);return 1;}
 int rewind_worker_ready(RewindWorker *w){return w!=NULL;}
 void rewind_worker_wait(RewindWorker *w){(void)w;}
 void rewind_worker_destroy(RewindWorker *w){free(w);}
+void rt_history_configure(size_t depth,size_t bytes) {(void)depth;(void)bytes;}
+void rt_history_reverse(int active) {(void)active;}
+void rt_history_mark(uint64_t tick) {(void)tick;}
+void rt_history_branch(uint64_t tick) {(void)tick;}
 static uint64_t clock_ns;
 static int muted, presented, resumed, netplay, safe=1;
 static uint8_t ram_image[8193];

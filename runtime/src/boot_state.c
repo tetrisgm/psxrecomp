@@ -14,6 +14,7 @@
 #include "gpu.h"           /* gpu_get_vram — CPU-auth mirror under dual-raster   */
 #include "gpu_render.h"    /* gr_vram_transfer_in / gr_vram_transfer_out          */
 #include "gpu_vram_dirty.h"
+#include "pgxp.h"
 #include "cpu_state.h"     /* gte_canonicalize_cpu_state after CPU wire restore   */
 #include "interrupts.h"
 #include "psx_cycles.h"
@@ -1229,6 +1230,12 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
     if (!ok)
         return 0;
 
+    /* Raw RAM/register replacement bypasses the store hooks. Precision
+     * provenance from the abandoned timeline must never alias restored words.
+     * This invalidates metadata, not any PGXP feature/configuration. */
+#ifdef PSX_PGXP
+    pgxp_invalidate_all();
+#endif
     /* RAM was memcpy'd; force overlay revalidation before resume. */
     overlay_watch_invalidate_after_ram_restore();
 

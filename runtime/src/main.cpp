@@ -1,4 +1,4 @@
-#include "audio_sync.h"
+﻿#include "audio_sync.h"
 #include "audio_catchup.h"
 /* main.cpp — Phase 3 runtime entry point.
  *
@@ -8795,10 +8795,7 @@ extern "C" void psx_frontend_rewind_audio(int paused) {
             psx_sdl_audio_lock(sdl_audio_device);
             /* Drop the abandoned timeline including the resampler's filter
              * history; preserve telemetry and the allocated filter bank. */
-            s_drc.out_pos=(double)s_drc.in_count+s_drc.half;
-            s_drc.primed=0; s_drc.gain=0;
-            s_drc.last_out[0]=s_drc.last_out[1]=0;
-            rab_resume_after_sink(&s_drc);
+            s_drc.reset_timeline();
             psx_sdl_audio_unlock(sdl_audio_device);
         }
     } else {
@@ -8823,6 +8820,13 @@ extern "C" void psx_frontend_rewind_service(int present) {
     rewind_poll_toggle_buttons();
     starvation_watchdog_heartbeat();
     if(!present) return;
+    /* Flush grouped restore records into the incomplete producer packet, then
+     * invalidate it before replaying the captured frame's owned provenance. */
+    if(g_gl_active && rt_running()) {
+        gl_renderer_render_thread_frame_boundary();
+        PsxRewindStats restored;psx_rewind_get_stats(&restored);
+        if(rt_history_present(restored.frame)) return;
+    }
     GpuDisplayInfo di; gpu_get_display_info(&di);
     unsigned w=di.width, h=di.height;
     if(!w || !h || w>1024 || h>512) return;
@@ -8838,6 +8842,7 @@ extern "C" void psx_frontend_rewind_service(int present) {
         gl_renderer_set_interpolation_suspended(1);
         gl_renderer_present(pixels,(int)w,(int)h,0,1,0,psx_cycle_count,
                             0,0,0,0,0,0);
+        gl_renderer_render_thread_frame_boundary();
     } else if(sdl_renderer) {
         SDL_Texture *texture=SDL_CreateTexture(sdl_renderer,SDL_PIXELFORMAT_ARGB8888,
             SDL_TEXTUREACCESS_STREAMING,(int)w,(int)h);

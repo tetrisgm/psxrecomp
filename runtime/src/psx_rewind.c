@@ -10,6 +10,7 @@
 #include "psx_scheduler.h"
 #include "savestate.h"
 #include "present_thread.h"
+#include "render_thread.h"
 #include "host_time.h"
 #include <stdlib.h>
 #include <string.h>
@@ -132,6 +133,7 @@ static void publish_history(void) {
     published_bytes=history.bytes+history.size;
 }
 void psx_rewind_shutdown(void) {
+    rt_history_configure(0,0);
     capture_priority(0);
     rewind_worker_destroy(worker);worker=NULL;
     boot_state_pending_destroy(pending);pending=NULL;capturing=0;
@@ -153,12 +155,13 @@ void psx_rewind_configure(uint32_t b, uint32_t e) {
         }
         configured=worker!=NULL;
     }
-    if(configured)capture_priority(1);
+    if(configured) { capture_priority(1);rt_history_configure(depth+1,512u*1024u*1024u); }
 }
 uint32_t psx_rewind_discard_history(void) {
     rewind_worker_wait(worker);
     uint32_t n=history.count;
     if(capturing){boot_state_pending_destroy(pending);pending=boot_state_pending_create();capturing=0;if(!pending)configured=0;}
+    rt_history_configure(depth+1,512u*1024u*1024u);
     rw_reset(&history);publish_history();due=0;g_psx_rewind_pending=0;return n;
 }
 int psx_rewind_enabled(void) { return enabled&&configured; }
@@ -274,12 +277,13 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc) {
         }
         if(saved) {
             stats.serialize_ms+=capture_cost;
+            rt_history_mark(frame);
             capture_tick=frame;capturing=1;poll_wait=0;due=0;g_psx_rewind_pending=1;
         } else stats.failures++;
         return;
     }
     if(!wants_rewind()||!psx_hle_scheduler_enabled()||!history.size) return;
-    active=1;
+    active=1;rt_history_reverse(1);
     psx_frontend_rewind_audio(1);
     uint64_t next=pt_clock_ns();
     int restored=0;
@@ -312,9 +316,10 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc) {
         }
         psx_host_sleep_ms(1);
     }
-    active=0; g_psx_rewind_pending=0;
+    active=0;rt_history_reverse(0); g_psx_rewind_pending=0;
     psx_frontend_rewind_audio(0);
     if(restored) {
+        rt_history_branch(history.tick);
         psx_frontend_on_savestate_loaded();
         psx_scheduler_resume_at(cpu->pc);
     }

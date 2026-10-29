@@ -1,5 +1,6 @@
 /* Exercise the real snapshot writer/loader and handoff latch with hardware
  * doubles. In particular, restore must never run the destructive boot hook. */
+#define PSX_PGXP 1
 #include "boot_state.c"
 #include "fntrace.c"
 #include <assert.h>
@@ -15,7 +16,8 @@ static int delayed_patch(void *unused,size_t offset,const void *data,size_t size
 }
 static uint8_t ram[2*1024*1024], spad[1024], spuram[512*1024];
 static uint16_t vram[1024*512];
-static int boot_clears, cd_handoffs;
+static int boot_clears, cd_handoffs, precision_invalidations;
+void pgxp_invalidate_all(void) { ++precision_invalidations; }
 uint32_t i_stat, i_mask, g_psx_icache_tv[1024];
 uint64_t psx_cycle_count;
 uint32_t g_psx_gcs_frac;
@@ -106,7 +108,9 @@ int main(void) {
         const size_t handoff=handoff_section(saved,len), count=r32(saved+28);
         assert(saved[4]==9 && saved[handoff+16]==started);
         fntrace_restore_game_started(!started); ram[0x100]=0; cpu.pc=0;
+        int before_precision=precision_invalidations;
         assert(boot_state_load_buffer(saved,len,123,0x801b0000,&cpu));
+        assert(precision_invalidations==before_precision+1);
         assert(fntrace_is_game_started()==started && ram[0x100]==0xab && cpu.pc==0x80050044);
         assert(!boot_clears && !cd_handoffs);
         /* Malformed, missing and duplicate phase sections must reject before

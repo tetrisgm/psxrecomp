@@ -21,6 +21,9 @@ typedef struct FramePacketView {
     const void *records;
     size_t record_bytes;
     const void *attachment;
+    const struct FramePacketView *preroll;
+    size_t preroll_count;
+    int warmup;
 } FramePacketView;
 
 /* Limits are per slot, with three slots total (writing, pending, reading).
@@ -58,6 +61,15 @@ uint64_t frame_packet_replaced(const FramePacketQueue *queue);
  * Consumer checks current immediately before handing an image to present. */
 void frame_packet_invalidate(FramePacketQueue *queue);
 int frame_packet_current(const FramePacketQueue *queue,const FramePacketView *view);
+
+/* Optional bounded CPU packet history, producer only. Leased storage survives
+ * eviction. Limits include allocated vector capacities and attachment bytes.
+ * Replays are not inserted into history; caller invalidates the epoch first. */
+void frame_packet_history_configure(FramePacketQueue *,size_t depth,size_t bytes);
+size_t frame_packet_history_bytes(const FramePacketQueue *);
+int frame_packet_history_has(const FramePacketQueue *,uint64_t sequence);
+int frame_packet_history_replay(FramePacketQueue *,uint64_t saved,uint64_t sequence);
+void frame_packet_history_branch(FramePacketQueue *,uint64_t sequence);
 
 #ifdef __cplusplus
 }
