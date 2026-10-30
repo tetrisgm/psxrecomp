@@ -10598,6 +10598,12 @@ static int s_agpu_on=-1;
 static GLuint s_agpu_q[AGPU_Q]; static int s_agpu_kind[AGPU_Q];
 static unsigned s_agpu_head,s_agpu_tail; static int s_agpu_open;
 static _Atomic uint64_t s_agpu_ns[5],s_agpu_n[5],s_agpu_lost;
+void gl_renderer_async_gpu_times(uint64_t ns[5], uint64_t counts[5]) {
+    for (int i=0;i<5;++i) {
+        ns[i]=atomic_load(&s_agpu_ns[i]);
+        counts[i]=atomic_load(&s_agpu_n[i]);
+    }
+}
 static _Atomic uint64_t s_agpu_op_ns[RTH_GROUP+1],s_agpu_op_n[RTH_GROUP+1]; static int s_agpu_ops=-1;
 static int agpu_on(void) {
     if (s_agpu_on<0) { const char *e=getenv("PSX_GL_ASYNC_GPU_TIMER"); s_agpu_on=e && *e && *e!='0' &&

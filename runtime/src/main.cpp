@@ -5095,6 +5095,33 @@ static void openxr_ready_report_tick(uint64_t frames) {
     }
 }
 
+/* Offline input replay for release-build measurements. Each row is an
+ * absolute VBlank number, active-low pad word (hex), and save slot (-1 for
+ * no save). Parsed once; no file polling or debug-server dependency. */
+static void env_pad_script_tick(uint64_t frames) {
+    struct Step { unsigned long long frame; unsigned pad; int save; };
+    static std::vector<Step> steps;
+    static size_t next = 0;
+    static bool initialized = false;
+    if (!initialized) {
+        initialized = true;
+        if (const char *path = std::getenv("PSX_PAD_SCRIPT")) {
+            if (FILE *f = std::fopen(path, "r")) {
+                Step step{};
+                while (std::fscanf(f, "%llu %x %d", &step.frame, &step.pad, &step.save) == 3)
+                    steps.push_back(step);
+                std::fclose(f);
+            }
+        }
+    }
+    while (next < steps.size() && frames >= steps[next].frame) {
+        const Step &step = steps[next++];
+        if (step.save >= 0 && step.save < SAVESTATE_SLOTS)
+            savestate_request_save(step.save);
+    }
+    if (next) sio_set_pad_state_slot(0, (uint16_t)steps[next-1].pad);
+}
+
 static void frame_report_tick(uint64_t frames) {
     static int interval_ms = -1;
     static uint64_t first_ticks = 0, last_ticks = 0, last_frames = 0;
@@ -5140,10 +5167,16 @@ static void frame_report_tick(uint64_t frames) {
     const double bp_ms = (double)(rs.backpressure_ns + rs.ring_full_ns - last_bp_ns) * 1e-6;
     last_pt_presents = pts.presents;
     last_bp_ns = rs.backpressure_ns + rs.ring_full_ns;
+    double audio_fill, audio_target, audio_correction;
+    uint64_t audio_underruns, audio_overflows;
+    int audio_legacy, audio_rate;
+    psx_audio_out_stats(&audio_fill, &audio_target, &audio_underruns,
+                       &audio_overflows, &audio_correction, &audio_legacy, &audio_rate);
     std::fprintf(stdout,
                  "psxrecomp: frames=%llu elapsed_ms=%llu fps=%.1f avg_fps=%.1f "
                  "emu_busy=%.1f%% render_busy=%.1f%% dynres=%d load=%.2f gen_fps=%.1f real_fps=%.1f "
-                 "swaps=%llu present_max_ms=%.1f queue_wait_ms=%.1f\n",
+                 "swaps=%llu present_max_ms=%.1f queue_wait_ms=%.1f "
+                 "audio_underruns=%llu audio_fill_ms=%.1f\n",
                  (unsigned long long)frames,
                  (unsigned long long)(now - first_ticks),
                  win_s > 0.0 ? (double)(frames - last_frames) / win_s : 0.0,
@@ -5151,7 +5184,15 @@ static void frame_report_tick(uint64_t frames) {
                  emu_busy, rt_busy, ds.level, g_dynres.rt.last_load,
                  pc_s > 0.0 ? (double)(gen - last_gen) / pc_s : 0.0,
                  pc_s > 0.0 ? (double)(real - last_real) / pc_s : 0.0,
-                 (unsigned long long)pt_swaps, pts.present_max_ns / 1e6, bp_ms);
+                 (unsigned long long)pt_swaps, pts.present_max_ns / 1e6, bp_ms,
+                 (unsigned long long)audio_underruns, audio_fill);
+    uint64_t gpu_ns[5], gpu_count[5];
+    gl_renderer_async_gpu_times(gpu_ns, gpu_count);
+    std::fprintf(stdout, "psxrecomp: gpu_ns=%llu,%llu,%llu,%llu,%llu gpu_n=%llu,%llu,%llu,%llu,%llu\n",
+        (unsigned long long)gpu_ns[0], (unsigned long long)gpu_ns[1],
+        (unsigned long long)gpu_ns[2], (unsigned long long)gpu_ns[3], (unsigned long long)gpu_ns[4],
+        (unsigned long long)gpu_count[0], (unsigned long long)gpu_count[1],
+        (unsigned long long)gpu_count[2], (unsigned long long)gpu_count[3], (unsigned long long)gpu_count[4]);
     std::fflush(stdout);
     last_ticks = now;
     last_frames = frames;
@@ -8046,6 +8087,8 @@ static void env_pad_hold_apply(void) {
         if (i == 1) sio_set_pad_connected(1, 1);
         sio_set_pad_state_slot(i, w[i]);
     }
+    extern uint64_t s_frame_count;
+    env_pad_script_tick(s_frame_count);
 }
 
 static void sample_headless_pad_into_sio(int override) {

@@ -103,6 +103,8 @@ typedef struct GLRenderAsyncStats {
     uint64_t flush_ns, capture_ns, rollback_ns, compose_ns;
 } GLRenderAsyncStats;
 void gl_renderer_pass_async_stats(GLRenderAsyncStats *out);
+/* Cumulative nonblocking async-query receipts: replay/compose/enter/finish/reserve. */
+void gl_renderer_async_gpu_times(uint64_t ns[5], uint64_t counts[5]);
 /* Main-thread discontinuity: cancel queued timed images and all outstanding
  * tokens immediately, without acquiring GL or waiting for workers. */
 void gl_renderer_pass_async_invalidate(void);
