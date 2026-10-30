@@ -347,3 +347,16 @@ max25.479ms,CPU15781.25/1801=8.763ms. Worst117450447 thread CPU cycles,
 0.0004ms pacing,0.0566ms native completion. This is not a20ms pass; the mean
 CPU increase versus candidate3 also precludes claiming a uniform improvement.
 Receipt: analysis/guest-execution-interval-deadline.{json,txt}.
+
+Fifth completed interval candidate REJECTED: exact integer ADDI shortcut passed
+350000 byte-exact PGXP comparisons,13 focused/22 permitted/3 emitter tests,
+480 exact fingerprints and579545 ordered triangle records. A smoke screenshot
+hit a display-disabled menu transition; the fresh rerun passed all40 steps,
+zero dispatch/segment misses, display capture and hook arming/disarming.
+Clean build completed after rerunning an interrupted build/dependency-log recovery.
+Fresh slot11:59.97 harness/60.000 cadence,0starved/packet allocations,
+max25.675ms,CPU15890.625/1802=8.818ms. Runtime grew144147456->147761664bytes;
+transform span130736bytes. This offers no measured max/mean win over candidate4,
+so remove the shortcut and retain the50000 targeted regression cases.
+Candidate4 GTE deadline differential also passes133511 cases at O0.
+Receipt: analysis/guest-execution-interval-integer.{json,txt}.
