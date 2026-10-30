@@ -21575,7 +21575,9 @@ session_reboot:
         std::atexit(game_options_save_now);
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
-        host_sampler_start();   /* this is the emulation thread */
+        const char *host_sampling=std::getenv("PSX_HOST_SAMPLER");
+        if(!host_sampling || *host_sampling!='0')
+            host_sampler_start();   /* this is the emulation thread */
 #else
         (void)debug_port;
 #endif

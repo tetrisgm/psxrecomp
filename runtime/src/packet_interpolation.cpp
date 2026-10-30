@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <cstdlib>
 
 namespace {
 struct Key {
@@ -61,7 +62,15 @@ extern "C" void packet_interpolation_destroy(PacketInterpolation *c) { delete c;
 extern "C" int packet_interpolation_pair(PacketInterpolation *c,
     const PacketInterpolationPacket *a,const PacketInterpolationPacket *b,double max_motion) {
     if(!c) return 0;
-    *c=PacketInterpolation{};
+    // A new pair invalidates values, not reusable scratch capacity. Destroying
+    // all vectors here put multi-megabyte heap churn on every geometry deadline.
+    static const bool reuse=[] {const char *v=std::getenv("PSX_INTERPOLATION_REUSE");return !v || *v!='0';}();
+    if(!reuse) *c=PacketInterpolation{};
+    else {
+        c->a.clear();c->b.clear();c->matches.clear();c->source_previous.clear();
+        c->source_masks.clear();c->source_slots.clear();c->source_owners.clear();
+        c->source_samples.clear();c->source_mode=false;c->stats={};c->ready=false;
+    }
     if(!a || !b || (a->count && !a->primitives) || (b->count && !b->primitives) ||
        !std::isfinite(max_motion)) return 0;
     try {
