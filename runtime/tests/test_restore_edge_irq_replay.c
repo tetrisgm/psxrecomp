@@ -393,8 +393,34 @@ static int recover_hook(CPUState *c, uint32_t *out_pc)
     return 1;
 }
 
+extern unsigned g_test_gpu_vblanks;
+extern uint32_t g_psx_vblank_cycles;
+static unsigned host_gate_calls;
+static uint64_t host_gate_cycle;
+static void host_vblank_gate(void) {
+    /* This must precede both IRQ publication and the GPU's FIELD/mod hooks. */
+    if (i_stat || g_test_gpu_vblanks || psx_cycle_count != host_gate_cycle ||
+        interrupts_get_cycles_since_vblank() != g_psx_vblank_cycles) abort();
+    ++host_gate_calls;
+}
+static void test_host_vblank_gate(void) {
+    interrupts_init();
+    i_stat = 0; g_test_gpu_vblanks = host_gate_calls = 0;
+    host_gate_cycle = psx_cycle_count;
+    interrupts_set_vblank_pacer(host_vblank_gate);
+    interrupts_set_cycles_since_vblank(g_psx_vblank_cycles - 1);
+    interrupts_advance_cycles(1);
+    if (host_gate_calls != 1 || g_test_gpu_vblanks != 1 || !(i_stat & 1) ||
+        psx_cycle_count != host_gate_cycle || interrupts_get_cycles_since_vblank()) abort();
+    interrupts_set_vblank_pacer(NULL);
+    interrupts_advance_cycles(g_psx_vblank_cycles);
+    if (host_gate_calls != 1 || g_test_gpu_vblanks != 2) abort();
+    puts("host VBlank gate ordering and guest-cycle invariance: PASS");
+}
+
 int main(void)
 {
+    test_host_vblank_gate();
     int fail = 0;
     const uint32_t SR_ON = SR_IEC | SR_IM2;
 

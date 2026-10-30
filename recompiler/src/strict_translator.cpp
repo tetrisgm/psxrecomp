@@ -284,7 +284,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
             case 0x10: { // MFHI rd
                 r.supported = true;
                 r.c_code = emit_gpr_write(rd, "cpu->hi")
-                    + "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
+                    + "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall_compiled(cpu);\n#endif";
                 r.comment = fmt::format("mfhi {}", gpr_name(rd));
                 return r;
             }
@@ -300,7 +300,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
             case 0x12: { // MFLO rd
                 r.supported = true;
                 r.c_code = emit_gpr_write(rd, "cpu->lo")
-                    + "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
+                    + "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall_compiled(cpu);\n#endif";
                 r.comment = fmt::format("mflo {}", gpr_name(rd));
                 return r;
             }
@@ -322,7 +322,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
                     "{{ int64_t psx_p = (int64_t)(int32_t)cpu->gpr[{}] * (int64_t)(int32_t)cpu->gpr[{}]; "
                     "cpu->lo = (uint32_t)((uint64_t)psx_p & 0xFFFFFFFFu); "
                     "cpu->hi = (uint32_t)((uint64_t)psx_p >> 32); }}"
-                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_s(cpu->gpr[{}]));\n#endif",
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, psx_mult_latency_s(cpu->gpr[{}]));\n#endif",
                     static_cast<int>(rs), static_cast<int>(rt), static_cast<int>(rs));
                 r.comment = fmt::format("mult {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
@@ -334,7 +334,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
                     "{{ uint64_t psx_p = (uint64_t)cpu->gpr[{}] * (uint64_t)cpu->gpr[{}]; "
                     "cpu->lo = (uint32_t)(psx_p & 0xFFFFFFFFu); "
                     "cpu->hi = (uint32_t)(psx_p >> 32); }}"
-                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_u(cpu->gpr[{}]));\n#endif",
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, psx_mult_latency_u(cpu->gpr[{}]));\n#endif",
                     static_cast<int>(rs), static_cast<int>(rt), static_cast<int>(rs));
                 r.comment = fmt::format("multu {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
@@ -369,7 +369,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
                     "cpu->lo = (uint32_t)psx_q; "
                     "cpu->hi = (uint32_t)psx_r; "
                     "}} }}"
-                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, 37u);\n#endif",
                     static_cast<int>(rs), static_cast<int>(rt));
                 r.comment = fmt::format("div {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
@@ -395,7 +395,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
                     "cpu->lo = psx_q; "
                     "cpu->hi = psx_r; "
                     "}} }}"
-                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, 37u);\n#endif",
                     static_cast<int>(rs), static_cast<int>(rt));
                 r.comment = fmt::format("divu {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
@@ -1348,13 +1348,13 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
         // Faithful GTE: any COP2 register access stalls to the pending command
         // completion deadline (gte_execute arms it). Cost-free unless in flight.
         const std::string gte_stall =
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall_compiled(cpu);\n#endif\n    ";
         // MFC2/CFC2 (GPR-dest reads): stall to the GTE deadline AND hand the stall
         // amount to the next instruction(s) as a load-delay give-back (Beetle
         // MFC2/CFC2: LDAbsorb=gte_ts_done-ts, LDWhich=rt). §1+DO_LDS ran in the
         // function's per-instruction psx_cyc_step (COP2 is non-load).
         const std::string gte_read = fmt::format(
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", static_cast<int>(rt));
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read_compiled(cpu, {});\n#endif\n    ", static_cast<int>(rt));
 
         if (cop_op == 0x00) { // MFC2 — move from COP2 data register
             r.supported = true;
@@ -1434,7 +1434,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
         r.supported = true;
         // Faithful GTE: COP2 reg write stalls to the command deadline.
         const std::string gte_stall =
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall_compiled(cpu);\n#endif\n    ";
         // §1+DO_LDS charged by full_function_emitter's psx_cyc_step (op 0x32 is
         // non-load); the GTE deadline stall by psx_gte_stall; psx_cyc_lwc2_read does
         // the ReadMemory timing (completion +1, no LDWhich arm — dest is a GTE reg).
@@ -1468,7 +1468,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
         r.supported = true;
         // Faithful GTE: COP2 reg read stalls to the command deadline.
         const std::string gte_stall =
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall_compiled(cpu);\n#endif\n    ";
         std::string value = PSXRecompGTERegisters::data_read_needs_helper(rt)
             ? fmt::format("gte_read_data(cpu, {})", static_cast<int>(rt))
             : fmt::format("cpu->gte_data[{}]", static_cast<int>(rt));

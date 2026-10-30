@@ -2436,3 +2436,19 @@ pairs. Boot-wide audit retains two earlier failed pairs (peak unmatched 2),
 also present in the phase4 baseline. No performance acceptance was measured.
 Earlier phase4 unfiltered CTest inadvertently ran the PGXP-off boot test;
 subsequent tests exclude it and all functional smoke runs retain PGXP.
+
+2026-10-29 guest interval time-box disposition: G4 f88e83b7 is merged/pushed
+to r4/main dd5dca60, ancestry verified after fetch. Separate fix/vblank-interval
+is NOT promoted: best/final fresh slot11 30s max24.962ms, cadence60.006Hz,
+0starved/packet allocations, mean thread CPU8.934ms. Exact worst interval has
+115365297 CPU cycles,0.0003ms pacing,0.0606ms native completion; remaining
+bottleneck is active generated execution plus timing/GTE/PGXP/device work,
+not a queue wait. Another4.962ms (~19.9%) reduction plus margin is needed.
+No claim of hardware cache-miss attribution. Mixed-load block timing/GPR
+localization is a larger estimated3-7day implementation/validation project,
+not safe to start within this three-hour time box. Stop and publish tested
+topic + regenerated R4 output, leaving main on G4. Build/focused13/root22/
+emitter3/native/stamps/480 fingerprints/571890 triangles/40-step zero-miss
+smoke pass; broad legacy suite is not claimed green. Full candidate table,
+root-cause limits and numeric receipts: docs/internal/GUEST_EXECUTION.md and
+GUEST_EXECUTION_INTERVAL_RECEIPTS.json.

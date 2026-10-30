@@ -398,6 +398,8 @@ static int should_defer_vblank_for_sio(void) {
  *
  * From PR #102 by Alexandros Mandravillis. */
 static void (*s_midframe_audio_pump)(void);
+static void (*s_vblank_pacer)(void);
+void interrupts_set_vblank_pacer(void (*fn)(void)) { s_vblank_pacer = fn; }
 
 /* First-divergence telemetry for the per-sample SPU scheduler. */
 uint64_t g_spu_sample_deadline_queries;
@@ -483,6 +485,7 @@ void psx_spu_sample_event_service(void) {
 }
 
 static void fire_vblank_edge(void) {
+    if (s_vblank_pacer) s_vblank_pacer();
     /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
      * carries forward. Prevents long-running blocks from rounding multiple
      * VBlanks together. */

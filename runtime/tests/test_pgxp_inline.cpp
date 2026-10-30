@@ -20,6 +20,21 @@ static void value(PGXPValue &v) {
     v.y16 = (int32_t)(v.value & 0xffff0000u) | (next() & 0xffffu);
 }
 int main() {
+    // Independent libm oracle across normal/exceptional IEEE encodings and
+    // all guest shift counts. Compare payloads, signed zero and every bit.
+    const uint64_t edges[] = {0, UINT64_C(0x8000000000000000), 1,
+        UINT64_C(0x000fffffffffffff), UINT64_C(0x0010000000000000),
+        UINT64_C(0x7fefffffffffffff), UINT64_C(0x7ff0000000000000),
+        UINT64_C(0xfff0000000000000), UINT64_C(0x7ff8000012345678),
+        UINT64_C(0x7ff0000012345678)};
+    for (unsigned n=0;n<1000000;++n) {
+        uint64_t bits=n<630 ? edges[(n/63)%10] : (uint64_t(next())<<32)|next();
+        double a;std::memcpy(&a,&bits,sizeof a);
+        int sh=int(n%63)-31;
+        double expected=std::ldexp(a,sh), actual=pgxp_scale_pow2(a,sh);
+        assert(!std::memcmp(&expected,&actual,sizeof actual));
+    }
+    std::puts("PASS: 1000000 power-of-two scales match libm bit for bit");
     pgxp_set_enabled(1); pgxp_set_cpu_mode(1);
     const uint32_t ops[] = {0,2,3,4,6,7,0x10,0x11,0x12,0x13,0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x2a,0x2b};
     const uint32_t imms[] = {8,9,0xa,0xb,0xc,0xd,0xe,0xf,0x10};
@@ -90,6 +105,40 @@ int main() {
             std::printf("STORE mismatch case=%u instr=%08x\n",n,instr);return 3;
         }
     }
+    /* Exact integer addresses, carry boundaries and near misses exercise the
+     * ADDI shortcut. Compare every byte, including dormant destination data. */
+    for (unsigned n=0;n<50000;++n) {
+        pgxp_set_cpu_mode((n % 13) != 0);
+        pgxp_set_preserve_projection((n & 1) != 0);
+        uint32_t rs=1+next()%31, rt=(n&1)?rs:next()%32;
+        value(g_pgxp_cpu.gpr[rs]); value(g_pgxp_cpu.gpr[rt]);
+        uint32_t s1=next();
+        if(n%7==0) s1=(uint16_t)s1;
+        if(n%7==1) s1=(uint32_t)(int32_t)(int16_t)s1;
+        auto &a=g_pgxp_cpu.gpr[rs];
+        a.gen=g_pgxp_cpu.gen; a.value=s1; a.flags=PGXP_F_VXY;
+        a.x16=(int32_t)(s1<<16); a.y16=(int32_t)(s1&0xffff0000u);
+        auto &sc=g_pgxp_cpu.scalar[rs];sc.gen=0;sc.value=s1;sc.v=(int32_t)s1+0.25;
+        switch(n%11) {
+        case 0:sc.gen=g_pgxp_cpu.gen;break;
+        case 1:a.x16|=1;break;
+        case 2:a.flags|=PGXP_F_VZ;break;
+        case 3:a.gen=0;break;
+        case 4:a.flags|=PGXP_F_DX;break;
+        case 5:a.value^=1;break;
+        }
+        uint32_t imm=next()&0xffffu;
+        uint32_t instr=((8u+(n&1))<<26)|(rs<<21)|(rt<<16)|imm;
+        uint32_t result=s1+(uint32_t)(int32_t)(int16_t)imm;
+        if(n%19==0)result^=1;
+        PGXPCompiledState before=g_pgxp_cpu;
+        psx_pgxp_alu(nullptr,instr,result,s1,imm);
+        PGXPCompiledState after=g_pgxp_cpu;
+        g_pgxp_cpu=before;psx_pgxp_alu_inline(nullptr,instr,result,s1,imm);
+        if(std::memcmp(&after,&g_pgxp_cpu,sizeof(after))) {
+            std::printf("ADDI mismatch case=%u instr=%08x source=%08x\n",n,instr,s1);return 4;
+        }
+    }
     /* Journal restoration and explicit diagnostics must remain on the reference path. */
     uint32_t sw=(0x2bu<<26)|(1u<<16),lw=(0x23u<<26)|(2u<<16);
     PGXPValue prior=*pgxp_inline_ptr(0x80100000u);
@@ -104,5 +153,5 @@ int main() {
     assert(pgxp_store_ring(&ring,&cap)==1 && cap);
     pgxp_store_trace_enable(0);psx_pgxp_store_inline(nullptr,sw,0x80100000u,10);
     assert(pgxp_store_ring(&ring,&cap)==1);
-    std::puts("PASS: 300000 PGXP operations match all state bytes; checkpoint/trace semantics pass");
+    std::puts("PASS: 350000 PGXP operations match all state bytes; checkpoint/trace semantics pass");
 }

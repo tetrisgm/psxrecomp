@@ -2663,7 +2663,7 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
      * (serializing back-to-back ops). Any later COP2 register access stalls to
      * it. Single shared site for BOTH backends (compiled + dirty interp both
      * route GTE commands through gte_execute). */
-    if (charge_latency) psx_gte_set(cpu, psx_gte_cmd_latency(cmd));
+    if (charge_latency) psx_gte_set_compiled(cpu, psx_gte_cmd_latency(cmd));
 #endif
 }
 

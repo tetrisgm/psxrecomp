@@ -5,6 +5,7 @@
  * against its own state. docs/THREADED_CONTEXTS.md, "PGXP". */
 
 #include "pgxp.h"
+#include "pgxp_scale.h"
 #include "pgxp_ctx.h"
 #include "gte_ctx.h"
 #include "pgxp_hooks.h"

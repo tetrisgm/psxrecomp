@@ -5543,6 +5543,8 @@ static void handle_host_profile(int id, const char *json)
     const uint64_t seq = host_sampler_seq();
     const uint64_t oldest = seq > HOST_SAMPLER_CAP ? seq - HOST_SAMPLER_CAP : 0;
     int since = json_get_int(json, "since", -1);
+    const int until = json_get_int(json, "until", -1);
+    const uint64_t end = until >= 0 && (uint64_t)until < seq ? (uint64_t)until : seq;
     const int frames = json_get_int(json, "frames", -1);
     /* Optional absolute guest-frame window (inclusive): profile exactly one hitch. */
     const int frame_lo_abs = json_get_int(json, "frame_lo", -1);
@@ -5560,7 +5562,7 @@ static void handle_host_profile(int id, const char *json)
     if (frames > 0) frame_lo = (uint32_t)s_frame_count - (uint32_t)frames;
     int nb = 0;
     uint64_t total = 0, dropped = 0;
-    for (uint64_t i = from; i < seq; i++) {
+    for (uint64_t i = from; i < end; i++) {
         HostSample smp;
         if (!host_sampler_get(i, &smp)) continue;
         if (frames > 0 && (int32_t)(smp.frame - frame_lo) < 0) continue;
@@ -16604,7 +16606,7 @@ static void handle_warm_cd_route(int id, const char *json)
 /* reset=1 starts a new opt-in wall-time window. See main.cpp for semantics. */
 extern void psx_debug_main_cadence_json(int reset, char *out, size_t cap);
 static void handle_main_cadence(int id, const char *json) {
-    char buf[8192];
+    char buf[16384];
     psx_debug_main_cadence_json(json_get_int(json, "reset", 0), buf, sizeof buf);
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf);
 }

@@ -2,6 +2,12 @@
 #define PSX_MEM_INLINE_H
 #include "psx_memory.h"
 #include <string.h>
+/* Keep the ordinary compiled path contiguous; exceptional observers still run. */
+#if defined(__GNUC__) || defined(__clang__)
+#define PSX_MEM_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define PSX_MEM_LIKELY(x) (!!(x))
+#endif
 #if defined(_MSC_VER)
 #define PSX_MEM_INLINE static __forceinline
 #elif defined(__GNUC__) || defined(__clang__)
@@ -59,7 +65,7 @@ PSX_MEM_INLINE uint8_t *psx_mem_pointer(uint32_t addr, uint32_t width) {
 
 PSX_MEM_INLINE uint32_t psx_mem_read_word(CPUState *cpu, uint32_t addr) {
 #if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_DRAW_CTX_BUILD) && !defined(PSX_COSIM)
-    if (!g_ls_mode && !g_ds_recording) {
+    if (PSX_MEM_LIKELY(!g_ls_mode && !g_ds_recording)) {
         uint8_t *p = psx_mem_pointer(addr, 4u);
         if (p) {
             uint32_t value; memcpy(&value, p, sizeof(value));
@@ -74,7 +80,7 @@ PSX_MEM_INLINE uint32_t psx_mem_read_word(CPUState *cpu, uint32_t addr) {
 }
 PSX_MEM_INLINE uint16_t psx_mem_read_half(CPUState *cpu, uint32_t addr) {
 #if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_DRAW_CTX_BUILD) && !defined(PSX_COSIM)
-    if (!g_ls_mode && !g_ds_recording) {
+    if (PSX_MEM_LIKELY(!g_ls_mode && !g_ds_recording)) {
         uint8_t *p = psx_mem_pointer(addr, 2u);
         if (p) {
             uint16_t value; memcpy(&value, p, sizeof(value));
@@ -86,7 +92,7 @@ PSX_MEM_INLINE uint16_t psx_mem_read_half(CPUState *cpu, uint32_t addr) {
 }
 PSX_MEM_INLINE uint8_t psx_mem_read_byte(CPUState *cpu, uint32_t addr) {
 #if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_DRAW_CTX_BUILD) && !defined(PSX_COSIM)
-    if (!g_ls_mode && !g_ds_recording) {
+    if (PSX_MEM_LIKELY(!g_ls_mode && !g_ds_recording)) {
         uint8_t *p = psx_mem_pointer(addr, 1u);
         if (p) {
             uint8_t value; memcpy(&value, p, sizeof(value));

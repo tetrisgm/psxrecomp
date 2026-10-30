@@ -615,6 +615,8 @@ static uint64_t s_fps_last_frame = 0;
 static std::string s_fps_base_title;
 static int      s_fps_telemetry_enabled = -1; /* -1 = unread env */
 static FramePacer s_frame_pacer = { 0 };
+static bool s_pre_vblank_allowed = false, s_pre_vblank_ran = false;
+static uint64_t s_pre_vblank_wait_ticks = 0;
 static int      s_turbo_present_skip = 0;
 static int      s_fmv_skip_present_skip = 0;
 /* Netplay + depth24: present every other vblank (admit still every tick). */
@@ -4655,15 +4657,25 @@ static uint64_t main_cadence_cpu_100ns() {
     return 0;
 #endif
 }
+static uint64_t main_cadence_cpu_cycles() {
+#ifdef _WIN32
+    ULONG64 cycles = 0;
+    return QueryThreadCycleTime(GetCurrentThread(), &cycles) ? cycles : 0;
+#else
+    return 0;
+#endif
+}
 struct MainCadenceStats {
     struct Interval {
         uint64_t number=0, ticks=0, pacer=0, overshoot=0, sleep=0, sleep_overshoot=0, cpu=0;
         std::array<uint64_t,guest_wait_trace::Count> waits{};
+        uint64_t cpu_cycles = 0, profile_since = 0, profile_until = 0;
     };
     std::array<Interval,20> worst{};
     uint64_t pacer=0, overshoot=0;
     bool enabled = false;
     uint64_t previous_cpu=0, cpu=0, packet_allocations=0;
+    uint64_t previous_cpu_cycles=0, cpu_cycles=0, previous_profile_seq=0;
     uint64_t work_ticks=0, max_work_ticks=0;
     uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
@@ -4673,11 +4685,14 @@ static void main_cadence_frame() {
     if (!s_main_cadence.enabled) return;
     const uint64_t now = SDL_GetPerformanceCounter();
     const uint64_t cpu = main_cadence_cpu_100ns();
+    const uint64_t cpu_cycles = main_cadence_cpu_cycles();
+    const uint64_t profile_seq = host_sampler_seq();
     if (s_main_cadence.previous && now >= s_main_cadence.previous) {
         const uint64_t elapsed = now - s_main_cadence.previous;
         ++s_main_cadence.intervals;
         s_main_cadence.ticks += elapsed;
         s_main_cadence.cpu += cpu-s_main_cadence.previous_cpu;
+        s_main_cadence.cpu_cycles += cpu_cycles-s_main_cadence.previous_cpu_cycles;
         // Elapsed guest work is a conservative CPU upper bound: it includes
         // descheduling and completion waits, excludes only the pacer bracket.
         const uint64_t work = elapsed > s_main_cadence.pacer ? elapsed-s_main_cadence.pacer : 0;
@@ -4687,10 +4702,15 @@ static void main_cadence_frame() {
         MainCadenceStats::Interval row{s_main_cadence.intervals,elapsed,
             s_main_cadence.pacer,s_main_cadence.overshoot,s_frame_pacer.sleep_ticks,
             s_frame_pacer.sleep_overshoot_ticks,cpu-s_main_cadence.previous_cpu,guest_wait_trace::ns};
+        row.cpu_cycles = cpu_cycles-s_main_cadence.previous_cpu_cycles;
+        row.profile_since = s_main_cadence.previous_profile_seq;
+        row.profile_until = profile_seq;
         for(auto &entry:s_main_cadence.worst) if(row.ticks>entry.ticks) std::swap(row,entry);
     }
     s_main_cadence.previous = now;
     s_main_cadence.previous_cpu = cpu;
+    s_main_cadence.previous_cpu_cycles = cpu_cycles;
+    s_main_cadence.previous_profile_seq = profile_seq;
     s_main_cadence.pacer=s_main_cadence.overshoot=0;
     guest_wait_trace::ns={};
     s_frame_pacer.sleep_ticks=s_frame_pacer.sleep_overshoot_ticks=0;
@@ -4733,14 +4753,14 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
     append(",\"packet_allocation_events\":%llu",(unsigned long long)(frame_packet_allocation_events()-s.packet_allocations));
     append(",\"work_elapsed_mean_ms\":%.6f,\"work_elapsed_max_ms\":%.6f",
            s.intervals ? s.work_ticks*ms/s.intervals : 0.0, s.max_work_ticks*ms);
-    append(",\"cpu_ms\":%.6f,\"worst\":[",s.cpu/1e4);
+    append(",\"cpu_ms\":%.6f,\"cpu_cycles\":%llu,\"worst\":[",s.cpu/1e4,(unsigned long long)s.cpu_cycles);
     bool first=true;
     for(const auto &r:s.worst) if(r.ticks) {
         append("%s{\"interval\":%llu,\"ms\":%.6f,\"pacer_ms\":%.6f,\"overshoot_ms\":%.6f,"
-               "\"cpu_ms\":%.6f,\"sleep_ms\":%.6f,\"sleep_overshoot_ms\":%.6f,\"publish_ms\":%.6f,\"reserve_ms\":%.6f,\"native_lock_ms\":%.6f,"
-               "\"native_space_ms\":%.6f,\"history_ms\":%.6f,\"native_completion_ms\":%.6f}",
-               first?"":",",(unsigned long long)r.number,r.ticks*ms,r.pacer*ms,r.overshoot*ms,r.cpu/1e4,r.sleep*ms,r.sleep_overshoot*ms,
-               r.waits[0]/1e6,r.waits[1]/1e6,r.waits[2]/1e6,r.waits[3]/1e6,r.waits[4]/1e6,r.waits[5]/1e6);
+               "\"cpu_ms\":%.6f,\"cpu_cycles\":%llu,\"sleep_ms\":%.6f,\"sleep_overshoot_ms\":%.6f,\"publish_ms\":%.6f,\"reserve_ms\":%.6f,\"native_lock_ms\":%.6f,"
+               "\"native_space_ms\":%.6f,\"history_ms\":%.6f,\"native_completion_ms\":%.6f,\"profile_since\":%llu,\"profile_until\":%llu}",
+               first?"":",",(unsigned long long)r.number,r.ticks*ms,r.pacer*ms,r.overshoot*ms,r.cpu/1e4,(unsigned long long)r.cpu_cycles,r.sleep*ms,r.sleep_overshoot*ms,
+               r.waits[0]/1e6,r.waits[1]/1e6,r.waits[2]/1e6,r.waits[3]/1e6,r.waits[4]/1e6,r.waits[5]/1e6,(unsigned long long)r.profile_since,(unsigned long long)r.profile_until);
         first=false;
     }
     append("%s","]");
@@ -4888,8 +4908,9 @@ static void runtime_perf_frame_begin() {
     uint64_t now = SDL_GetPerformanceCounter();
     if (g_runtime_perf.last_frame_exit_counter &&
         now >= g_runtime_perf.last_frame_exit_counter) {
-        g_runtime_perf.guest_work_ticks +=
-            now - g_runtime_perf.last_frame_exit_counter;
+        const uint64_t elapsed = now - g_runtime_perf.last_frame_exit_counter;
+        g_runtime_perf.guest_work_ticks += elapsed > s_pre_vblank_wait_ticks ?
+            elapsed - s_pre_vblank_wait_ticks : 0;
     }
     runtime_perf_bench_tick(now);
 }
@@ -9779,6 +9800,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Render passes (render_pass.c) stay off while presentation is sped up. */
     s_presentation_fast_forward =
         (turbo_loads_active || fmv_skip_active) ? 1 : 0;
+    s_pre_vblank_allowed = !manual_turbo_requested && !turbo_loads_active && !fmv_skip_active;
 
     /* Guest-affecting per-frame services run on EVERY guest frame, before any
      * presentation early-out (headless, TCP turbo, load/FMV present skips).
@@ -9854,7 +9876,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                 host_osd_push(msg, 900);
             }
             turbo_was_down = 1;
-            if (mult >= 2 && g_frame_period_ms > 0.0) {
+            if (mult >= 2 && g_frame_period_ms > 0.0 && !s_pre_vblank_ran) {
                 uint64_t perf_start = runtime_perf_section_begin();
                 frame_pacer_wait(&s_frame_pacer,
                                  g_frame_period_ms / (double)mult);
@@ -9888,7 +9910,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * the divided period; the presentation skip below remains independent
          * so rendering cost does not distort the selected multiplier. */
         if (g_turbo_load_wall_multiplier >= 2 &&
-            g_frame_period_ms > 0.0) {
+            g_frame_period_ms > 0.0 && !s_pre_vblank_ran) {
             uint64_t perf_start = runtime_perf_section_begin();
             frame_pacer_wait(
                 &s_frame_pacer,
@@ -9955,7 +9977,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * resim. */
     if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
         uint64_t perf_start = runtime_perf_section_begin();
-        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
+        if (!s_pre_vblank_ran && !manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
 #ifndef PSX_NO_DEBUG_TOOLS
             s_frame_pacer.trace_waits=s_main_cadence.enabled;
@@ -11383,6 +11405,43 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
         c.down_block_until > now_s ? c.down_block_until - now_s : 0.0, blocked);
 }
 
+
+/* Gate the real guest event before FIELD/LCF, mod hooks and IRQ0. Pacing
+ * inside presentation adds a light quantum's sleep to the next heavy quantum,
+ * bunching event intervals despite a correct long-term rate. Frontend turbo
+ * policy takes effect at the next event; netplay and replay retain their gates.
+ * The callback only waits in host time and never advances guest state. */
+static void sdl_vblank_pace(void) {
+    s_pre_vblank_ran = false;
+    s_pre_vblank_wait_ticks = 0;
+    if (g_headless || !s_pre_vblank_allowed || psx_netplay_active() || psx_selfcheck_resim_active()) return;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (debug_server_turbo_enabled()) return;
+#endif
+    sync_guest_cadence_to_video_standard();
+    if (!present_should_wall_pace()) return;
+    const uint64_t start = SDL_GetPerformanceCounter();
+#ifndef PSX_NO_DEBUG_TOOLS
+    s_frame_pacer.trace_waits = s_main_cadence.enabled;
+    main_cadence_pace(start);
+    const uint64_t deadline = s_frame_pacer.next_deadline;
+#endif
+    frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
+    const uint64_t end = SDL_GetPerformanceCounter();
+    s_pre_vblank_wait_ticks = end - start;
+    s_pre_vblank_ran = true;
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (s_main_cadence.enabled) {
+        s_main_cadence.pacer += s_pre_vblank_wait_ticks;
+        if (deadline > start && end > deadline)
+            s_main_cadence.overshoot += end - deadline;
+    }
+#endif
+    g_frame_report_wait_ticks += s_pre_vblank_wait_ticks;
+    if (g_runtime_perf.enabled) g_runtime_perf.pacer_ticks += s_pre_vblank_wait_ticks;
+    if (g_dynres.active) g_dynres.pacer_ticks += s_pre_vblank_wait_ticks;
+    latency_ring_mark(LAT_PACED);
+}
 
 static void sdl_vblank_present(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -21976,6 +22035,7 @@ session_reboot:
     }
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
+    interrupts_set_vblank_pacer(sdl_vblank_pace);
 
     /* Delay-sync LAN (recomp-net). Menu/lobby UI is later work — CLI/env only.
      * Must start after SDL so local pad capture has devices; before the guest

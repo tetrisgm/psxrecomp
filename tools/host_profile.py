@@ -122,6 +122,10 @@ def main():
         current = query(a.port, command="frame").get("frame", 0)
         seen = set()
         for row in cadence.get("worst", [])[:8]:
+            if "profile_until" in row:
+                result = query(a.port, **dict(kw, since=row["profile_since"], until=row["profile_until"]))
+                neighborhoods.append(("interval %s [%s,%s)" % (row["interval"], row["profile_since"], row["profile_until"]), result))
+                continue
             frame = current - cadence.get("intervals", 0) + row["interval"]
             if any(abs(frame - old) <= 4 for old in seen):
                 continue
@@ -158,7 +162,7 @@ def main():
                 name = table[i][1] if i >= 0 and (size is None or rva < size) else "(outside executable)"
                 heavy[name] = heavy.get(name, 0) + count
         total_heavy = sum(heavy.values()) or 1
-        print("Post-window worst-interval neighborhoods (+/-2 frames):", [frame for frame, _ in neighborhoods])
+        print("Post-window worst intervals (sample bounds when available; otherwise +/-2 frames):", [frame for frame, _ in neighborhoods])
         for name, count in sorted(heavy.items(), key=lambda kv: -kv[1])[:a.top]:
             print("%6d %5.1f%%  %s" % (count, 100.0 * count / total_heavy, name))
 

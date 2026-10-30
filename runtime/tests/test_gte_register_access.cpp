@@ -68,6 +68,14 @@ extern "C" void gte_test_seed_geometry(uint32_t packed, int32_t x16,
 extern "C" void gte_test_execute_reference(CPUState *cpu, uint32_t cmd);
 
 /* gte.cpp runtime dependencies that are irrelevant to register-transfer tests. */
+extern "C" {
+/* Register-transfer fixture uses the existing latency double, no admitted block. */
+uint64_t psx_cycle_count;
+uint32_t g_psx_cyc_batch, g_psx_cyc_block_raw;
+int g_psx_cyc_block_active;
+uint32_t g_psx_gcs_recip_q16 = 65536u;
+}
+
 extern "C" int gpu_ws_present_native_43(void) { return 0; }
 static int g_test_precise_nclip_enabled;
 static int g_test_render_projective;
