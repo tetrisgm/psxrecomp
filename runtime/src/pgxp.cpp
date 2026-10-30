@@ -33,6 +33,7 @@
  */
 
 #include "pgxp.h"
+#include "pgxp_scale.h"
 #include "pgxp_hooks.h"
 #include "cpu_state.h"
 #include "psx_memory.h"

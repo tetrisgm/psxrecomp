@@ -4669,13 +4669,13 @@ struct MainCadenceStats {
     struct Interval {
         uint64_t number=0, ticks=0, pacer=0, overshoot=0, sleep=0, sleep_overshoot=0, cpu=0;
         std::array<uint64_t,guest_wait_trace::Count> waits{};
-        uint64_t cpu_cycles = 0;
+        uint64_t cpu_cycles = 0, profile_since = 0, profile_until = 0;
     };
     std::array<Interval,20> worst{};
     uint64_t pacer=0, overshoot=0;
     bool enabled = false;
     uint64_t previous_cpu=0, cpu=0, packet_allocations=0;
-    uint64_t previous_cpu_cycles=0, cpu_cycles=0;
+    uint64_t previous_cpu_cycles=0, cpu_cycles=0, previous_profile_seq=0;
     uint64_t work_ticks=0, max_work_ticks=0;
     uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
@@ -4686,6 +4686,7 @@ static void main_cadence_frame() {
     const uint64_t now = SDL_GetPerformanceCounter();
     const uint64_t cpu = main_cadence_cpu_100ns();
     const uint64_t cpu_cycles = main_cadence_cpu_cycles();
+    const uint64_t profile_seq = host_sampler_seq();
     if (s_main_cadence.previous && now >= s_main_cadence.previous) {
         const uint64_t elapsed = now - s_main_cadence.previous;
         ++s_main_cadence.intervals;
@@ -4702,11 +4703,14 @@ static void main_cadence_frame() {
             s_main_cadence.pacer,s_main_cadence.overshoot,s_frame_pacer.sleep_ticks,
             s_frame_pacer.sleep_overshoot_ticks,cpu-s_main_cadence.previous_cpu,guest_wait_trace::ns};
         row.cpu_cycles = cpu_cycles-s_main_cadence.previous_cpu_cycles;
+        row.profile_since = s_main_cadence.previous_profile_seq;
+        row.profile_until = profile_seq;
         for(auto &entry:s_main_cadence.worst) if(row.ticks>entry.ticks) std::swap(row,entry);
     }
     s_main_cadence.previous = now;
     s_main_cadence.previous_cpu = cpu;
     s_main_cadence.previous_cpu_cycles = cpu_cycles;
+    s_main_cadence.previous_profile_seq = profile_seq;
     s_main_cadence.pacer=s_main_cadence.overshoot=0;
     guest_wait_trace::ns={};
     s_frame_pacer.sleep_ticks=s_frame_pacer.sleep_overshoot_ticks=0;
@@ -4754,9 +4758,9 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
     for(const auto &r:s.worst) if(r.ticks) {
         append("%s{\"interval\":%llu,\"ms\":%.6f,\"pacer_ms\":%.6f,\"overshoot_ms\":%.6f,"
                "\"cpu_ms\":%.6f,\"cpu_cycles\":%llu,\"sleep_ms\":%.6f,\"sleep_overshoot_ms\":%.6f,\"publish_ms\":%.6f,\"reserve_ms\":%.6f,\"native_lock_ms\":%.6f,"
-               "\"native_space_ms\":%.6f,\"history_ms\":%.6f,\"native_completion_ms\":%.6f}",
+               "\"native_space_ms\":%.6f,\"history_ms\":%.6f,\"native_completion_ms\":%.6f,\"profile_since\":%llu,\"profile_until\":%llu}",
                first?"":",",(unsigned long long)r.number,r.ticks*ms,r.pacer*ms,r.overshoot*ms,r.cpu/1e4,(unsigned long long)r.cpu_cycles,r.sleep*ms,r.sleep_overshoot*ms,
-               r.waits[0]/1e6,r.waits[1]/1e6,r.waits[2]/1e6,r.waits[3]/1e6,r.waits[4]/1e6,r.waits[5]/1e6);
+               r.waits[0]/1e6,r.waits[1]/1e6,r.waits[2]/1e6,r.waits[3]/1e6,r.waits[4]/1e6,r.waits[5]/1e6,(unsigned long long)r.profile_since,(unsigned long long)r.profile_until);
         first=false;
     }
     append("%s","]");

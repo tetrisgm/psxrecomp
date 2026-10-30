@@ -360,3 +360,108 @@ transform span130736bytes. This offers no measured max/mean win over candidate4,
 so remove the shortcut and retain the50000 targeted regression cases.
 Candidate4 GTE deadline differential also passes133511 cases at O0.
 Receipt: analysis/guest-execution-interval-integer.{json,txt}.
+
+
+## 2026-10-29 interval time-box disposition: target not met
+
+G4 is merged and pushed to fork `r4/main` (`dd5dca60`, including topic
+`f88e83b7`); a fresh fetch verified ancestry. The interrupted build was rerun.
+Interval work remains on `fix/vblank-interval`, **not merged into r4/main**.
+The owner allowed approximately three hours from 2026-10-30 02:17 UTC.
+Stop within that bound rather than start a larger compiler rewrite with the
+remaining time. No performance acceptance is claimed.
+
+Final candidate replaces scalar power-of-two scaling with exact binary64
+exponent adjustment only when both input and output are normal. All exceptional
+encodings and exponent boundaries retain libm. One million comparisons against
+`ldexp` match every result bit, including signed zero and NaN payloads. Keep the
+rejected integer-ADDI shortcut removed. Opt-in cadence diagnostics now record
+exact sampler sequence bounds; `host_profile until` is exclusive and the tool
+uses these bounds instead of inferred frame neighborhoods.
+
+Each row is one completed-candidate, fresh slot-11 supervisor run (30 seconds,
+hidden 8K, all features on except FPS; rewind/car on, callers enabled). Every run
+reported zero starved samples and zero packet-allocation events. These are
+observations, not repeated isolated A/B estimates; small deltas can be noise.
+
+| Completed candidate | Harness VBlanks/s | Cadence VBlanks/s | Max interval ms | Mean thread CPU ms/VBlank |
+|---|---:|---:|---:|---:|
+| Pre-edge event pacing | 59.94 | 60.001 | 28.284 | 9.871 |
+| Shared bitwise/code layout | 59.94 | 60.007 | 26.857 | 9.073 |
+| Completed GTE transfers / memory timing | 60.00 | 60.006 | 25.822 | 8.498 |
+| Private GTE and MULT/DIV deadlines | 60.00 | 60.015 | 25.479 | 8.762 |
+| Exact integer ADDI (rejected, removed) | 59.97 | 60.000 | 25.675 | 8.818 |
+| Exact scalar scaling / precise attribution (final) | 59.98 | 60.006 | **24.962** | 8.934 |
+
+Prior G1 measured 37.319 ms and the G4 fields candidate 35.960 ms; the final
+integrated tree also includes the fork's newer surface renderer, so these are
+not isolated before/after comparisons. The final mean did not improve over the
+GTE-transfer candidate. Do not attribute the small maximum reduction to the
+scaling helper alone. Full numeric receipts are committed in
+[GUEST_EXECUTION_INTERVAL_RECEIPTS.json](GUEST_EXECUTION_INTERVAL_RECEIPTS.json).
+
+### Root cause and remaining cost
+
+The first cause was pacing placement: waiting after the guest VBlank edge
+combined a light frame's sleep with the next heavy execution quantum. Waiting
+before the actual scheduler edge, before IRQ/FIELD/hooks, removed that avoidable
+bunching while leaving the cadence probe and guest event order intact.
+
+The remaining maximum is predominantly **active guest-thread execution**.
+The final worst interval is 24.9619 ms with 115,365,297 thread CPU cycles,
+0.0003 ms pacer time, 0.0606 ms native completion, 0.0033 ms publication,
+0.0027 ms reserve, and zero native lock/space/history wait. Eight exact worst
+interval windows contain 132 samples: 48 in generated `func_*` code, with the
+rest spread across GTE, PGXP, cycle/device service, dispatch and packet work.
+No sampled wait/sleep/performance-counter function appears in those windows.
+This small sample set identifies the class of work, not precise per-function
+percentages or a single dominant instruction. `capture_write` is not necessarily
+a debug hook: the SPU implementation writes emulated capture RAM and checks IRQs;
+rewind's same-named serializer also performs required copies.
+
+Windows per-interval `GetThreadTimes` values are quantized (15.625 ms steps in
+these runs); only the whole-window CPU average is useful. Processor-dependent
+`QueryThreadCycleTime` counts corroborate substantial executed work but are not
+a fixed-frequency duration conversion. No hardware cache-miss measurement was
+made, so instruction-cache stalls are a hypothesis, not an established cause.
+
+Structural evidence: the 788-byte / 197-instruction guest transform
+`func_800657B0` links to 130,224 host bytes in the final build. Its emitted source
+still contains 31 timed CPU loads, 34 block-admission sites, 77 resume sites,
+12 composed ALU segments and 167 inline/fallback pipeline-step sites. Those are
+static source counts, not dynamic calls (many helpers are inlined and segment
+fallbacks are conditional). G2 removed much call overhead, but mixed load/GTE
+blocks still perform substantial dynamic pipeline/state work. The full final
+executable is 144,148,480 bytes.
+
+The current gate needs another **4.962 ms**, approximately **19.9%** of the
+heaviest measured interval, plus margin. Removing the measured waits cannot
+supply it. The next plausible generic project is block-local GPR/timing state
+and compile-time composition of mixed-load pipeline effects, with explicit
+materialization at MMIO, cache misses, live GTE deadlines and interrupt edges.
+It must cover both emitters, scaled timing, replay, re-entry and observation
+fallbacks; merely dropping interlocks or precision would be incorrect.
+Engineering estimate: roughly 2-5 days implementation plus 1-2 days differential
+and multi-title validation, with no performance guarantee until measured.
+That work does not fit the remainder of this time box.
+
+### Final verification and delivery
+
+Final native build exited 0. The PowerShell wrapper had reported failure after
+successful links because redirected Ninja warnings affected shell status; the
+explicit native exit-code rerun removed that ambiguity. The build's recovered
+dependency-log warning is recorded in local build receipts, not hidden.
+
+13 focused framework CTests, 22 permitted R4 CTests, three focused emitter
+checks, recorded native-raster oracle fixtures and current OpenBIOS stamp pass.
+The PGXP-off boot fixture remains excluded by owner rule. 350,000 exact PGXP
+state comparisons and one million scale comparisons pass; GTE/deadline proof
+passes 133,511 cases at O0 and O2. Final runtime comparison matches 480 guest
+fingerprints and 571,890 ordered PGXP triangles on 232 complete frames. The
+40-step hidden smoke has zero dispatch/segment misses and passes display-capture
+and debug-hook arming/disarming checks. Broader legacy recompiler source-guard
+failures described above remain outside this task; the full suite is not
+represented as green. OpenBIOS and R4 were regenerated through their tools.
+
+Publish the framework topic and the regenerated R4 topic pin for review, with
+this failed gate explicit. Leave `r4/main` at the accepted G4 integration.

@@ -20,6 +20,21 @@ static void value(PGXPValue &v) {
     v.y16 = (int32_t)(v.value & 0xffff0000u) | (next() & 0xffffu);
 }
 int main() {
+    // Independent libm oracle across normal/exceptional IEEE encodings and
+    // all guest shift counts. Compare payloads, signed zero and every bit.
+    const uint64_t edges[] = {0, UINT64_C(0x8000000000000000), 1,
+        UINT64_C(0x000fffffffffffff), UINT64_C(0x0010000000000000),
+        UINT64_C(0x7fefffffffffffff), UINT64_C(0x7ff0000000000000),
+        UINT64_C(0xfff0000000000000), UINT64_C(0x7ff8000012345678),
+        UINT64_C(0x7ff0000012345678)};
+    for (unsigned n=0;n<1000000;++n) {
+        uint64_t bits=n<630 ? edges[(n/63)%10] : (uint64_t(next())<<32)|next();
+        double a;std::memcpy(&a,&bits,sizeof a);
+        int sh=int(n%63)-31;
+        double expected=std::ldexp(a,sh), actual=pgxp_scale_pow2(a,sh);
+        assert(!std::memcmp(&expected,&actual,sizeof actual));
+    }
+    std::puts("PASS: 1000000 power-of-two scales match libm bit for bit");
     pgxp_set_enabled(1); pgxp_set_cpu_mode(1);
     const uint32_t ops[] = {0,2,3,4,6,7,0x10,0x11,0x12,0x13,0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x2a,0x2b};
     const uint32_t imms[] = {8,9,0xa,0xb,0xc,0xd,0xe,0xf,0x10};

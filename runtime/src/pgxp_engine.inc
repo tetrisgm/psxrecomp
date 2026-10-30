@@ -1060,11 +1060,11 @@ PGXP_S int alu_scalar(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2,
             if (left) {
                 const int64_t exact = (int64_t)(int32_t)s1 * ((int64_t)1 << sh);
                 if (exact != (int64_t)(int32_t)result) return 0;   /* wrapped     */
-                *out = std::ldexp(a, (int)sh);
+                *out = pgxp_scale_pow2(a, (int)sh);
                 return 1;
             }
             if (logical && (int32_t)s1 < 0) return 0;  /* not a division      */
-            *out = std::ldexp(a, -(int)sh);    /* floor(a/2^sh) is the guest  */
+            *out = pgxp_scale_pow2(a, -(int)sh);    /* floor(a/2^sh) is the guest  */
             return 1;
         }
         case 0x20: case 0x21: case 0x22: case 0x23: {  /* ADD(U) / SUB(U)     */
