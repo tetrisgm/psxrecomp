@@ -3042,7 +3042,7 @@ static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
     psx_host_schedule_thread(PsxHostThreadRole::Audio);
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
     int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
-    s_drc.pull(reinterpret_cast<int16_t*>(stream), frames);
+    s_drc.pull(reinterpret_cast<int16_t*>(stream), frames, rt_now_ns());
     /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
      * This callback is the tap's single writer while the bridge is active. */
     audio_trace_pcm(AUDIO_TAP_HOST, reinterpret_cast<const int16_t*>(stream),
@@ -18428,7 +18428,7 @@ int main(int argc, char** argv) {
     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     /* Legacy single deadzone (<0 => keep per-slot / input.ini defaults). */
     int  resolved_deadzone = -1;
-    int  resolved_audio_buffer_ms = 180;
+    int  resolved_audio_buffer_ms = 50;
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
      * lang_menu_options drives the launcher's "Localization" dropdown (empty =>

@@ -18,6 +18,26 @@ class PsxAudioTransport {
     alignas(64) std::atomic<uint64_t> consumed{0};
     int16_t pcm[capacity*2]{};
     rab_bridge bridge{};
+    uint64_t clock_start=0,clock_frames=0;
+    int previous_pull=0;
+    double measured_ratio=1.0;
+    void observe_clock(uint64_t now,int frames) {
+        if(!now)return;
+        if(!clock_start || now<=clock_start || now-clock_start>2000000000ull) {
+            clock_start=now;clock_frames=0;previous_pull=frames;return;
+        }
+        clock_frames+=previous_pull;previous_pull=frames;
+        const double seconds=double(now-clock_start)*1e-9;
+        if(seconds<0.5)return;
+        // Measure the sink clock independently of occupancy. A software
+        // device's callback period need not equal its nominal sample rate.
+        const double ratio=cfg.host_rate*seconds/double(clock_frames);
+        if(ratio>=0.95 && ratio<=1.05) {
+            measured_ratio+=(ratio-measured_ratio)*seconds/(1.0+seconds);
+            bridge.clock_ratio=measured_ratio;
+        }
+        clock_start=now;clock_frames=0;
+    }
     std::atomic<bool> resume_requested{false};
     std::atomic<uint64_t> discard_before{UINT64_MAX};
     std::atomic<uint64_t> pushed{0},pulled{0},underruns{0},overflow{0},input_drops{0};
@@ -25,7 +45,7 @@ class PsxAudioTransport {
 public:
     rab_config cfg{}; /* immutable between init and free */
     int init(const rab_config &config) {
-        cfg=config;
+        cfg=config;clock_start=clock_frames=0;previous_pull=0;measured_ratio=1.0;
         written=0;consumed=0;resume_requested=false;discard_before=UINT64_MAX;
         pushed=0;pulled=0;underruns=0;overflow=0;input_drops=0;
         correction=0;
@@ -50,7 +70,8 @@ public:
         pushed.fetch_add(frames,std::memory_order_relaxed);
         input_drops.fetch_add(uint64_t(frames)-count,std::memory_order_relaxed);
     }
-    void pull(int16_t *out,int frames) {
+    void pull(int16_t *out,int frames,uint64_t now_ns=0) {
+        observe_clock(now_ns,frames);
         uint64_t r=consumed.load(std::memory_order_relaxed);
         uint64_t w=written.load(std::memory_order_acquire);
         /* Read the reset after the producer cursor: a newly published batch

@@ -10,7 +10,8 @@
  * and the historical "fix" was to discard samples (drop/flush/decimate or a
  * nearest-neighbor servo) -- every discard is a click, and continuous micro
  * discard/dup is a sustained crackle. This bridge replaces all of that: the
- * controller nudges the *resample ratio* by <= +/-0.5% to hold the ring near a
+ * measured sink clock supplies the base resample ratio. Queue feedback adds
+ * at most +/-0.5% around that ratio to hold the ring near a
  * target fill, and the band-limited resampler keeps the waveform continuous.
  *
  * Single-file. Define RECOMP_AUDIO_DRC_IMPL in exactly ONE translation unit.
@@ -39,7 +40,7 @@ typedef struct {
     double host_rate;       /* host device sample rate (Hz)                     */
     int    taps;            /* prototype length; 16 min, 32 preferred          */
     int    phases;          /* fractional phases; 256-1024 (512 default)       */
-    double target_ms;       /* steady-state ring fill target (default 180)     */
+    double target_ms;       /* steady-state ring fill target (default 50)      */
     double ring_ms;         /* ring capacity in ms (default 280)               */
     double kp;              /* proportional gain (default 0.02)                */
     double ki_per_s;        /* optional integral gain per second (default 0):
@@ -74,6 +75,7 @@ typedef struct rab_bridge {
     double   out_pos;       /* fractional source-frame read cursor             */
 
     /* controller */
+    double clock_ratio;     /* measured nominal / actual host consumption */
     double cur_step;        /* current source frames consumed per output frame */
     double err_lp;          /* low-passed normalized error                     */
     double corr;            /* current (slew-limited) correction               */
@@ -144,14 +146,8 @@ void rab_config_defaults(rab_config *c) {
     c->host_rate      = 48000.0;
     c->taps           = 32;
     c->phases         = 512;
-    /* Streamed stage transitions can pause PSX audio production for ~140 ms
-     * while guest cadence catches up inside the same reporting window. A
-     * 160 ms target proved just short once: the 1024-frame host callback
-     * crossed the remaining edge and emitted 216 faded frames (4.9 ms).
-     * Keep 180 ms so the measured pause retains more than one callback of
-     * reserve. Sustained slow emulation still drains it and remains visible
-     * in telemetry. A 280 ms ring preserves 100 ms of overflow headroom. */
-    c->target_ms      = 180.0;
+    /* Latency is a queue target, not a reserve for long guest stalls. */
+    c->target_ms      = 50.0;
     c->ring_ms        = 280.0;
     c->kp             = 0.02;
     /* P-only intentionally: the former 0.02/s integral retained a +0.5%
@@ -220,6 +216,7 @@ int rab_init(rab_bridge *b, const rab_config *cfg) {
      * valid history behind it; otherwise the first half-1 outputs can't be
      * computed and the cursor would never advance. */
     b->out_pos  = (double)(b->half - 1);
+    b->clock_ratio = 1.0;
     b->cur_step = cfg->source_rate / cfg->host_rate;
     b->err_lp   = 0.0;
     b->corr     = 0.0;
@@ -280,9 +277,12 @@ static void rab__update_controller(rab_bridge *b, int pull_frames) {
     double dt_ms = (double)pull_frames * 1000.0 / c->host_rate;
     if (dt_ms < 0.1) dt_ms = 0.1;
     if (dt_ms > 100.0) dt_ms = 100.0;
-    double err = (fill_ms - c->target_ms) / c->target_ms;
-    if (fill_ms > c->target_ms - c->deadband_ms &&
-        fill_ms < c->target_ms + c->deadband_ms) {
+    /* The callback observes the queue before consuming a whole block.
+     * Control its midpoint, otherwise block size biases latency downward. */
+    const double midpoint_fill = fill_ms - 0.5 * dt_ms * b->clock_ratio;
+    double err = (midpoint_fill - c->target_ms) / c->target_ms;
+    if (midpoint_fill > c->target_ms - c->deadband_ms &&
+        midpoint_fill < c->target_ms + c->deadband_ms) {
         err = 0.0; /* deadband */
     }
     double alpha = dt_ms / (c->err_lp_ms + dt_ms);
@@ -313,8 +313,8 @@ static void rab__update_controller(rab_bridge *b, int pull_frames) {
     b->corr += d;
 
     /* A high queue (positive error) must be consumed FASTER -> larger step. */
-    b->cur_step = (c->source_rate / c->host_rate) * (1.0 + b->corr);
-    b->stats.last_correction = b->corr;
+    b->cur_step = (c->source_rate / c->host_rate) * b->clock_ratio * (1.0 + b->corr);
+    b->stats.last_correction = b->clock_ratio * (1.0 + b->corr) - 1.0;
 }
 
 void rab_resume_after_sink(rab_bridge *b) {
