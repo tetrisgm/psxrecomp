@@ -7,7 +7,7 @@
 int main() {
     for(double skew : {-0.015,0.0,0.015}) {
         rab_config cfg;rab_config_defaults(&cfg);cfg.source_rate=44100;cfg.host_rate=44100;
-        PsxAudioTransport transport;assert(!transport.init(cfg));
+        PsxAudioTransport transport;assert(!transport.init(cfg,false));
         int16_t in[4096*2]={},out[1024*2];
         double now=1.0,produced=0;uint64_t sent=0;
         double lo=1e9,hi=0,sum=0;unsigned samples=0;
