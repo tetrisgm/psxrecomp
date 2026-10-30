@@ -130,5 +130,21 @@ int main(void) {
   if (psx_cycle_count!=at || g_psx_gcs_frac!=frac || memcmp(&a,&b,sizeof a)) printf("lead=%u raw=%u read=%u scale=%u clock=%llu/%llu frac=%u/%u absorb=%u/%u\n",lead,raw,read,scale,(unsigned long long)psx_cycle_count,(unsigned long long)at,g_psx_gcs_frac,frac,b.ld_absorb,a.ld_absorb);
   CHECK(psx_cycle_count==at && g_psx_gcs_frac==frac && !memcmp(&a,&b,sizeof a));
  }
+ /* Deadline arming and HI/LO completion use the same admitted-window proof. */
+ for(unsigned kind=0;kind<3;kind++)for(unsigned lead=0;lead<=80;lead++)
+ for(unsigned raw=0;raw<=64;raw++)for(unsigned scale=1;scale<=2;scale++) {
+  CPUState a={0},b;a.gte_ts_done=a.muldiv_ts_done=1000+lead;
+  a.read_absorb_which=5;a.read_absorb[5].value=11;b=a;
+  const unsigned latency=7+(raw%37);
+  reset(0,7,0);psx_guest_cycle_scale_set(scale);g_psx_gcs_frac=0;psx_next_service_cycle=UINT64_MAX;
+  psx_cyc_block_begin(512);psx_cyc_charge(raw);
+  if(kind==0)psx_gte_set(&a,latency);else if(kind==1)psx_muldiv_set(&a,latency);else psx_muldiv_stall(&a);
+  psx_cyc_batch_flush();uint64_t at=psx_cycle_count;uint32_t frac=g_psx_gcs_frac;
+  reset(0,7,0);psx_guest_cycle_scale_set(scale);g_psx_gcs_frac=0;psx_next_service_cycle=UINT64_MAX;
+  psx_cyc_block_begin(512);psx_cyc_charge(raw);
+  if(kind==0)psx_gte_set_compiled(&b,latency);else if(kind==1)psx_muldiv_set_compiled(&b,latency);else psx_muldiv_stall_compiled(&b);
+  psx_cyc_batch_flush();
+  CHECK(psx_cycle_count==at && g_psx_gcs_frac==frac && !memcmp(&a,&b,sizeof a));
+ }
  printf("PASS %u production GTE pending-charge/deadline checks\n",checks);return 0;
 }

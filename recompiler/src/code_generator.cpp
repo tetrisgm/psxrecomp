@@ -693,7 +693,7 @@ std::string CodeGenerator::translate_mult(uint32_t instr) {
     uint32_t rt = get_rt(instr);
 
     return fmt::format("{{ int64_t result = (int64_t)(int32_t){} * (int64_t)(int32_t){}; cpu->lo = (uint32_t)result; cpu->hi = (uint32_t)(result >> 32); }}"
-                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_s({}));\n#endif",
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, psx_mult_latency_s({}));\n#endif",
                       reg_name(rs), reg_name(rt), reg_name(rs));
 }
 
@@ -702,7 +702,7 @@ std::string CodeGenerator::translate_multu(uint32_t instr) {
     uint32_t rt = get_rt(instr);
 
     return fmt::format("{{ uint64_t result = (uint64_t){} * (uint64_t){}; cpu->lo = (uint32_t)result; cpu->hi = (uint32_t)(result >> 32); }}"
-                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_u({}));\n#endif",
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, psx_mult_latency_u({}));\n#endif",
                       reg_name(rs), reg_name(rt), reg_name(rs));
 }
 
@@ -713,7 +713,7 @@ std::string CodeGenerator::translate_div(uint32_t instr) {
     // MIPS division: quotient in LO, remainder in HI
     // Handle division by zero (MIPS behavior: result is unpredictable but doesn't trap)
     return fmt::format("if ({} != 0) {{ cpu->lo = (uint32_t)((int32_t){} / (int32_t){}); cpu->hi = (uint32_t)((int32_t){} % (int32_t){}); }} else {{ cpu->lo = ((int32_t){} >= 0) ? 0xFFFFFFFF : 1; cpu->hi = (uint32_t){}; }}"
-                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, 37u);\n#endif",
                       reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs), reg_name(rs));
 }
 
@@ -724,7 +724,7 @@ std::string CodeGenerator::translate_divu(uint32_t instr) {
     // MIPS division: quotient in LO, remainder in HI
     // Handle division by zero (MIPS behavior: result is unpredictable but doesn't trap)
     return fmt::format("if ({} != 0) {{ cpu->lo = {} / {}; cpu->hi = {} % {}; }} else {{ cpu->lo = 0xFFFFFFFF; cpu->hi = {}; }}"
-                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set_compiled(cpu, 37u);\n#endif",
                       reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs));
 }
 
@@ -733,7 +733,7 @@ std::string CodeGenerator::translate_mfhi(uint32_t instr) {
 
     // Stall until the mult/div completion deadline (faithful R3000A) — happens
     // even when rd==$zero (the read still stalls on HW).
-    const char* stall = "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
+    const char* stall = "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall_compiled(cpu);\n#endif";
     if (config_.optimize_zero_reg && rd == 0) {
         return fmt::format("/* nop: write to $zero */{}", stall);
     }
@@ -744,7 +744,7 @@ std::string CodeGenerator::translate_mfhi(uint32_t instr) {
 std::string CodeGenerator::translate_mflo(uint32_t instr) {
     uint32_t rd = get_rd(instr);
 
-    const char* stall = "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
+    const char* stall = "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall_compiled(cpu);\n#endif";
     if (config_.optimize_zero_reg && rd == 0) {
         return fmt::format("/* nop: write to $zero */{}", stall);
     }

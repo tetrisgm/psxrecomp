@@ -336,3 +336,14 @@ thread cycles/15312.5ms CPU gives4.630Mcycles/ms as an aggregate diagnostic;
 not a fixed-frequency guarantee. Remaining maxima are predominantly executing
 guest work rather than waiting on native completion. Target still not met.
 Receipt: analysis/guest-execution-interval-gte.{json,txt}.
+
+Fourth completed interval candidate: keep completed GTE and MULT/DIV deadlines
+private in admitted event-free blocks, retaining original publishing/stall
+behavior elsewhere.133511 GTE/deadline comparisons at O2,13 focused runtime,
+22 permitted R4 and3 emitter tests pass, as do native fixtures, BIOS stamp,
+480 exact fingerprints,576888 ordered PGXP triangles and40-step zero-miss smoke.
+Fresh slot11:60.00 harness/60.015 cadence,0starved/packet allocations,
+max25.479ms,CPU15781.25/1801=8.763ms. Worst117450447 thread CPU cycles,
+0.0004ms pacing,0.0566ms native completion. This is not a20ms pass; the mean
+CPU increase versus candidate3 also precludes claiming a uniform improvement.
+Receipt: analysis/guest-execution-interval-deadline.{json,txt}.

@@ -258,6 +258,35 @@ PSX_MEM_INLINE void psx_gte_read_compiled(CPUState *cpu, uint32_t rt) {
         cpu->ld_which_t = (uint8_t)rt;
     } else psx_gte_read(cpu, rt);
 }
+/* Arming a deadline is also private while the admitted window excludes
+ * events. A later uncompleted access publishes before stalling as usual. */
+PSX_MEM_INLINE void psx_gte_set_compiled(CPUState *cpu, uint32_t latency) {
+    if (psx_gte_completed_in_block(cpu))
+        cpu->gte_ts_done = psx_cycle_count + g_psx_cyc_batch + g_psx_cyc_block_raw + latency;
+    else psx_gte_set(cpu, latency);
+}
+PSX_MEM_INLINE void psx_muldiv_set_compiled(CPUState *cpu, uint32_t latency) {
+#if defined(PSX_ENABLE_BLOCK_CYCLES) && !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
+    if (g_psx_cyc_block_active && !PSX_GCS_ACTIVE()) {
+        cpu->muldiv_ts_done = psx_cycle_count + g_psx_cyc_batch + g_psx_cyc_block_raw + latency;
+        return;
+    }
+#endif
+    psx_muldiv_set(cpu, latency);
+}
+PSX_MEM_INLINE void psx_muldiv_stall_compiled(CPUState *cpu) {
+#if defined(PSX_ENABLE_BLOCK_CYCLES) && !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
+    if (g_psx_cyc_block_active && !PSX_GCS_ACTIVE()) {
+        const uint64_t now = psx_cycle_count + g_psx_cyc_batch + g_psx_cyc_block_raw;
+        if (cpu->muldiv_ts_done <= now) return;
+        if (cpu->muldiv_ts_done == now + 1u) {
+            --cpu->muldiv_ts_done; /* hardware's one-cycle deadline retract */
+            return;
+        }
+    }
+#endif
+    psx_muldiv_stall(cpu);
+}
 /* RAM/ROM timing cannot publish a device event inside an admitted block.
  * Outside that proof retain the original immediate publication semantics. */
 PSX_MEM_INLINE void psx_cyc_memory_charge(uint32_t cycles) {
