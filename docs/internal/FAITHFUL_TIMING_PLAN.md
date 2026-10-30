@@ -2467,3 +2467,11 @@ No guest cycles, inputs, native VRAM, rewind state or SPU production change.
 Tests compare output sample vectors with 25 ms arrival spikes at 33.3 ms
 buffering, test reset/delay bounds, and preserve stamps through rewind.
 Integrated evidence: PRESENT_GUEST_CLOCK.md.
+
+
+2026-10-30: Restage storage pooling retains enhanced allocations across
+sequence gaps, with native ownership reset and lazy attachment clearing.
+Focused GL checks 26+88 pass. Full busy-PC LLE A/B gate fails: A 45.04
+distinct/s, zero starvation; B 42.40 completed presents/s upper bound,
+1743 starved samples and TCP-quit shutdown lifetime crash. No merge of
+this candidate into r4/main. See RESTAGE_GATE.md and receipts.
