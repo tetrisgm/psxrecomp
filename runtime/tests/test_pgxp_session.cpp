@@ -108,6 +108,8 @@ static std::array<uint8_t, 2 * 1024 * 1024> ram;
 extern "C" {
 uint64_t psx_cycle_count,psx_next_service_cycle;
 int psx_in_device_service,g_event_step_conservative,g_ls_replay_active;
+uint32_t g_psx_cyc_block_raw;
+int g_psx_cyc_block_active;
 uint32_t g_psx_cyc_batch,g_psx_cyc_batch_limit;
 void psx_devices_service_to_now(void) { std::abort(); }
 void psx_advance_cycles_slow(uint32_t) { std::abort(); }

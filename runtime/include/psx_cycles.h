@@ -56,6 +56,9 @@ extern int g_ls_replay_active;
  * match the published counter. Guest totals at those barriers are unchanged. */
 extern uint32_t g_psx_cyc_batch;
 extern uint32_t g_psx_cyc_batch_limit;
+/* Unpublished CPU work in a statically bounded, deadline-free block. */
+extern uint32_t g_psx_cyc_block_raw;
+extern int g_psx_cyc_block_active;
 
 /* GCC/Clang-generated functions can defer deadline probes within a basic
  * block. Interrupt/MMIO edges still publish the accumulated guest cycles. */
@@ -141,9 +144,25 @@ static inline uint32_t psx_gcs_scale(uint32_t cpu_cycles) {
 #else
 #define PSX_GCS_ACTIVE() (g_psx_gcs_recip_q16 != 65536u)
 #endif
+#if defined(PSX_ENABLE_BLOCK_CYCLES) && !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
+/* Publication is an observation barrier. The block entry proved that this
+ * entire raw bound fits strictly before the next device event. Scaling is
+ * additive with its carried fraction, so combining these charges is exact.
+ * Never service devices here: the ordinary flush/advance owns that ordering. */
+static inline void psx_cyc_block_publish(void) {
+    g_psx_cyc_block_active = 0;
+    uint32_t raw = g_psx_cyc_block_raw;
+    if (!raw) return;
+    g_psx_cyc_block_raw = 0;
+    g_psx_cyc_batch += PSX_GCS_ACTIVE() ? psx_gcs_scale(raw) : raw;
+}
+#else
+static inline void psx_cyc_block_publish(void) { }
+#endif
 #if !defined(PSX_OVERLAY_DLL_BUILD)
 /* CPU cycles -> guest cycles. Identity at scale 1 (no state touched). */
 static inline uint32_t psx_cpu_cycles(uint32_t cpu_cycles) {
+    psx_cyc_block_publish();
     return PSX_GCS_ACTIVE() ? psx_gcs_scale(cpu_cycles) : cpu_cycles;
 }
 #endif
@@ -162,6 +181,7 @@ void psx_advance_cycles(uint32_t cycles);
  * per-instruction charge. MotK VLC issues millions of advances/s; two add+
  * branch pairs there were pure host tax. */
 static inline void psx_advance_cycles(uint32_t cycles) {
+    psx_cyc_block_publish();
 #if !defined(PSX_COSIM)
     if (g_psx_cyc_batch) {
         uint32_t b = g_psx_cyc_batch;
@@ -214,6 +234,7 @@ static inline void psx_advance_cycles(uint32_t cycles) {
 void psx_cpu_charge(uint32_t cycles);
 #else
 static inline void psx_cpu_charge(uint32_t cycles) {
+    psx_cyc_block_publish();
     if (PSX_GCS_ACTIVE()) {
         cycles = psx_gcs_scale(cycles);
         if (cycles == 0u) return;
@@ -245,6 +266,7 @@ static inline void psx_cyc_local_publish(void) {
 }
 
 static inline void psx_cyc_batch_flush(void) {
+    psx_cyc_block_publish();
 #if !defined(PSX_COSIM)
     psx_cyc_local_publish();
     uint32_t b = g_psx_cyc_batch;

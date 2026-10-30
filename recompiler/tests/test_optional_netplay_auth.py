@@ -16,7 +16,7 @@ def main():
     ap.add_argument("--source", type=Path,
                     default=Path(__file__).resolve().parents[2] / "runtime/src/main.cpp")
     args = ap.parse_args()
-    source = args.source.read_text(encoding="utf-8")
+    source = args.source.read_text(encoding="utf-8-sig")
     lines = source.splitlines()
     source = "\n".join(line for line in lines if not re.match(r"\s*#\s*include\b", line)
                        or "recomp_net/" in line)

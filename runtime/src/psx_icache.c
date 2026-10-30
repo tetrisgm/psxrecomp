@@ -81,7 +81,7 @@ void psx_icache_fetch_miss(CPUState* cpu, uint32_t addr) {
     if (g_psx_icache_tv[idx] == addr) return;        /* HIT: +0, no give-back clear */
 
     /* MISS — clear the pending load give-back (Beetle cpu.cpp:542-543). */
-    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb[cpu->read_absorb_which].value = 0u;
     cpu->read_absorb_which = 0u;
 
     if (psx_fetch_uncached(addr)) { /* KSEG1 / uncached (BIOS ROM): every fetch */

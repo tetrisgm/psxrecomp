@@ -2118,7 +2118,7 @@ static int psx_synth_recurse(volatile int n) {
     int r = psx_synth_recurse(n + 1);
     return r + pad[0];
 }
-void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
+void debug_server_synth_recurse_arm(void) { g_debug_call_hooks = 1; s_synth_recurse_armed = 1; }
 #endif
 
 static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
@@ -2159,6 +2159,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
+    if (!g_debug_call_hooks) return;
     if (s_fmv_quiet) return;
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
@@ -2754,6 +2755,7 @@ static inline void pc_probe_observe(uint32_t block_leader_phys)
  * entries, which is required for a clean, KNOWN-instruction-sequence ruler.
  * Disarmed cost = one volatile load + return (see cyc_watch_observe). */
 int g_debug_cycle_hooks = 0;
+int g_debug_call_hooks = 0;
 void debug_server_cyc_observe_enabled(uint32_t block_leader_phys) {
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)block_leader_phys;
@@ -2844,6 +2846,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     (void)func_addr;
     return;
 #endif
+    if (!g_debug_call_hooks) return;
     if (s_fmv_quiet) return;
     ls_suppress_begin();
     /* cyc_watch: compiled-dispatch path. func_addr is already the physical
@@ -5532,7 +5535,7 @@ static void handle_geom_correction(int id, const char *json)
  * "seq" from one reply as "since" of the next to profile what ran between. */
 static void handle_host_profile(int id, const char *json)
 {
-    enum { MAXB = 4096 };
+    enum { MAXB = 32768 };
     static uint64_t rvas[MAXB];
     static uint32_t counts[MAXB];
     static uint16_t bins[MAXB*2];
@@ -5550,7 +5553,7 @@ static void handle_host_profile(int id, const char *json)
     uint64_t via_callers = 0;
     int top = json_get_int(json, "top", 60);
     if (top < 1) top = 1;
-    if (top > 400) top = 400;
+    if (top > MAXB) top = MAXB;
     uint64_t from = since >= 0 ? (uint64_t)since : oldest;
     if (from < oldest) from = oldest;
     uint32_t frame_lo = 0;
@@ -5567,7 +5570,7 @@ static void handle_host_profile(int id, const char *json)
         if (phase >= 0 && (int)smp.phase != phase) continue;
         total++;
         if (callers && smp.caller) { smp.rva = smp.caller; via_callers++; }
-        /* Open addressing avoids a linear 4096-bin search per sample.
+        /* Open addressing avoids a linear histogram search per sample.
          * This handler runs on the guest: a full-ring query must not create
          * the hitch that the profiler is supposed to diagnose. */
         uint64_t hash=smp.rva;
@@ -5633,8 +5636,8 @@ static void handle_host_profile(int id, const char *json)
         (unsigned long long)total, (unsigned long long)dropped,
         (unsigned long long)via_callers);
     for (int k = 0; k < top; k++) {
-        int best = -1;
-        for (int b = 0; b < nb; b++)
+        int best = top >= nb ? (k < nb ? k : -1) : -1;
+        for (int b = 0; top < nb && b < nb; b++)
             if (counts[b] && (best < 0 || counts[b] > counts[best])) best = b;
         if (best < 0) break;
         n += (size_t)snprintf(buf + n, cap - n, "%s[\"0x%llX\",%u]", k ? "," : "",
@@ -5646,7 +5649,7 @@ static void handle_host_profile(int id, const char *json)
         n += (size_t)snprintf(buf + n, cap - n, "%s[\"%s\",%llu]", m ? "," : "", modnames[m],
                               (unsigned long long)modcount[m]);
     snprintf(buf + n, cap - n, "]}");
-    send_fmt("%s", buf);
+    debug_server_send_line(buf);
     free(buf);
 }
 
@@ -5858,6 +5861,8 @@ static void handle_pgxp_tri_ring(int id, const char *json)
  * shadow afterwards (flags, 16.16 halves). */
 static void handle_pgxp_store_ring(int id, const char *json)
 {
+    int enabled = json_get_int(json, "enabled", -1);
+    if (enabled >= 0) pgxp_store_trace_enable(enabled);
     const PGXPStoreRecord *ring; uint32_t cap;
     const uint64_t total = pgxp_store_ring(&ring, &cap);
     if (!cap) { send_err(id, "pgxp store ring not allocated (engine never armed)"); return; }
@@ -17029,8 +17034,9 @@ static void process_command(const char *line)
         g_debug_write_hooks=(g_debug_write_hooks & 2u) |
             (json_get_int(line,"writes",0)?1u:0u);
         g_debug_cycle_hooks=json_get_int(line,"cycles",0)!=0;
-        send_fmt("{\"id\":%d,\"ok\":true,\"writes\":%u,\"cycles\":%d}",
-            id,g_debug_write_hooks,g_debug_cycle_hooks);
+        g_debug_call_hooks=json_get_int(line,"calls",0)!=0;
+        send_fmt("{\"id\":%d,\"ok\":true,\"writes\":%u,\"cycles\":%d,\"calls\":%d}",
+            id,g_debug_write_hooks,g_debug_cycle_hooks,g_debug_call_hooks);
         return;
     }
     if (!strncmp(cmd,"wtrace",6) || !strncmp(cmd,"card_trace",10) ||
@@ -17038,6 +17044,12 @@ static void process_command(const char *line)
     if (!strncmp(cmd,"cyc_",4) || !strncmp(cmd,"pc_probe",8) ||
         !strncmp(cmd,"lockstep",8) || !strncmp(cmd,"guest_cycle",11) || !strncmp(cmd,"ls_",3) || !strcmp(cmd,"gcp_ring")) g_debug_cycle_hooks=1;
 
+
+    if (!strcmp(cmd,"fn_filter") || !strcmp(cmd,"fn_clear") ||
+        !strcmp(cmd,"fntrace_arm") || !strcmp(cmd,"fntrace_clear") ||
+        !strcmp(cmd,"sreg_trace_clear") || !strcmp(cmd,"card_mgr_clear") ||
+        !strcmp(cmd,"call_focus_reset") || !strcmp(cmd,"cyc_watch") ||
+        !strcmp(cmd,"event_hook") || !strcmp(cmd,"synth_recurse")) g_debug_call_hooks=1;
 
     for (const CmdEntry *e = s_commands; e->name; e++) {
         if (strcmp(cmd, e->name) == 0) {
@@ -17359,6 +17371,7 @@ void debug_server_init(int port)
     s_wtrace_trans_range_count = 0;
 
     fntrace_arm_from_env("PSX_FNTRACE_ARM");
+    if (fntrace_arm_count()) g_debug_call_hooks=1;
 
     /* Function entry/exit ring buffers (32 MB each, 64 MB total). */
     if (!s_fn_entry) s_fn_entry = (FnEntryEntry *)calloc(FN_TRACE_CAP, sizeof(FnEntryEntry));

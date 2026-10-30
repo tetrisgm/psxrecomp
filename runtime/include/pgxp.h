@@ -241,7 +241,7 @@ enum {
  *               unknown (immediate GP0 writes) — skips the dataflow tier.
  *   packet_word the actual word (validation key).
  *   int_x/int_y the natively parsed 11-bit positions (pre-draw-offset).
- * On DATAFLOW/FALLBACK, *x16/*y16 hold the sub-pixel position (16.16, same
+ * On DATAFLOW/FALLBACK, *x16 and *y16 hold the sub-pixel position (16.16, same
  * coordinate space as the packet halves); *sz is the projected depth or 0.
  * Safeguards applied here: the integer part must match the native parse
  * (truncation agreement; a bounded window under preserve-projection) and the
@@ -476,6 +476,7 @@ typedef struct PGXPStoreRecord {
     uint16_t dst_flags;     /* destination word shadow flags afterwards     */
     int32_t  dst_x16, dst_y16;
 } PGXPStoreRecord;
+void pgxp_store_trace_enable(int enabled);
 uint64_t pgxp_store_ring(const PGXPStoreRecord **ring, uint32_t *cap);
 /* The host's store-PC breadcrumb and frame counter, for the rings above. */
 void pgxp_set_trace_sources(const uint32_t *store_pc, const uint64_t *frame);

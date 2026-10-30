@@ -2123,15 +2123,17 @@ std::string CodeGenerator::translate_basic_block(
     // disagree. Stage 1 cost is identity (1/insn) => this equals
     // instruction_count(+1 outside delay) exactly => byte-identical regen; Stage 2
     // edits ONLY psx_instr_base_cycles and both backends update together.
-    uint32_t block_exec_cycles = 0;
+    uint32_t block_exec_cycles = 0, block_raw_bound = 0;
     for (uint32_t a = block.start_addr; a <= block.end_addr; a += 4) {
         auto w = exe_.read_word(a);
         if (!w.has_value()) break;
         block_exec_cycles += psx_instr_base_cycles(*w);
+        block_raw_bound += PSXStaticTiming::bound(*w);
     }
     if (exit_delay_slot_outside) {
         auto dw = exe_.read_word(block.end_addr + 4u);  // the delay-slot clone
-        if (dw.has_value()) block_exec_cycles += psx_instr_base_cycles(*dw);
+        if (dw.has_value()) { block_exec_cycles += psx_instr_base_cycles(*dw);
+            block_raw_bound += PSXStaticTiming::bound(*dw); }
     }
 
     {
@@ -2158,6 +2160,8 @@ std::string CodeGenerator::translate_basic_block(
     }
 
     const bool cycle_per_insn = codegen_cycle_per_insn();
+    if (cycle_per_insn && PSXStaticTiming::enabled())
+        ss << fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_cyc_block_begin({}u);\n#endif\n", block_raw_bound);
     // Per-instruction R3000A load-delay interlock (cycle_per_insn mode): §1 base +
     // GPR_DEPRES + DO_LDS, emitted BEFORE the instruction body so §1 precedes any
     // muldiv/GTE deadline stall the body applies (Beetle order). CPU loads (op
@@ -2195,6 +2199,19 @@ std::string CodeGenerator::translate_basic_block(
               extra_labels_.count(insn_addr))) return;
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
         ss << indent << fmt::format("psx_icache_fetch_compiled(cpu, 0x{:08X}u);\n", pc);
+        if (cycle_per_insn && PSXStaticTiming::enabled()) {
+            uint32_t remaining = 0;
+            for (uint32_t a = insn_addr; a <= block.end_addr; a += 4) {
+                auto word = exe_.read_word(a);
+                if (!word) break;
+                remaining += PSXStaticTiming::bound(*word);
+            }
+            if (exit_delay_slot_outside) {
+                auto word = exe_.read_word(block.end_addr + 4u);
+                if (word) remaining += PSXStaticTiming::bound(*word);
+            }
+            ss << indent << fmt::format("psx_cyc_block_resume({}u);\n", remaining);
+        }
         ss << "#endif\n";
     };
     auto emit_cosim_instr = [&](uint32_t insn_addr, const std::string& indent) {
@@ -2325,7 +2342,7 @@ std::string CodeGenerator::translate_basic_block(
         if (!is_cf && cycle_per_insn && PSXStaticTiming::enabled() &&
             !delayed_load_active && !psx_fetch_uncached(runtime_pc(addr))) {
             std::vector<uint32_t> words;
-            std::vector<std::string> bodies, precise;
+            std::vector<std::string> precise;
             for (uint32_t a = addr; a <= block.end_addr && words.size() < 4; a += 4) {
                 if ((runtime_pc(a) & ~15u) != (runtime_pc(addr) & ~15u) ||
                     (a != addr && extra_labels_.count(a))) break;
@@ -2334,7 +2351,6 @@ std::string CodeGenerator::translate_basic_block(
                 std::string body = translate_instruction(a, *w);
                 if (body.find("psx_mod_") != std::string::npos) break;
                 words.push_back(*w);
-                bodies.push_back(body);
                 precise.push_back(fmt::format(
                     "    psx_cyc_step(cpu, 0x{:X}u);\n{}\n"
                     "#ifdef PSX_COSIM\n    cosim_instr(0x{:08X}u);\n#endif\n",
@@ -2342,7 +2358,7 @@ std::string CodeGenerator::translate_basic_block(
             }
             if (words.size() >= 2) {
                 emit_pre_icache(addr, config_.indent);
-                ss << PSXStaticTiming::emit(words, bodies, precise);
+                ss << PSXStaticTiming::emit(words, precise);
                 addr += static_cast<uint32_t>(words.size()) * 4u;
                 continue;
             }

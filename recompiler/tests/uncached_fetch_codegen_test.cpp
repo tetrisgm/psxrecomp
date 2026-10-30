@@ -83,7 +83,7 @@ std::string generate_at(uint32_t segment) {
 }
 
 std::vector<uint32_t> fetch_tags(const std::string& code) {
-    static const std::string needle = "psx_icache_fetch(cpu, 0x";
+    static const std::string needle = "psx_icache_fetch_compiled(cpu, 0x";
     std::vector<uint32_t> tags;
     for (size_t pos = code.find(needle); pos != std::string::npos;
          pos = code.find(needle, pos + 1)) {

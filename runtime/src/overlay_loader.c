@@ -4692,7 +4692,12 @@ static int shadow_cpu_diff(const CPUState *native, const CPUState *interp,
     SHCMP_ARRAY(SHDIFF_GTE_CTRL, gte_ctrl, 32);
     SHCMP_SCALAR(SHDIFF_MULDIV_TS, muldiv_ts_done);
     SHCMP_SCALAR(SHDIFF_GTE_TS, gte_ts_done);
-    SHCMP_ARRAY(SHDIFF_READ_ABSORB, read_absorb, 33);
+    for (int i = 0; i < 33; ++i) {
+        if (native->read_absorb[i].value != interp->read_absorb[i].value) {
+            *index = i; *nv = native->read_absorb[i].value;
+            *iv = interp->read_absorb[i].value; return SHDIFF_READ_ABSORB;
+        }
+    }
     SHCMP_SCALAR(SHDIFF_READ_WHICH, read_absorb_which);
     SHCMP_SCALAR(SHDIFF_READ_FUDGE, read_fudge);
     SHCMP_SCALAR(SHDIFF_LD_WHICH, ld_which_t);

@@ -151,8 +151,20 @@ void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState *cpu);
  * generated function. Release (PSX_NO_DEBUG_TOOLS): inlined in cpu_state.h
  * (stamp g_psx_last_fn_entry). Debug builds use the out-of-line ring path. */
 extern volatile uint32_t g_psx_last_fn_entry;
+extern int g_debug_call_hooks;
 #ifndef PSX_NO_DEBUG_TOOLS
 void debug_server_log_call_entry(uint32_t func_addr);
+#if !defined(PSX_DEBUG_HOTPATH_IMPLEMENTATION) && !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_STACK_GUARD)
+/* The function stamp is consumed by PGXP provenance even without diagnostics.
+ * Replay must retain its original no-stamp behavior. Everything else stays
+ * behind an opt-in gate, including historical register/ring bookkeeping. */
+static inline void debug_server_log_call_entry_compiled(uint32_t func_addr) {
+    if (g_debug_call_hooks || g_ls_replay_active)
+        (debug_server_log_call_entry)(func_addr);
+    else g_psx_last_fn_entry = func_addr;
+}
+#define debug_server_log_call_entry(addr) debug_server_log_call_entry_compiled(addr)
+#endif
 #endif
 void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);
 /* Addressable stub for overlay CPS callbacks (always out-of-line). */

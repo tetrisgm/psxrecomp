@@ -94,7 +94,7 @@ int main(void) {
   CHECK(cpu.muldiv_ts_done==deadline && psx_cycle_count==1000+at_set);
   CHECK(g_psx_cyc_batch==0 && local==0);
   pend(mode,elapsed);
-  cpu.read_absorb_which=5;cpu.read_absorb[5]=(uint8_t)give;
+  cpu.read_absorb_which=5;cpu.read_absorb[5].value=(uint8_t)give;
   psx_muldiv_stall(&cpu);
   const uint64_t now=1000+at_set+elapsed;
   uint64_t want=now,want_done=deadline;unsigned want_give=give;
@@ -102,7 +102,7 @@ int main(void) {
   else if(deadline>now){unsigned stall=(unsigned)(deadline-now);
    want=deadline;want_give=give>stall?give-stall:0;}
   CHECK(psx_cycle_count==want && cpu.muldiv_ts_done==want_done);
-  CHECK(cpu.read_absorb[5]==want_give);
+  CHECK(cpu.read_absorb[5].value==want_give);
   CHECK(g_psx_cyc_batch==0 && local==0);
  }
  printf("PASS %u production mult/div pending-charge/deadline checks\n",checks);return 0;

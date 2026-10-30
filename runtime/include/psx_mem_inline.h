@@ -12,6 +12,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+#if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_DRAW_CTX_BUILD) && !defined(PSX_COSIM)
 extern uint8_t *g_psx_ram, *g_psx_scratchpad, *g_psx_bios_rom;
 extern int g_ls_mode, g_ram_read_watch_active;
 extern volatile int g_ds_recording;
@@ -30,7 +31,7 @@ extern uint32_t g_psx_text_modified_bitmap[], g_psx_overlay_watch_bitmap[];
 extern uint32_t g_dirty_ram_exec_page_bitmap[];
 extern void (*g_overlay_flush_pending_cycles)(void);
 extern uint32_t g_psx_dirty_ram_bitmap[], g_dirty_ram_code_gen, g_psx_memory_word_probe;
-void psx_memory_store_observers(uint32_t addr, uint32_t phys, const uint8_t *p, uint32_t value, uint32_t width);
+void psx_memory_store_observers(uint32_t phys, const uint8_t *p, uint32_t value, uint32_t width);
 void psx_memory_kernel_write(uint32_t phys);
 void psx_memory_code_write(uint32_t phys, uint32_t width);
 void debug_server_trace_write_check(uint32_t phys, uint32_t old, uint32_t value, uint8_t width);
@@ -53,6 +54,8 @@ PSX_MEM_INLINE uint8_t *psx_mem_pointer(uint32_t addr, uint32_t width) {
         return g_psx_bios_rom + (phys - 0x1FC00000u);
     return NULL;
 }
+
+#endif
 
 PSX_MEM_INLINE uint32_t psx_mem_read_word(CPUState *cpu, uint32_t addr) {
 #if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_DRAW_CTX_BUILD) && !defined(PSX_COSIM)
@@ -113,15 +116,14 @@ PSX_MEM_INLINE int psx_mem_store_fast(CPUState *cpu, uint32_t addr,
     if (!p) return 0;
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
     ++g_guest_store_count;
-    if (phys >= 0x1FC00000u && phys < 0x1FC80000u) {
-        if (g_psx_track_last_store) {
+    if (g_psx_track_last_store) {
+        if (width == 4u) {
             g_guest_last_store_addr = addr; g_guest_last_store_val = value;
-        }
-        return 1; /* ROM */
+        } else g_guest_last_store_addr = 0xffffffffu;
     }
-    if (g_psx_track_last_store || g_debug_write_hooks ||
-        g_parity_trace_armed || g_card_data_write_armed)
-        psx_memory_store_observers(addr, phys, p, value, width);
+    if (phys >= 0x1FC00000u && phys < 0x1FC80000u) return 1; /* ROM */
+    if (g_debug_write_hooks || g_parity_trace_armed || g_card_data_write_armed)
+        psx_memory_store_observers(phys, p, value, width);
     if (phys < PSX_MAIN_RAM_WINDOW_BYTES) {
         uint32_t page = phys >> 12, bit = 1u << (page & 31u);
         if (phys < 0x10000u) {

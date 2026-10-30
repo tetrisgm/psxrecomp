@@ -25,19 +25,19 @@ static int run(void (*fetch)(CPUState *, uint32_t)) {
     g_psx_icache_active = 1;
     test_cycles = 0;
     cpu.read_absorb_which = 1;
-    cpu.read_absorb[0] = 77u;
-    cpu.read_absorb[1] = 99u;
+    cpu.read_absorb[0].value = 77u;
+    cpu.read_absorb[1].value = 99u;
     fetch(&cpu, 0x80010000u);
     if (!expect(test_cycles == 7u, "word-0 cold refill cost")) return 1;
-    if (!expect(cpu.read_absorb_which == 0u && cpu.read_absorb[1] == 0u &&
-                cpu.read_absorb[0] == 77u,
+    if (!expect(cpu.read_absorb_which == 0u && cpu.read_absorb[1].value == 0u &&
+                cpu.read_absorb[0].value == 77u,
                 "true miss clears only the selected load give-back")) return 1;
     cpu.read_absorb_which = 1;
-    cpu.read_absorb[1] = 55u;
+    cpu.read_absorb[1].value = 55u;
     fetch(&cpu, 0x80010000u);
     fetch(&cpu, 0x80010004u);
     if (!expect(test_cycles == 7u, "steady tag hits are cycle-free")) return 1;
-    if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1] == 55u,
+    if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1].value == 55u,
                 "tag hits preserve load give-back")) return 1;
 
     psx_icache_reset();
@@ -77,18 +77,18 @@ static int run(void (*fetch)(CPUState *, uint32_t)) {
     test_cycles = 0;
     g_ls_replay_active = 1;
     cpu.read_absorb_which = 1;
-    cpu.read_absorb[1] = 44u;
+    cpu.read_absorb[1].value = 44u;
     fetch(&cpu, 0x80010000u);
     g_ls_replay_active = 0;
     if (!expect(test_cycles == 0u, "lockstep replay does not mutate cache")) return 1;
     if (!expect(g_psx_icache_tv[0] == 1u, "replay preserved cold tag")) return 1;
-    if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1] == 44u,
+    if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1].value == 44u,
                 "replay preserves load give-back")) return 1;
 
     g_psx_icache_active = 0;
     fetch(&cpu, 0x80010000u);
     if (!expect(test_cycles == 0u, "disabled cache model is free")) return 1;
-    if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1] == 44u,
+    if (!expect(cpu.read_absorb_which == 1u && cpu.read_absorb[1].value == 44u,
                 "disabled cache preserves load give-back")) return 1;
 
     puts("PASS: interpreter I-cache hit path preserves miss/refill semantics");

@@ -58,6 +58,8 @@ int      g_exec_phase = 0;
 int      g_idle_skip_enabled = 0;
 int      g_ls_replay_active = 0;
 int      g_ls_suppress_record = 0;
+uint32_t g_psx_cyc_block_raw;
+int g_psx_cyc_block_active;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 int      g_psx_cyc_bb_defer = 0;

@@ -73,10 +73,21 @@ typedef struct PGXPHooks {
     void (*cop2)  (struct CPUState *cpu, uint32_t instr, uint32_t value, uint32_t addr);
 } PGXPHooks;
 
+#if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_DRAW_CTX_BUILD) && !defined(PSX_PGXP_PRECISE_HOOKS)
+#include "pgxp_inline.h"
+#define PGXP_COMPILED_LOAD psx_pgxp_load_inline
+#define PGXP_COMPILED_STORE psx_pgxp_store_inline
+#define PGXP_COMPILED_ALU psx_pgxp_alu_inline
+#else
+#define PGXP_COMPILED_LOAD psx_pgxp_load
+#define PGXP_COMPILED_STORE psx_pgxp_store
+#define PGXP_COMPILED_ALU psx_pgxp_alu
+#endif
+
 #if defined(PSX_PGXP) && PSX_PGXP
-#define PGXP_LOAD(instr, addr, val)              psx_pgxp_load(cpu, (instr), (addr), (val))
-#define PGXP_STORE(instr, addr, val)             psx_pgxp_store(cpu, (instr), (addr), (val))
-#define PGXP_ALU(instr, res, s1, s2)             psx_pgxp_alu(cpu, (instr), (res), (s1), (s2))
+#define PGXP_LOAD(instr, addr, val)              PGXP_COMPILED_LOAD(cpu, (instr), (addr), (val))
+#define PGXP_STORE(instr, addr, val)             PGXP_COMPILED_STORE(cpu, (instr), (addr), (val))
+#define PGXP_ALU(instr, res, s1, s2)             PGXP_COMPILED_ALU(cpu, (instr), (res), (s1), (s2))
 #define PGXP_MULDIV(instr, hi, lo, s1, s2)       psx_pgxp_muldiv(cpu, (instr), (hi), (lo), (s1), (s2))
 #define PGXP_COP2(instr, val, addr)              psx_pgxp_cop2(cpu, (instr), (val), (addr))
 #else

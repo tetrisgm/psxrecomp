@@ -48,6 +48,12 @@ set(_files
     recompiler/src/mips_decoder.cpp
     recompiler/src/bios_slice_walker.cpp
     recompiler/src/basic_block.cpp
+    runtime/include/pgxp_hooks.h
+    runtime/include/pgxp_cpu_state.h
+    runtime/include/pgxp_inline.h
+    runtime/include/debug_server.h
+    runtime/include/psx_mem_inline.h
+    runtime/include/cpu_state.h
     runtime/include/psx_cyc.h
     runtime/include/psx_instr_cost.h)
 set(_paths)

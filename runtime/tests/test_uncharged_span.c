@@ -76,6 +76,7 @@ int main(void) {
 
     psx_cycles_resync_after_restore(NULL);
     psx_advance_cycles(12345);
+    g_psx_cyc_block_raw = 19; g_psx_cyc_block_active = 1;
     g_psx_cyc_batch = 40;
     g_psx_cyc_local_acc = &local;
     cyc0 = psx_cycle_count;
@@ -89,7 +90,8 @@ int main(void) {
           "time frozen, but this is not a render pass (stores stay live)");
     CHECK(!psx_cycle_uncharged_begin(&pass, 0), "spans do not nest");
     CHECK(!psx_cycle_freeze_begin(&pass, 0, NULL), "no render pass inside a span");
-    CHECK(g_psx_cyc_batch == 0 && g_psx_cyc_local_acc == NULL,
+    CHECK(!g_psx_cyc_block_raw && !g_psx_cyc_block_active &&
+          g_psx_cyc_batch == 0 && g_psx_cyc_local_acc == NULL,
           "the caller's pending charges are parked");
     for (int i = 0; i < 1000; i++) psx_advance_cycles(1000);
     psx_advance_cycles_slow(5000);
@@ -107,8 +109,10 @@ int main(void) {
     CHECK(g_psx_guest_time_frozen == 0, "time is live again");
     CHECK(psx_cycle_count == cyc0 && psx_next_service_cycle == next0,
           "clock and service deadline restored exactly: zero guest time");
-    CHECK(g_psx_cyc_batch == 40 && g_psx_cyc_local_acc == &local && local == 7,
+    CHECK(g_psx_cyc_block_raw == 19 && g_psx_cyc_block_active == 1 &&
+          g_psx_cyc_batch == 40 && g_psx_cyc_local_acc == &local && local == 7,
           "the caller's pending charges come back untouched");
+    g_psx_cyc_block_raw = 0; g_psx_cyc_block_active = 0;
     g_psx_cyc_batch = 0;
     g_psx_cyc_local_acc = NULL;
 

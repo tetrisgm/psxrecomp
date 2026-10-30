@@ -626,14 +626,47 @@ if(BUILD_TESTING)
     add_test(NAME mod_immediate_codegen_test
              COMMAND mod_immediate_codegen_test)
 
+    # These closed fixtures include complete production translation units.
+    # COFF Clang LTO retains unused external definitions and their dependencies;
+    # internalize the test object before optimization, preserving main only.
+    function(psx_isolated_fixture_source output name source)
+        if(MINGW AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+            find_package(Python3 REQUIRED COMPONENTS Interpreter)
+            set(_object "${CMAKE_CURRENT_BINARY_DIR}/${name}_isolated.obj")
+            set(_depfile "${_object}.d")
+            set(_compiler "${CMAKE_CURRENT_SOURCE_DIR}/../tools/compile_isolated_fixture.py")
+            add_custom_command(OUTPUT "${_object}"
+                COMMAND ${Python3_EXECUTABLE} "${_compiler}"
+                    --cc "${CMAKE_C_COMPILER}"
+                    --source "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+                    --output "${_object}" --depfile "${_depfile}"
+                    --include "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include"
+                    --include "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/src"
+                DEPENDS "${source}" "${_compiler}"
+                DEPFILE "${_depfile}" VERBATIM)
+            set_source_files_properties("${_object}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+            set(${output} "${_object}" PARENT_SCOPE)
+        else()
+            set(${output} "${source}" PARENT_SCOPE)
+        endif()
+    endfunction()
+    if(MINGW AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME isolated_fixture_compiler_test
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/../tools/compile_isolated_fixture.py"
+                --cc "${CMAKE_C_COMPILER}" --self-test)
+    endif()
+
     # The same explicit cull kinds in the dirty-RAM interpreter: gpu.c's
     # sorted, capped site store and real interpreted bgez/bltz/branch-keep/
     # clip-edge instructions at margin 0 and at a forced margin. The test
     # #includes gpu.c and dirty_ram_interp.c; link-time dead-code removal
     # keeps the stub set small (dead_strip is Apple ld's --gc-sections).
     if(NOT MSVC)
+        psx_isolated_fixture_source(_ws_cull_edge_interp_source ws_cull_edge_interp
+            ../runtime/tests/test_ws_cull_edge_interp.c)
         add_executable(ws_cull_edge_interp_test
-            ../runtime/tests/test_ws_cull_edge_interp.c
+            ${_ws_cull_edge_interp_source}
             ../runtime/src/ws_aspect_cone_math.c)
         target_include_directories(ws_cull_edge_interp_test PRIVATE
             ../runtime/include
@@ -659,8 +692,10 @@ if(BUILD_TESTING)
     # store and switch and real interpreted guard instructions. The test
     # #includes draw_distance.c and dirty_ram_interp.c (as above).
     if(NOT MSVC)
+        psx_isolated_fixture_source(_draw_distance_interp_source draw_distance_interp
+            ../runtime/tests/test_draw_distance_interp.c)
         add_executable(draw_distance_interp_test
-            ../runtime/tests/test_draw_distance_interp.c
+            ${_draw_distance_interp_source}
             ../runtime/src/ws_aspect_cone_math.c)
         target_include_directories(draw_distance_interp_test PRIVATE
             ../runtime/include
