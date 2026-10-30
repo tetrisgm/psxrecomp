@@ -18,18 +18,65 @@ class PsxAudioTransport {
     alignas(64) std::atomic<uint64_t> consumed{0};
     int16_t pcm[capacity*2]{};
     rab_bridge bridge{};
+    uint64_t clock_start=0,clock_frames=0;
+    int previous_pull=0;
+    double measured_ratio=1.0;
+    bool adaptive=true;
+    uint64_t last_risk=0,last_growth=0;
+    double floor_target=60;
+    std::atomic<double> target{60};
+    void adapt_target(uint64_t now,int frames,bool dry) {
+        if(!adaptive || !now)return;
+        const double dt=double(frames)/cfg.host_rate;
+        const double remaining=rab_fill_ms(&bridge)-dt*1000*bridge.clock_ratio;
+        // React before the queue empties, not just after an audible gap.
+        const bool risk=bridge.primed && remaining<std::max(20.0,2*dt*1000+8.0);
+        double next=bridge.cfg.target_ms;
+        if(dry || risk) {
+            last_risk=now;
+            if(dry || !last_growth || now-last_growth>=1000000000ull) {
+                next=std::min(120.0,next+20.0);last_growth=now;
+            }
+        } else if(last_risk && now>last_risk && now-last_risk>30000000000ull) {
+            next=std::max(floor_target,next-dt*0.25);
+        }
+        bridge.cfg.target_ms=next;target.store(next,std::memory_order_relaxed);
+        // Reserve recovery uses continuous resampling, never PCM deletion or
+        // re-priming silence. Limit the pitch excursion to two percent.
+        bridge.cfg.max_correction=std::max(cfg.max_correction,0.02);
+    }
+    void observe_clock(uint64_t now,int frames) {
+        if(!now)return;
+        if(!clock_start || now<=clock_start || now-clock_start>2000000000ull) {
+            clock_start=now;clock_frames=0;previous_pull=frames;return;
+        }
+        clock_frames+=previous_pull;previous_pull=frames;
+        const double seconds=double(now-clock_start)*1e-9;
+        if(seconds<0.5)return;
+        // Measure the sink clock independently of occupancy. A software
+        // device's callback period need not equal its nominal sample rate.
+        const double ratio=cfg.host_rate*seconds/double(clock_frames);
+        if(ratio>=0.95 && ratio<=1.05) {
+            measured_ratio+=(ratio-measured_ratio)*seconds/(1.0+seconds);
+            bridge.clock_ratio=measured_ratio;
+        }
+        clock_start=now;clock_frames=0;
+    }
     std::atomic<bool> resume_requested{false};
     std::atomic<uint64_t> discard_before{UINT64_MAX};
     std::atomic<uint64_t> pushed{0},pulled{0},underruns{0},overflow{0},input_drops{0};
     std::atomic<double> out_position{0},correction{0};
 public:
     rab_config cfg{}; /* immutable between init and free */
-    int init(const rab_config &config) {
-        cfg=config;
+    int init(const rab_config &config,bool adapt=true) {
+        cfg=config;if(adapt)cfg.ring_ms=std::max(cfg.ring_ms,160.0);clock_start=clock_frames=0;previous_pull=0;measured_ratio=1.0;
         written=0;consumed=0;resume_requested=false;discard_before=UINT64_MAX;
         pushed=0;pulled=0;underruns=0;overflow=0;input_drops=0;
-        correction=0;
+        correction=0;adaptive=adapt;last_risk=last_growth=0;
+        floor_target=std::clamp(cfg.target_ms,60.0,120.0);
         const int result=rab_init(&bridge,&cfg);
+        if(adaptive)bridge.cfg.target_ms=floor_target;
+        target=bridge.cfg.target_ms;
         out_position=bridge.out_pos;
         return result;
     }
@@ -50,7 +97,8 @@ public:
         pushed.fetch_add(frames,std::memory_order_relaxed);
         input_drops.fetch_add(uint64_t(frames)-count,std::memory_order_relaxed);
     }
-    void pull(int16_t *out,int frames) {
+    void pull(int16_t *out,int frames,uint64_t now_ns=0) {
+        observe_clock(now_ns,frames);
         uint64_t r=consumed.load(std::memory_order_relaxed);
         uint64_t w=written.load(std::memory_order_acquire);
         /* Read the reset after the producer cursor: a newly published batch
@@ -77,7 +125,10 @@ public:
         }
         if(resume_requested.exchange(false,std::memory_order_acquire))
             rab_resume_after_sink(&bridge);
+        adapt_target(now_ns,frames,false);
+        const uint64_t dry_before=bridge.stats.underrun_events;
         rab_pull(&bridge,out,frames);
+        if(bridge.stats.underrun_events>dry_before)adapt_target(now_ns,frames,true);
         rab_stats s;rab_get_stats(&bridge,&s);
         pulled.store(s.pulled_frames,std::memory_order_relaxed);
         underruns.store(s.underrun_events,std::memory_order_relaxed);
@@ -91,6 +142,7 @@ public:
     void reset_timeline() {
         discard_before.store(written.load(std::memory_order_relaxed),std::memory_order_release);
     }
+    double target_ms() const {return target.load(std::memory_order_relaxed);}
     double fill_ms() const {
         const uint64_t w=written.load(std::memory_order_acquire);
         /* One monotonic domain covers both queues. Subtracting transport

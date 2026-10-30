@@ -1,0 +1,527 @@
+{
+  "cpu_percent_basis": "100% = one logical CPU; 16 logical CPUs",
+  "runs": {
+    "debug-120": {
+      "summary": {
+        "report_seconds": 120.074,
+        "vblanks_per_s": 59.679864083814984,
+        "presented_per_s": 57.68109665706148,
+        "game_cpu_core_percent": 97.47473584621747,
+        "host_cpu_percent": 73.6675925925926,
+        "audio_underruns": 26726,
+        "device_gpu_utilization_percent": 51.03703703703704,
+        "device_gpu_utilization_peak_percent": 80.0,
+        "game_machine_cpu_percent": 6.092170990388592,
+        "estimated_background_cpu_percent": 67.575421602204
+      },
+      "threads": [
+        {
+          "tid": 46320,
+          "name": "PSX emulation",
+          "cpu_percent": 47.121728428140564
+        },
+        {
+          "tid": 47296,
+          "name": "PSX render",
+          "cpu_percent": 27.093031531004748
+        },
+        {
+          "tid": 16472,
+          "name": "PSX native raster",
+          "cpu_percent": 8.372544751252072
+        },
+        {
+          "tid": 19196,
+          "name": "",
+          "cpu_percent": 7.849260704298817
+        },
+        {
+          "tid": 33084,
+          "name": "",
+          "cpu_percent": 2.2239571995513314
+        },
+        {
+          "tid": 34748,
+          "name": "",
+          "cpu_percent": 1.1119785997756657
+        },
+        {
+          "tid": 31056,
+          "name": "",
+          "cpu_percent": 1.020403891558846
+        },
+        {
+          "tid": 39272,
+          "name": "",
+          "cpu_percent": 0.8895828798205325
+        },
+        {
+          "tid": 34492,
+          "name": "",
+          "cpu_percent": 0.8895828798205325
+        },
+        {
+          "tid": 46060,
+          "name": "",
+          "cpu_percent": 0.31397042817195264
+        },
+        {
+          "tid": 36564,
+          "name": "PSX audio",
+          "cpu_percent": 0.28780622582428994
+        },
+        {
+          "tid": 32048,
+          "name": "",
+          "cpu_percent": 0.22239571995513313
+        },
+        {
+          "tid": 16496,
+          "name": "",
+          "cpu_percent": 0.06541050586915681
+        },
+        {
+          "tid": 38760,
+          "name": "psx-dbg-io",
+          "cpu_percent": 0.013082101173831361
+        },
+        {
+          "tid": 15268,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 14568,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 22616,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 34204,
+          "name": "WindhawkMainLoopThreadAttachExempt",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 40928,
+          "name": "overlay-preserve-write",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 30136,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 21116,
+          "name": "DeviceHotplugThread",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 46340,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 42364,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 9436,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 48424,
+          "name": "SDL_joystick",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 41540,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 46684,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 14312,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 44236,
+          "name": "",
+          "cpu_percent": 0.0
+        }
+      ],
+      "provenance": {
+        "executable": "C:\\Users\\Shokunin\\dev\\r4-wt-release-waits\\build\\r4-runtime.exe",
+        "sha256": "e53b5553f456c33fefd193ff8395a107aecf687d905187721d3895c8d85edb79",
+        "environment": {
+          "SDL_AUDIODRIVER": "dummy",
+          "PSX_FRAME_REPORT_MS": "1000",
+          "PSX_GL_ASYNC_GPU_TIMER": "1",
+          "PSX_HLE_SCHEDULER": "0",
+          "PSX_BIOS_HLE": "0",
+          "PSX_PRESENT_IMAGE_RING": "0",
+          "PSX_HOST_SAMPLER": "1",
+          "PSX_RUNTIME_PERF_DIAG": "1"
+        },
+        "seconds": 120.0
+      },
+      "raw_directory": "C:\\Users\\Shokunin\\dev\\r4-wt-release-waits\\analysis\\release-waits\\debug-120"
+    },
+    "release-120": {
+      "summary": {
+        "report_seconds": 121.016,
+        "vblanks_per_s": 60.000330534805315,
+        "presented_per_s": 59.95075031400806,
+        "game_cpu_core_percent": 80.74086254859098,
+        "host_cpu_percent": 53.85963302752293,
+        "audio_underruns": 0.0,
+        "gpu_ms_per_present": 3.4475494241212954,
+        "gpu_present_ms_per_present": 0.9579076101998621,
+        "device_gpu_utilization_percent": 49.23853211009175,
+        "device_gpu_utilization_peak_percent": 67.0,
+        "game_machine_cpu_percent": 5.046303909286936,
+        "estimated_background_cpu_percent": 48.813329118236,
+        "packet_gpu_dropped_delta": 0.0,
+        "packet_gpu_samples_delta": 7256.0
+      },
+      "threads": [
+        {
+          "tid": 16580,
+          "name": "PSX emulation",
+          "cpu_percent": 43.401323066090335
+        },
+        {
+          "tid": 22164,
+          "name": "PSX render",
+          "cpu_percent": 19.57314569647211
+        },
+        {
+          "tid": 35088,
+          "name": "",
+          "cpu_percent": 7.043713969700332
+        },
+        {
+          "tid": 29636,
+          "name": "PSX native raster",
+          "cpu_percent": 5.996321557848981
+        },
+        {
+          "tid": 44612,
+          "name": "",
+          "cpu_percent": 2.0555076082582753
+        },
+        {
+          "tid": 2236,
+          "name": "",
+          "cpu_percent": 1.099762032443918
+        },
+        {
+          "tid": 7800,
+          "name": "",
+          "cpu_percent": 0.6153430419626683
+        },
+        {
+          "tid": 46952,
+          "name": "PSX audio",
+          "cpu_percent": 0.3665873441479726
+        },
+        {
+          "tid": 33276,
+          "name": "",
+          "cpu_percent": 0.23566329266655384
+        },
+        {
+          "tid": 17096,
+          "name": "",
+          "cpu_percent": 0.23566329266655384
+        },
+        {
+          "tid": 46800,
+          "name": "",
+          "cpu_percent": 0.10473924118513504
+        },
+        {
+          "tid": 31624,
+          "name": "",
+          "cpu_percent": 0.01309240514814188
+        },
+        {
+          "tid": 46828,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 48488,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 5248,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 39812,
+          "name": "WindhawkMainLoopThreadAttachExempt",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 41916,
+          "name": "overlay-preserve-write",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 43872,
+          "name": "DeviceHotplugThread",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 30352,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 48536,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 24928,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 4112,
+          "name": "SDL_joystick",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 25604,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 1996,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 19708,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 31132,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 12352,
+          "name": "",
+          "cpu_percent": 0.0
+        }
+      ],
+      "provenance": {
+        "executable": "C:\\Users\\Shokunin\\dev\\r4-wt-release-waits\\build\\r4-runtime.exe",
+        "sha256": "cf5f08b596a485876cf4cfefee139f1805997c7bdcacbed3d149acd89b2d1398",
+        "environment": {
+          "SDL_AUDIODRIVER": "dummy",
+          "PSX_FRAME_REPORT_MS": "1000",
+          "PSX_GL_ASYNC_GPU_TIMER": "1",
+          "PSX_HLE_SCHEDULER": "0",
+          "PSX_BIOS_HLE": "0",
+          "PSX_PRESENT_IMAGE_RING": "0",
+          "PSX_LOAD_SLOT": "9",
+          "PSX_HOLD_PADS": "bfff"
+        },
+        "seconds": 120.0
+      },
+      "raw_directory": "C:\\Users\\Shokunin\\dev\\r4-wt-release-waits\\analysis\\release-waits\\release-120"
+    },
+    "fixed-120": {
+      "summary": {
+        "report_seconds": 121.027,
+        "vblanks_per_s": 60.003139795252295,
+        "presented_per_s": 59.573483602832425,
+        "game_cpu_core_percent": 82.90545104318403,
+        "host_cpu_percent": 65.9908256880734,
+        "audio_underruns": 0.0,
+        "gpu_ms_per_present": 3.4670795095700417,
+        "gpu_present_ms_per_present": 0.968913628848821,
+        "device_gpu_utilization_percent": 46.825688073394495,
+        "device_gpu_utilization_peak_percent": 73.0,
+        "game_machine_cpu_percent": 5.181590690199002,
+        "estimated_background_cpu_percent": 60.8092349978744,
+        "packet_wait_ns_delta": 4011008.0,
+        "packet_restage_ns_delta": 72601600.0,
+        "packet_restages_delta": 44.0,
+        "packet_gpu_dropped_delta": 0.0,
+        "packet_gpu_samples_delta": 7213.0
+      },
+      "threads": [
+        {
+          "tid": 33344,
+          "name": "PSX emulation",
+          "cpu_percent": 42.110705291776014
+        },
+        {
+          "tid": 33524,
+          "name": "PSX render",
+          "cpu_percent": 20.69053217925133
+        },
+        {
+          "tid": 22508,
+          "name": "",
+          "cpu_percent": 6.749178632778457
+        },
+        {
+          "tid": 2488,
+          "name": "PSX native raster",
+          "cpu_percent": 6.306182351862497
+        },
+        {
+          "tid": 7284,
+          "name": "",
+          "cpu_percent": 2.697065592635407
+        },
+        {
+          "tid": 14312,
+          "name": "",
+          "cpu_percent": 1.8241023331833668
+        },
+        {
+          "tid": 43460,
+          "name": "",
+          "cpu_percent": 1.224754423708832
+        },
+        {
+          "tid": 38380,
+          "name": "PSX audio",
+          "cpu_percent": 0.4429962809159605
+        },
+        {
+          "tid": 41252,
+          "name": "PSX present",
+          "cpu_percent": 0.3517911642567922
+        },
+        {
+          "tid": 3612,
+          "name": "PSX input reclamation",
+          "cpu_percent": 0.3257325594970298
+        },
+        {
+          "tid": 22208,
+          "name": "",
+          "cpu_percent": 0.14332232617869312
+        },
+        {
+          "tid": 7712,
+          "name": "PSX transform storage",
+          "cpu_percent": 0.03908790713964357
+        },
+        {
+          "tid": 29880,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 23192,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 10904,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 41968,
+          "name": "WindhawkMainLoopThreadAttachExempt",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 26188,
+          "name": "overlay-preserve-write",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 20768,
+          "name": "DeviceHotplugThread",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 4336,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 43080,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 5288,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 36152,
+          "name": "SDL_joystick",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 35844,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 16720,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 33548,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 10792,
+          "name": "",
+          "cpu_percent": 0.0
+        },
+        {
+          "tid": 28200,
+          "name": "",
+          "cpu_percent": 0.0
+        }
+      ],
+      "provenance": {
+        "executable": "C:\\Users\\Shokunin\\dev\\r4-wt-release-waits\\build\\r4-runtime.exe",
+        "sha256": "fc4b3af453aa31de4f6173198fb0d10a47267d85a9584ad380e1c9870574521d",
+        "environment": {
+          "SDL_AUDIODRIVER": "dummy",
+          "PSX_FRAME_REPORT_MS": "1000",
+          "PSX_GL_ASYNC_GPU_TIMER": "1",
+          "PSX_HLE_SCHEDULER": "0",
+          "PSX_BIOS_HLE": "0",
+          "PSX_PRESENT_IMAGE_RING": "0",
+          "PSX_LOAD_SLOT": "9",
+          "PSX_HOLD_PADS": "bfff"
+        },
+        "seconds": 120.0
+      },
+      "raw_directory": "C:\\Users\\Shokunin\\dev\\r4-wt-release-waits\\analysis\\release-waits\\fixed-120"
+    }
+  }
+}

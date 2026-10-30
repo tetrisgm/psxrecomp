@@ -165,6 +165,9 @@ void psx_frontend_on_savestate_refused(int is_load, int slot, const char *reason
  * pending, serialize with cpu->pc = resume_pc; if a load is pending, restore and
  * longjmp to the scheduler (never returns in that case). Near-free when idle. */
 void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+/* Restore on the startup stack, before psx_scheduler_run. Works with LLE
+ * fibers because it never longjmps across a guest fiber. Fails once running. */
+int savestate_restore_startup(CPUState* cpu, int slot);
 
 #ifdef __cplusplus
 }

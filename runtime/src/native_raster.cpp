@@ -2,6 +2,7 @@
 #include "native_raster.h"
 #include "gpu_sw_renderer.h"
 #include "host_scheduling.h"
+#include "host_thread_name.h"
 
 #include <array>
 #include <atomic>
@@ -10,6 +11,7 @@
 #include <type_traits>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -20,6 +22,8 @@ struct NativeInputTile {
     uint32_t index=0;
     std::array<uint16_t,64*64> pixels;
 };
+static std::mutex checkpoint_mutex;
+static std::condition_variable checkpoint_finished;
 struct NativeRasterInputs {
     NativeRasterInputs* retired_next=nullptr;
     void (*retire_callback)(void*)=nullptr;
@@ -47,6 +51,7 @@ class NativeInputPool {
     std::atomic<bool> stop{false}, parked{false};
     std::thread worker;
     void run() {
+        psx_host_thread_name(L"PSX input reclamation");
         for(;;) {
             auto* list=retired.exchange(nullptr);
             if(!list && !stop.load()) {
@@ -475,7 +480,11 @@ struct NativeRaster {
             }
             completed.store(++completed_count,std::memory_order_release);
             if (job.completion) job.completion->notify();
-        if (job.checkpoint_done) job.checkpoint_done->store(true,std::memory_order_release);
+        if (job.checkpoint_done) {
+            std::lock_guard<std::mutex> lock(checkpoint_mutex);
+            job.checkpoint_done->store(true,std::memory_order_release);
+            checkpoint_finished.notify_all();
+        }
     }
     void service_checkpoint(uint64_t before) {
         if(checkpoint_pending.load() && checkpoint.sequence<=before) {
@@ -711,7 +720,8 @@ extern "C" int native_raster_checkpoint_ready(NativeRasterCheckpoint *c) {
 }
 extern "C" void native_raster_checkpoint_release(NativeRasterCheckpoint *c) {
     if(c) {
-        while(!c->done.load(std::memory_order_acquire))std::this_thread::yield();
+        std::unique_lock<std::mutex> lock(checkpoint_mutex);
+        checkpoint_finished.wait(lock,[c]{return c->done.load(std::memory_order_acquire);});
         delete c;
     }
 }

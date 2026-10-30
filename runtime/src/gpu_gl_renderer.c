@@ -1,3 +1,4 @@
+#include "blocking_sync.h"
 #include "packet_interpolation_stream.h"
 #include "packet_presenter.h"
 #include "interrupts.h"
@@ -905,11 +906,14 @@ static int s_selected_bank_failed;
 typedef struct GlRasterSurface {
     GLuint tex,fbo,rb;
     int x,y,w,h,allocation_scale;
+    int invalid;
+    uint64_t last_use;
 } GlRasterSurface;
 typedef struct GlSurfacePool {
     GlCoverage coverage;
     GlRasterSurface **surfaces;
     size_t count,capacity;
+    uint64_t use_clock;
 } GlSurfacePool;
 static GlSurfacePool s_region_pool;
 typedef struct GlDrawRegion {
@@ -1003,7 +1007,7 @@ typedef struct AsyncSeamPrepared {
     struct AsyncSeamPrepared *next, *work_next;
 } AsyncSeamPrepared;
 static AsyncSeamPrepared *s_async_seam_ready, *s_async_seam_active;
-static atomic_flag s_async_seam_ready_guard = ATOMIC_FLAG_INIT;
+static PsxBlockingMutex s_async_seam_ready_guard = PSX_BLOCKING_MUTEX_INIT;
 static int s_async_seam_failed;
 static int s_async_seam_reset_pending;
 static _Atomic uint64_t s_async_seam_prepared_count, s_async_seam_used_count;
@@ -2691,8 +2695,33 @@ static void apply_psx_blend(int mode) {
  * Pack narrow rows densely: reserving the intervening VRAM columns used to
  * copy nearly 128 KiB for a single 8 KiB tile. s_native_upload_scratch is render-owner scratch
  * shared by native inputs and guest uploads. */
+/* Exact render-owner residency. Versions of native tiles can change without
+ * changing their bytes; interpolation also revisits the same immutable inputs.
+ * Keep one contiguous known span per row, never treating an unuploaded gap as
+ * resident. GPU writes and texture replacement invalidate the whole census. */
+static uint16_t s_native_resident[VRAM_W*VRAM_H];
+static int s_native_resident_lo[VRAM_H],s_native_resident_hi[VRAM_H];
+static GLuint s_native_resident_texture;
+static void native_texture_residency_invalidate(void) {
+    memset(s_native_resident_hi,0,sizeof s_native_resident_hi);
+    s_native_resident_texture=0;
+}
 static void native_texture_upload_rect(int x,int y,int w,int h) {
     if(w<=0 || h<=0)return;
+    if(s_native_resident_texture!=s_raw_tex) {
+        native_texture_residency_invalidate();s_native_resident_texture=s_raw_tex;
+    }
+    int resident=1;
+    for(int row=y;row<y+h && resident;++row)
+        resident=s_native_resident_hi[row]>0 && x>=s_native_resident_lo[row] &&
+            x+w<=s_native_resident_hi[row] &&
+            !memcmp(s_native_resident+(size_t)row*VRAM_W+x,
+                    s_vram+(size_t)row*VRAM_W+x,(size_t)w*sizeof(uint16_t));
+    if(resident) {
+        p_glActiveTexture(PSXGL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,s_raw_tex);
+        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH,0);glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+        p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER,0);return;
+    }
     const uint16_t *source=s_vram+(size_t)y*VRAM_W+x;
     if(w!=VRAM_W && h>1) {
         uint16_t *packed=s_native_upload_scratch;
@@ -2712,6 +2741,15 @@ static void native_texture_upload_rect(int x,int y,int w,int h) {
         GL_UNSIGNED_SHORT,(const void *)(uintptr_t)offset);
     glPixelStorei(GL_UNPACK_ALIGNMENT,4);
     p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER,0);
+    for(int row=y;row<y+h;++row) {
+        memcpy(s_native_resident+(size_t)row*VRAM_W+x,
+               s_vram+(size_t)row*VRAM_W+x,(size_t)w*sizeof(uint16_t));
+        if(s_native_resident_hi[row]>0 && x<=s_native_resident_hi[row] &&
+           x+w>=s_native_resident_lo[row]) {
+            if(x<s_native_resident_lo[row])s_native_resident_lo[row]=x;
+            if(x+w>s_native_resident_hi[row])s_native_resident_hi[row]=x+w;
+        } else {s_native_resident_lo[row]=x;s_native_resident_hi[row]=x+w;}
+    }
     ++s_pack_native_uploads;
     atomic_fetch_add(&s_pack_native_bytes,bytes);
 }
@@ -3470,6 +3508,7 @@ static void pack_flush(void) {
         return;
     }
 
+    native_texture_residency_invalidate();
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
     glViewport(0, 0, VRAM_W, VRAM_H);
     glEnable(GL_SCISSOR_TEST);
@@ -6566,6 +6605,7 @@ static void depth24_clear_skipped_fb(void) {
     hiw_clear_rect(x0, y0, rw, rh, 0.f, 0.f, 0.f, 0.f, 0);
     }
     if (s_raw_fbo) {
+        native_texture_residency_invalidate();
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
         glViewport(0, 0, VRAM_W, VRAM_H);
         glScissor(x0, y0, rw, rh);
@@ -7065,6 +7105,7 @@ if(legacy_surface_test()) {
     if (!s_native_upload_scratch) return 0;
 
     s_hd_dummy_tex = make_tex(GL_RGBA8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE);
+    native_texture_residency_invalidate();
     s_raw_tex     = make_tex(PSXGL_R16UI, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT);
     /* Force the driver's first texture-upload allocation while the renderer is
      * initializing. NVIDIA otherwise defers it until the first MDEC frame,
@@ -7906,8 +7947,12 @@ void gl_renderer_restage_vram_after_savestate(void) {
     if(s_region_pool.coverage.rects) {
         flush_flat_batch();flush_tex_batch();
         s_draw_surface=&s_primary_surface;g_wide_cur=0;
-        surface_pool_destroy(&s_region_pool);
-        if(!surface_pool_init(&s_region_pool))abort();
+        const char *reuse=getenv("PSX_SURFACE_REUSE");
+        if(!reuse || *reuse!='0') surface_pool_invalidate(&s_region_pool);
+        else {
+            surface_pool_destroy(&s_region_pool);
+            if(!surface_pool_init(&s_region_pool))abort();
+        }
     }
     /* Belt-and-suspenders after boot_state VRAM apply: force CPU mirror → FBO
      * even if a depth24 skip swallowed the restore, then re-arm scanout-band
@@ -9304,7 +9349,7 @@ typedef struct AsyncSeamBaseline {
     PgxpRthSeamDepth depth;       /* depth-clear state at the snapshot */
 } AsyncSeamBaseline;
 static AsyncSeamBaseline s_async_seam_baseline[PASS_GENERATIONS];
-static atomic_flag s_async_seam_lock = ATOMIC_FLAG_INIT;
+static PsxBlockingMutex s_async_seam_lock = PSX_BLOCKING_MUTEX_INIT;
 static SDL_Thread *s_async_seam_worker;
 static SDL_mutex *s_async_seam_work_mutex;
 static SDL_cond *s_async_seam_work_cv;
@@ -9312,10 +9357,10 @@ static AsyncSeamPrepared *s_async_seam_work_head, *s_async_seam_work_tail;
 static unsigned s_async_seam_work_n;
 static int s_async_seam_work_stop;
 static void async_seam_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&s_async_seam_lock, memory_order_acquire)) {}
+    psx_blocking_lock(&s_async_seam_lock);
 }
 static void async_seam_unlock(void) {
-    atomic_flag_clear_explicit(&s_async_seam_lock, memory_order_release);
+    psx_blocking_unlock(&s_async_seam_lock);
 }
 static _Atomic uint64_t s_async_resource_epoch=1;
 static GLuint s_async_live_raw_tex,s_async_live_raw_fbo;
@@ -9424,6 +9469,11 @@ static void async_seam_baseline_publish(int gi, uint64_t epoch, uint64_t generat
     }
     slot->present = src != NULL;
     async_seam_unlock();
+    if (s_async_seam_work_mutex) {
+        SDL_LockMutex(s_async_seam_work_mutex);
+        SDL_CondBroadcast(s_async_seam_work_cv);
+        SDL_UnlockMutex(s_async_seam_work_mutex);
+    }
 }
 static void async_seam_baseline_invalidate(uint64_t epoch, uint64_t generation) {
     async_seam_lock();
@@ -9470,20 +9520,27 @@ static void async_seam_prepared_unref(AsyncSeamPrepared *p) {
 static void async_seam_prepare_one(AsyncSeamPrepared *p) {
     p->baseline = (PgxpSnap *)calloc(1, sizeof *p->baseline);
     if (!p->baseline) return;
+    SDL_LockMutex(s_async_seam_work_mutex);
     while (pt_clock_ns() < p->deadline &&
+           !s_async_seam_work_stop &&
            atomic_load_explicit(&p->refs, memory_order_acquire) > 1) {
         int32_t area[4];
         PgxpRthSeamDepth depth;
         if (async_seam_baseline_copy(p->epoch, p->generation,
                                      p->baseline, &p->baseline_present, area, &depth)) {
+            SDL_UnlockMutex(s_async_seam_work_mutex);
             p->ready = pgxp_rth_seam_stream_mark_resets(&p->stream, area, &depth) &&
                        pgxp_snap_batch_prepare(&p->batch, p->baseline,
                                                 p->generation, p->stream.input,
                                                 p->stream.count);
             return;
         }
-        SDL_Delay(0);
+        const uint64_t now = pt_clock_ns();
+        if (now >= p->deadline) break;
+        SDL_CondWaitTimeout(s_async_seam_work_cv, s_async_seam_work_mutex,
+            (uint32_t)((p->deadline - now + 999999u) / 1000000u));
     }
+    SDL_UnlockMutex(s_async_seam_work_mutex);
 }
 static int async_seam_prepare_thread(void *arg) {
     (void)arg;
@@ -9552,10 +9609,10 @@ static void async_seam_worker_stop(void) {
     s_async_seam_work_n = 0;
 }
 static void async_seam_ready_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&s_async_seam_ready_guard, memory_order_acquire)) {}
+    psx_blocking_lock(&s_async_seam_ready_guard);
 }
 static void async_seam_ready_unlock(void) {
-    atomic_flag_clear_explicit(&s_async_seam_ready_guard, memory_order_release);
+    psx_blocking_unlock(&s_async_seam_ready_guard);
 }
 static void async_seam_ready_insert(AsyncSeamPrepared *p) {
     async_seam_ready_lock();
@@ -9711,7 +9768,12 @@ static void restore_presentation_invalidate(void) {
     DEPTH_REQUEST_CLEAR(DCLR_CONFIG);
     s_depth_used=0;s_depth_last_avg=0;
     if(s_snap)pgxp_snap_reset(s_snap);
-    gl_renderer_clear_hd_texture_cache();
+    // Packet restaging changes native residency, not immutable replacement
+    // image content. Cache keys include pack generation; preserve those GL
+    // images across skipped/rewound packets instead of re-uploading them.
+    const char *retain=getenv("PSX_PACKET_HD_CACHE");
+    if(!s_rth_packet_replaying || (retain && *retain=='0'))
+        gl_renderer_clear_hd_texture_cache();
     hold_invalidate();interp_reset_history();
 }
 
@@ -10116,6 +10178,7 @@ size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
 static void pass_blit(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
                       int w, int h, GLbitfield mask) {
     hiw_flush_queue();   /* queued wide mirrors land before a copy reads or writes */
+    if(dst==s_raw_fbo && (mask&GL_COLOR_BUFFER_BIT))native_texture_residency_invalidate();
     if(src==s_hr_fbo){sx-=s_hr_origin_x*s_hr_scale;sy-=s_hr_origin_y*s_hr_scale;}
     if(dst==s_hr_fbo){dx-=s_hr_origin_x*s_hr_scale;dy-=s_hr_origin_y*s_hr_scale;}
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src);
@@ -10548,6 +10611,12 @@ static int s_agpu_on=-1;
 static GLuint s_agpu_q[AGPU_Q]; static int s_agpu_kind[AGPU_Q];
 static unsigned s_agpu_head,s_agpu_tail; static int s_agpu_open;
 static _Atomic uint64_t s_agpu_ns[5],s_agpu_n[5],s_agpu_lost;
+void gl_renderer_async_gpu_times(uint64_t ns[5], uint64_t counts[5]) {
+    for (int i=0;i<5;++i) {
+        ns[i]=atomic_load(&s_agpu_ns[i]);
+        counts[i]=atomic_load(&s_agpu_n[i]);
+    }
+}
 static _Atomic uint64_t s_agpu_op_ns[RTH_GROUP+1],s_agpu_op_n[RTH_GROUP+1]; static int s_agpu_ops=-1;
 static int agpu_on(void) {
     if (s_agpu_on<0) { const char *e=getenv("PSX_GL_ASYNC_GPU_TIMER"); s_agpu_on=e && *e && *e!='0' &&
@@ -10878,6 +10947,7 @@ static int async_vram_enter(int gi) {
     }
     memcpy(s_async_work.cpu,v->cpu,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
     s_async_live_cpu=s_vram; s_async_live_raw_tex=s_raw_tex; s_async_live_raw_fbo=s_raw_fbo;
+    native_texture_residency_invalidate();
     s_vram=s_async_work.cpu; s_raw_tex=s_async_work.raw_tex; s_raw_fbo=s_async_work.raw_fbo;
     rth_rebind_vram(s_vram); s_async_vram_bound=1;
     rect_clear(&s_cpu_dirty); rect_clear(&s_pack_dirty); s_gpu_dirty=0; s_up_nrects=0;
@@ -10891,6 +10961,7 @@ static int async_vram_enter(int gi) {
 }
 static void async_vram_leave(void) {
     if(!s_async_vram_bound) return;
+    native_texture_residency_invalidate();
     s_vram=s_async_live_cpu; s_raw_tex=s_async_live_raw_tex; s_raw_fbo=s_async_live_raw_fbo;
     rth_rebind_vram(s_vram); s_async_vram_bound=0;
 }
@@ -13245,9 +13316,9 @@ static void dyn_rescale_in_place(GLuint fbo, int surf_w, const int (*cols)[2], i
  * captured when the step was recorded (gpu.c's display state is the
  * emulation thread's). */
 static int s_dyn_rth_disp_valid = 0, s_dyn_rth_disp[5];
-static atomic_flag s_dyn_stats_lock = ATOMIC_FLAG_INIT;   /* s_dyn_stats: render thread writes */
-static void dyn_stats_lock(void) { while (atomic_flag_test_and_set_explicit(&s_dyn_stats_lock, memory_order_acquire)) {} }
-static void dyn_stats_unlock(void) { atomic_flag_clear_explicit(&s_dyn_stats_lock, memory_order_release); }
+static PsxBlockingMutex s_dyn_stats_lock = PSX_BLOCKING_MUTEX_INIT;   /* s_dyn_stats: render thread writes */
+static void dyn_stats_lock(void) { psx_blocking_lock(&s_dyn_stats_lock); }
+static void dyn_stats_unlock(void) { psx_blocking_unlock(&s_dyn_stats_lock); }
 static _Atomic int s_rthm_scale = 1; /* producer request / owner allocation completion */
 
 static int dyn_apply(int snew) {
@@ -14438,7 +14509,7 @@ static _Atomic uint64_t s_fg_gen_cost_ns = 0, s_fg_gen_measured = 0;
 /* Counts are consumed by the emulation thread's production controller, not
  * just diagnostics. The sequence publishes each measured count/cost pair
  * coherently (one RT writer); all payload fields are atomic as well. */
-static _Atomic unsigned s_fg_gen_cost_seq = 0;
+static PsxBlockingMutex s_fg_gen_cost_mutex = PSX_BLOCKING_MUTEX_INIT;
 static _Atomic uint64_t s_fg_generated = 0, s_fg_real_presents = 0;
 static uint64_t  s_fg_flips = 0,
                  s_fg_flushed = 0, s_fg_skipped_plan = 0, s_fg_dups = 0;
@@ -16320,10 +16391,10 @@ static void fg_overload(void) {
 }
 
 static void fg_gen_cost_publish(uint64_t cost_ns) {
-    atomic_fetch_add(&s_fg_gen_cost_seq, 1);
+    psx_blocking_lock(&s_fg_gen_cost_mutex);
     atomic_fetch_add(&s_fg_gen_cost_ns, cost_ns);
     atomic_fetch_add(&s_fg_gen_measured, 1);
-    atomic_fetch_add(&s_fg_gen_cost_seq, 1);
+    psx_blocking_unlock(&s_fg_gen_cost_mutex);
 }
 
 static void fg_gen_cost_poll(void) {
@@ -16846,16 +16917,11 @@ void gl_renderer_frame_gen_counts(uint64_t *generated, uint64_t *real_presents) 
 }
 
 void gl_renderer_frame_gen_costs(uint64_t *generated, uint64_t *measured, uint64_t *cost_ns) {
-    unsigned before, after;
     uint64_t count, cost;
-    do {
-        before = atomic_load(&s_fg_gen_cost_seq);
-        if (before & 1u) continue;
-        count = atomic_load(&s_fg_gen_measured);
-        cost = atomic_load(&s_fg_gen_cost_ns);
-        after = atomic_load(&s_fg_gen_cost_seq);
-        if (before == after) break;
-    } while (1);
+    psx_blocking_lock(&s_fg_gen_cost_mutex);
+    count = atomic_load(&s_fg_gen_measured);
+    cost = atomic_load(&s_fg_gen_cost_ns);
+    psx_blocking_unlock(&s_fg_gen_cost_mutex);
     if (generated) *generated = atomic_load(&s_fg_generated);
     if (measured) *measured = count;
     if (cost_ns) *cost_ns = cost;
@@ -18020,7 +18086,11 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     sw_native_texture_load(&seed->cache);
     if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
     if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence>s_rth_packet_last_sequence+1) {
+        const uint64_t restage_begin=rt_now_ns();
+        packet_timer_restage_begin();
         gl_renderer_restage_vram_after_savestate();fg_invalidate();
+        packet_timer_restage_end();
+        packet_presenter_trace(4,restage_begin,rt_now_ns());
     }
     rth_frame_state_apply(&seed->draw);
     const uint8_t *records=packet->records;
@@ -18044,6 +18114,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     packet_timer_end();
     surface_pool_retire_unused();
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
+    packet_presenter_trace(2,draw_begin,rt_now_ns());
     atomic_fetch_add(&s_packet_draw_ns,rt_now_ns()-draw_begin);
 }
 static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled) {
@@ -18066,6 +18137,7 @@ static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled)
         }
         s_packet_collect=0;packet_interpolation_stream_end();
     }
+    packet_presenter_trace(1,prepare_begin,rt_now_ns());
     atomic_fetch_add(&s_packet_prepare_ns,rt_now_ns()-prepare_begin);
     // Held-display VBlanks do not publish a new geometry endpoint. Presenting
     // their native endpoint between samples would jump forward then backward.

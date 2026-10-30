@@ -3042,7 +3042,7 @@ static void sdl_drc_callback(void* /*user*/, Uint8* stream, int len) {
     psx_host_schedule_thread(PsxHostThreadRole::Audio);
     if (!s_drc_ready) { std::memset(stream, 0, (size_t)len); return; }
     int frames = len / (int)(2 * sizeof(int16_t)); /* stereo S16 */
-    s_drc.pull(reinterpret_cast<int16_t*>(stream), frames);
+    s_drc.pull(reinterpret_cast<int16_t*>(stream), frames, rt_now_ns());
     /* T3 tap in bridge mode: the exact device-rate bytes the host consumes.
      * This callback is the tap's single writer while the bridge is active. */
     audio_trace_pcm(AUDIO_TAP_HOST, reinterpret_cast<const int16_t*>(stream),
@@ -4586,7 +4586,7 @@ extern "C" int psx_audio_out_stats(double *fill_ms, double *target_ms,
     rab_stats st;
     s_drc.stats(&st);
     *fill_ms = st.last_fill_ms;
-    *target_ms = s_drc.cfg.target_ms;
+    *target_ms = s_drc.target_ms();
     *underruns = st.underrun_events;
     *overflow_drops = st.overflow_drops;
     *correction = st.last_correction;
@@ -5095,6 +5095,47 @@ static void openxr_ready_report_tick(uint64_t frames) {
     }
 }
 
+/* Startup restore runs before any guest fiber or native guest stack exists. */
+static bool env_load_slot_startup(CPUState *cpu) {
+    const char *value = std::getenv("PSX_LOAD_SLOT");
+    if (!value || !*value) return true;
+    char *end = nullptr;
+    const long slot = std::strtol(value, &end, 10);
+    if (!end || *end || slot < 0 || slot >= SAVESTATE_SLOTS || psx_netplay_active()) return false;
+    const int ok = savestate_restore_startup(cpu, (int)slot);
+    openxr_ready_record_load_request((int)slot, ok ? nullptr : "state_load_failed");
+    std::fprintf(stdout, "psxrecomp: PSX_LOAD_SLOT=%ld %s\n", slot, ok ? "restored" : "failed");
+    std::fflush(stdout);
+    return ok != 0;
+}
+
+/* Offline input replay for release-build measurements. Each row is an
+ * absolute VBlank number, active-low pad word (hex), and save slot (-1 for
+ * no save). Parsed once; no file polling or debug-server dependency. */
+static void env_pad_script_tick(uint64_t frames) {
+    struct Step { unsigned long long frame; unsigned pad; int save; };
+    static std::vector<Step> steps;
+    static size_t next = 0;
+    static bool initialized = false;
+    if (!initialized) {
+        initialized = true;
+        if (const char *path = std::getenv("PSX_PAD_SCRIPT")) {
+            if (FILE *f = std::fopen(path, "r")) {
+                Step step{};
+                while (std::fscanf(f, "%llu %x %d", &step.frame, &step.pad, &step.save) == 3)
+                    steps.push_back(step);
+                std::fclose(f);
+            }
+        }
+    }
+    while (next < steps.size() && frames >= steps[next].frame) {
+        const Step &step = steps[next++];
+        if (step.save >= 0 && step.save < SAVESTATE_SLOTS)
+            savestate_request_save(step.save);
+    }
+    if (next) sio_set_pad_state_slot(0, (uint16_t)steps[next-1].pad);
+}
+
 static void frame_report_tick(uint64_t frames) {
     static int interval_ms = -1;
     static uint64_t first_ticks = 0, last_ticks = 0, last_frames = 0;
@@ -5140,10 +5181,16 @@ static void frame_report_tick(uint64_t frames) {
     const double bp_ms = (double)(rs.backpressure_ns + rs.ring_full_ns - last_bp_ns) * 1e-6;
     last_pt_presents = pts.presents;
     last_bp_ns = rs.backpressure_ns + rs.ring_full_ns;
+    double audio_fill, audio_target, audio_correction;
+    uint64_t audio_underruns, audio_overflows;
+    int audio_legacy, audio_rate;
+    psx_audio_out_stats(&audio_fill, &audio_target, &audio_underruns,
+                       &audio_overflows, &audio_correction, &audio_legacy, &audio_rate);
     std::fprintf(stdout,
                  "psxrecomp: frames=%llu elapsed_ms=%llu fps=%.1f avg_fps=%.1f "
                  "emu_busy=%.1f%% render_busy=%.1f%% dynres=%d load=%.2f gen_fps=%.1f real_fps=%.1f "
-                 "swaps=%llu present_max_ms=%.1f queue_wait_ms=%.1f\n",
+                 "swaps=%llu present_max_ms=%.1f queue_wait_ms=%.1f "
+                 "audio_underruns=%llu audio_fill_ms=%.1f\n",
                  (unsigned long long)frames,
                  (unsigned long long)(now - first_ticks),
                  win_s > 0.0 ? (double)(frames - last_frames) / win_s : 0.0,
@@ -5151,7 +5198,18 @@ static void frame_report_tick(uint64_t frames) {
                  emu_busy, rt_busy, ds.level, g_dynres.rt.last_load,
                  pc_s > 0.0 ? (double)(gen - last_gen) / pc_s : 0.0,
                  pc_s > 0.0 ? (double)(real - last_real) / pc_s : 0.0,
-                 (unsigned long long)pt_swaps, pts.present_max_ns / 1e6, bp_ms);
+                 (unsigned long long)pt_swaps, pts.present_max_ns / 1e6, bp_ms,
+                 (unsigned long long)audio_underruns, audio_fill);
+    uint64_t gpu[5];
+    gl_renderer_packet_gpu_stats(gpu);
+    std::fprintf(stdout, "psxrecomp: packet_gpu_samples=%llu packet_gpu_ns=%llu packet_present_ns=%llu packet_gpu_max_ns=%llu packet_gpu_dropped=%llu\n",
+        (unsigned long long)gpu[0], (unsigned long long)gpu[1],
+        (unsigned long long)gpu[2], (unsigned long long)gpu[3], (unsigned long long)gpu[4]);
+    uint64_t details[4]; gl_renderer_packet_gpu_details(details);
+    std::fprintf(stdout, "psxrecomp: packet_wait_ns=%llu packet_restage_ns=%llu packet_restages=%llu\n",
+        (unsigned long long)details[0], (unsigned long long)details[1], (unsigned long long)details[2]);
+    static const bool op_profile = std::getenv("PSX_RENDER_OP_PROFILE") != nullptr;
+    if (op_profile) { GLRenderAsyncStats stats; gl_renderer_pass_async_stats(&stats); }
     std::fflush(stdout);
     last_ticks = now;
     last_frames = frames;
@@ -5329,7 +5387,7 @@ static int sdl_audio_catchup_sink(int other_sink) {
     }
     s_drc.stats(&stats);
     const double fill_ms = s_drc.fill_ms();
-    const double target_ms = s_drc.cfg.target_ms;
+    const double target_ms = s_drc.target_ms();
     const int active = psx_audio_catchup_update(&state,
         psx_audio_sync_enabled() && !psx_netplay_active() && present_should_wall_pace(),
         other_sink || (g_turbo_audio_sink_active && !state.active),
@@ -8046,6 +8104,8 @@ static void env_pad_hold_apply(void) {
         if (i == 1) sio_set_pad_connected(1, 1);
         sio_set_pad_state_slot(i, w[i]);
     }
+    extern uint64_t s_frame_count;
+    env_pad_script_tick(s_frame_count);
 }
 
 static void sample_headless_pad_into_sio(int override) {
@@ -18428,7 +18488,7 @@ int main(int argc, char** argv) {
     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     /* Legacy single deadzone (<0 => keep per-slot / input.ini defaults). */
     int  resolved_deadzone = -1;
-    int  resolved_audio_buffer_ms = 180;
+    int  resolved_audio_buffer_ms = 60;
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
      * lang_menu_options drives the launcher's "Localization" dropdown (empty =>
@@ -21575,7 +21635,9 @@ session_reboot:
         std::atexit(game_options_save_now);
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
-        host_sampler_start();   /* this is the emulation thread */
+        const char *host_sampling=std::getenv("PSX_HOST_SAMPLER");
+        if(host_sampling && *host_sampling=='1')
+            host_sampler_start();   /* this is the emulation thread */
 #else
         (void)debug_port;
 #endif
@@ -21729,7 +21791,7 @@ session_reboot:
                 cfg.source_rate = 44100.0;            /* SPU render rate */
                 cfg.host_rate   = (double)have.freq;  /* actual device rate */
                 cfg.target_ms   = (double)resolved_audio_buffer_ms;
-                if (s_drc.init(cfg) == 0) s_drc_ready = true;
+                if (s_drc.init(cfg, !(std::getenv("PSX_AUDIO_ADAPTIVE") && *std::getenv("PSX_AUDIO_ADAPTIVE")=='0')) == 0) s_drc_ready = true;
             }
             g_audio_host_rate = have.freq;
             audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
@@ -22300,36 +22362,7 @@ session_reboot:
         psx_rewind_set_depth((uint32_t)g_rewind_depth);
         psx_rewind_set_interval((uint32_t)g_rewind_interval);
         psx_rewind_configure(memory_get_bios_checksum(), game_entry_pc);
-        /* Headless load: PSX_LOAD_SLOT=N stages slot load (0..11)
-         * at the next safe block boundary after boot. */
-        if (const char *ls = std::getenv("PSX_LOAD_SLOT"); ls && *ls) {
-            char *end = nullptr;
-            const long parsed = std::strtol(ls, &end, 10);
-            if (!end || *end != '\0' || parsed < 0 || parsed >= SAVESTATE_SLOTS) {
-                openxr_ready_record_load_request(
-                    -1, "state_load_request_invalid");
-                std::fprintf(stderr,
-                             "psxrecomp: PSX_LOAD_SLOT=%s ignored (expected 0..%d)\n",
-                             ls, SAVESTATE_SLOTS - 1);
-            } else {
-                const int slot = static_cast<int>(parsed);
-                if (psx_netplay_active()) {
-                    openxr_ready_record_load_request(
-                        slot, "state_load_unavailable_netplay");
-                    std::fprintf(stdout,
-                        "psxrecomp: PSX_LOAD_SLOT=%d ignored (use the save-state menu after netplay starts)\n",
-                        slot);
-                } else if (savestate_request_load(slot)) {
-                    openxr_ready_record_load_request(slot, nullptr);
-                    std::fprintf(stdout, "psxrecomp: PSX_LOAD_SLOT=%d staged\n", slot);
-                } else {
-                    openxr_ready_record_load_request(
-                        slot, "state_load_request_refused");
-                    std::fprintf(stderr,
-                        "psxrecomp: PSX_LOAD_SLOT=%d could not be staged\n", slot);
-                }
-            }
-        }
+
     }
     /* Netplay: refresh RB bios/entry after savestate_configure (start() ran
      * earlier with zeros); guest also sandboxes .pst/.mcd under saves/netplay/. */
@@ -22549,6 +22582,7 @@ session_reboot:
      * Go back to the room; do not boot the game offline. */
     if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
         goto soft_return_lobby;
+    if (!env_load_slot_startup(&cpu)) return 1;
     psx_scheduler_run(&cpu);
     if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
         goto soft_return_lobby;

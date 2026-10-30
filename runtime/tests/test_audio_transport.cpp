@@ -11,7 +11,7 @@ int main() {
     config.source_rate=44100;config.host_rate=48000;
     PsxAudioTransport transport;
     rab_bridge reference;
-    assert(!transport.init(config));assert(!rab_init(&reference,&config));
+    assert(!transport.init(config,false));assert(!rab_init(&reference,&config));
     int16_t input[2048*2],actual[1024*2],expected[1024*2];
     /* Exact waveform/controller parity through repeated wrap, startup,
      * depletion, overflow, resume and non-integral resampling. */
@@ -30,7 +30,7 @@ int main() {
     /* A load discards already-resampled and pending old-timeline PCM, but
      * retains samples published after the reset request. No callback-side
      * allocation or producer-side device synchronization is involved. */
-    assert(!transport.init(config));
+    assert(!transport.init(config,false));
     for(auto &v:input) v=24000;
     for(int i=0;i<6;++i) transport.push(input,2048);
     transport.pull(actual,1024);
@@ -45,7 +45,7 @@ int main() {
     transport.pull(actual,1024);
     for(auto v:actual) assert(v==0);
     transport.free();
-    assert(!transport.init(config));
+    assert(!transport.init(config,false));
     std::atomic<bool> done{false};
     std::thread producer([&]{
         int16_t constant[256*2];for(auto &v:constant)v=8192;

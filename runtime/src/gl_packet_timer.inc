@@ -4,10 +4,12 @@
 #define PACKET_TIMER_SLOTS 8
 #define PACKET_TIMER_PRESENTS 8
 #define PACKET_TIMER_WAITS 8
-#define PACKET_TIMER_QUERIES (2+2*PACKET_TIMER_PRESENTS+2*PACKET_TIMER_WAITS)
+#define PACKET_TIMER_RESTAGE (2+2*PACKET_TIMER_PRESENTS+2*PACKET_TIMER_WAITS)
+#define PACKET_TIMER_QUERIES (PACKET_TIMER_RESTAGE+2)
 typedef struct PacketTimerSlot {
     GLuint query[PACKET_TIMER_QUERIES];
     unsigned presents,waits;
+    int restage;
     void *fence;
 } PacketTimerSlot;
 static PacketTimerSlot s_pkt_time[PACKET_TIMER_SLOTS];
@@ -18,6 +20,7 @@ static int s_pkt_wait_open;
 static _Atomic uint64_t s_pkt_samples,s_pkt_ns,s_pkt_present_ns,s_pkt_max_ns,s_pkt_dropped;
 static _Atomic uint64_t s_pkt_wait_ns,s_pkt_wait_dropped;
 static _Atomic uint64_t s_pkt_fence_retired;
+static _Atomic uint64_t s_pkt_restage_ns,s_pkt_restage_samples;
 static void packet_timer_resolve(void) {
     while(s_pkt_tail<s_pkt_head) {
         PacketTimerSlot *slot=&s_pkt_time[s_pkt_tail%PACKET_TIMER_SLOTS];
@@ -53,6 +56,12 @@ static void packet_timer_resolve(void) {
             atomic_fetch_add(&s_pkt_wait_ns,wait);
             if(ns>atomic_load(&s_pkt_max_ns))atomic_store(&s_pkt_max_ns,ns);
         }
+        if(slot->restage) {
+            GLuint64 a=0,b=0;
+            p_glGetQueryObjectui64v(slot->query[PACKET_TIMER_RESTAGE],GL_QUERY_RESULT,&a);
+            p_glGetQueryObjectui64v(slot->query[PACKET_TIMER_RESTAGE+1],GL_QUERY_RESULT,&b);
+            if(b>=a) { atomic_fetch_add(&s_pkt_restage_ns,b-a);atomic_fetch_add(&s_pkt_restage_samples,1); }
+        }
         if(slot->fence){p_glDeleteSync(slot->fence);slot->fence=NULL;}
         ++s_pkt_tail;
     }
@@ -73,6 +82,7 @@ static void packet_timer_begin(void) {
     }
     s_pkt_active=(int)(s_pkt_head%PACKET_TIMER_SLOTS);
     s_pkt_time[s_pkt_active].presents=s_pkt_time[s_pkt_active].waits=0;
+    s_pkt_time[s_pkt_active].restage=0;
     s_pkt_present_open=s_pkt_wait_open=0;
     p_glQueryCounter(s_pkt_time[s_pkt_active].query[0],GL_TIMESTAMP);
 }
@@ -95,6 +105,14 @@ static void packet_timer_end(void) {
     p_glQueryCounter(s_pkt_time[s_pkt_active].query[1],GL_TIMESTAMP);
     s_pkt_time[s_pkt_active].fence=p_glFenceSync(0x9117 /* GPU_COMMANDS_COMPLETE */,0);
     ++s_pkt_head;s_pkt_active=-1;
+}
+static void packet_timer_restage_begin(void) {
+    if(s_pkt_active>=0) p_glQueryCounter(s_pkt_time[s_pkt_active].query[PACKET_TIMER_RESTAGE],GL_TIMESTAMP);
+}
+static void packet_timer_restage_end(void) {
+    if(s_pkt_active<0)return;
+    p_glQueryCounter(s_pkt_time[s_pkt_active].query[PACKET_TIMER_RESTAGE+1],GL_TIMESTAMP);
+    s_pkt_time[s_pkt_active].restage=1;
 }
 /* Measure a server-side wait separately; keep the original inclusive packet
  * span unchanged. A present-slot reuse fence can idle the GPU without doing
@@ -122,6 +140,7 @@ static void packet_timer_reset(void) {
     atomic_store(&s_pkt_samples,0);atomic_store(&s_pkt_ns,0);
     atomic_store(&s_pkt_present_ns,0);atomic_store(&s_pkt_max_ns,0);atomic_store(&s_pkt_dropped,0);
     atomic_store(&s_pkt_fence_retired,0);
+    atomic_store(&s_pkt_restage_ns,0);atomic_store(&s_pkt_restage_samples,0);
     atomic_store(&s_pkt_wait_ns,0);atomic_store(&s_pkt_wait_dropped,0);s_pkt_wait_open=0;
 }
 void gl_renderer_packet_gpu_stats(uint64_t out[5]) {
@@ -129,4 +148,8 @@ void gl_renderer_packet_gpu_stats(uint64_t out[5]) {
     out[0]=atomic_load(&s_pkt_samples);out[1]=atomic_load(&s_pkt_ns);
     out[2]=atomic_load(&s_pkt_present_ns);out[3]=atomic_load(&s_pkt_max_ns);
     out[4]=atomic_load(&s_pkt_dropped);
+}
+void gl_renderer_packet_gpu_details(uint64_t out[4]) {
+    out[0]=atomic_load(&s_pkt_wait_ns);out[1]=atomic_load(&s_pkt_restage_ns);
+    out[2]=atomic_load(&s_pkt_restage_samples);out[3]=atomic_load(&s_pkt_fence_retired);
 }

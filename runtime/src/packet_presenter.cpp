@@ -24,6 +24,20 @@ std::atomic<double> delay_ms{0},interval_ms{0},motion_sum_ms{0},motion_sum_sq_ms
 std::atomic<uint64_t> motion_steps{0};
 uint64_t last_motion=0;
 }
+extern "C" void packet_presenter_trace(unsigned event,uint64_t begin,uint64_t end) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    static FILE *file=[] {const char *p=std::getenv("PSX_PRESENT_SLOT_TRACE");
+        FILE *f=p&&*p?std::fopen(p,"wb"):nullptr;
+        if(f){std::setvbuf(f,nullptr,_IOFBF,256*1024);std::fprintf(f,"event,begin_ns,end_ns,sequence,period_ns,start_ns,due_ns,snapped\n");}return f;}();
+    if(file)std::fprintf(file,"%u,%llu,%llu,%llu,%llu,%llu,%llu,%d\n",event,
+        (unsigned long long)begin,(unsigned long long)end,(unsigned long long)last_sequence,
+        (unsigned long long)period,(unsigned long long)start,
+        (unsigned long long)(rate?packet_interpolation_deadline(display_origin,index,rate,1):0),
+        packet_interpolation_stream_snapped());
+#else
+    (void)event;(void)begin;(void)end;
+#endif
+}
 extern "C" void packet_presenter_reset(void) {
     frame_packet_lease_release(current);current=nullptr;
     frame_packet_lease_release(previous);previous=nullptr;
@@ -59,6 +73,7 @@ extern "C" int packet_presenter_submit(const FramePacketView *packet,uint64_t no
     return 1;
 }
 extern "C" uint64_t packet_presenter_tick(uint64_t now,PacketPresenterDraw draw) {
+    packet_presenter_trace(0,now,now);
 #ifndef PSX_NO_DEBUG_TOOLS
     const int requested=requested_sample.exchange(-1);
     if(requested>=0 && current && draw) {
@@ -159,6 +174,7 @@ extern "C" int packet_presenter_buffer(const FramePacketView *packet,uint64_t no
     static const bool bypass=[] {const char *v=std::getenv("PSX_PRESENT_GUEST_CLOCK");return v && *v=='0';}();
     if(bypass)return 0;
 #endif
+    packet_presenter_trace(3,now,now);
     const unsigned hz=packet_interpolation_rate();
     if(!hz) {packet_presenter_buffer_reset();return 0;}
     if(delivery_rate!=hz) {packet_presenter_buffer_reset();packet_presenter_reset();delivery_rate=hz;}

@@ -814,7 +814,7 @@ struct RuntimeConfig {
     // games with smoother production cadence may opt into a lower value to
     // reduce controller-to-sound latency. This is a game-developer setting,
     // not a player preference.
-    int                   audio_buffer_ms = 180;
+    int                   audio_buffer_ms = 60;
 
     // spu_hq: enable the SPU float-shadow re-render (Catmull-Rom resample, float
     // headroom). Verified-enhancement, default OFF — spu_render output is

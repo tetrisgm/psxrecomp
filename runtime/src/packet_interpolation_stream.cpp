@@ -1,5 +1,7 @@
 #include "guest_wait_trace.h"
 #include "deferred_return.h"
+#include "worker_event.h"
+#include "host_thread_name.h"
 #include "packet_interpolation_stream.h"
 #include "packet_interpolation.h"
 #include <cstdio>
@@ -44,9 +46,15 @@ struct TransformStorage {
     TransformBlock *free_blocks=nullptr;
     PacketTransformTable *free_tables=nullptr;
     std::thread worker;
+    WorkerEvent changed;
     void release(TransformBlock* block) {
-        if(block && block->references.fetch_sub(1,std::memory_order_acq_rel)==1)
+        if(block && block->references.fetch_sub(1,std::memory_order_acq_rel)==1) {
             returned_blocks.push(block);
+            changed.notify();
+        }
+    }
+    void return_table(PacketTransformTable* table) {
+        returned_tables.push(table);changed.notify();
     }
     void reclaim() {
         while(auto* table=returned_tables.pop()) {
@@ -79,22 +87,24 @@ struct TransformStorage {
     TransformStorage() {
         for(size_t i=0;i<capacity;++i) prepare(); // startup, before guest execution
         worker=std::thread([this] {
+            psx_host_thread_name(L"PSX transform storage");
             while(!stopping.load(std::memory_order_acquire)) {
                 reclaim();
                 try {
                     while(written.load(std::memory_order_relaxed)-read.load(std::memory_order_acquire)<capacity &&
                           !stopping.load(std::memory_order_relaxed)) prepare();
                 } catch(...) {} // exhausted optional storage rejects a packet, never waits on the guest
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                changed.wait();
             }
             reclaim();
         });
     }
-    ~TransformStorage() {stopping.store(true,std::memory_order_release);worker.join();}
+    ~TransformStorage() {stopping.store(true,std::memory_order_release);changed.notify();worker.join();}
     PacketTransformTable* take() {
         const size_t head=read.load(std::memory_order_relaxed);
         if(head==written.load(std::memory_order_acquire)) {misses.fetch_add(1);return nullptr;}
-        auto* table=ready[head%capacity];read.store(head+1,std::memory_order_release);return table;
+        auto* table=ready[head%capacity];read.store(head+1,std::memory_order_release);
+        changed.notify();return table;
     }
 } transform_storage;
 struct TransformProducer {
@@ -103,7 +113,7 @@ struct TransformProducer {
     bool failed=false;
     TransformProducer() {
         auto* table=transform_storage.take();block=table->spare;table->spare=nullptr;
-        transform_storage.returned_tables.push(table);
+        transform_storage.return_table(table);
     }
     ~TransformProducer() {
         for(auto* item:history) transform_storage.release(item);
@@ -223,7 +233,7 @@ extern "C" PacketTransformTable *packet_interpolation_transform_seal(void) {
 }
 extern "C" void packet_interpolation_transform_free(PacketTransformTable *p) {
     guest_wait_trace::Scope trace(guest_wait_trace::History);
-    if(p) transform_storage.returned_tables.push(p);
+    if(p) transform_storage.return_table(p);
 }
 extern "C" size_t packet_interpolation_transform_bytes(const PacketTransformTable *p) {
     if(!p) return 0;
