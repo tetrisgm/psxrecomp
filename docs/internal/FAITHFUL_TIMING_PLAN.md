@@ -213,6 +213,20 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-10-30: Release blocking-wait audit passes the requested hidden 18x/8K
+120-second race gate: 59.573 presented images/s, 60.003 VBlanks/s, zero audio
+underruns, 3.467 ms GPU packet span/presentation. PGXP on, LLE, dummy audio,
+owner background applications untouched (65.99% whole-machine CPU). OS thread
+times total only 0.829 logical CPU; original Release already used 0.807 and
+passed. No 4-7-core runtime spin cost or total-CPU improvement is claimed.
+Waiters now block, pacer tail is 200 us, host sampling is opt-in. Startup-only
+LLE slot restore runs before fibers; no cross-fiber interactive restore.
+Focused six CTests, restore IRQ-edge check, hidden full-PGXP GL packet fixture,
+and 22 R4 root tests pass. Debug comparison, full thread receipts and limits:
+RELEASE_WAIT_AUDIT.md and RELEASE_WAIT_RECEIPTS.json. Owner explicitly requested
+promotion to fork r4/main on this gate, superseding the earlier topic-only rule.
+
+
 2026-10-30: Pooled restage and exact native-upload residency passed hidden
 full-PGXP LLE fixtures. Two fresh-grid laps failed acceptance after one retry;
 topic pushed, no main merge. See INTEGRATED_PRESENT_AUDIT.md. Guest timing
