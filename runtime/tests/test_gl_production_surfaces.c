@@ -65,8 +65,15 @@ static int run_scale(int scale) {
     s_alloc_scale=scale;check(dyn_apply(scale>1?1:scale),"dynamic scale preserves surface ownership");
     check(s_region_pool.count==old_count,"scale change does not allocate native-only VRAM");
     gl_renderer_restage_vram_after_savestate();
-    check(s_region_pool.count==1 && !g_wide_cur && s_draw_surface==&s_primary_surface,
-        "restore discards disposable enhanced owners");
+    check(s_region_pool.count==old_count && !g_wide_cur && s_draw_surface==&s_primary_surface,
+        "restore retains storage while detaching enhanced targets");
+    check(s_region_pool.coverage.count==1 && !s_region_pool.coverage.rects[0].owner,
+        "restore discards disposable enhanced ownership");
+    s_region_pool.use_clock+=9;
+    surface_pool_collect(&s_region_pool,NULL,0);
+    int retained=0;
+    for(size_t i=1;i<s_region_pool.count;++i)retained+=s_region_pool.surfaces[i]!=NULL;
+    check(!retained,"unused invalidated storage retires after reuse horizon");
     check(!s_primary_surface.fbo,"restore never recreates full-VRAM enhanced target");
     check(glGetError()==GL_NO_ERROR,"production lifecycle GL state");
     free(pixels);gl_renderer_shutdown();

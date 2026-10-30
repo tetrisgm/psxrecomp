@@ -905,11 +905,14 @@ static int s_selected_bank_failed;
 typedef struct GlRasterSurface {
     GLuint tex,fbo,rb;
     int x,y,w,h,allocation_scale;
+    int invalid;
+    uint64_t last_use;
 } GlRasterSurface;
 typedef struct GlSurfacePool {
     GlCoverage coverage;
     GlRasterSurface **surfaces;
     size_t count,capacity;
+    uint64_t use_clock;
 } GlSurfacePool;
 static GlSurfacePool s_region_pool;
 typedef struct GlDrawRegion {
@@ -7906,8 +7909,12 @@ void gl_renderer_restage_vram_after_savestate(void) {
     if(s_region_pool.coverage.rects) {
         flush_flat_batch();flush_tex_batch();
         s_draw_surface=&s_primary_surface;g_wide_cur=0;
-        surface_pool_destroy(&s_region_pool);
-        if(!surface_pool_init(&s_region_pool))abort();
+        const char *reuse=getenv("PSX_SURFACE_REUSE");
+        if(!reuse || *reuse!='0') surface_pool_invalidate(&s_region_pool);
+        else {
+            surface_pool_destroy(&s_region_pool);
+            if(!surface_pool_init(&s_region_pool))abort();
+        }
     }
     /* Belt-and-suspenders after boot_state VRAM apply: force CPU mirror → FBO
      * even if a depth24 skip swallowed the restore, then re-arm scanout-band

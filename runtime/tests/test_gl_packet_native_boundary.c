@@ -30,6 +30,31 @@ int main(void) {
     static uint32_t pixels[320*240];int w,h;
     check(gl_renderer_read_display_hires(0,0,320,240,pixels,320*240,&w,&h)==320*240,"GPU image still rendered");
     check((pixels[30*320+30]&0x00ffffff)!=0,"packet draw produced colour");
+    unsigned owner=surface_pool_acquire(&s_region_pool,-16,0,352,240,0,0,320,240,1,0);
+    check(owner!=0,"allocation for reset regression");
+    GLuint old_fbo=s_region_pool.surfaces[owner]->fbo;
+    /* Poison every attachment, including the reveal margin. A reset test
+     * starting from freshly cleared storage cannot detect a missing clear. */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,old_fbo);
+    glDisable(GL_SCISSOR_TEST);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+    glDepthMask(GL_TRUE);glStencilMask(255);
+    glClearColor(1,0,1,1);glClearDepth(0.25);glClearStencil(123);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+    gl_renderer_restage_vram_after_savestate();
+    check(s_region_pool.surfaces[owner]->fbo==old_fbo,"invalidation retains allocation identity");
+    check(s_region_pool.coverage.count==1 && !s_region_pool.coverage.rects[0].owner,"invalidation removes all enhanced ownership");
+    surface_pool_retire_unused();
+    check(s_region_pool.surfaces[owner]!=NULL,"alternate target survives packet retirement");
+    unsigned reused=surface_pool_acquire(&s_region_pool,-16,0,352,240,0,0,320,240,1,0);
+    check(reused==owner && s_region_pool.surfaces[reused]->fbo==old_fbo,"same bounds reacquire exact allocation");
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,old_fbo);
+    uint32_t clear_colour=~0u;float clear_depth=0;unsigned char clear_stencil=255;
+    glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,&clear_colour);
+    glReadPixels(0,0,1,1,GL_DEPTH_COMPONENT,GL_FLOAT,&clear_depth);
+    glReadPixels(0,0,1,1,GL_STENCIL_INDEX,GL_UNSIGNED_BYTE,&clear_stencil);
+    check(clear_colour==0 && clear_depth==1 && clear_stencil==0,"reveal colour depth stencil match fresh allocation");
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
     printf("checks=%d failures=%d\n",checks,failures);
     gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();return failures?1:0;
 }
