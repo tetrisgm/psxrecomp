@@ -1,3 +1,6 @@
+#ifndef PSX_GL_PRODUCTION_SURFACES_TEST
+#define PSX_GL_LEGACY_SURFACE_TEST 1
+#endif
 /* Render thread equivalence on a real, hidden OpenGL context.
  *
  * Run twice per scale by run_gl_render_thread.py, once with the render thread

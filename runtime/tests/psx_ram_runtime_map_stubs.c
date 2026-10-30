@@ -176,6 +176,12 @@ uint32_t spu_get_ram_bytes(void) { return (uint32_t)sizeof s_spu_ram; }
 
 static uint16_t s_vram[1024u * 512u];
 const uint16_t *gpu_get_vram(void) { return s_vram; }
+const uint16_t *gpu_snapshot_native_vram(void) { return s_vram; }
+/* This fixture exercises synchronous save/load, never a queued capture. */
+struct GpuNativeCapture;
+int gpu_native_capture_begin(struct GpuNativeCapture *capture) {
+    (void)capture; __builtin_trap();
+}
 int gpu_snapshot_valid_size(uint32_t size) { return size==gpu_snapshot_bytes(); }
 void gpu_native_vram_restore(const uint16_t *source) { memcpy(s_vram,source,sizeof s_vram); }
 void gpu_native_vram_read(int x,int y,int w,int h,uint16_t *destination) {

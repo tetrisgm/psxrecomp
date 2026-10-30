@@ -43,7 +43,11 @@ assert "cands[n++] = psx_irq_resume_context_snapshot_pc();" in STATE
 assert "cands[n++] = psx_irq_resume_context_snapshot_pc();" in REWIND
 assert "int pc_ok = savestate_resume_pc_ok(pc);" in STATE
 assert "(resume_pc == 0u && !pc_matches_cpu) || !snapshot_safe || !pc_ok" in STATE
-assert "!psx_irq_resume_context_snapshot_safe_at(pc) || !resume_pc_ok(pc)" in REWIND
+rewind_compact = "".join(REWIND.split())
+assert any(guard in rewind_compact for guard in (
+    "if(!psx_irq_resume_context_snapshot_safe_at(pc)||!resume_pc_ok(pc))return;",
+    "if(!resume_pc_ok(pc)||!psx_irq_resume_context_snapshot_safe_at(pc))return;",
+))
 assert "psx_check_interrupts_at(cpu, pc)" in DIRTY
 print("savestate status protocol guard passed")
 

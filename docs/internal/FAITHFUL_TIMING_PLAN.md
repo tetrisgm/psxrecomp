@@ -2280,6 +2280,7 @@ still pending; see [GUEST_HOTPATH.md](GUEST_HOTPATH.md) for measurements and gat
 2026-10-29 G2: static cached ALU segment interlock composition and inline constant-PC cache hit checks in both emitters. 200,000 randomized timing cases and 120 grid frames bit-identical to G1 (zero tolerance/misses), R4 CTest 23/23, focused timing/cache/overlay tests and 40-step hidden smoke pass. OpenBIOS regenerated/stamped and R4 regenerated. Completed grid mean guest CPU 10.050 ms, cadence 60.048, harness 59.94, zero starved/packet allocations, max wall 37.381 ms. Phase identity gate passes; final budget remains unmet. See GUEST_EXECUTION.md.
 
 2026-10-29 G3: inline compiled RAM/scratch/BIOS access, exact load pipeline/deadline ordering and page dirty markers. 30k randomized load cases, differential stores, 120 exact grid frames, 23 root CTests, focused emitter/native fixtures and repeated zero-miss smoke pass. First complete candidate regressed (58.25/34668 starved); compact revision 60.01/0, mean CPU 11.792 ms vs G2 10.050, max wall36.667. Final budget still unmet. See GUEST_EXECUTION.md.
+<<<<<<< HEAD
 
 2026-10-29 G4 continuation (unaccepted, unmerged): compiled PGXP main-state
 propagation passes 300k exact state comparisons, checkpoint/trace cases,
@@ -2333,3 +2334,108 @@ header leak, stale compiled-fetch/store expectations, BOM-aware preprocessing,
 and duplicate textual timing branches. Unrelated prior renderer/session/source
 assertion failures are not claimed green. Required runtime/focused gates above
 remain the acceptance evidence; follow-up interval work must preserve them.
+=======
+2026-10-29 phase 3 groundwork: scissored depth clears replace clear geometry; bounded fenced streams replace flat/textured/upload-quad buffer orphaning (persistent mapping on target, fixed storage/subdata for GL3.3). Hidden stream fixture4110checks, PGXP1x/4x/9x and packet74checks pass; R4 dev build32tests and hidden smoke zero misses. Packet timestamp telemetry excludes inter-packet idle. Fresh slot10 required by execution-profile compatibility identity; old slot9 preserved. 18x active-effects race60.044Hz,max41.345ms,zero starved,51.2swap completions/s; GPU timeline18.948ms/packet including12.509ms presentation. Full surfaces and duplicate primitive depth remain; phase3 not accepted or promoted. No guest timing/codegen changes.
+
+2026-10-29 phase3 continuation: cropped-target colour/depth parity passes18cases at1x/4x/9x. Removed CPU-input-only GL batch flushes, retained actual upload ordering. Packet82checks, full-PGXP bank4cases, R4 32tests pass. Same slot10 18x all-on60.044Hz,max37.413ms,zero starved,60swaps/s(not distinct),GPU packet15.693ms,7.3batches versus69.7. Full allocation and depth replay remain; no phase acceptance.
+
+2026-10-29 phase3 surface groundwork: cross-target enhanced copies and cropped-to-wide translucent overlays pass colour/depth parity at1x/4x/9x, including72copy mask combinations. Dev build and R4 32tests pass. Receipt phase3-cross-target-overlay/rth-68qop30w. Full-VRAM allocation and duplicate depth remain; no phase acceptance.
+
+2026-10-29 phase3 continued WIP: merged fork d2185504 (completed rewind/audit) in87c415a5. Production PGXP colour/depth one pass; masked depth writes fixed; opt-in audit probes retained. Cropped/analytic/mask/packet hidden fixtures pass, R4 32/32. Async fenced32x18 present receipt proves1800distinct samples/30s, no missing. Recovered SPSC native draw transport while retaining ordered checkpoint mailbox:20 repeated native tests pass; worst submission .533->.245ms, no overall pacing gain. Release debug-tools-off built;30s59.997Hz,entry33.358ms,return18.519ms,zero starved. Entry includes prior pacer sleep; no ten-minute gate or surface cutover acceptance. Full allocation/duplicate wide remain; no promotion. All runs dummy audio.
+
+2026-10-29 phase3 direct-output groundwork: cropped readers, display-band blits,
+transaction coordinates and one-pass wide projection now tested through18x.
+Hidden fixture phase3-direct-wide-18x/rth-nq_cv7nr covers ordinary/backdrop
+flat/textured geometry, lines, uploads, fills, enhanced cross-target copies,
+mask semantics, captures and backup/restore. Textured output byte exact;
+flat Gouraud differences bounded to one RGB code (362pixels at18x), alpha
+exact, all page positions byte-identical. Production still uses full-VRAM
+allocation: no acceptance or promotion. Dev build/R4 32tests passed. Ghidra
+MCP available with OpenBIOS and game analyzed. All runs dummy audio.
+
+2026-10-29 phase3 WIP: common explicit-region colour/depth allocator and
+multi-source enhanced copy staging pass hidden1x/4x/9x/18x fixture
+phase3-region-allocation-18x/rth-9_kedxl7. Native texture uploads now share
+bounded fenced persistent/fixed-storage streams; removed per-upload PBO
+orphaning/client-memory branch. Hidden vertex+upload lifetime fixture passes
+4626checks in persistent and GL3.3-compatible modes, including strided uploads
+across ring wraps: phase3-native-upload-stream/rth-fo1q54gz. Production full
+HR allocation remains, no phase promotion. Packet growth avoids redundant
+zero-fill; opt-in timings show .079ms allocation/.036ms cleanup in worst
+35.670ms interval, not a pacing fix. Sampler overhead A/B inconclusive and
+contended with a non-owned runtime. Latest distinct receipt31.766/s despite
+60swaps/s, zero missing receipts/starved/misses. Absolute worst-frame marker
+and existing span/frame/sampler probes support continued hitch attribution.
+
+2026-10-29 phase3 continued: direct-wide copy valid coverage excludes reveal
+margins; hidden1/4/9/18x fixture phase3-wide-copy-coverage/rth-vyyoz6kq passes.
+Release held-pad harness now connects explicit P1 and supports NeGcon analog
+pressure without changing device type. Read-only owned-process monitoring
+confirmed driving in phase3-release-connected18:59.996Hz,entry33.946ms,
+return20.160ms(one over20),zero starved. Earlier release-upload18 had no
+throttle and is not driving proof. No ten-minute acceptance; full HR region
+selection/cutover still open, no promotion. Full framework build in progress.
+2026-10-29 phase3 integration: full framework build passes after adding the
+native snapshot API doubles to the RAM-map fixture. Non-hardware ctest ran
+301 enabled tests: one stale rewind source guard failed because the same two
+safety predicates changed order; guard repaired and rerun passed. Three
+external/platform tests skipped, two disabled. Dev build and R4 32/32 passed;
+hidden smoke phase3-copy-gates ended with zero dispatch and segment misses.
+Copy clipping and canonical wide coverage pass through18x in
+phase3-copy-clip18/rth-nwrp_hgz; scratch never grows to full scaled VRAM for a
+cropped destination. Packet texture sampling now consumes captured native
+inputs without GPU-to-native packing, independent of HD replacement mode.
+Updated packet fixture removes its synthetic texture-page framebuffer uploads
+and checks actual enhanced output:900 checks pass, zero GPU pack draws,
+phase3-native-packet-textures/rth-a3xp02_l. Production surface cutover still
+open; no phase acceptance or mainline promotion.
+
+2026-10-29 phase3 texture coherence: the first native-route race exposed117025
+uploads/102.77GB in30s. Reusing captured tile versions per packet and separating
+enhanced draw dirt from native sampling dirt reduced this to9531 uploads/
+4.53GB; GPU packet span20.681->16.567ms, zero pack draws/starved/misses. Distinct
+images remain30/s, entry35.958ms/return27.627ms, no acceptance. Dense row staging
+passes4628 checks in persistent and portable storage, with16384 narrow uploads
+per mode to force ring reuse. Removed CPU1555->RGBA upload conversion, the
+full native RGBA staging texture and upload vertex batches: native R16UI now
+seeds enhanced regions directly, including cropped/direct-wide regions and
+legacy high-resolution tiles. Replaced optional HD dummy binding with1x1 RGBA.
+Cropped1/4/9/18x fixture phase3-native-region-seed/rth-94m_pwqm and packet/history
+fixture phase3-native-seed-packet/rth-5038v24r (909checks) pass. Full-VRAM HR
+colour/depth allocation still exists; production pool/cutover remains open.
+2026-10-29 latest: native region seed/bank PGXP gates pass, odd-width upload
+stress4630checks passes. Race phase3-native-seed18:60.019Hz,entry37.227ms,
+return34.424ms,zero starved/misses,29.998distinct/s,GPU packet16.628ms,
+1.44GB native staged bytes/30s. No cadence acceptance. Present-slot GPU server
+wait timestamps added separately without changing inclusive packet span;
+914 packet/history/timer checks pass in phase3-slot-wait-timer/rth-a54ztt2_.
+2026-10-29 phase3 copy preparation: NativeRaster packet inputs now capture
+pre-copy source tiles, with wrap and zero-size encoding tests; native_raster_test
+passes. Native-seeded sparse enhanced copy fixture passes1/4/9/18x in
+phase3-sparse-copy-seed/rth-cdr48agl. Present-slot GPU fence timing is only
+0.000589ms/packet in phase3-slot-wait18, not the16.641ms packet span's cause.
+Guest59.997Hz,entry33.609ms,return30.283ms,zero starved/misses,35.566distinct/s.
+Production full-HR allocation/pool routing still open; no acceptance.
+2026-10-29 phase3: whole-image asynchronous receipts replace 32x18 sampling; single-pixel corner/odd-size fixture passes40 swaps/20 changes. phase3-whole-image18:49.667distinct/s,0.411ms GPU hash,60.023Hz,35.250ms entry/24.623ms return,zero starved/misses. Packet timestamp retirement stalled without GL error; completion-fence probe underway, GPU frame result invalid. Copy application separated from gather, cropped1/4/9/18x passes; full-HR pool cutover still pending.
+2026-10-29 phase3 receipt follow-up: phase3-whole-image-fence18 completes1804 packet GPU samples with zero drops using completion fences;9.730ms packet/1.431ms present,0.410ms whole-image hash,58.166distinct/s. Guest60.001Hz,entry33.822ms/return23.175ms,zero starved/misses. No full-surface cutover or10-minute gate yet; no promotion.
+2026-10-29 phase3: event pacing before FIELD/LCF, mod hooks and IRQ0 committed6f0dabcc; ordering/cycle-invariance test passes. Release120s59.990Hz,max19.594ms,zero over20ms/starved,9.746ms inclusive GPU packet; no10-minute gate. Region pool routed flat/textured triangles and depth clears pass1/4/9/18x; wrapped overlapping128-pixel block copies pass pixel/CPU-shadow tests (phase3-routed-copy-wrap/rth-g75q0rrq). Production full-HR allocation still pending removal; no promotion.
+2026-10-29 phase3 continuation: direct-wide selection/presentation of two independent426x240 vertical display bands passes1/4/9/18x (phase3-wide-present/rth-f6s8yxu8), with full PGXP. Root build and32/32 pass before the latest presentation adapter.120s Release receipts reduced:7200 receipts,7115 changed,59.290distinct/s,zero missing. Full-HR production allocation remains; pool activation/lifecycle and remaining legacy consumers must be cut over before promotion.
+
+2026-10-29 phase3 functional integration: merged 499a12ab over fork r4/main
+1ae4b9f5 (already includes phase4 7a46df9e). Production now allocates native
+VRAM plus owned display bands and on-demand offscreen tiles; the full scaled
+VRAM target is confined to the legacy comparison fixture. Presentation,
+diagnostic gathers, copies, rescale, restore and shutdown use owned surfaces.
+Empty draw areas skip rendering; wide clears clip to their owned band.
+Native packet copies capture source tiles before mutation. No CPU/recompiler,
+memory, guest timing or PGXP-inline changes were made for this integration.
+Functional evidence: R4 build passes; 26 permitted CTests pass (r4_pgxp_boot
+excluded because it disables PGXP); production GL fixture passes 80 checks
+at 1x/4x/9x/18x, cropped-reference parity and native-raster/coverage fixtures
+pass. Hidden dummy-audio smoke phase3-gate has zero dispatch/segment misses;
+45 moving race pairs have zero unmatched/ambiguous/invalid and no new failed
+pairs. Boot-wide audit retains two earlier failed pairs (peak unmatched 2),
+also present in the phase4 baseline. No performance acceptance was measured.
+Earlier phase4 unfiltered CTest inadvertently ran the PGXP-off boot test;
+subsequent tests exclude it and all functional smoke runs retain PGXP.
+>>>>>>> origin/r4/main

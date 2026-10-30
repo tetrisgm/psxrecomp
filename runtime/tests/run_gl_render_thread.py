@@ -75,7 +75,7 @@ def main():
     sdl_includes = [str(pathlib.Path(d).resolve()) for d in args.sdl_include.split(";") if d]
     args.sdl_library = str(pathlib.Path(args.sdl_library).resolve())
     framework = pathlib.Path(__file__).resolve().parents[2]
-    fixture = args.fixture or framework / "runtime/tests/test_gl_render_thread.c"
+    fixture = args.fixture.resolve() if args.fixture else framework / "runtime/tests/test_gl_render_thread.c"
     out_root = pathlib.Path(args.output).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     dest = pathlib.Path(tempfile.mkdtemp(prefix="rth-", dir=out_root))
