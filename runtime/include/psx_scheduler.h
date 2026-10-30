@@ -87,6 +87,10 @@ int psx_is_dispatchable(uint32_t pc);
  * exit-diagnostic dump then runs. Forward-declared for main.cpp (C++). */
 struct CPUState;
 void psx_scheduler_run(struct CPUState* cpu);
+int psx_scheduler_can_restore_startup(void);
+/* Before run only: preserve restored live registers rather than reloading a
+ * potentially older TCB image. No stack unwind and no scheduler-mode change. */
+int psx_scheduler_prepare_startup_restore(uint32_t pc);
 
 /*
  * Soft-exit netplay back to the lobby UI. Sets PSX_RUN_RETURN_TO_LOBBY and

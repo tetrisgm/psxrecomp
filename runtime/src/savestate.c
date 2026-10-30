@@ -57,6 +57,7 @@ static uint32_t s_openbios_wordsum;   /* bundled OpenBIOS wordsum for migrate */
 static uint32_t s_bios_checksum;
 static uint32_t s_entry_pc;
 static int      s_configured   = 0;
+static int s_startup_restore;
 static int      s_title_blocked;
 static int      s_content_scope_valid = 1;
 static char     s_content_token[71]; /* "_mods_" + complete SHA-256 + NUL */
@@ -803,7 +804,7 @@ static int request_load_inner(int slot) {
         return 0;
     }
     if (slot < 0 || slot >= SAVESTATE_SLOTS) return 0;
-    if (!psx_hle_scheduler_enabled()) {
+    if (!s_startup_restore && !psx_hle_scheduler_enabled()) {
         /* LLE (host-fiber) mode: the restore longjmp target lives on the
          * scheduler fiber; cross-fiber unwind is unsafe. HLE is the default. */
         fprintf(stderr, "savestate: load requires the HLE scheduler (default); "
@@ -829,6 +830,14 @@ int savestate_request_save(int slot) {
 int savestate_request_load(int slot) {
     if (netplay_user_blocked()) return 0;
     return request_load_inner(slot);
+}
+int savestate_restore_startup(CPUState* cpu, int slot) {
+    if (!cpu || !psx_scheduler_can_restore_startup() || netplay_user_blocked()) return 0;
+    s_startup_restore = 1;
+    const int accepted = request_load_inner(slot);
+    if (accepted) savestate_poll(cpu, cpu->pc);
+    s_startup_restore = 0;
+    return accepted && s_load_completed && psx_scheduler_prepare_startup_restore(cpu->pc);
 }
 
 int savestate_request_save_protocol(int slot) {
@@ -1125,7 +1134,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
 #endif
             /* Unwind to the scheduler and re-dispatch the restored PC. Never
              * returns; abandons the suspended CPS frames on the current stack. */
-            psx_scheduler_resume_at(cpu->pc);
+            if (!s_startup_restore) psx_scheduler_resume_at(cpu->pc);
         }
     }
 }

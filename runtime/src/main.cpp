@@ -5095,6 +5095,20 @@ static void openxr_ready_report_tick(uint64_t frames) {
     }
 }
 
+/* Startup restore runs before any guest fiber or native guest stack exists. */
+static bool env_load_slot_startup(CPUState *cpu) {
+    const char *value = std::getenv("PSX_LOAD_SLOT");
+    if (!value || !*value) return true;
+    char *end = nullptr;
+    const long slot = std::strtol(value, &end, 10);
+    if (!end || *end || slot < 0 || slot >= SAVESTATE_SLOTS || psx_netplay_active()) return false;
+    const int ok = savestate_restore_startup(cpu, (int)slot);
+    openxr_ready_record_load_request((int)slot, ok ? nullptr : "state_load_failed");
+    std::fprintf(stdout, "psxrecomp: PSX_LOAD_SLOT=%ld %s\n", slot, ok ? "restored" : "failed");
+    std::fflush(stdout);
+    return ok != 0;
+}
+
 /* Offline input replay for release-build measurements. Each row is an
  * absolute VBlank number, active-low pad word (hex), and save slot (-1 for
  * no save). Parsed once; no file polling or debug-server dependency. */
@@ -5186,13 +5200,11 @@ static void frame_report_tick(uint64_t frames) {
                  pc_s > 0.0 ? (double)(real - last_real) / pc_s : 0.0,
                  (unsigned long long)pt_swaps, pts.present_max_ns / 1e6, bp_ms,
                  (unsigned long long)audio_underruns, audio_fill);
-    uint64_t gpu_ns[5], gpu_count[5];
-    gl_renderer_async_gpu_times(gpu_ns, gpu_count);
-    std::fprintf(stdout, "psxrecomp: gpu_ns=%llu,%llu,%llu,%llu,%llu gpu_n=%llu,%llu,%llu,%llu,%llu\n",
-        (unsigned long long)gpu_ns[0], (unsigned long long)gpu_ns[1],
-        (unsigned long long)gpu_ns[2], (unsigned long long)gpu_ns[3], (unsigned long long)gpu_ns[4],
-        (unsigned long long)gpu_count[0], (unsigned long long)gpu_count[1],
-        (unsigned long long)gpu_count[2], (unsigned long long)gpu_count[3], (unsigned long long)gpu_count[4]);
+    uint64_t gpu[5];
+    gl_renderer_packet_gpu_stats(gpu);
+    std::fprintf(stdout, "psxrecomp: packet_gpu_samples=%llu packet_gpu_ns=%llu packet_present_ns=%llu packet_gpu_max_ns=%llu packet_gpu_dropped=%llu\n",
+        (unsigned long long)gpu[0], (unsigned long long)gpu[1],
+        (unsigned long long)gpu[2], (unsigned long long)gpu[3], (unsigned long long)gpu[4]);
     std::fflush(stdout);
     last_ticks = now;
     last_frames = frames;
@@ -22345,36 +22357,7 @@ session_reboot:
         psx_rewind_set_depth((uint32_t)g_rewind_depth);
         psx_rewind_set_interval((uint32_t)g_rewind_interval);
         psx_rewind_configure(memory_get_bios_checksum(), game_entry_pc);
-        /* Headless load: PSX_LOAD_SLOT=N stages slot load (0..11)
-         * at the next safe block boundary after boot. */
-        if (const char *ls = std::getenv("PSX_LOAD_SLOT"); ls && *ls) {
-            char *end = nullptr;
-            const long parsed = std::strtol(ls, &end, 10);
-            if (!end || *end != '\0' || parsed < 0 || parsed >= SAVESTATE_SLOTS) {
-                openxr_ready_record_load_request(
-                    -1, "state_load_request_invalid");
-                std::fprintf(stderr,
-                             "psxrecomp: PSX_LOAD_SLOT=%s ignored (expected 0..%d)\n",
-                             ls, SAVESTATE_SLOTS - 1);
-            } else {
-                const int slot = static_cast<int>(parsed);
-                if (psx_netplay_active()) {
-                    openxr_ready_record_load_request(
-                        slot, "state_load_unavailable_netplay");
-                    std::fprintf(stdout,
-                        "psxrecomp: PSX_LOAD_SLOT=%d ignored (use the save-state menu after netplay starts)\n",
-                        slot);
-                } else if (savestate_request_load(slot)) {
-                    openxr_ready_record_load_request(slot, nullptr);
-                    std::fprintf(stdout, "psxrecomp: PSX_LOAD_SLOT=%d staged\n", slot);
-                } else {
-                    openxr_ready_record_load_request(
-                        slot, "state_load_request_refused");
-                    std::fprintf(stderr,
-                        "psxrecomp: PSX_LOAD_SLOT=%d could not be staged\n", slot);
-                }
-            }
-        }
+
     }
     /* Netplay: refresh RB bios/entry after savestate_configure (start() ran
      * earlier with zeros); guest also sandboxes .pst/.mcd under saves/netplay/. */
@@ -22594,6 +22577,7 @@ session_reboot:
      * Go back to the room; do not boot the game offline. */
     if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
         goto soft_return_lobby;
+    if (!env_load_slot_startup(&cpu)) return 1;
     psx_scheduler_run(&cpu);
     if (psx_return_to_lobby_requested() && g_netplay_from_lobby)
         goto soft_return_lobby;

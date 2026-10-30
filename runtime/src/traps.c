@@ -802,6 +802,14 @@ static int psx_change_thread(CPUState* cpu, uint32_t target_tcb)
 }
 
 static int g_in_scheduler_run = 0;
+static int g_scheduler_has_run;
+static uint32_t g_startup_restore_pc;
+int psx_scheduler_can_restore_startup(void) { return !g_scheduler_has_run; }
+int psx_scheduler_prepare_startup_restore(uint32_t pc) {
+    if (!psx_scheduler_can_restore_startup() || !psx_is_dispatchable(pc)) return 0;
+    g_startup_restore_pc = pc;
+    return 1;
+}
 static int g_return_to_lobby_req = 0;
 
 void psx_clear_return_to_lobby(void)
@@ -830,7 +838,15 @@ void psx_scheduler_run(CPUState* cpu)
 {
     extern int g_psx_dispatch_depth;
     g_in_scheduler_run = 1;
+    g_scheduler_has_run = 1;
     g_sched_escape.reason = PSX_RUN_CONTINUE;
+    if (g_startup_restore_pc) {
+        g_sched_escape.reason = PSX_RUN_RESUME_CURRENT;
+        g_sched_escape.resume_pc = g_startup_restore_pc;
+        g_startup_restore_pc = 0;
+        g_sched_top_level_resume = 1;
+        g_sched_restore_edge_check = 1;
+    }
     for (;;) {
         if (setjmp(g_scheduler_jmpbuf) != 0) {
             psx_snapshot_host_call_reset();

@@ -13,6 +13,8 @@ void psx_frontend_on_savestate_refused(int load, int slot, const char* reason) {
 int psx_netplay_active(void) { return 0; }
 int psx_netplay_is_host(void) { return 1; }
 int psx_hle_scheduler_enabled(void) { return 1; }
+int psx_scheduler_can_restore_startup(void) { return 0; }
+int psx_scheduler_prepare_startup_restore(uint32_t pc) { (void)pc; assert(0); return 0; }
 int psx_mod_function_entry_active(void) { return 0; }
 int psx_is_dispatchable(uint32_t pc) { return pc != 0; }
 uint32_t psx_last_irq_check_pc(void) { return 0; }
