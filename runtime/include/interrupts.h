@@ -32,6 +32,10 @@ void psx_snapshot_host_call_restore(unsigned depth);
 
 void interrupts_init(void);
 
+/* Host-only wall-clock gate before consuming or publishing a VBlank edge.
+ * Must not mutate guest state. Replay/netplay policy belongs to the frontend. */
+void interrupts_set_vblank_pacer(void (*fn)(void));
+
 /* Save-state restore: re-anchor host-only IRQ pacing after psx_cycle_count is
  * overwritten from a snapshot. Clears absolute-cycle cooldowns / deferred
  * switches that would otherwise strand delivery until the restored clock

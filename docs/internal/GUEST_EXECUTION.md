@@ -287,3 +287,24 @@ header leak, stale compiled-fetch/store expectations, BOM-aware preprocessing,
 and duplicate textual timing branches. Unrelated prior renderer/session/source
 assertion failures are not claimed green. Required runtime/focused gates above
 remain the acceptance evidence; follow-up interval work must preserve them.
+
+
+2026-10-29 interval task, first completed candidate: restored host pacing before
+the actual scheduler VBlank edge (before I_STAT, FIELD and mod hooks), based on
+6f0dabcc, which the phase-3 final integration had omitted. Preserve the original
+cadence probe. Headless/debug turbo, netplay and resimulation keep their policy;
+frontend fast-forward transitions apply at the next event and cannot wait twice.
+The scheduler fixture proves pre-IRQ ordering and unchanged guest cycles.
+
+Integrated build,13 focused framework tests,22 permitted R4 CTests (exclude
+PGXP-disabling boot fixture),current OpenBIOS stamp,native recorded-oracle
+fixtures and40-step hidden zero-dispatch/segment-miss smoke pass. Exact480
+guest fingerprints and581880 ordered PGXP triangles on236 complete frames.
+Fresh supervisor slot11 all-on/FPS-off grid:59.94 harness/60.001 cadence,
+0starved,0packet allocations,max28.284ms,meanCPU17796.875/1803=9.871ms.
+Worst interval has0.0005ms pacing and0.0539ms native completion: the remaining
+spike is guest work, not sleep debt or native completion. This does not pass20ms.
+Receipt: analysis/guest-execution-interval-event.{json,txt} in R4 worktree.
+The previous G4 fields maximum was35.960ms and G1 was37.319ms; this integrated
+measurement also includes the fork's phase-3 surfaces, so it is not an isolated
+A/B attribution for every changed component.

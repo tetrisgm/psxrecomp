@@ -83,7 +83,8 @@ void timers_tick(int c) { (void)c; }
 void sio_tick_quantum(void) {}
 uint32_t sio_get_seq(void) { return 0; }
 int  sio_card_protocol_active(void) { return 0; }
-void gpu_vblank_tick(void) {}
+unsigned g_test_gpu_vblanks;
+void gpu_vblank_tick(void) { ++g_test_gpu_vblanks; }
 void gpu_vblank_flush_present(void) {}
 void gpu_vblank_clear_deferred_present(void) {}
 void psx_guest_cycle_scale_vblank(void) {}
