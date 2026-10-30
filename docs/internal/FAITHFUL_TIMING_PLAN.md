@@ -2467,3 +2467,12 @@ No guest cycles, inputs, native VRAM, rewind state or SPU production change.
 Tests compare output sample vectors with 25 ms arrival spikes at 33.3 ms
 buffering, test reset/delay bounds, and preserve stamps through rewind.
 Integrated evidence: PRESENT_GUEST_CLOCK.md.
+
+
+### 2026-10-29 integrated presentation/audio audit
+
+Packet replay must not rerasterize immutable native inputs; Windows presentation
+deadlines require an interruptible high-resolution timer; audio queue feedback
+must use measured device consumption. See INTEGRATED_PRESENT_AUDIT.md for
+regression tests and the outstanding performance gate. No guest timing or HLE
+implementation changed.
