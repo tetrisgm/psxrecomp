@@ -2280,7 +2280,6 @@ still pending; see [GUEST_HOTPATH.md](GUEST_HOTPATH.md) for measurements and gat
 2026-10-29 G2: static cached ALU segment interlock composition and inline constant-PC cache hit checks in both emitters. 200,000 randomized timing cases and 120 grid frames bit-identical to G1 (zero tolerance/misses), R4 CTest 23/23, focused timing/cache/overlay tests and 40-step hidden smoke pass. OpenBIOS regenerated/stamped and R4 regenerated. Completed grid mean guest CPU 10.050 ms, cadence 60.048, harness 59.94, zero starved/packet allocations, max wall 37.381 ms. Phase identity gate passes; final budget remains unmet. See GUEST_EXECUTION.md.
 
 2026-10-29 G3: inline compiled RAM/scratch/BIOS access, exact load pipeline/deadline ordering and page dirty markers. 30k randomized load cases, differential stores, 120 exact grid frames, 23 root CTests, focused emitter/native fixtures and repeated zero-miss smoke pass. First complete candidate regressed (58.25/34668 starved); compact revision 60.01/0, mean CPU 11.792 ms vs G2 10.050, max wall36.667. Final budget still unmet. See GUEST_EXECUTION.md.
-<<<<<<< HEAD
 
 2026-10-29 G4 continuation (unaccepted, unmerged): compiled PGXP main-state
 propagation passes 300k exact state comparisons, checkpoint/trace cases,
@@ -2334,7 +2333,6 @@ header leak, stale compiled-fetch/store expectations, BOM-aware preprocessing,
 and duplicate textual timing branches. Unrelated prior renderer/session/source
 assertion failures are not claimed green. Required runtime/focused gates above
 remain the acceptance evidence; follow-up interval work must preserve them.
-=======
 2026-10-29 phase 3 groundwork: scissored depth clears replace clear geometry; bounded fenced streams replace flat/textured/upload-quad buffer orphaning (persistent mapping on target, fixed storage/subdata for GL3.3). Hidden stream fixture4110checks, PGXP1x/4x/9x and packet74checks pass; R4 dev build32tests and hidden smoke zero misses. Packet timestamp telemetry excludes inter-packet idle. Fresh slot10 required by execution-profile compatibility identity; old slot9 preserved. 18x active-effects race60.044Hz,max41.345ms,zero starved,51.2swap completions/s; GPU timeline18.948ms/packet including12.509ms presentation. Full surfaces and duplicate primitive depth remain; phase3 not accepted or promoted. No guest timing/codegen changes.
 
 2026-10-29 phase3 continuation: cropped-target colour/depth parity passes18cases at1x/4x/9x. Removed CPU-input-only GL batch flushes, retained actual upload ordering. Packet82checks, full-PGXP bank4cases, R4 32tests pass. Same slot10 18x all-on60.044Hz,max37.413ms,zero starved,60swaps/s(not distinct),GPU packet15.693ms,7.3batches versus69.7. Full allocation and depth replay remain; no phase acceptance.
@@ -2438,4 +2436,3 @@ pairs. Boot-wide audit retains two earlier failed pairs (peak unmatched 2),
 also present in the phase4 baseline. No performance acceptance was measured.
 Earlier phase4 unfiltered CTest inadvertently ran the PGXP-off boot test;
 subsequent tests exclude it and all functional smoke runs retain PGXP.
->>>>>>> origin/r4/main
