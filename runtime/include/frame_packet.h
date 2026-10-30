@@ -16,6 +16,7 @@ extern "C" {
 typedef struct FramePacketQueue FramePacketQueue;
 typedef struct FramePacketView {
     uint64_t sequence,epoch;
+    uint64_t guest_time_ns; /* producer-stamped guest VBlank, retained by history */
     const void *initial;
     size_t initial_bytes;
     const void *records;
@@ -57,6 +58,7 @@ int frame_packet_append_records(FramePacketQueue *queue,const void *records,size
 /* Discard only the open producer frame, preserving the last complete pending
  * frame and its epoch. Used for a failed native-input capture. */
 void frame_packet_cancel(FramePacketQueue *queue);
+void frame_packet_stamp(FramePacketQueue *queue,uint64_t guest_time_ns);
 int frame_packet_publish(FramePacketQueue *queue);
 int frame_packet_acquire(FramePacketQueue *queue,FramePacketView *view);
 void frame_packet_release(FramePacketQueue *queue);

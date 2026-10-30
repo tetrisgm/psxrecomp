@@ -11327,7 +11327,7 @@ static void handle_packet_interpolation(int id, const char *json)
         packet_interpolation_capture_json(buf,sizeof buf,json_get_int(json,"older",0),
                                           (size_t)json_get_int(json,"start",0));
     else packet_interpolation_stream_json(buf,sizeof buf);
-    char presenter[512];packet_presenter_json(presenter,sizeof presenter);
+    char presenter[1024];packet_presenter_json(presenter,sizeof presenter);
     send_fmt("{\"id\":%d,\"ok\":true,\"interpolation\":%s,\"presenter\":%s}",id,buf,presenter);
 }
 

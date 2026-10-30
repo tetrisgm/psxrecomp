@@ -2452,3 +2452,18 @@ emitter3/native/stamps/480 fingerprints/571890 triangles/40-step zero-miss
 smoke pass; broad legacy suite is not claimed green. Full candidate table,
 root-cause limits and numeric receipts: docs/internal/GUEST_EXECUTION.md and
 GUEST_EXECUTION_INTERVAL_RECEIPTS.json.
+
+
+### 2026-10-29: presentation guest clock
+
+`fix/present-guest-clock` stamps immutable packets with guest VBlank time,
+retains those stamps in rewind history, and buffers delivery on a fixed
+host mapping before preparing geometry/metadata pairs. Display samples use
+a persistent display grid. The extra jitter delay defaults to one VBlank;
+`PSX_PRESENT_DELAY_MS` selects 0-100 ms. Late endpoints hold rather than
+extrapolate unverified geometry; >100 ms mapping drift, epochs and backwards
+timestamps resynchronize. Eight retained envelopes bound consumer storage.
+No guest cycles, inputs, native VRAM, rewind state or SPU production change.
+Tests compare output sample vectors with 25 ms arrival spikes at 33.3 ms
+buffering, test reset/delay bounds, and preserve stamps through rewind.
+Integrated evidence: PRESENT_GUEST_CLOCK.md.

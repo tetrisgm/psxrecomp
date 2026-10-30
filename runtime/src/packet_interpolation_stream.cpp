@@ -404,6 +404,7 @@ static void stream_end_impl(void) {
     {
         std::lock_guard<std::mutex> lock(stats_mutex);
         published=stream.failed?PacketInterpolationStats{}:packet_interpolation_stats(stream.pair);
+        if(packet_interpolation_stream_snapped())published.snapped=1;
         published_source_mode=stream.source_mode;
         published_sequence=stream.sequence;published_missing=stream.missing;
         published_count=stream.union_geometry.size();published_failed=stream.failed;
@@ -509,6 +510,9 @@ extern "C" unsigned packet_interpolation_rate(void) {unsigned rate=output_rate.l
 extern "C" void packet_interpolation_display_rate(double hz) {if(hz>=1 && hz<=1000) display_rate.store(unsigned(hz+0.5));}
 extern "C" size_t packet_interpolation_stream_count(void) {return stream.older.size();}
 extern "C" int packet_interpolation_stream_sample(double t) {
+    // Never mix a matched subset with held, unverified geometry. Arrival
+    // stalls can expose a wider topology transition; use the exact endpoint.
+    if(t!=1.0 && packet_interpolation_stream_snapped())return 0;
     try {stream.sampled.resize(stream.union_geometry.size());}
     catch(...) {return 0;}
     return packet_interpolation_sample(stream.pair,t,stream.sampled.data(),stream.sampled.size());
@@ -527,4 +531,8 @@ extern "C" const PacketInterpolationPrimitive *packet_interpolation_stream_retir
     return i<stream.retiring_endpoints.size()?&stream.retiring_endpoints[i]:nullptr;
 }
 
-extern "C" int packet_interpolation_stream_snapped(void) {return packet_interpolation_stats(stream.pair).snapped;}
+extern "C" int packet_interpolation_stream_snapped(void) {
+    const auto stats=packet_interpolation_stats(stream.pair);
+    return stats.snapped || stats.unmatched || stats.ambiguous || stats.invalid ||
+           stats.unexplained || stream.failed || stream.missing;
+}

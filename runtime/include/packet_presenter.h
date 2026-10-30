@@ -10,6 +10,12 @@ extern "C" {
  * the current endpoint. Neither callback may execute guest code. */
 typedef void (*PacketPresenterDraw)(const FramePacketView *, double);
 void packet_presenter_reset(void);
+/* Render-owner bounded delivery buffer, before any pair/metadata preparation.
+ * prepare receives the mapped deadline, not wall-clock arrival. */
+typedef void (*PacketPresenterPrepare)(const FramePacketView *,uint64_t);
+void packet_presenter_buffer_reset(void);
+int packet_presenter_buffer(const FramePacketView *,uint64_t,double,PacketPresenterPrepare);
+uint64_t packet_presenter_deliver(uint64_t,PacketPresenterPrepare);
 int packet_presenter_active(void);
 const FramePacketView *packet_presenter_previous(void);
 int packet_presenter_json(char *,size_t);

@@ -31,6 +31,7 @@ int frame_owner_attach(FrameOwner *owner,void *attachment,size_t bytes,void (*di
 void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags,uint32_t bytes);
 int frame_owner_append_records(FrameOwner *owner,const void *records,size_t bytes);
 void frame_owner_cancel(FrameOwner *owner);
+void frame_owner_stamp(FrameOwner *owner,uint64_t guest_time_ns);
 int frame_owner_publish(FrameOwner *owner);
 void frame_owner_invalidate(FrameOwner *owner);
 /* Durable asynchronous controls/diagnostics, separate from droppable frames.

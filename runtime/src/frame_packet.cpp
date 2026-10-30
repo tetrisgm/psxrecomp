@@ -97,7 +97,7 @@ struct Storage {
     size_t cost() const { return sizeof(Storage)+(initial.capacity()+records.capacity())*RT_ALIGN+attachment_bytes; }
 };
 struct Packet {
-    uint64_t sequence=0,epoch=0;
+    uint64_t sequence=0,epoch=0,guest_time_ns=0;
     std::shared_ptr<Storage> data;
 };
 size_t blocks(size_t bytes) { return bytes/RT_ALIGN+(bytes%RT_ALIGN!=0); }
@@ -157,7 +157,7 @@ extern "C" int frame_packet_reserve_initial(FramePacketQueue *q,uint64_t sequenc
     if(!p.initial.resize(blocks(bytes))) {
         q->reclaim_spares();if(!p.initial.resize(blocks(bytes)))return 0;
     }
-    slot.sequence=sequence;slot.epoch=q->epoch.load(std::memory_order_relaxed);
+    slot.sequence=sequence;slot.epoch=q->epoch.load(std::memory_order_relaxed);slot.guest_time_ns=0;
     p.initial_bytes=bytes;p.record_bytes=0;
     q->valid=true;
     *initial=p.initial.data();
@@ -200,6 +200,9 @@ extern "C" void *frame_packet_append(FramePacketQueue *q,uint16_t op,uint16_t fl
     std::memset(reinterpret_cast<unsigned char*>(cmd+1)+bytes,0,size-sizeof(RtCmd)-bytes);
     p.record_bytes+=size;
     return cmd+1;
+}
+extern "C" void frame_packet_stamp(FramePacketQueue *q,uint64_t time) {
+    if(q && q->open && q->valid) q->mailbox.writing().guest_time_ns=time;
 }
 extern "C" int frame_packet_publish(FramePacketQueue *q) {
     if(!q || !q->open) return 0;
@@ -253,7 +256,7 @@ extern "C" int frame_packet_acquire(FramePacketQueue *q,FramePacketView *view) {
     const auto *p=q->mailbox.acquire();
     if(!p) { *view={};return 0; }
     const auto &d=*p->data;
-    *view={p->sequence,p->epoch,d.initial.data(),d.initial_bytes,d.records.data(),d.record_bytes,d.attachment,&p->data};
+    *view={p->sequence,p->epoch,p->guest_time_ns,d.initial.data(),d.initial_bytes,d.records.data(),d.record_bytes,d.attachment,&p->data};
     return 1;
 }
 extern "C" void frame_packet_release(FramePacketQueue *q) { q->mailbox.release(); }

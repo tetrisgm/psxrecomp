@@ -60,6 +60,9 @@ int main() {
     assert(std::strstr(json,"\"ambiguous\":1,"));
     assert(std::strstr(json,"\"resolved_assignment\":1,"));
     assert(std::strstr(json,"\"duplicate_equal\":1,"));
+    assert(packet_interpolation_stream_snapped());
+    assert(!packet_interpolation_stream_sample(0.5));
+    assert(packet_interpolation_stream_sample(1.0));
     // A frozen debug capture owns its pair across subsequent packet reuse.
     packet_interpolation_capture_request();
     packet_interpolation_stream_begin(1,5);
