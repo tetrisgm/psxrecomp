@@ -213,6 +213,12 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-10-30: Pooled restage and exact native-upload residency passed hidden
+full-PGXP LLE fixtures. Two fresh-grid laps failed acceptance after one retry;
+topic pushed, no main merge. See INTEGRATED_PRESENT_AUDIT.md. Guest timing
+unchanged.
+
+
 ### 2026-10-29: phase-4 guest wait attribution
 
 On `feat/frame-arch-4-interp`, opt-in `main_cadence reset=1` now retains the
