@@ -21,6 +21,22 @@ static void surface_pool_destroy(GlSurfacePool *pool) {
     free(pool->surfaces);gl_coverage_destroy(&pool->coverage);
     memset(pool,0,sizeof *pool);
 }
+/* A skipped immutable packet invalidates ownership, not storage. Clearing is
+ * deferred to reacquisition, so unused allocations do not consume GPU work. */
+static void surface_pool_invalidate(GlSurfacePool *pool) {
+    for(size_t i=1;i<pool->count;++i)if(pool->surfaces[i])pool->surfaces[i]->invalid=1;
+    pool->coverage.rects[0]=(GlCoverageRect){0,0,VRAM_W,VRAM_H,0};
+    pool->coverage.count=1;
+}
+static void surface_pool_clear_invalid(GlRasterSurface *surface) {
+    if(!surface->invalid)return;
+    glDisable(GL_SCISSOR_TEST);glClearStencil(0);glClearDepth(1.0);
+    glClearColor(0,0,0,0);glStencilMask(255);glDepthMask(GL_TRUE);
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,surface->fbo);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);surface->invalid=0;
+}
 /* Call after flushing batches. Retain any front/back target handles still
  * used by the caller; otherwise allocations without canonical owners can
  * be deleted immediately (GL retains pending command references). */
@@ -31,7 +47,9 @@ static void surface_pool_collect(GlSurfacePool *pool,const unsigned *keep,size_t
         int used=0;
         for(size_t j=0;j<keep_count;++j)used|=keep[j]==i;
         for(size_t j=0;j<pool->coverage.count && !used;++j)used=pool->coverage.rects[j].owner==i;
-        if(used)continue;
+        // Retain recently used allocations across the eight-packet delivery
+        // horizon. Obsolete bounds still retire automatically.
+        if(used || pool->use_clock-s->last_use<=8)continue;
         p_glDeleteFramebuffers(1,&s->fbo);p_glDeleteRenderbuffers(1,&s->rb);glDeleteTextures(1,&s->tex);
         free(s);pool->surfaces[i]=NULL;
     }
@@ -143,6 +161,8 @@ static unsigned surface_pool_acquire(GlSurfacePool *pool,
         owner=(unsigned)slot;pool->surfaces[slot]=s;
         if(slot==pool->count)++pool->count;
     }
+    GlRasterSurface *selected=pool->surfaces[owner];
+    surface_pool_clear_invalid(selected);selected->last_use=pool->use_clock;
     surface_pool_seed(pool,owner,valid_x,valid_y,valid_w,valid_h,tile);
     int assigned=tile?gl_coverage_claim_native(&pool->coverage,valid_x,valid_y,valid_w,valid_h,owner):
         gl_coverage_replace(&pool->coverage,valid_x,valid_y,valid_w,valid_h,owner);
@@ -204,6 +224,7 @@ static int surface_pool_rescale(GlSurfacePool *pool,int scale) {
     free(next);p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);return ok;
 }
 static void surface_pool_retire_unused(void) {
+    ++s_region_pool.use_clock;
     if(!s_region_pool.coverage.rects)return;
     unsigned keep[2]={0,0};
     for(size_t i=1;i<s_region_pool.count;++i) {
