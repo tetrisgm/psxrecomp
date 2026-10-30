@@ -11301,7 +11301,7 @@ void debug_server_capture_mark(void)
 static void handle_render_thread(int id, const char *json)
 {
     (void)json;
-    char buf[4096];
+    char buf[16384];
     if (gl_renderer_render_thread_json(buf, sizeof buf) <= 0) buf[0] = 0;
     send_fmt("{\"id\":%d,\"ok\":true,%s}", id, buf[0] ? buf : "\"active\":0");
 }

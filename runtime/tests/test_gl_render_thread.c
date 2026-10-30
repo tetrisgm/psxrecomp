@@ -114,6 +114,7 @@ int gpu_ws_netplay_local_viewport_width(void){return 0;}
 int render_pass_netplay_enabled(void){return 0;}
 uint64_t psx_cycle_count=0;
 uint32_t g_psx_vblank_cycles=564480u;
+uint32_t interrupts_get_cycles_since_vblank(void){return 0;}
 /* Frontend hooks of the present path (host overlays, pacing, rings). */
 int host_osd_image(const uint32_t **p,int *w,int *h){*p=NULL;*w=*h=0;return 0;}
 int host_osd_volume_image(const uint32_t **p,int *w,int *h){*p=NULL;*w=*h=0;return 0;}
