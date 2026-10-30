@@ -5,6 +5,7 @@
  * mutex guards all slot state; nothing is held while present() runs. */
 
 #include "present_thread.h"
+#include "host_thread_name.h"
 
 #include <string.h>
 
@@ -94,6 +95,7 @@ static struct {
 static int s_pt_inited = 0;
 
 static void *present_loop(void) {
+    psx_host_thread_name(L"PSX present");
     int ok = P.cfg.ctx(P.cfg.user, 1);
     mtx_lock(&P.mtx);
     P.init_done = 1;

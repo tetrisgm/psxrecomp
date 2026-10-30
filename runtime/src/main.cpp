@@ -5205,6 +5205,11 @@ static void frame_report_tick(uint64_t frames) {
     std::fprintf(stdout, "psxrecomp: packet_gpu_samples=%llu packet_gpu_ns=%llu packet_present_ns=%llu packet_gpu_max_ns=%llu packet_gpu_dropped=%llu\n",
         (unsigned long long)gpu[0], (unsigned long long)gpu[1],
         (unsigned long long)gpu[2], (unsigned long long)gpu[3], (unsigned long long)gpu[4]);
+    uint64_t details[4]; gl_renderer_packet_gpu_details(details);
+    std::fprintf(stdout, "psxrecomp: packet_wait_ns=%llu packet_restage_ns=%llu packet_restages=%llu\n",
+        (unsigned long long)details[0], (unsigned long long)details[1], (unsigned long long)details[2]);
+    static const bool op_profile = std::getenv("PSX_RENDER_OP_PROFILE") != nullptr;
+    if (op_profile) { GLRenderAsyncStats stats; gl_renderer_pass_async_stats(&stats); }
     std::fflush(stdout);
     last_ticks = now;
     last_frames = frames;
@@ -21631,7 +21636,7 @@ session_reboot:
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
         const char *host_sampling=std::getenv("PSX_HOST_SAMPLER");
-        if(!host_sampling || *host_sampling!='0')
+        if(host_sampling && *host_sampling=='1')
             host_sampler_start();   /* this is the emulation thread */
 #else
         (void)debug_port;

@@ -712,6 +712,7 @@ void gl_renderer_render_thread_sync(const char *reason);
 /* Consumed-packet timestamps: samples,total_ns,present_ns,max_ns,dropped.
  * Explicit PSX_GL_ASYNC_GPU_TIMER opt-in also works in Release builds. */
 void gl_renderer_packet_gpu_stats(uint64_t out[5]);
+void gl_renderer_packet_gpu_details(uint64_t out[4]);
 int  gl_renderer_render_thread_json(char *out, size_t cap);
 /* [video] present_thread (docs/RENDER_THREAD.md "Present thread"): set before
  * gl_renderer_render_thread_start; with the render thread, composed frames go

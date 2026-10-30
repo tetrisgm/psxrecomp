@@ -1,3 +1,4 @@
+#include "blocking_sync.h"
 #include "packet_interpolation_stream.h"
 #include "packet_presenter.h"
 #include "interrupts.h"
@@ -1006,7 +1007,7 @@ typedef struct AsyncSeamPrepared {
     struct AsyncSeamPrepared *next, *work_next;
 } AsyncSeamPrepared;
 static AsyncSeamPrepared *s_async_seam_ready, *s_async_seam_active;
-static atomic_flag s_async_seam_ready_guard = ATOMIC_FLAG_INIT;
+static PsxBlockingMutex s_async_seam_ready_guard = PSX_BLOCKING_MUTEX_INIT;
 static int s_async_seam_failed;
 static int s_async_seam_reset_pending;
 static _Atomic uint64_t s_async_seam_prepared_count, s_async_seam_used_count;
@@ -9348,7 +9349,7 @@ typedef struct AsyncSeamBaseline {
     PgxpRthSeamDepth depth;       /* depth-clear state at the snapshot */
 } AsyncSeamBaseline;
 static AsyncSeamBaseline s_async_seam_baseline[PASS_GENERATIONS];
-static atomic_flag s_async_seam_lock = ATOMIC_FLAG_INIT;
+static PsxBlockingMutex s_async_seam_lock = PSX_BLOCKING_MUTEX_INIT;
 static SDL_Thread *s_async_seam_worker;
 static SDL_mutex *s_async_seam_work_mutex;
 static SDL_cond *s_async_seam_work_cv;
@@ -9356,10 +9357,10 @@ static AsyncSeamPrepared *s_async_seam_work_head, *s_async_seam_work_tail;
 static unsigned s_async_seam_work_n;
 static int s_async_seam_work_stop;
 static void async_seam_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&s_async_seam_lock, memory_order_acquire)) {}
+    psx_blocking_lock(&s_async_seam_lock);
 }
 static void async_seam_unlock(void) {
-    atomic_flag_clear_explicit(&s_async_seam_lock, memory_order_release);
+    psx_blocking_unlock(&s_async_seam_lock);
 }
 static _Atomic uint64_t s_async_resource_epoch=1;
 static GLuint s_async_live_raw_tex,s_async_live_raw_fbo;
@@ -9468,6 +9469,11 @@ static void async_seam_baseline_publish(int gi, uint64_t epoch, uint64_t generat
     }
     slot->present = src != NULL;
     async_seam_unlock();
+    if (s_async_seam_work_mutex) {
+        SDL_LockMutex(s_async_seam_work_mutex);
+        SDL_CondBroadcast(s_async_seam_work_cv);
+        SDL_UnlockMutex(s_async_seam_work_mutex);
+    }
 }
 static void async_seam_baseline_invalidate(uint64_t epoch, uint64_t generation) {
     async_seam_lock();
@@ -9514,20 +9520,27 @@ static void async_seam_prepared_unref(AsyncSeamPrepared *p) {
 static void async_seam_prepare_one(AsyncSeamPrepared *p) {
     p->baseline = (PgxpSnap *)calloc(1, sizeof *p->baseline);
     if (!p->baseline) return;
+    SDL_LockMutex(s_async_seam_work_mutex);
     while (pt_clock_ns() < p->deadline &&
+           !s_async_seam_work_stop &&
            atomic_load_explicit(&p->refs, memory_order_acquire) > 1) {
         int32_t area[4];
         PgxpRthSeamDepth depth;
         if (async_seam_baseline_copy(p->epoch, p->generation,
                                      p->baseline, &p->baseline_present, area, &depth)) {
+            SDL_UnlockMutex(s_async_seam_work_mutex);
             p->ready = pgxp_rth_seam_stream_mark_resets(&p->stream, area, &depth) &&
                        pgxp_snap_batch_prepare(&p->batch, p->baseline,
                                                 p->generation, p->stream.input,
                                                 p->stream.count);
             return;
         }
-        SDL_Delay(0);
+        const uint64_t now = pt_clock_ns();
+        if (now >= p->deadline) break;
+        SDL_CondWaitTimeout(s_async_seam_work_cv, s_async_seam_work_mutex,
+            (uint32_t)((p->deadline - now + 999999u) / 1000000u));
     }
+    SDL_UnlockMutex(s_async_seam_work_mutex);
 }
 static int async_seam_prepare_thread(void *arg) {
     (void)arg;
@@ -9596,10 +9609,10 @@ static void async_seam_worker_stop(void) {
     s_async_seam_work_n = 0;
 }
 static void async_seam_ready_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&s_async_seam_ready_guard, memory_order_acquire)) {}
+    psx_blocking_lock(&s_async_seam_ready_guard);
 }
 static void async_seam_ready_unlock(void) {
-    atomic_flag_clear_explicit(&s_async_seam_ready_guard, memory_order_release);
+    psx_blocking_unlock(&s_async_seam_ready_guard);
 }
 static void async_seam_ready_insert(AsyncSeamPrepared *p) {
     async_seam_ready_lock();
@@ -13303,9 +13316,9 @@ static void dyn_rescale_in_place(GLuint fbo, int surf_w, const int (*cols)[2], i
  * captured when the step was recorded (gpu.c's display state is the
  * emulation thread's). */
 static int s_dyn_rth_disp_valid = 0, s_dyn_rth_disp[5];
-static atomic_flag s_dyn_stats_lock = ATOMIC_FLAG_INIT;   /* s_dyn_stats: render thread writes */
-static void dyn_stats_lock(void) { while (atomic_flag_test_and_set_explicit(&s_dyn_stats_lock, memory_order_acquire)) {} }
-static void dyn_stats_unlock(void) { atomic_flag_clear_explicit(&s_dyn_stats_lock, memory_order_release); }
+static PsxBlockingMutex s_dyn_stats_lock = PSX_BLOCKING_MUTEX_INIT;   /* s_dyn_stats: render thread writes */
+static void dyn_stats_lock(void) { psx_blocking_lock(&s_dyn_stats_lock); }
+static void dyn_stats_unlock(void) { psx_blocking_unlock(&s_dyn_stats_lock); }
 static _Atomic int s_rthm_scale = 1; /* producer request / owner allocation completion */
 
 static int dyn_apply(int snew) {
@@ -14496,7 +14509,7 @@ static _Atomic uint64_t s_fg_gen_cost_ns = 0, s_fg_gen_measured = 0;
 /* Counts are consumed by the emulation thread's production controller, not
  * just diagnostics. The sequence publishes each measured count/cost pair
  * coherently (one RT writer); all payload fields are atomic as well. */
-static _Atomic unsigned s_fg_gen_cost_seq = 0;
+static PsxBlockingMutex s_fg_gen_cost_mutex = PSX_BLOCKING_MUTEX_INIT;
 static _Atomic uint64_t s_fg_generated = 0, s_fg_real_presents = 0;
 static uint64_t  s_fg_flips = 0,
                  s_fg_flushed = 0, s_fg_skipped_plan = 0, s_fg_dups = 0;
@@ -16378,10 +16391,10 @@ static void fg_overload(void) {
 }
 
 static void fg_gen_cost_publish(uint64_t cost_ns) {
-    atomic_fetch_add(&s_fg_gen_cost_seq, 1);
+    psx_blocking_lock(&s_fg_gen_cost_mutex);
     atomic_fetch_add(&s_fg_gen_cost_ns, cost_ns);
     atomic_fetch_add(&s_fg_gen_measured, 1);
-    atomic_fetch_add(&s_fg_gen_cost_seq, 1);
+    psx_blocking_unlock(&s_fg_gen_cost_mutex);
 }
 
 static void fg_gen_cost_poll(void) {
@@ -16904,16 +16917,11 @@ void gl_renderer_frame_gen_counts(uint64_t *generated, uint64_t *real_presents) 
 }
 
 void gl_renderer_frame_gen_costs(uint64_t *generated, uint64_t *measured, uint64_t *cost_ns) {
-    unsigned before, after;
     uint64_t count, cost;
-    do {
-        before = atomic_load(&s_fg_gen_cost_seq);
-        if (before & 1u) continue;
-        count = atomic_load(&s_fg_gen_measured);
-        cost = atomic_load(&s_fg_gen_cost_ns);
-        after = atomic_load(&s_fg_gen_cost_seq);
-        if (before == after) break;
-    } while (1);
+    psx_blocking_lock(&s_fg_gen_cost_mutex);
+    count = atomic_load(&s_fg_gen_measured);
+    cost = atomic_load(&s_fg_gen_cost_ns);
+    psx_blocking_unlock(&s_fg_gen_cost_mutex);
     if (generated) *generated = atomic_load(&s_fg_generated);
     if (measured) *measured = count;
     if (cost_ns) *cost_ns = cost;
@@ -18079,7 +18087,9 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
     if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence>s_rth_packet_last_sequence+1) {
         const uint64_t restage_begin=rt_now_ns();
+        packet_timer_restage_begin();
         gl_renderer_restage_vram_after_savestate();fg_invalidate();
+        packet_timer_restage_end();
         packet_presenter_trace(4,restage_begin,rt_now_ns());
     }
     rth_frame_state_apply(&seed->draw);

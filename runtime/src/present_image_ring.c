@@ -1,3 +1,4 @@
+#include "blocking_sync.h"
 #include "present_image_ring.h"
 
 #include <stdlib.h>
@@ -18,11 +19,11 @@ static uint32_t s_head = 0;
 static uint32_t s_sequence = 0;
 static _Atomic int s_ready = 0; /* 0 uninitialized, 1 ready, -1 disabled */
 static _Atomic int s_frozen = 0;
-static atomic_flag s_lock = ATOMIC_FLAG_INIT;
+static PsxBlockingMutex s_lock = PSX_BLOCKING_MUTEX_INIT;
 static void ring_lock(void) {
-    while(atomic_flag_test_and_set_explicit(&s_lock,memory_order_acquire)) {}
+    psx_blocking_lock(&s_lock);
 }
-static void ring_unlock(void) { atomic_flag_clear_explicit(&s_lock,memory_order_release); }
+static void ring_unlock(void) { psx_blocking_unlock(&s_lock); }
 /* Conversion happens outside the publication lock. Only a completed native
  * thumbnail and its metadata are copied while readers are excluded. */
 static _Thread_local uint16_t s_staging[PRESENT_IMAGE_RING_MAX_W*PRESENT_IMAGE_RING_H];

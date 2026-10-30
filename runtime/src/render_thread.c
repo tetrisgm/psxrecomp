@@ -3,6 +3,7 @@
  * newest complete packet without applying backpressure to guest execution. */
 #include "render_thread.h"
 #include "frame_owner.h"
+#include "blocking_sync.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,21 +187,23 @@ void rt_release(void) {}
 /* Test-only completion barrier. Runtime source must not call this; unlike
  * acquisition it never transfers the context. Tests close their synthetic
  * frame here before inspecting it through an owner-side request. */
+static PsxBlockingMutex drain_mutex = PSX_BLOCKING_MUTEX_INIT;
+static PsxBlockingCond drain_condition = PSX_BLOCKING_COND_INIT;
 static void drain_complete(const void *payload) {
-    _Atomic int *done;memcpy(&done,payload,sizeof done);atomic_store(done,1);
+    _Atomic int *done;memcpy(&done,payload,sizeof done);
+    psx_blocking_lock(&drain_mutex);
+    atomic_store(done,1);
+    psx_blocking_notify(&drain_condition);
+    psx_blocking_unlock(&drain_mutex);
 }
 void rt_drain(void) {
     if(!owner || frame_owner_is_thread()) return;
     if(frame_bytes) rt_frame_end();
     _Atomic int done=0;_Atomic int *pointer=&done;
     if(!rt_request(drain_complete,&pointer,sizeof pointer)) abort();
-    while(!atomic_load(&done)) {
-#ifdef _WIN32
-        Sleep(0);
-#else
-        sched_yield();
-#endif
-    }
+    psx_blocking_lock(&drain_mutex);
+    while(!atomic_load(&done)) psx_blocking_wait(&drain_condition,&drain_mutex);
+    psx_blocking_unlock(&drain_mutex);
 }
 typedef struct Request { void (*callback)(const void *); unsigned char payload[]; } Request;
 static void execute_request(void *unused,const void *payload,size_t count,int stale) {

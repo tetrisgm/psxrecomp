@@ -29,7 +29,7 @@ uint32_t frame_pacing_sleep_us(uint64_t now,uint64_t deadline,uint64_t freq,uint
     uint64_t remaining=deadline-now;
     if(remaining>period)remaining=period;
     uint64_t us=remaining*1000000u/freq;
-    return us>500 ? (uint32_t)(us-500) : 0;
+    return us>200 ? (uint32_t)(us-200) : 0;
 }
 
 #ifndef FRAME_PACING_PURE_ONLY
@@ -94,7 +94,7 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
 #endif
     }
     while (SDL_GetPerformanceCounter() < p->next_deadline) {
-        /* final sub-ms spin */
+        /* At most a 200-us final scheduling margin. */
     }
     p->next_deadline += period;
 }

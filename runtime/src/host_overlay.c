@@ -1,5 +1,6 @@
 /* host_overlay.c -- see host_overlay.h. */
 #include "host_overlay.h"
+#include "blocking_sync.h"
 
 #include <stdatomic.h>
 #include <stddef.h>
@@ -62,12 +63,18 @@ static __declspec(thread) int s_in_draw = 0;
 static _Thread_local int s_in_draw = 0;
 #endif
 
-static void draw_yield(void) {
-#if defined(_WIN32)
-    Sleep(0);
-#else
-    sched_yield();
-#endif
+static PsxBlockingMutex s_callbacks_mutex = PSX_BLOCKING_MUTEX_INIT;
+static PsxBlockingCond s_callbacks_done = PSX_BLOCKING_COND_INIT;
+static void wait_callbacks(atomic_int *inflight) {
+    psx_blocking_lock(&s_callbacks_mutex);
+    while (atomic_load(inflight) > 0)
+        psx_blocking_wait(&s_callbacks_done, &s_callbacks_mutex);
+    psx_blocking_unlock(&s_callbacks_mutex);
+}
+static void finish_callback(atomic_int *inflight) {
+    psx_blocking_lock(&s_callbacks_mutex);
+    if (atomic_fetch_sub(inflight, 1) == 1) psx_blocking_notify(&s_callbacks_done);
+    psx_blocking_unlock(&s_callbacks_mutex);
 }
 
 void psx_host_overlay_set_draw_cb(PsxHostOverlayDrawFn fn, void *ctx) {
@@ -80,7 +87,7 @@ void psx_host_overlay_set_draw_cb(PsxHostOverlayDrawFn fn, void *ctx) {
     }
     old = atomic_exchange(&s_draw, rec); /* seq_cst: ordered with the readers' count */
     if (s_in_draw) return; /* from inside the callback: see above; old stays (rare) */
-    while (atomic_load(&s_draw_inflight) > 0) draw_yield();
+    wait_callbacks(&s_draw_inflight);
     free(old);
 }
 
@@ -98,13 +105,13 @@ void psx_host_overlay_draw(int width, int height) {
         rec->fn(width, height, rec->ctx);
         s_in_draw = 0;
     }
-    atomic_fetch_sub(&s_draw_inflight, 1);
+    finish_callback(&s_draw_inflight);
 }
 
 /* ---- Game HUD layer ------------------------------------------------------- */
 static PsxHostOverlayDrawFn s_hud_fn = NULL;
 static void *s_hud_ctx = NULL;
-static atomic_flag s_hud_lock = ATOMIC_FLAG_INIT;
+static PsxBlockingMutex s_hud_lock = PSX_BLOCKING_MUTEX_INIT;
 static atomic_int s_hud_inflight = 0;
 #if defined(_MSC_VER)
 static __declspec(thread) int s_in_hud = 0;
@@ -113,11 +120,10 @@ static _Thread_local int s_in_hud = 0;
 #endif
 
 static void hud_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&s_hud_lock, memory_order_acquire))
-        draw_yield();
+    psx_blocking_lock(&s_hud_lock);
 }
 static void hud_unlock(void) {
-    atomic_flag_clear_explicit(&s_hud_lock, memory_order_release);
+    psx_blocking_unlock(&s_hud_lock);
 }
 
 void psx_host_set_hud_draw_cb(PsxHostOverlayDrawFn fn, void *ctx) {
@@ -129,7 +135,7 @@ void psx_host_set_hud_draw_cb(PsxHostOverlayDrawFn fn, void *ctx) {
      * The single GL owner may unregister itself; its current call then ends
      * before another frame can consume the replacement. */
     if (!s_in_hud)
-        while (atomic_load(&s_hud_inflight) > 0) draw_yield();
+        wait_callbacks(&s_hud_inflight);
 }
 
 void psx_host_hud_draw(int width, int height) {
@@ -144,7 +150,7 @@ void psx_host_hud_draw(int width, int height) {
         fn(width, height, ctx);
         s_in_hud = 0;
     }
-    atomic_fetch_sub(&s_hud_inflight, 1);
+    finish_callback(&s_hud_inflight);
 }
 
 /* ---- P3: input sink -------------------------------------------------------- */

@@ -578,6 +578,16 @@ int main() {
     assert(saved==restored);
     frame_packet_release(frames);frame_packet_destroy(frames);
 
+    // Release is a completion barrier even without polling ready first.
+    // Repeated submissions exercise both completion-before-wait and a parked
+    // releaser, while preserving the snapshot's exact command position.
+    for (unsigned i=0;i<128;++i) {
+        send(r,NR_WRITE,{11,12,(int32_t)i});
+        auto *closing=native_raster_checkpoint_async(r,restored.data(),dirty,&texture);
+        assert(closing);
+        native_raster_checkpoint_release(closing);
+        assert(restored[12*1024+11]==i);
+    }
     // Reuse one completion token across changing pixels and an idle consumer.
     NativeRasterCheckpoint *reusable=native_raster_checkpoint_create();
     assert(reusable);

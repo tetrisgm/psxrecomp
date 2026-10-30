@@ -34,8 +34,8 @@ int main(void) {
     const uint64_t PERIOD = (uint64_t)((double)FREQ * (1000.0 / 59.94) / 1000.0);
 
     CHECK(frame_pacing_sleep_us(100,99,FREQ,PERIOD)==0,"microsecond decision never underflows");
-    CHECK(frame_pacing_sleep_us(0,FREQ/1000,FREQ,PERIOD)==500,"1 ms leaves 500 us margin");
-    CHECK(frame_pacing_sleep_us(0,FREQ/4000,FREQ,PERIOD)==0,"250 us spins");
+    CHECK(frame_pacing_sleep_us(0,FREQ/1000,FREQ,PERIOD)==800,"1 ms leaves 200 us margin");
+    CHECK(frame_pacing_sleep_us(0,FREQ/4000,FREQ,PERIOD)==50,"250 us still blocks");
     CHECK(frame_pacing_sleep_us(0,UINT64_MAX,FREQ,PERIOD)<17000,"microsecond sleep is frame bounded");
     CHECK(frame_pacing_sleep_us(0,100,0,PERIOD)==0,"zero frequency does not divide");
     /* 1. The Bug B scenario: counter sampled just AFTER the deadline

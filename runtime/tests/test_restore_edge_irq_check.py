@@ -32,8 +32,12 @@ def main():
     assert "if (g_sched_restore_edge_check) {" in loop
     assert "g_sched_restore_edge_check = 0;" in loop
     assert "psx_check_interrupts_dispatch_entry(cpu, run_pc);" in loop
-    # Armed only by resume_at (all restores), never by the recovery path.
-    assert traps.count("g_sched_restore_edge_check = 1;") == 1
+    # Startup restores also enter at the exact saved block edge, without
+    # jumping across a guest fiber or restoring stale registers from the TCB.
+    startup = traps[traps.index("if (g_startup_restore_pc) {"):traps.index("for (;;) {", traps.index("void psx_scheduler_run"))]
+    assert "PSX_RUN_RESUME_CURRENT" in startup
+    assert "g_sched_restore_edge_check = 1;" in startup
+    assert traps.count("g_sched_restore_edge_check = 1;") == 2
     print("restore edge irq check: ok")
 
 
