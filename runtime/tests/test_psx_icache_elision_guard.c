@@ -20,10 +20,10 @@ static uint64_t run(int omit_body, uint32_t *giveback, uint32_t *tag) {
     cycles = 0;
     psx_icache_fetch(&cpu, 0x80010000u); /* header */
     cpu.read_absorb_which = 1;
-    cpu.read_absorb[1] = 99;
+    cpu.read_absorb[1].value = 99;
     if (!omit_body) psx_icache_fetch(&cpu, 0x80010020u); /* cold body line */
     psx_icache_fetch(&cpu, 0x80010000u); /* header again */
-    *giveback = cpu.read_absorb[1];
+    *giveback = cpu.read_absorb[1].value;
     *tag = g_psx_icache_tv[8];
     return cycles;
 }

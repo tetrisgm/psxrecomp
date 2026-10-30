@@ -52,6 +52,7 @@ uint32_t i_mask;
 uint64_t psx_cycle_count;
 uint32_t g_psx_mod_function_entry_hooks;
 uint32_t g_psx_mod_instruction_hooks;
+int (*g_psx_func_override_hook)(CPUState *, uint32_t);
 static uint32_t address_calls, shadow_address, address_word;
 uint32_t psx_mod_memory_address(const CPUState *cpu, uint32_t pc, uint32_t word, uint32_t address) {
     (void)cpu; (void)pc; (void)word;
@@ -66,6 +67,15 @@ uint32_t g_psx_ram_size = PSX_MAIN_RAM_RETAIL_BYTES;
 uint32_t g_psx_ram_mask = PSX_MAIN_RAM_RETAIL_BYTES - 1u;
 
 static uint8_t test_ram[0x00200000u];
+/* The compiled byte-load helper now shares the direct RAM map. Keep the
+ * fixture's real RAM storage wired to it; unexpected device/debug paths fail. */
+uint8_t *g_psx_ram = test_ram, *g_psx_scratchpad, *g_psx_bios_rom;
+volatile int g_ds_recording;
+int g_ram_read_watch_active;
+void debug_server_trace_ram_read_watch(uint32_t addr, uint32_t value) {
+    (void)addr; (void)value; abort();
+}
+
 
 uint8_t *memory_get_ram_ptr(void) { return test_ram; }
 uint8_t psx_read_byte(uint32_t a) { return test_ram[a & 0x1FFFFFu]; }
@@ -75,10 +85,10 @@ uint16_t psx_read_half(uint32_t a) {
 uint32_t psx_read_word(uint32_t a) {
     uint32_t v; memcpy(&v, test_ram + (a & 0x1FFFFCu), sizeof v); return v;
 }
-uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t a, uint32_t rt, uint32_t m) {
+uint8_t psx_cyc_load_byte_slow(CPUState *cpu, uint32_t a, uint32_t rt, uint32_t m) {
     (void)cpu; (void)rt; (void)m; return psx_read_byte(a);
 }
-uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t a) { (void)cpu; return psx_read_word(a); }
+uint32_t psx_cyc_lwc2_read_slow(CPUState *cpu, uint32_t a) { (void)cpu; return psx_read_word(a); }
 int dirty_ram_is_dirty(uint32_t phys) { (void)phys; return 1; }
 int mdec_recently_active(uint32_t f) { (void)f; return 0; }
 void gte_execute(CPUState *cpu, uint32_t cmd) { (void)cpu; (void)cmd; }

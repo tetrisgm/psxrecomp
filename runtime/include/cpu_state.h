@@ -21,6 +21,12 @@ extern "C" {
 
 /* (sljit shard host-helper table removed 2026-07-15 with the sljit tier.) */
 
+/* A distinct byte type lets alias analysis distinguish timing-array stores
+ * from unrelated global flags. Size/alignment and serialized CPU bytes stay
+ * identical to the original uint8_t array. */
+typedef struct PsxReadAbsorbByte { uint8_t value; } PsxReadAbsorbByte;
+typedef char PsxReadAbsorbByteSizeMustRemainOne[sizeof(PsxReadAbsorbByte) == 1 ? 1 : -1];
+
 typedef struct CPUState {
     uint32_t gpr[32];   /* $0..$31; gpr[0] is hardwired zero, never written */
     uint32_t pc;        /* program counter */
@@ -60,7 +66,7 @@ typedef struct CPUState {
      * instead of charging their own +1 base; plus the +2 "fudge" charged on a
      * load whose predecessor committed no load. Appended at END so prior field
      * offsets are unchanged (precompiled overlay DLLs bake offsets). */
-    uint8_t  read_absorb[33];   /* ReadAbsorb[0..31] + [32]=0x20 DO_LDS dummy slot */
+    PsxReadAbsorbByte read_absorb[33];   /* ReadAbsorb[0..31] + [32]=0x20 DO_LDS dummy slot */
     uint8_t  read_absorb_which; /* ReadAbsorbWhich: GPR the last committed load wrote */
     uint8_t  read_fudge;        /* ReadFudge: last committed load's dest reg, or 0x20 = none */
     uint8_t  ld_which_t;        /* LDWhich (timing): pending load dest reg, 0x20 = none */

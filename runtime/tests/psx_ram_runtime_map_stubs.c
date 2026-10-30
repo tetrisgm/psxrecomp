@@ -23,6 +23,8 @@ int g_ls_replay_active;
 int g_ls_suppress_record;
 int g_ram_read_watch_active;
 void (*g_overlay_flush_pending_cycles)(void);
+uint32_t g_psx_cyc_block_raw;
+int g_psx_cyc_block_active;
 uint32_t g_psx_cyc_batch;
 uint32_t g_psx_cyc_batch_limit;
 uint32_t *g_psx_cyc_local_acc;
@@ -50,7 +52,7 @@ uint32_t g_dirty_ram_exec_page_bitmap[((0x00800000u / 4096u) + 31u) / 32u];
 /* ---- hooks the RAM paths notify (no behaviour under test) ------------------ */
 void debug_server_trace_mmio_write(uint32_t a, uint32_t v, uint8_t w) { (void)a; (void)v; (void)w; }
 void debug_server_trace_ram_read_watch(uint32_t p, uint32_t v) { (void)p; (void)v; }
-void debug_server_trace_write_check(uint32_t p, uint32_t o, uint32_t n, int w) { (void)p; (void)o; (void)n; (void)w; }
+void debug_server_trace_write_check(uint32_t p, uint32_t o, uint32_t n, uint8_t w) { (void)p; (void)o; (void)n; (void)w; }
 int  card_data_writes_check(uint32_t p, uint32_t v, uint8_t w) { (void)p; (void)v; (void)w; return 0; }
 void ds_note_dma_write(void) {}
 void ds_note_read(uint32_t a, uint32_t s) { (void)a; (void)s; }

@@ -11,6 +11,9 @@ compiler=fixture.normalize_cc(parser.parse_args().cc)
 os.environ["PATH"]=str(pathlib.Path(compiler).parent)+os.pathsep+os.environ.get("PATH", "")
 fixture.STUBS_C += r"""
 uint64_t psx_next_service_cycle = 1000;
+uint32_t g_psx_cyc_block_raw;
+int g_psx_cyc_block_active;
+int g_debug_cycle_hooks, g_psx_guest_time_frozen;
 uint32_t g_psx_cyc_batch, g_psx_cyc_batch_limit;
 int g_psx_cyc_bb_defer, psx_in_device_service;
 uint32_t *g_psx_cyc_local_acc;
@@ -35,6 +38,7 @@ extern unsigned services;
 static uint32_t seed = 0x12345678;
 static uint32_t next(void) { seed ^= seed<<13; seed ^= seed>>17; seed ^= seed<<5; return seed; }
 static void reset(unsigned scale, uint32_t frac, unsigned deadline) {
+    g_psx_cyc_block_raw = 0; g_psx_cyc_block_active = 0;
     psx_cycle_count = g_psx_cyc_batch = g_psx_cyc_batch_limit = 0;
     g_psx_gcs_recip_q16 = psx_gcs_recip_for(scale); g_psx_gcs_frac = frac;
     psx_next_service_cycle = deadline; services = 0;
@@ -45,7 +49,7 @@ int main(void) {
         0x1F800000,0x9F800010,0x1FC00000,0xBFC00200,0xC0011000};
     for (unsigned trial=0; trial<30000; ++trial) {
         CPUState a={0}, b;
-        for (unsigned r=0;r<33;r++) a.read_absorb[r]=next()%10;
+        for (unsigned r=0;r<33;r++) a.read_absorb[r].value=next()%10;
         a.read_absorb_which=next()%32; a.ld_which_t=next()%33;
         a.ld_absorb=next()%10; a.read_fudge=next()%33; b=a;
         uint32_t addr=addresses[next()%8], rt=next()%32, mask=next();
@@ -54,11 +58,14 @@ int main(void) {
         reset(scale,frac,deadline);
         uint32_t v = width==0 ? psx_cyc_load_byte_slow(&a,addr,rt,mask) :
             width==1 ? psx_cyc_load_half_slow(&a,addr,rt,mask) : width==2 ? psx_cyc_load_word_slow(&a,addr,rt,mask) : psx_cyc_lwc2_read_slow(&a,addr);
+        psx_cyc_batch_flush();
         uint64_t clock=psx_cycle_count+g_psx_cyc_batch;
         uint32_t remainder=g_psx_gcs_frac; unsigned events=services;
         reset(scale,frac,deadline);
+        psx_cyc_block_begin(8);
         uint32_t w = width==0 ? psx_cyc_load_byte(&b,addr,rt,mask) :
             width==1 ? psx_cyc_load_half(&b,addr,rt,mask) : width==2 ? psx_cyc_load_word(&b,addr,rt,mask) : psx_cyc_lwc2_read(&b,addr);
+        psx_cyc_batch_flush();
         assert(v==w && memcmp(&a,&b,sizeof a)==0);
         assert(clock==psx_cycle_count+g_psx_cyc_batch && remainder==g_psx_gcs_frac);
         assert(events==services);

@@ -629,6 +629,7 @@ static void interp_check_interrupts(CPUState* cpu) {
 /* ---- Public step/run ---- */
 
 uint32_t interp_step(CPUState* cpu, uint32_t count) {
+    psx_cyc_block_publish();
     s_hit_bp = 0;
     uint32_t executed = 0;
     for (uint32_t i = 0; i < count; i++) {

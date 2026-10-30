@@ -90,7 +90,15 @@ static inline void psx_cyc_local_cleanup(uint32_t **guard) {
 }
 #endif
 
-static inline void psx_cyc_charge(uint32_t cycles) {
+/* Keep exceptional publication/replay machinery out of every instruction.
+ * Literal dependency masks can then fold in the small inline interlocks. */
+#if defined(_MSC_VER)
+static __declspec(noinline) void psx_cyc_charge_slow(uint32_t cycles) {
+#elif defined(__GNUC__) || defined(__clang__)
+static __attribute__((noinline)) void psx_cyc_charge_slow(uint32_t cycles) {
+#else
+static void psx_cyc_charge_slow(uint32_t cycles) {
+#endif
     if (cycles == 0u) return;
 #if defined(PSX_OVERLAY_DLL_BUILD)
     psx_cpu_charge(cycles);
@@ -200,25 +208,67 @@ static inline void psx_cyc_charge(uint32_t cycles) {
 #endif
 }
 
+/* Arm once per generated block using its static upper bound. A device,
+ * cache refill, GTE/muldiv observation or ordinary publication disarms it.
+ * No deadline can occur between the instructions accumulated here. */
+static inline void psx_cyc_block_begin(uint32_t bound) {
+#if defined(PSX_ENABLE_BLOCK_CYCLES) && !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
+    extern int g_debug_cycle_hooks, g_psx_guest_time_frozen, g_ls_mode;
+    extern volatile int g_ds_recording;
+    psx_cyc_block_publish();
+    if (!bound || bound > 1048576u || g_psx_cyc_batch > UINT32_MAX - bound ||
+        g_ls_replay_active || g_event_step_conservative || psx_in_device_service ||
+        g_debug_cycle_hooks || g_psx_guest_time_frozen || g_ls_mode || g_ds_recording ||
+        g_psx_cyc_local_acc) return;
+    uint64_t now = psx_cycle_count + g_psx_cyc_batch;
+    if (psx_next_service_cycle > now && psx_next_service_cycle - now > bound)
+        g_psx_cyc_block_active = 1;
+#else
+    (void)bound;
+#endif
+}
+
+/* Recheck after a cache refill or another observation disabled accumulation.
+ * A still-active block retains its original proof and pending raw charges. */
+PSX_MEM_INLINE void psx_cyc_block_resume(uint32_t bound) {
+#if defined(PSX_ENABLE_BLOCK_CYCLES) && !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
+    if (!g_psx_cyc_block_active) psx_cyc_block_begin(bound);
+#else
+    (void)bound;
+#endif
+}
+
+/* Only an add on the guarded path. Keep general timing out of the generated
+ * instruction bodies; outlining it also avoids a large instruction-cache tax. */
+PSX_MEM_INLINE void psx_cyc_charge(uint32_t cycles) {
+#if defined(PSX_ENABLE_BLOCK_CYCLES) && !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
+    if (g_psx_cyc_block_active) {
+        g_psx_cyc_block_raw += cycles;
+        return;
+    }
+#endif
+    psx_cyc_charge_slow(cycles);
+}
+
 /* §1 base (Beetle cpu.cpp:795-798). */
-static inline void psx_cyc_base(CPUState* cpu) {
+PSX_MEM_INLINE void psx_cyc_base(CPUState* cpu) {
     uint8_t w = cpu->read_absorb_which;
-    if (cpu->read_absorb[w]) cpu->read_absorb[w]--;
+    if (cpu->read_absorb[w].value) cpu->read_absorb[w].value--;
     else                     psx_cyc_charge(1u);
 }
 
 /* GPR_DEPRES (Beetle cpu.cpp:702-705): zero ReadAbsorb[n] for every source/dest
  * GPR of this instruction, preserving ReadAbsorb[0] (skipping bit 0 == Beetle's
  * save/restore of ReadAbsorb[0]). */
-static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
+PSX_MEM_INLINE void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
     reg_mask &= 0xFFFFFFFEu;   /* never touch ReadAbsorb[0] */
     if (reg_mask && (reg_mask & (reg_mask - 1u)) == 0u) {
 #if defined(_MSC_VER)
         unsigned long n;
         _BitScanForward(&n, reg_mask);
-        cpu->read_absorb[(unsigned)n] = 0u;
+        cpu->read_absorb[(unsigned)n].value = 0u;
 #else
-        cpu->read_absorb[(unsigned)__builtin_ctz(reg_mask)] = 0u;
+        cpu->read_absorb[(unsigned)__builtin_ctz(reg_mask)].value = 0u;
 #endif
         return;
     }
@@ -230,16 +280,16 @@ static inline void psx_cyc_deps(CPUState* cpu, uint32_t reg_mask) {
 #else
         unsigned n = (unsigned)__builtin_ctz(reg_mask);
 #endif
-        cpu->read_absorb[n] = 0u;
+        cpu->read_absorb[n].value = 0u;
         reg_mask &= reg_mask - 1u;
     }
 }
 
 /* DO_LDS timing-commit (Beetle cpu.cpp:800). LDWhich==0x20 (no pending) writes the
  * dummy slot read_absorb[32] and sets read_fudge=0x20 (=> next load gets +2 fudge). */
-static inline void psx_cyc_lds(CPUState* cpu) {
+PSX_MEM_INLINE void psx_cyc_lds(CPUState* cpu) {
     uint8_t lw = cpu->ld_which_t;
-    cpu->read_absorb[lw]    = (uint8_t)cpu->ld_absorb;
+    cpu->read_absorb[lw].value    = (uint8_t)cpu->ld_absorb;
     cpu->read_fudge         = lw;
     cpu->read_absorb_which  = (uint8_t)(cpu->read_absorb_which | (lw & 0x1Fu));
     cpu->ld_which_t         = 0x20u;
@@ -249,7 +299,7 @@ static inline void psx_cyc_lds(CPUState* cpu) {
  * branch, jump, store, COP control, LWC2/SWC2 pre-step, mult/div, mfhi/mflo, ...).
  * reg_mask from psx_cyc_dep_res_mask(). MUST be emitted BEFORE the instruction
  * body so §1 precedes any muldiv/GTE deadline stall in the body (Beetle order). */
-static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
+PSX_MEM_INLINE void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
     psx_cyc_base(cpu);
     psx_cyc_deps(cpu, reg_mask);
     psx_cyc_lds(cpu);
@@ -259,11 +309,12 @@ static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
  * Leave a strict margin before the next device deadline: a callback can inspect
  * registers, so moving a charge over that boundary would be observably wrong.
  * Diagnostic/replay builds retain instruction-by-instruction sequencing. */
-static inline int psx_cyc_segment_ready(uint32_t count) {
+PSX_MEM_INLINE int psx_cyc_segment_ready(uint32_t count) {
 #if defined(PSX_OVERLAY_DLL_BUILD) || defined(PSX_COSIM)
     (void)count; return 0;
 #else
     extern int g_debug_cycle_hooks;
+    if (g_psx_cyc_block_active) return 1;
     if (g_ls_replay_active || g_event_step_conservative || psx_in_device_service ||
         g_debug_cycle_hooks || g_psx_cyc_local_acc) return 0;
     uint64_t now = psx_cycle_count + g_psx_cyc_batch;
@@ -275,12 +326,12 @@ static inline int psx_cyc_segment_ready(uint32_t count) {
  * change the active give-back slot; thereafter LDWhich is the dummy slot and
  * the first dependency on the active register ends its overlap. Each mask is
  * a compile-time constant supplied by the emitter. */
-static inline void psx_cyc_segment(CPUState *cpu, uint32_t count,
+PSX_MEM_INLINE void psx_cyc_segment(CPUState *cpu, uint32_t count,
                                   uint32_t m0, uint32_t m1,
                                   uint32_t m2, uint32_t m3) {
     uint8_t w = cpu->read_absorb_which;
-    uint32_t cost = cpu->read_absorb[w] ? 0u : 1u;
-    if (cpu->read_absorb[w]) --cpu->read_absorb[w];
+    uint32_t cost = cpu->read_absorb[w].value ? 0u : 1u;
+    if (cpu->read_absorb[w].value) --cpu->read_absorb[w].value;
     psx_cyc_deps(cpu, m0);
     psx_cyc_lds(cpu);
     w = cpu->read_absorb_which;
@@ -289,13 +340,13 @@ static inline void psx_cyc_segment(CPUState *cpu, uint32_t count,
     uint32_t stop = (m1 & bit) ? 1u :
         (count > 2u && (m2 & bit)) ? 2u :
         (count > 3u && (m3 & bit)) ? 3u : rest;
-    uint32_t overlap = cpu->read_absorb[w];
+    uint32_t overlap = cpu->read_absorb[w].value;
     if (overlap > stop) overlap = stop;
     cost += rest - overlap;
-    cpu->read_absorb[w] = cpu->read_absorb[w] > rest ?
-        (uint8_t)(cpu->read_absorb[w] - rest) : 0u;
+    cpu->read_absorb[w].value = cpu->read_absorb[w].value > rest ?
+        (uint8_t)(cpu->read_absorb[w].value - rest) : 0u;
     psx_cyc_deps(cpu, m1 | (count > 2u ? m2 : 0u) | (count > 3u ? m3 : 0u));
-    cpu->read_absorb[32] = (uint8_t)cpu->ld_absorb;
+    cpu->read_absorb[32].value = (uint8_t)cpu->ld_absorb;
     cpu->read_fudge = 32u;
     psx_cyc_charge(cost);
 }
@@ -340,15 +391,15 @@ uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
 /* Compiled data loads share the exact pipeline update, then read contiguous
  * storage directly. RAM word/half retain their established batched charge;
  * bytes and ROM use the original publishing charge. Scratchpad has no wait. */
-static inline void psx_cyc_direct_load_timing(CPUState *cpu, uint32_t phys,
-                                             uint32_t rt, uint32_t mask, int batch_ram) {
+PSX_MEM_INLINE void psx_cyc_direct_load_timing(
+    CPUState *cpu, uint32_t phys, uint32_t rt, uint32_t mask, int batch_ram) {
     if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
     if (!g_psx_load_delay) return;
     psx_cyc_base(cpu);
     psx_cyc_deps(cpu, mask);
     if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
     psx_cyc_lds(cpu);
-    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb[cpu->read_absorb_which].value = 0u;
     cpu->read_absorb_which = 0u;
     if (phys >= 0x1F800000u && phys < 0x1F800400u) cpu->ld_absorb = 0u;
     else {
@@ -445,7 +496,7 @@ PSX_MEM_INLINE uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t addr) {
         if (p) {
             uint32_t phys = addr & 0x1FFFFFFFu;
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-            cpu->read_absorb[cpu->read_absorb_which] = 0u;
+            cpu->read_absorb[cpu->read_absorb_which].value = 0u;
             cpu->read_absorb_which = 0u;
             if (phys >= 0x1F800000u && phys < 0x1F800400u) cpu->ld_absorb = 0u;
             else {

@@ -59,6 +59,8 @@ file(WRITE "${CMAKE_BINARY_DIR}/properties.txt" "${base}|${release}|${debug}|${o
             return dest, result
         off, _ = configure("off", "-DSIMULATE_UNSUPPORTED=ON")
         assert (off / "properties.txt").read_text() == "base-NOTFOUND|release-NOTFOUND|debug-NOTFOUND|others-NOTFOUND"
+        explicit_off, _ = configure("explicit_off", "-DPSX_RUNTIME_IPO=OFF")
+        assert (explicit_off / "properties.txt").read_text() == "base-NOTFOUND|release-NOTFOUND|debug-NOTFOUND|others-NOTFOUND"
         parent, _ = configure("parent", "-DPARENT_IPO=ON", "-DSIMULATE_UNSUPPORTED=ON")
         assert (parent / "properties.txt").read_text().startswith("TRUE|release-NOTFOUND|")
         _, failure = configure("unsupported", "-DPSX_RUNTIME_IPO=ON", "-DSIMULATE_UNSUPPORTED=ON", ok=False)
@@ -69,15 +71,17 @@ file(WRITE "${CMAKE_BINARY_DIR}/properties.txt" "${base}|${release}|${debug}|${o
             print("PASS: default/parent/unsupported guards; SKIP actual IPO link: toolchain reports unsupported")
             return
         assert (on / "properties.txt").read_text() == "FALSE|TRUE|FALSE|others-NOTFOUND"
-        build = run([args.cmake, "--build", on, "--verbose"])
+        automatic, _ = configure("automatic")
+        assert (automatic / "properties.txt").read_text() == "FALSE|TRUE|FALSE|others-NOTFOUND"
+        build = run([args.cmake, "--build", on, "--verbose", "--parallel", "4"])
         # MSVC and GCC/Clang spell IPO flags differently; this test's explicit
         # Ninja/compiler arguments cover either native toolchain.
         assert any(flag in build.stdout for flag in ("-flto", "/GL", "-GL")), build.stdout
         run([on / ("subject.exe" if os.name == "nt" else "subject")])
         debug, _ = configure("debug", "-DPSX_RUNTIME_IPO=ON", "-DCMAKE_BUILD_TYPE=Debug")
-        dbg_build = run([args.cmake, "--build", debug, "--verbose"])
+        dbg_build = run([args.cmake, "--build", debug, "--verbose", "--parallel", "4"])
         assert not any(flag in dbg_build.stdout for flag in ("-flto", "/GL", "-GL"))
-        print("PASS: default OFF, parent policy, unsupported failure, scoped ON, actual IPO link/run, Debug OFF")
+        print("PASS: AUTO unsupported fallback, parent policy, unsupported failure, scoped ON, actual IPO link/run, Debug OFF")
 
 if __name__ == "__main__":
     main()

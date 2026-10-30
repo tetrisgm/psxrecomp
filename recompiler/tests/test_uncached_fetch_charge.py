@@ -115,11 +115,11 @@ int main(void) {
         if (op != 'E' && op != 'N' && op != 'I') continue;
         unsigned long long before = cycles;
         cpu.read_absorb_which = 1u;
-        cpu.read_absorb[1] = 1u;
+        cpu.read_absorb[1].value = 1u;
         if (op == 'E') psx_icache_fetch(&cpu, (uint32_t)strtoul(line + 2, 0, 16));
         if (op == 'I') psx_icache_fetch_interp(&cpu, (uint32_t)strtoul(line + 2, 0, 16));
         printf("%llu %d\n", cycles - before,
-               (cpu.read_absorb_which == 0u && cpu.read_absorb[1] == 0u) ? 1 : 0);
+               (cpu.read_absorb_which == 0u && cpu.read_absorb[1].value == 0u) ? 1 : 0);
     }
     return 0;
 }

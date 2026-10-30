@@ -31,6 +31,8 @@ uint64_t psx_next_service_cycle;
 uint64_t g_psx_cycle_fast_limit;
 int      psx_in_device_service;
 int      g_event_step_conservative;
+uint32_t g_psx_cyc_block_raw;
+int g_psx_cyc_block_active;
 uint32_t g_psx_cyc_batch;
 uint32_t g_psx_cyc_batch_limit;
 int      g_psx_cyc_bb_defer;

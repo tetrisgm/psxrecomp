@@ -8,29 +8,44 @@
  * Forward declarations are main-mode only: a class member cannot be
  * declared twice. Do not add includes here. */
 
-PGXP_S PGXPValue *s_ram = nullptr;            /* lazily allocated: RAM + mod regions */
-PGXP_S PGXPValue  s_scratch[PGXP_SCRATCH_WORDS];
-PGXP_S PGXPValue  s_gpr[34];                  /* 32 GPRs + HI + LO            */
+#ifndef PGXP_MEMBER_MODE
+PGXPCompiledState g_pgxp_cpu = {{}, {}, {}, nullptr, 1, 0, 0, 0, 0, 0};
+#define s_ram g_pgxp_cpu.ram
+#define s_scratch g_pgxp_cpu.scratch
+#define s_gpr g_pgxp_cpu.gpr
+#define s_gpr_s g_pgxp_cpu.scalar
+#define s_gen g_pgxp_cpu.gen
+#define s_cpu_mode g_pgxp_cpu.cpu_mode
+#define s_ck_depth g_pgxp_cpu.checkpoint_depth
+#define g_pgxp_active g_pgxp_cpu.active
+#define s_store_trace g_pgxp_cpu.store_trace
+#define s_preserve_projection g_pgxp_cpu.preserve_projection
+#else
+PGXP_S PGXPValue *s_ram = nullptr;
+PGXP_S PGXPValue s_scratch[PGXP_SCRATCH_WORDS];
+PGXP_S PGXPValue s_gpr[34];
+PGXP_S PGXPScalar s_gpr_s[34];
+PGXP_S uint32_t s_gen = 1, s_ck_depth = 0;
+PGXP_S int s_cpu_mode = 0, g_pgxp_active = 0, s_store_trace = 0;
+#endif
 PGXP_S PGXPValue  s_gte[32];                  /* GTE data registers           */
 PGXP_S PGXPValue  s_gtc[32];                  /* GTE control registers (CTC2) */
 
-PGXP_S PGXPScalar s_gpr_s[34];                /* GPRs + HI + LO               */
 PGXP_S PGXPScalar s_gte_s[32];                /* GTE data registers (IR, MAC) */
 PGXP_S PGXPScalar s_gtc_s[32];                /* GTE control (TR / BK words)  */
 
-PGXP_S uint32_t s_gen = 1;
 PGXP_S int      s_enabled = 0;
-PGXP_S int      s_cpu_mode = 0;
 PGXP_S int      s_projection_tracking = 0;
 PGXP_S float    s_tolerance = 0.5f;   /* user-validated seam clamp (G1.10) */
 PGXP_S int      s_position_fallback = 1;   /* G1.4 cache tier (G1.11 switch) */
+#ifdef PGXP_MEMBER_MODE
 PGXP_S int      s_preserve_projection = 0; /* exact-projection shadows (G1.11) */
+#endif
 PGXP_S int      s_culling = 0;             /* precise NCLIP sign (G1.12)   */
 PGXP_S uint32_t s_suppress = 0;
 PGXP_S int      s_deferred_invalidate = 0;
 
 /* Single hot-path gate for every hook. */
-PGXP_S int g_pgxp_active = 0;
 PGXP_S inline void recompute_active(void) {
     g_pgxp_active = (s_enabled && s_suppress == 0) ? 1 : 0;
 }
@@ -69,9 +84,6 @@ PGXP_API void pgxp_invalidate_all(void) {
 
 PGXP_API void pgxp_set_enabled(int enabled) {
     int resized = 0;
-    if (enabled && !s_store_ring)
-        s_store_ring = (PGXPStoreRecord *)std::calloc(PGXP_STORE_RING_CAP,
-                                                      sizeof(PGXPStoreRecord));
     if (enabled && !s_ram) {
         s_ram = (PGXPValue *)std::calloc(PGXP_SHADOW_WORDS, sizeof(PGXPValue));
         if (s_ram)
@@ -208,7 +220,7 @@ PGXP_API void pgxp_set_trace_sources(const uint32_t *store_pc,
 
 PGXP_S void note_store(uint32_t op, uint32_t reg, const PGXPValue *src,
                        uint32_t addr, uint32_t value, const PGXPValue *dst) {
-    if (!s_store_ring) return;
+    if (!s_store_trace || !s_store_ring) return;
     PGXPStoreRecord *r = &s_store_ring[s_store_seq % PGXP_STORE_RING_CAP];
     r->seq = s_store_seq++;
     r->frame = s_trace_frame ? (uint32_t)*s_trace_frame : 0u;
@@ -223,6 +235,12 @@ PGXP_S void note_store(uint32_t op, uint32_t reg, const PGXPValue *src,
     r->dst_flags = (dst && dst->gen == s_gen) ? dst->flags : 0u;
     r->dst_x16 = dst ? dst->x16 : 0;
     r->dst_y16 = dst ? dst->y16 : 0;
+}
+
+PGXP_API void pgxp_store_trace_enable(int enabled) {
+    if (enabled && !s_store_ring)
+        s_store_ring = (PGXPStoreRecord *)std::calloc(PGXP_STORE_RING_CAP, sizeof(PGXPStoreRecord));
+    s_store_trace = enabled && s_store_ring;
 }
 
 PGXP_API uint64_t pgxp_store_ring(const PGXPStoreRecord **ring, uint32_t *cap) {
@@ -272,7 +290,6 @@ struct PGXPJournalEntry {
     PGXPValue old;
 };
 
-PGXP_S uint32_t          s_ck_depth = 0;
 PGXP_S uint8_t          *s_ck_bits = nullptr;     /* one bit per shadow slot */
 PGXP_S PGXPValue        *s_ck_ram = nullptr;      /* s_ram the bits index    */
 PGXP_S PGXPJournalEntry *s_ck_log = nullptr;
@@ -646,8 +663,10 @@ PGXP_API void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
     switch (sop) {
     case 0x2B: {                               /* SW                          */
         PGXPValue before;
-        std::memset(&before, 0, sizeof before);
-        if (src) before = *src;
+        if (s_store_trace) {
+            std::memset(&before, 0, sizeof before);
+            if (src) before = *src;
+        }
         if (src && src->gen == s_gen) {
             pv_validate(src, value);
             *dst = *src;
@@ -669,7 +688,7 @@ PGXP_API void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
                 dst->flags = (uint16_t)(PGXP_F_VXY | (derived ? PGXP_F_DX : 0));
             }
         }
-        note_store(0x2B, rt, src ? &before : nullptr, addr, value, dst);
+        if (s_store_trace) note_store(0x2B, rt, src ? &before : nullptr, addr, value, dst);
         return;
     }
     case 0x29: {                               /* SH                          */
@@ -704,7 +723,7 @@ PGXP_API void psx_pgxp_store(struct CPUState *cpu, uint32_t instr,
             if (hi_half) { dst->y16 = src->x16; dst->flags |= (uint16_t)(PGXP_F_VY | d); }
             else         { dst->x16 = src->x16; dst->flags |= (uint16_t)(PGXP_F_VX | d); }
         }
-        note_store(0x29, rt, src, addr, half, dst);
+        if (s_store_trace) note_store(0x29, rt, src, addr, half, dst);
         return;
     }
     case 0x28: {                               /* SB                          */
@@ -752,14 +771,15 @@ PGXP_API void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
         PGXPValue *dst = pgxp_ptr_w(addr);
         if (!dst) return;
         PGXPValue *src = &s_gte[f_rt(instr)];
-        const PGXPValue before = *src;
+        PGXPValue before;
+        if (s_store_trace) before = *src;
         if (src->gen == s_gen) {
             pv_validate(src, value);
             *dst = *src;
         } else {
             pv_reset(dst, value);
         }
-        note_store(0x3A, f_rt(instr), &before, addr, value, dst);
+        if (s_store_trace) note_store(0x3A, f_rt(instr), &before, addr, value, dst);
         return;
     }
     case 0x12: {                               /* COP2 register transfers     */

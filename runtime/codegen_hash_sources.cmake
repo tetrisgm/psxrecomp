@@ -82,6 +82,9 @@ set(PSXRECOMP_CODEGEN_HASH_SRCS
     # math the .inc includes.
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/overlay_api.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/cpu_state.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/debug_server.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/pgxp_cpu_state.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/pgxp_inline.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/pgxp_hooks.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/psx_mem_inline.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/runtime/include/psx_cyc.h

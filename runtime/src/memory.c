@@ -2461,7 +2461,7 @@ static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
 static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
                                    uint32_t compl_cost, uint32_t arm_rt) {
     /* ReadMemory start (369-370): clear the current give-back slot. */
-    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb[cpu->read_absorb_which].value = 0u;
     cpu->read_absorb_which = 0u;
     /* Scratchpad (the D-cache): no wait, no give-back (414-422). */
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
@@ -2695,11 +2695,8 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 }
 
 /* Exceptional observers stay out of each generated store's instruction body. */
-void psx_memory_store_observers(uint32_t addr, uint32_t phys, const uint8_t *p,
+void psx_memory_store_observers(uint32_t phys, const uint8_t *p,
                                 uint32_t value, uint32_t width) {
-    if (g_psx_track_last_store) {
-        g_guest_last_store_addr = addr; g_guest_last_store_val = value;
-    }
 #ifndef PSX_NO_DEBUG_TOOLS
     if (g_debug_write_hooks) {
         uint32_t old = 0; memcpy(&old, p, width);

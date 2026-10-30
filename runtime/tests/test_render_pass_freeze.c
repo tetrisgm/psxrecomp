@@ -79,6 +79,9 @@ int main(void) {
 
     psx_cycles_resync_after_restore(NULL);
     psx_advance_cycles(12345);            /* some live history */
+    psx_guest_cycle_scale_set(2); psx_guest_cycle_scale_set_gated(1);
+    psx_guest_cycle_scale_gate_open(1); g_psx_gcs_frac = 12345;
+    g_psx_cyc_block_raw = 19; g_psx_cyc_block_active = 1;
     g_psx_cyc_batch = 40;                 /* deferred charges of the guest code */
     g_psx_cyc_local_acc = &local;
     cyc0 = psx_cycle_count;
@@ -90,8 +93,10 @@ int main(void) {
     CHECK(psx_cycle_freeze_begin(&save, 0, NULL), "freeze begins");
     CHECK(g_psx_render_pass_active == 1, "pass flag set");
     CHECK(!psx_cycle_freeze_begin(&save, 0, NULL), "freezes do not nest");
-    CHECK(g_psx_cyc_batch == 0 && g_psx_cyc_local_acc == NULL,
+    CHECK(!g_psx_cyc_block_raw && !g_psx_cyc_block_active &&
+          g_psx_cyc_batch == 0 && g_psx_cyc_local_acc == NULL,
           "the guest's pending charges are parked, not published");
+    psx_guest_cycle_scale_gate_open(0); /* a pass can change a mod gate */
     for (int i = 0; i < 1000; i++) psx_advance_cycles(1000);   /* 10^6 cycles */
     psx_advance_cycles_slow(5000);
     psx_devices_service_to_now();
@@ -105,10 +110,16 @@ int main(void) {
     CHECK(g_psx_render_pass_active == 0, "pass flag cleared");
     CHECK(psx_cycle_count == cyc0, "cycle count restored exactly");
     CHECK(psx_next_service_cycle == next0, "service deadline restored exactly");
-    CHECK(g_psx_cyc_batch == 40 && g_psx_cyc_local_acc == &local && local == 7,
+    CHECK(g_psx_cyc_block_raw == 19 && g_psx_cyc_block_active == 1 &&
+          g_psx_cyc_batch == 40 && g_psx_cyc_local_acc == &local && local == 7,
           "the guest's pending charges come back untouched");
 
+    CHECK(psx_guest_cycle_scale()==2 && g_psx_gcs_frac==12345,
+          "restoring a gate must not publish pending work at the pass scale");
+
     /* The live timeline continues exactly as if the pass never happened. */
+    g_psx_cyc_block_raw = 0; g_psx_cyc_block_active = 0;
+    psx_guest_cycle_scale_set_gated(0); psx_guest_cycle_scale_set(1);
     g_psx_cyc_batch = 0;
     g_psx_cyc_local_acc = NULL;
     psx_advance_cycles(3000);

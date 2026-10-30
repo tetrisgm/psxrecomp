@@ -4664,6 +4664,7 @@ struct MainCadenceStats {
     uint64_t pacer=0, overshoot=0;
     bool enabled = false;
     uint64_t previous_cpu=0, cpu=0, packet_allocations=0;
+    uint64_t work_ticks=0, max_work_ticks=0;
     uint64_t previous = 0, intervals = 0, ticks = 0, max_ticks = 0;
     uint64_t pace_checks = 0, late = 0, missed = 0, max_late_ticks = 0;
 };
@@ -4677,6 +4678,11 @@ static void main_cadence_frame() {
         ++s_main_cadence.intervals;
         s_main_cadence.ticks += elapsed;
         s_main_cadence.cpu += cpu-s_main_cadence.previous_cpu;
+        // Elapsed guest work is a conservative CPU upper bound: it includes
+        // descheduling and completion waits, excludes only the pacer bracket.
+        const uint64_t work = elapsed > s_main_cadence.pacer ? elapsed-s_main_cadence.pacer : 0;
+        s_main_cadence.work_ticks += work;
+        s_main_cadence.max_work_ticks = std::max(s_main_cadence.max_work_ticks, work);
         if (elapsed > s_main_cadence.max_ticks) s_main_cadence.max_ticks = elapsed;
         MainCadenceStats::Interval row{s_main_cadence.intervals,elapsed,
             s_main_cadence.pacer,s_main_cadence.overshoot,s_frame_pacer.sleep_ticks,
@@ -4725,6 +4731,8 @@ extern "C" void psx_debug_main_cadence_json(int reset, char *out, size_t cap) {
         if(n>0) used+=size_t(n);
     };
     append(",\"packet_allocation_events\":%llu",(unsigned long long)(frame_packet_allocation_events()-s.packet_allocations));
+    append(",\"work_elapsed_mean_ms\":%.6f,\"work_elapsed_max_ms\":%.6f",
+           s.intervals ? s.work_ticks*ms/s.intervals : 0.0, s.max_work_ticks*ms);
     append(",\"cpu_ms\":%.6f,\"worst\":[",s.cpu/1e4);
     bool first=true;
     for(const auto &r:s.worst) if(r.ticks) {

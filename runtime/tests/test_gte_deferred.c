@@ -80,7 +80,7 @@ int main(void) {
  /* Authored timing equivalent of DPCS / ADDIU / SWC2 with two remaining
   * load-overlap credits. Source return(ret-1) gives a seven-cycle deadline.
   * SWC2's one pending base cycle must be part of its stall comparison. */
- reset(0,0,0);cpu.read_absorb_which=23;cpu.read_absorb[23]=2;
+ reset(0,0,0);cpu.read_absorb_which=23;cpu.read_absorb[23].value=2;
  cpu.ld_which_t=32;cpu.ld_absorb=5;
  psx_cyc_step(&cpu,0);psx_gte_set(&cpu,psx_gte_cmd_latency(0x10));
  psx_cyc_step(&cpu,(1u<<2)|(1u<<14));psx_cyc_step(&cpu,0);
@@ -102,13 +102,13 @@ int main(void) {
  for(unsigned elapsed=0;elapsed<=64;elapsed++)for(unsigned pending=0;pending<=elapsed;pending++)
  for(unsigned mode=0;mode<2;mode++)for(unsigned read=0;read<2;read++) {
   memset(&cpu,0,sizeof(cpu));cpu.gte_ts_done=1043;cpu.ld_absorb=19;cpu.ld_which_t=32;
-  cpu.read_absorb_which=5;cpu.read_absorb[5]=11;
+  cpu.read_absorb_which=5;cpu.read_absorb[5].value=11;
   reset(elapsed-pending,mode?0:pending,mode?pending:0);
   if(read)psx_gte_read(&cpu,7);else psx_gte_stall(&cpu);
   unsigned stall=elapsed<43?43-elapsed:0;
   CHECK(psx_cycle_count==1000+elapsed+stall);
   CHECK(cpu.ld_absorb==(read?stall:19) && cpu.ld_which_t==(read?7:32));
-  CHECK(cpu.read_absorb[5]==11 && g_psx_cyc_batch==0 && local==0);
+  CHECK(cpu.read_absorb[5].value==11 && g_psx_cyc_batch==0 && local==0);
  }
  printf("PASS %u production GTE pending-charge/deadline checks\n",checks);return 0;
 }

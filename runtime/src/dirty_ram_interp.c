@@ -99,8 +99,8 @@ extern int g_event_step_conservative;
 
 static inline void interp_cyc_step(CPUState *cpu, uint32_t reg_mask) {
     uint8_t w = cpu->read_absorb_which;
-    if (cpu->read_absorb[w]) {
-        cpu->read_absorb[w]--;
+    if (cpu->read_absorb[w].value) {
+        cpu->read_absorb[w].value--;
     } else if (!g_ls_replay_active) {
         if (PSX_GCS_ACTIVE()) {
             psx_cpu_charge(1u);   /* the CPU charge, scaled */
@@ -2656,6 +2656,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
  * still needs the oracle; this converts a hard crash into a catchable, diagnosed
  * bail (Rule 15: make the failure observable). */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
+    psx_cyc_block_publish();
     extern int g_psx_dispatch_depth;
     extern void psx_fatal_halt(const char *reason);
     /* `addr` is architectural: the interpreter runs at exactly this PC, so a
@@ -2672,7 +2673,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
         uint32_t vphys = addr & 0x1FFFFFFFu;
         if (vphys == 0xA0u || vphys == 0xB0u || vphys == 0xC0u) {
             extern void debug_server_trace_dispatch(uint32_t func_addr);
-            debug_server_trace_dispatch(vphys);
+            if (g_debug_call_hooks) debug_server_trace_dispatch(vphys);
         }
     }
 #endif
@@ -2789,6 +2790,7 @@ void dirty_ram_span_last_failure(DirtyRamSpanFailure *out) {
 
 int dirty_ram_run_span(CPUState* cpu, uint32_t start_pc, uint32_t stop_pc,
                        uint64_t max_insns) {
+    psx_cyc_block_publish();
     const uint32_t lo = start_pc & 0x1FFFFFFFu, hi = stop_pc & 0x1FFFFFFFu;
     DirtyRamSpanFailure f = {0u, start_pc, start_pc, stop_pc, 0u, 0u, 0u};
     if (!cpu || s_span_hi || ((start_pc | stop_pc) & 3u) || lo >= hi ||
@@ -2891,6 +2893,7 @@ static int precise_pc_dispatchable(uint32_t pc) {
  * `bcyc` = originating block's cycle budget; `deadline_entry` = entered because an
  * event is due within bcyc (vs a side-effect-only block, which runs one block). */
 static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
+    psx_cyc_block_publish();
     int prev_precise = g_precise_mode;
     int prev_active  = g_dirty_interp_active;
     int prev_phase   = g_exec_phase;
@@ -3067,6 +3070,7 @@ int psx_slice_block_impl(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int 
      * correctness upgrade, NOT the current FMV blocker (that is the -8 cycle
      * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1). */
     if (!g_psx_precise_slice) return 0;
+    psx_cyc_block_publish();
 
     /* No nested slicing: a handler dispatched from inside precise-mode, and any
      * block executed while in_exception, run compiled (interrupts are gated during

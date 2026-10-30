@@ -23,6 +23,7 @@ extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
 extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t g_debug_current_func_addr;
 extern void debug_server_trace_dispatch(uint32_t func_addr);
+extern int g_debug_call_hooks;
 /* BIOS HLE tier (CLAUDE.md §0 amendment 2026-07-02): null-by-default
  * hook consulted at the top of every dispatch iteration, BEFORE any
  * backend (game image / dirty-RAM interp / static table) claims the
@@ -9087,6 +9088,9 @@ static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) 
      * without growing the native stack. Interrupts are only checked when
      * the outermost dispatch returns, so a nested callee cannot interrupt
      * before its generated caller runs the post-call continuation. */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    psx_cyc_block_publish();
+#endif
     int outermost = (g_psx_dispatch_depth++ == 0);
     /* Call contract (Bug D family): the guest $sp at the call.  A C
      * continuation behind this dispatch may only run if the guest
@@ -9194,7 +9198,9 @@ static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) 
                     !psx_kernel_bless_dispatchable(phys))
                     break; /* found stays 0 -> dirty_ram_dispatch */
                 g_debug_current_func_addr = phys;
-                debug_server_trace_dispatch(phys);
+#ifndef PSX_NO_DEBUG_TOOLS
+                if (g_debug_call_hooks) debug_server_trace_dispatch(phys);
+#endif
                 psx_bios_hit_body(cpu, addr, phys, dispatch_table[mid].func)(cpu);
                 g_dispatch_static_hits++;
                 found = 1;

@@ -25,10 +25,10 @@ import subprocess
 import sys
 
 
-def query(port, **kw):
+def query(port, command="host_profile", **kw):
     with socket.create_connection(("127.0.0.1", port), 5) as s:
         s.settimeout(30)
-        s.sendall((json.dumps(dict(id=1, cmd="host_profile", **kw)) + "\n").encode())
+        s.sendall((json.dumps(dict(id=1, cmd=command, **kw)) + "\n").encode())
         with s.makefile("rb") as f:
             return json.loads(f.readline())
 
@@ -99,7 +99,7 @@ def main():
                     help="only samples in this emulation-thread phase (4 = GP0)")
     ap.add_argument("--nm")
     a = ap.parse_args()
-    kw = {"top": 400}
+    kw = {"top": 32768}
     if a.frames > 0:
         kw["frames"] = a.frames
     if a.since >= 0:
@@ -113,6 +113,23 @@ def main():
     r = query(a.port, **kw)
     if not r.get("ok") or not r.get("supported"):
         sys.exit("sampler unavailable: %s" % r)
+    neighborhoods = []
+    # Optional post-window diagnosis. Never adds a run or changes guest state.
+    # Cadence reports interval ordinals; allow two frames around the inferred
+    # guest frame for separate TCP snapshots and callback/frame-count ordering.
+    if os.environ.get("PSX_HOST_PROFILE_WORST_FRAMES"):
+        cadence = query(a.port, command="main_cadence")
+        current = query(a.port, command="frame").get("frame", 0)
+        seen = set()
+        for row in cadence.get("worst", [])[:8]:
+            frame = current - cadence.get("intervals", 0) + row["interval"]
+            if any(abs(frame - old) <= 4 for old in seen):
+                continue
+            seen.add(frame)
+            neighborhoods.append((frame, query(a.port, **dict(kw, frame_lo=max(0, frame-2), frame_hi=frame+2))))
+    if os.environ.get("PSX_HOST_PROFILE_JSON"):
+        with open(os.environ["PSX_HOST_PROFILE_JSON"], "w", encoding="utf-8") as output:
+            json.dump(dict(window=r, neighborhoods=neighborhoods), output)
     table = symbols(find_nm(a.nm), a.exe)
     keys = [t[0] for t in table]
     size = image_size(a.exe)
@@ -126,11 +143,24 @@ def main():
             name = table[i][1]
         per[name] = per.get(name, 0) + n
     total = r["samples"] or 1
-    print("samples %d (binned top 400 addresses; %d not binned) seq %d%s" %
-          (r["samples"], r["unbinned"], r["seq"],
+    print("samples %d (%d addresses returned; %d not binned, %d omitted) seq %d%s" %
+          (r["samples"], len(r["top"]), r["unbinned"],
+           r["samples"] - r["unbinned"] - sum(n for _, n in r["top"]), r["seq"],
            " via_callers %d" % r.get("via_callers", 0) if a.callers else ""))
     for name, n in sorted(per.items(), key=lambda kv: -kv[1])[:a.top]:
         print("%6d %5.1f%%  %s" % (n, 100.0 * n / total, name))
+    if neighborhoods:
+        heavy = {}
+        for frame, result in neighborhoods:
+            for rva_s, count in result["top"]:
+                rva = int(rva_s, 16)
+                i = bisect.bisect_right(keys, rva) - 1
+                name = table[i][1] if i >= 0 and (size is None or rva < size) else "(outside executable)"
+                heavy[name] = heavy.get(name, 0) + count
+        total_heavy = sum(heavy.values()) or 1
+        print("Post-window worst-interval neighborhoods (+/-2 frames):", [frame for frame, _ in neighborhoods])
+        for name, count in sorted(heavy.items(), key=lambda kv: -kv[1])[:a.top]:
+            print("%6d %5.1f%%  %s" % (count, 100.0 * count / total_heavy, name))
 
 
 if __name__ == "__main__":

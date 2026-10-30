@@ -119,3 +119,171 @@ Precise load timing remains shared (0.7%) independently of direct memory access.
 All 120 grid frames match G1, root CTest 23/23, native fixtures, ten focused
 emitter checks and repeated 40-step smoke (zero misses) pass. OpenBIOS restamped.
 Merge G3 as the compiled-memory phase; G4 owns the still-unmet final CPU budget.
+
+## G4 in progress (not measured or accepted)
+
+Branch fix/inline-pgxp begins at G3 merge 1ae4b9f5. A C-compatible host-only
+precision-state view shares the main engine's actual registers/scalars and
+RAM/scratch shadow arrays; private draw engines remain independent. Generated
+hooks inline loads/stores, moves, constants, comparisons and no-precision ALU
+cases. Scalar stores, complex arithmetic and checkpoint journaling retain the
+reference engine. Store diagnostic recording is explicitly enabled through
+pgxp_store_ring enabled=1; disabled stores allocate/copy/record nothing for it.
+
+300,000 randomized operations compare every state byte (including stale
+projection bytes) against original engine functions; checkpoint rollback and
+trace enable/disable tested. Existing PGXP and word-shadow fixtures pass.
+Baseline grid stream captured from retained G3 executable; 120 exact guest
+fingerprints and 143,487 ordered triangle records over 59 drawing frames.
+G4 runtime build, stream comparison, smoke/CTest and final grid gate pending.
+Main cadence also tracks elapsed work excluding the pacing bracket, a
+conservative upper bound on non-pacing guest CPU (includes waits/descheduling).
+No final average/heaviest/wall budget claim is made.
+
+First completed G4 gate: 59.99 VBlanks/s, zero starvation/packet allocations,
+19859.375 / 1807 = 10.990 ms mean CPU, 34.451 ms max non-pacing elapsed,
+39.552 ms max interval. PGXP load/store calls disappear, ALU falls to 0.7%;
+cycle charge is 3.2%. G4 remains unaccepted/unmerged. 480 grid fingerprints
+exact, 568,895 triangle records on 231 complete frames exact, six PGXP/context
+fixtures and root 23 CTests/native/40-step smoke pass.
+
+Next correction removes duplicated ALU/PGXP bodies from the static-timing
+fast/deadline alternatives and inlines the common open-batch cycle charge.
+300k differential charge cases and 200k segment cases pass. A review also
+identified G3's idle-loop last-store metadata was incorrectly treating narrow
+stores as word stores; narrow stores must invalidate its address and preserve
+the previous word value. New regression assertions cover this and ROM stores;
+move this frequently enabled tracker back inline, outside the rare debug path.
+Build and final correction/verification pending; do not measure until done.
+
+G4 compact completed gate (still rejected): 60.30 measured VBlanks/s,
+938 starved samples, 40.167 ms maximum interval, zero packet allocations,
+20953.125 / 1810 = 11.576 ms average guest CPU, 36.708 ms maximum
+non-pacing elapsed. Profile aggregation previously truncated addresses before
+function grouping. The tool now requests all 32,768 available bins and the
+handler emits an unsorted full histogram in linear time. This window returned
+8,874 distinct addresses, zero unbinned samples and zero omitted samples.
+Consequently percentages are not directly comparable to the truncated older
+reports. Timing load 2.6%, general charge 2.4%, PGXP ALU 2.3%, instruction
+interlock 1.2%, static segment 1.0%. The capture_write symbol also names real
+SPU capture/rewind work; it must not be disabled as though it were debug-only.
+
+Next completed candidate keeps exceptional cycle handling out of line and
+forces small timing interlocks inline, folding literal dependency masks.
+Fractional-only charges and opening ordinary batches also stay inline.
+300,000 differential charges and 200,000 segments pass, including scaling,
+replay/conservative/device-service/local-sink modes and overflow. Memory
+regressions pass. Rebuilt correctness and final performance gates pending.
+
+G4 interlock completed gate rejected: 59.35 VBlanks/s, 12,658 starved,
+51.693 ms max interval, 23812.5 / 1782 = 13.363 ms mean CPU, 41.605 ms
+max non-pacing elapsed. Executable 196,705,280 bytes. Timing helper calls
+vanished, but code growth regressed execution. Correctness: 480 exact frames,
+586,644 exact triangles on 238 complete frames, root23/framework7/native/
+stamp/40-step smoke all pass. Do not confuse removal of call symbols with
+removal of their work. No merge or final-budget claim.
+
+The next revision accumulates raw CPU costs inside a block whose static upper
+bound fits strictly before the next device deadline. Common interlocks add to
+that accumulator; scaling/publication happens once at an observation barrier.
+Near deadlines, replay, diagnostics, frozen time and local-sink modes retain
+the original general path. Cache refills, MMIO, GTE/muldiv, dispatch and clock
+publication disarm accumulation. Freeze/replay preserve pending raw state;
+restore discards it. Host-only state, no serialized CPU layout change.
+50k randomized blocks match original clocks, fractional carry and services at
+observations; 30k load cases exercise guarded accumulation and deadlines that
+mutate loaded RAM. Freeze/uncharged tests and ten focused emitter tests pass.
+Broad recompiler build exposed unrelated standalone GPU/interpreter fixture
+link wiring (their whole included GPU sources retain unresolved dependencies);
+not a claim that the entire framework suite passes. Runtime rebuild and exact
+race/PGXP/smoke checks pending before another completed-phase measurement.
+
+G4 block candidate completed: 60.02 VBlanks/s, zero starved/packet allocations,
+16796.875 / 1807 = 9.295 ms mean CPU, max interval 39.480 ms and max
+non-pacing elapsed 32.066 ms. Still rejected against the final budget.
+480 fingerprints and 586,644 ordered triangles on 238 complete frames match;
+root 23 CTests, focused framework/emitter/native and zero-miss smoke pass.
+
+A freeze regression now compiles with block accumulation enabled: restoring
+scale gates must preserve saved pending raw charges and fractional carry,
+without publishing them under a temporary render-pass scale. The new assertion
+fails before the correction and passes after it. Supported optimized runtime
+builds now select IPO automatically, with supported linker workers bounded to
+four; OFF remains explicit and unsupported AUTO falls back. Isolated IPO
+configuration/link/run tests pass. Runtime correctness and grid gate pending.
+
+G4 IPO completed gate: 60.01 VBlanks/s, zero starvation/packet allocation,
+15234.375 / 1803 = 8.449 ms mean guest CPU, 37.966 ms max interval,
+26.260 ms max non-pacing elapsed. Still rejected. Root23/framework9/native/
+stamps/40-step smoke pass; exact480 fingerprints and586644 triangle records.
+The next correction rechecks guarded accumulation after emitted cache fetches:
+refill costs publish normally, then the containing block bound must fit before
+the next device deadline. Active blocks keep their existing proof and charges.
+
+G4 guarded restart completed gate: 59.98 harness / 60.014 cadence VBlanks/s,
+zero starvation/packet allocations, 14296.875 / 1802 = 7.934 ms mean CPU,
+38.396 ms max interval,23.615 ms max non-pacing elapsed. Average now meets
+budget; spikes still reject the phase. Exact480 fingerprints/584109 triangles
+on237 complete frames, root23/framework9/native/stamp/smoke pass. Optional
+post-window profile neighborhoods use the existing sample ring only (+/-2
+frames because cadence ordinals and frame queries are separate snapshots).
+
+Next revision inlines precision-bearing shifts and bitwise half propagation,
+preserving dormant destination bytes and falling back for precise scalar
+shifts. Differential tests now alternate CPU mode and projection preservation;
+300k operations and both original/compiled PGXP suites pass. Restart admission
+uses the remaining static bound instead of the whole containing block bound.
+Rebuild and complete correctness/performance gate pending.
+
+Before measuring the fields revision, review found function-entry tracing was
+still unconditionally reading register/TCB state and filling diagnostic rings.
+Compiled unarmed entries now only stamp the provenance function address;
+replay and stack guards retain their semantics. Dispatch diagnostic bookkeeping
+is also opt-in; actual dispatch counts/current-function stamps remain live.
+Use debug_hotpath calls=1/0 to arm/disarm; trace configuration/clear commands
+also arm, while fn_stats polling does not. A unit fixture proves 10000 unarmed
+entries make zero observer calls, and verifies arming/replay/disarming. Hidden
+runtime verification also checks trace counters advance only when armed.
+
+G4 fields/call-hook completed gate: 59.93 harness / 60.029 cadence,
+zero starvation/packet allocations,13015.625/1807=7.203ms average CPU,
+maxwall35.960/non-pacing22.640. Still rejected. Exact480fingerprints/584205
+triangles on237frames; root23/framework10/emitter10/native/stamps/40-step smoke
+and live diagnostic arming/disarming pass. Two stale standalone interpreter
+fixtures now wire direct RAM and inactive override state; both pass with GCC
+LTO. Clang's whole-GPU fixture link limitation remains configuration-specific.
+Assembly inspection: the788-byte guest transform function becomes164864 host
+bytes. The next revision shares inactive/direct-load timing machinery out of
+line and retains only exact RAM pipeline updates/raw charges on the proven
+active block path. No guest state/model change; differential gates pending.
+
+
+G4 compact-load completed gate rejected: 59.98 harness /60.051 cadence,
+zero starvation/packet allocations,20015.625/1803=11.101ms average CPU,
+maxwall37.871/non-pacing33.470. Exact480fingerprints/571542 ordered triangles
+on232 complete frames, root23/framework10/native/stamps/40-step smoke pass.
+The smaller147MB executable and131KB transform did not improve measured cost.
+Restored the fields candidate's inline timing and bitwise paths. A separate
+compiler assembly proof identified byte-array aliasing: writes through the
+ReadAbsorb uint8 array force unrelated flag reloads. Replaced each element
+with a distinct one-byte struct (compile-time size check; identical serialized
+layout), updating runtime/overlay headers and differential tests. 30000 load
+cases, static timing/cache tests and300000 PGXP comparisons pass. Regenerating
+and building; no further performance claim and G4 remains unmerged.
+
+
+2026-10-29 owner acceptance update: merge G4 now; the approximately38ms maximum
+interval predates G4 (G1 37.319ms) and is explicitly removed as a G4 gate.
+G4 fields achieved7.203ms average guest CPU with0 starved samples. The final
+ReadAbsorb alias revision preserves the byte layout and passed480 exact guest
+frames/581682 ordered PGXP triangles, root23/framework10/native fixtures and
+40-step zero-miss smoke. A final rebuild follows the header isolation and
+single-source timing-body repairs; no final-revision performance claim yet.
+The separate interval task is limited to three hours from2026-10-30 02:17 UTC.
+
+Broader recompiler checks:135/149 executed tests passed before repairs (three
+additional tests disabled). Fixed the Clang closed-fixture links, draw-context
+header leak, stale compiled-fetch/store expectations, BOM-aware preprocessing,
+and duplicate textual timing branches. Unrelated prior renderer/session/source
+assertion failures are not claimed green. Required runtime/focused gates above
+remain the acceptance evidence; follow-up interval work must preserve them.

@@ -63,6 +63,18 @@ static void verify_edges(void) {
     g_psx_dirty_ram_bitmap[0] &= ~(1u<<2);
     psx_mem_write_word(&cpu,0x80002000,0x5678);
     assert((g_psx_dirty_ram_bitmap[0] & (1u<<2)) && g_dirty_ram_code_gen==generation+1);
+    g_psx_track_last_store=1;
+    psx_mem_write_word(&cpu,0x80011000,0x12345678);
+    assert(g_guest_last_store_addr==0x80011000 && g_guest_last_store_val==0x12345678);
+    psx_mem_write_half(&cpu,0x80011004,0x4321);
+    assert(g_guest_last_store_addr==0xffffffffu && g_guest_last_store_val==0x12345678);
+    psx_mem_write_byte(&cpu,0x80011006,0x56);
+    assert(g_guest_last_store_addr==0xffffffffu && g_guest_last_store_val==0x12345678);
+    psx_mem_write_word(&cpu,0x1fc00000,0x89abcdef);
+    assert(g_guest_last_store_addr==0x1fc00000 && g_guest_last_store_val==0x89abcdef);
+    psx_mem_write_half(&cpu,0x1fc00000,0x4321);
+    assert(g_guest_last_store_addr==0xffffffffu && g_guest_last_store_val==0x89abcdef);
+    g_psx_track_last_store=0;
     g_psx_ram_size=0x800000; g_psx_ram_mask=0x7FFFFF;
     ram[0x11000]=0x11;
     psx_mem_write_byte(&cpu,0x80611000,0x22);

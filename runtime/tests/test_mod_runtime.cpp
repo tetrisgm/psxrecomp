@@ -178,6 +178,8 @@ uint64_t psx_next_service_cycle = 0;
 int      psx_in_device_service = 0;
 int      g_event_step_conservative = 0;
 int      g_ls_replay_active = 0;
+uint32_t g_psx_cyc_block_raw;
+int g_psx_cyc_block_active;
 uint32_t g_psx_cyc_batch = 0;
 uint32_t g_psx_cyc_batch_limit = 0;
 void psx_devices_service_to_now(void) {}

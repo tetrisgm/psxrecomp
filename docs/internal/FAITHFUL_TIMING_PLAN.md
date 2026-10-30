@@ -2280,3 +2280,56 @@ still pending; see [GUEST_HOTPATH.md](GUEST_HOTPATH.md) for measurements and gat
 2026-10-29 G2: static cached ALU segment interlock composition and inline constant-PC cache hit checks in both emitters. 200,000 randomized timing cases and 120 grid frames bit-identical to G1 (zero tolerance/misses), R4 CTest 23/23, focused timing/cache/overlay tests and 40-step hidden smoke pass. OpenBIOS regenerated/stamped and R4 regenerated. Completed grid mean guest CPU 10.050 ms, cadence 60.048, harness 59.94, zero starved/packet allocations, max wall 37.381 ms. Phase identity gate passes; final budget remains unmet. See GUEST_EXECUTION.md.
 
 2026-10-29 G3: inline compiled RAM/scratch/BIOS access, exact load pipeline/deadline ordering and page dirty markers. 30k randomized load cases, differential stores, 120 exact grid frames, 23 root CTests, focused emitter/native fixtures and repeated zero-miss smoke pass. First complete candidate regressed (58.25/34668 starved); compact revision 60.01/0, mean CPU 11.792 ms vs G2 10.050, max wall36.667. Final budget still unmet. See GUEST_EXECUTION.md.
+
+2026-10-29 G4 continuation (unaccepted, unmerged): compiled PGXP main-state
+propagation passes 300k exact state comparisons, checkpoint/trace cases,
+480 exact guest frames and 578,767 ordered triangle records on 235 complete
+race frames. Root CTest 23/23, seven focused framework tests, ten emitter
+checks, native fixtures and 40-step smoke (zero misses) pass. Completed grid
+candidates still fail the final budget: first mean CPU 10.990 ms/max39.552,
+compact mean11.576/max40.167 with938 starvation. Corrected profiler retains
+all addresses before grouping (8874 bins, no dropped/omitted samples in
+compact window). New literal-mask timing interlocks and shared exceptional
+charges are building; correctness and completed-phase performance gates
+remain pending. Details and rejected measurements: GUEST_EXECUTION.md.
+
+2026-10-29 G4 block candidate remains unaccepted: 9.295 ms average guest CPU,
+60.02/zero starved, max wall39.480, max non-pacing32.066. Exact480 guest
+frames/586644 triangles, root23/framework/emitter/native/smoke pass. Fixed
+freeze scale restore consuming pending raw charges; regression fails before
+and passes after with block cycles enabled. Bounded supported-runtime IPO
+candidate building; no G4 merge or final-budget claim. See GUEST_EXECUTION.md.
+
+2026-10-29 G4 continuation: supported bounded IPO lowers meanCPU8.449ms;
+guarded restart after cache fetch lowers it to7.934ms (1802 intervals),
+zero starved/packet allocations. Maxwall38.396/non-pacing23.615 still reject
+G4. Exact480frames/584109triangles, root23/framework9/emitter10/native/stamp/
+40-step zero-miss smoke pass. Precision-bearing bitwise/shift propagation now
+inline, with300k byte-exact comparisons across CPU/projection modes. Remaining
+static bounds tighten restart admission. Regeneration/build/gates pending;
+G4 remains unmerged. Isolated whole-GPU interpreter fixture links still fail;
+unsuccessful linker experiments were removed. See GUEST_EXECUTION.md.
+
+2026-10-29 G4 fields gate:7.203ms mean CPU,zero starved,maxwall35.960,
+non-pacing22.640; still rejected. Compact-load outlining regressed to11.101ms
+mean,maxwall37.871. Correctness gates pass for both. Restored inline paths;
+a byte-layout-preserving ReadAbsorb element type removes compiler-proven
+alias reloads. Differential timing/cache/PGXP tests pass; rebuild pending.
+G4 remains unmerged. See GUEST_EXECUTION.md for complete receipts.
+
+
+2026-10-29 owner acceptance update: merge G4 now; the approximately38ms maximum
+interval predates G4 (G1 37.319ms) and is explicitly removed as a G4 gate.
+G4 fields achieved7.203ms average guest CPU with0 starved samples. The final
+ReadAbsorb alias revision preserves the byte layout and passed480 exact guest
+frames/581682 ordered PGXP triangles, root23/framework10/native fixtures and
+40-step zero-miss smoke. A final rebuild follows the header isolation and
+single-source timing-body repairs; no final-revision performance claim yet.
+The separate interval task is limited to three hours from2026-10-30 02:17 UTC.
+
+Broader recompiler checks:135/149 executed tests passed before repairs (three
+additional tests disabled). Fixed the Clang closed-fixture links, draw-context
+header leak, stale compiled-fetch/store expectations, BOM-aware preprocessing,
+and duplicate textual timing branches. Unrelated prior renderer/session/source
+assertion failures are not claimed green. Required runtime/focused gates above
+remain the acceptance evidence; follow-up interval work must preserve them.

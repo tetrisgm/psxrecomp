@@ -9,30 +9,7 @@
 #include "psx_memory.h"
 #include "mod_memory.h"
 
-enum {
-    PGXP_F_VX = 1u << 0,   /* low half  (screen X) tracked                    */
-    PGXP_F_VY = 1u << 1,   /* high half (screen Y) tracked                    */
-    PGXP_F_VZ = 1u << 2,   /* projected depth rode along intact               */
-    PGXP_F_PROJECTION = 1u << 3,
-    /* The tracked half was DERIVED by guest arithmetic that rounds (a CPU
-     * divide of a precise sum, see the scalar tier below), so the guest
-     * integer is that arithmetic's rounding of the value, not its floor: the
-     * precise value may sit up to one pixel below or two above it. */
-    PGXP_F_DX = 1u << 4,
-    PGXP_F_DY = 1u << 5,
-    PGXP_F_UNCLAMPED = 1u << 6, /* exact GTE projection; intact word only */
-    PGXP_F_VXY = PGXP_F_VX | PGXP_F_VY,
-};
-
-struct PGXPValue {
-    int32_t  x16, y16;   /* sub-pixel screen coords, 16.16                    */
-    uint16_t z;          /* projected SZ depth (perspective source), 0 = none */
-    uint16_t flags;
-    uint32_t value;      /* the guest word this shadow describes              */
-    uint32_t gen;        /* valid iff == s_gen (O(1) invalidate-all)          */
-    uint32_t source_address; /* original load address, valid with generation/value */
-    PGXPProjection projection;
-};
+#include "pgxp_cpu_state.h"
 
 /* Shadow covers the host RAM backing so the opt-in 8 MB map tracks its high
  * banks; retail sessions only ever touch the low 2 MiB of it. The same array
@@ -59,11 +36,6 @@ struct PGXPValue {
  * still equals the register, killed by every hooked write that does not
  * produce one. It turns back into a half shadow only when stored (SH / SW)
  * as a 16-bit coordinate. */
-struct PGXPScalar {
-    double   v;          /* precise value of the 32-bit register              */
-    uint32_t value;      /* the register value it describes                   */
-    uint32_t gen;
-};
 struct PgxpRamShadow {
     uint32_t index;
     PGXPValue value;

@@ -425,11 +425,11 @@ bool FullFunctionEmitter::emit_function(
     // instruction; precise R3000A timing (load delays, multiply/divide,
     // memory stalls) is a future refinement. Includes terminator and
     // delay slot in the block before the next leader. */
-    std::map<uint32_t, uint32_t> block_cycles;
+    std::map<uint32_t, uint32_t> block_cycles, block_raw_bounds, instruction_raw_bounds;
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t leader = it->first;
         if (!block_leaders.count(leader)) continue;
-        uint32_t count = 0;
+        uint32_t count = 0, raw_bound = 8; /* includes any orphaned delay slot */
         auto walker = it;
         while (walker != addr_to_raw.end()) {
             /* Single-source per-instruction cost (psx_instr_cost.h), summed over
@@ -437,11 +437,17 @@ bool FullFunctionEmitter::emit_function(
              * this equals the old instruction count; Stage-2 real costs land in
              * that one function and every backend updates together. */
             count += psx_instr_base_cycles(walker->second);
+            raw_bound += PSXStaticTiming::bound(walker->second);
             ++walker;
             if (walker == addr_to_raw.end()) break;
             if (block_leaders.count(walker->first)) break;
         }
         block_cycles[leader] = count;
+        block_raw_bounds[leader] = raw_bound;
+        for (auto tail = it; tail != walker; ++tail) {
+            instruction_raw_bounds[tail->first] = raw_bound;
+            raw_bound -= PSXStaticTiming::bound(tail->second);
+        }
     }
 
     /* Emit branch-predicate variable declarations at function entry,
@@ -814,8 +820,15 @@ bool FullFunctionEmitter::emit_function(
         const uint32_t pc = relocate_ra(rom_addr);
         if (!psx_fetch_uncached(pc) &&
             !(block_leaders.count(rom_addr) || (pc & 0xCu) == 0)) return;
-        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch_compiled(cpu, 0x{:08X}u);\n#endif\n",
-                           pc);
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch_compiled(cpu, 0x{:08X}u);\n", pc);
+        if (PSXStaticTiming::enabled()) {
+            // A refill is an observation barrier. Re-arm after it using a
+            // remaining static bound through the block (or orphan slot).
+            auto remaining = instruction_raw_bounds.find(rom_addr);
+            uint32_t bound = remaining == instruction_raw_bounds.end() ? 8u : remaining->second;
+            out += fmt::format("    psx_cyc_block_resume({}u);\n", bound);
+        }
+        out += "#endif\n";
     };
 
     auto emit_patch_range_guard = [&](uint32_t addr) {
@@ -959,6 +972,8 @@ bool FullFunctionEmitter::emit_function(
                     out += "#endif\n";
                 }
             }
+            if (per_insn_cycles && PSXStaticTiming::enabled())
+                out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_cyc_block_begin({}u);\n#endif\n", block_raw_bounds[addr]);
             if (should_probe_pc(addr)) {
                 out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
             }
@@ -967,7 +982,7 @@ bool FullFunctionEmitter::emit_function(
         if (per_insn_cycles && PSXStaticTiming::enabled() &&
             !psx_fetch_uncached(relocate_ra(addr))) {
             std::vector<uint32_t> words;
-            std::vector<std::string> bodies, precise;
+            std::vector<std::string> precise;
             auto scan = it;
             for (; scan != addr_to_raw.end() && words.size() < 4; ++scan) {
                 uint32_t a = scan->first, w = scan->second;
@@ -979,14 +994,13 @@ bool FullFunctionEmitter::emit_function(
                 auto tr = StrictTranslator::translate(d, relocate_ra(a));
                 if (!tr.supported || tr.is_terminator) break;
                 words.push_back(w);
-                bodies.push_back("    " + tr.c_code);
                 precise.push_back(fmt::format("    psx_cyc_step(cpu, 0x{:X}u);\n"
                     "    /* 0x{:08X}: {:08X}  {} */\n    {}\n",
                     psx_cyc_dep_res_mask(w), a, w, tr.comment, tr.c_code) + emit_cosim_instr(a));
             }
             if (words.size() >= 2) {
                 emit_icache_fetch(addr);
-                out += PSXStaticTiming::emit(words, bodies, precise);
+                out += PSXStaticTiming::emit(words, precise);
                 std::advance(it, words.size() - 1u);
                 continue;
             }
@@ -1857,6 +1871,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     out += "extern uint32_t g_debug_current_func_addr;\n";
     out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n";
+    out += "extern int g_debug_call_hooks;\n";
     out += "/* BIOS HLE tier (CLAUDE.md \xC2\xA7""0 amendment 2026-07-02): null-by-default\n";
     out += " * hook consulted at the top of every dispatch iteration, BEFORE any\n";
     out += " * backend (game image / dirty-RAM interp / static table) claims the\n";
@@ -2289,6 +2304,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "     * without growing the native stack. Interrupts are only checked when\n";
     out += "     * the outermost dispatch returns, so a nested callee cannot interrupt\n";
     out += "     * before its generated caller runs the post-call continuation. */\n";
+    out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_cyc_block_publish();\n#endif\n";
     out += "    int outermost = (g_psx_dispatch_depth++ == 0);\n";
     out += "    /* Call contract (Bug D family): the guest $sp at the call.  A C\n";
     out += "     * continuation behind this dispatch may only run if the guest\n";
@@ -2417,7 +2433,7 @@ void FullFunctionEmitter::emit_dispatch(
         out += "                    break; /* found stays 0 -> dirty_ram_dispatch */\n";
     }
     out += "                g_debug_current_func_addr = phys;\n";
-    out += "                debug_server_trace_dispatch(phys);\n";
+    out += "#ifndef PSX_NO_DEBUG_TOOLS\n                if (g_debug_call_hooks) debug_server_trace_dispatch(phys);\n#endif\n";
     // The exact PC picks the body: a segment variant, or the home body
     // (recorded when the PC is in another segment than it, §5.4).
     out += "                psx_bios_hit_body(cpu, addr, phys, dispatch_table[mid].func)(cpu);\n";

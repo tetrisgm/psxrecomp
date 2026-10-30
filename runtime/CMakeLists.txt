@@ -782,9 +782,8 @@ if(BUILD_TESTING)
             tests/test_pgxp_untracked_store.c
             tests/psx_ram_runtime_map_stubs.c
             src/memory.c
-            src/dma.c
-            src/gpu_timeline.c
-            src/boot_state.c
+            tests/pgxp_memory_devices.c
+            src/kernel_patch_ranges.c
             src/pgxp.cpp
             src/psx_ram_geometry.c)
         target_include_directories(pgxp_untracked_store_test PRIVATE include src)
@@ -1087,10 +1086,23 @@ if(BUILD_TESTING)
     # suppression bracket, invalidate-all, and GetPreciseVertex safeguards
     # (truncation agreement + tolerance clamp). White-box: includes src/pgxp.cpp
     # and stubs the gte.cpp fallback-cache extern.
+    add_executable(debug_call_hook_test tests/test_debug_call_hook.c)
+    target_include_directories(debug_call_hook_test PRIVATE include)
+    add_test(NAME debug_call_hook_test COMMAND debug_call_hook_test)
+
+    add_executable(pgxp_inline_test tests/test_pgxp_inline.cpp src/psx_ram_geometry.c)
+    target_include_directories(pgxp_inline_test PRIVATE include)
+    add_test(NAME pgxp_inline_test COMMAND pgxp_inline_test)
     add_executable(pgxp_test tests/test_pgxp.cpp src/pgxp.cpp
         src/psx_ram_geometry.c)
     target_include_directories(pgxp_test PRIVATE include)
     add_test(NAME pgxp_test COMMAND pgxp_test)
+
+    add_executable(pgxp_compiled_test tests/test_pgxp.cpp src/pgxp.cpp
+        src/psx_ram_geometry.c tests/pgxp_test_mod_memory.cpp)
+    target_include_directories(pgxp_compiled_test PRIVATE include)
+    target_compile_definitions(pgxp_compiled_test PRIVATE PSX_PGXP_TEST_COMPILED=1)
+    add_test(NAME pgxp_compiled_test COMMAND pgxp_compiled_test)
 
     add_executable(pgxp_word_shadow_test tests/test_pgxp_word_shadow.cpp
         src/pgxp.cpp src/psx_ram_geometry.c)
@@ -2033,6 +2045,7 @@ if(BUILD_TESTING)
         tests/test_render_pass_freeze.c
         src/psx_cycles.c)
     target_include_directories(render_pass_freeze_test PRIVATE include)
+    target_compile_definitions(render_pass_freeze_test PRIVATE PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME render_pass_freeze_test COMMAND render_pass_freeze_test)
 
     # Uncharged guest-time spans (psx_mod_call_guest_uncharged's time layer)
@@ -2041,6 +2054,7 @@ if(BUILD_TESTING)
         tests/test_uncharged_span.c
         src/psx_cycles.c)
     target_include_directories(uncharged_span_test PRIVATE include)
+    target_compile_definitions(uncharged_span_test PRIVATE PSX_ENABLE_BLOCK_CYCLES=1)
     add_test(NAME uncharged_span_test COMMAND uncharged_span_test)
 
     # Render-pass watchdog abort from nested guest frames: the real

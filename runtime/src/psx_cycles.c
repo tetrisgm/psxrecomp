@@ -24,6 +24,8 @@
 uint64_t psx_cycle_count = 0;
 uint32_t g_psx_gcs_recip_q16 = 65536u;
 uint32_t g_psx_gcs_frac = 0u;
+uint32_t g_psx_cyc_block_raw = 0;
+int g_psx_cyc_block_active = 0;
 int g_psx_gcs_batch = 0;   /* [timing] guest_cycle_scale_batch */
 static uint32_t s_psx_gcs_cfg = 1u;     /* [timing] guest_cycle_scale */
 static uint32_t s_psx_gcs_live = 1u;
@@ -36,11 +38,12 @@ static uint32_t s_psx_gcs_ram_n = 0;
 static int      s_psx_gcs_ram_open = 0; /* last VBlank's verdict */
 static uint32_t (*s_psx_gcs_ram_read)(uint32_t phys, uint32_t size) = NULL;
 
-static void psx_guest_cycle_scale_apply(void) {
+static void psx_guest_cycle_scale_apply(int publish) {
     const int open = (!s_psx_gcs_gated || s_psx_gcs_open) &&
                      (s_psx_gcs_ram_n == 0u || s_psx_gcs_ram_open);
     uint32_t n = open ? s_psx_gcs_cfg : 1u;
     if (n == s_psx_gcs_live) return;
+    if (publish) psx_cyc_block_publish();
     s_psx_gcs_live = n;
     g_psx_gcs_recip_q16 = psx_gcs_recip_for(n);
     g_psx_gcs_frac = 0u;
@@ -50,17 +53,17 @@ void psx_guest_cycle_scale_set(uint32_t scale) {
     if (scale < 1u) scale = 1u;
     if (scale > 64u) scale = 64u;
     s_psx_gcs_cfg = scale;
-    psx_guest_cycle_scale_apply();
+    psx_guest_cycle_scale_apply(1);
 }
 
 void psx_guest_cycle_scale_set_gated(int gated) {
     s_psx_gcs_gated = gated ? 1 : 0;
-    psx_guest_cycle_scale_apply();
+    psx_guest_cycle_scale_apply(1);
 }
 
 void psx_guest_cycle_scale_gate_open(int open) {
     s_psx_gcs_open = open ? 1 : 0;
-    psx_guest_cycle_scale_apply();
+    psx_guest_cycle_scale_apply(1);
 }
 
 void psx_guest_cycle_scale_set_ram_reader(uint32_t (*read)(uint32_t phys, uint32_t size)) {
@@ -80,14 +83,14 @@ int psx_guest_cycle_scale_ram_gate_add(uint32_t addr, uint32_t size,
     s_psx_gcs_ram[s_psx_gcs_ram_n].value = value & mask;
     s_psx_gcs_ram_n++;
     s_psx_gcs_ram_open = 0;                 /* shut until the first VBlank */
-    psx_guest_cycle_scale_apply();
+    psx_guest_cycle_scale_apply(1);
     return 1;
 }
 
 void psx_guest_cycle_scale_ram_gate_clear(void) {
     s_psx_gcs_ram_n = 0u;
     s_psx_gcs_ram_open = 0;
-    psx_guest_cycle_scale_apply();
+    psx_guest_cycle_scale_apply(1);
 }
 
 /* VBlank edge (interrupts.c fire_vblank_edge): a guest-time point, so every
@@ -101,7 +104,7 @@ void psx_guest_cycle_scale_vblank(void) {
     }
     if (open == s_psx_gcs_ram_open) return;
     s_psx_gcs_ram_open = open;
-    psx_guest_cycle_scale_apply();
+    psx_guest_cycle_scale_apply(1);
 }
 
 /* Public mod API (mod_plugins.h): the mod gate. */
@@ -121,7 +124,9 @@ void psx_guest_cycle_scale_snapshot(uint32_t out[3]) {
 void psx_guest_cycle_scale_restore(const uint32_t in[3]) {
     s_psx_gcs_open = in[1] ? 1 : 0;
     s_psx_gcs_ram_open = in[2] ? 1 : 0;
-    psx_guest_cycle_scale_apply();
+    /* Restore replaces clock state; never charge saved pending work using
+     * the temporary span's scale or fractional carry. */
+    psx_guest_cycle_scale_apply(0);
     g_psx_gcs_frac = PSX_GCS_ACTIVE() ? (in[0] & 0xFFFFu) : 0u;
 }
 
@@ -168,9 +173,14 @@ static void psx_cycle_freeze_tick(void) {
     }
 }
 
+static uint32_t s_cycle_replay_block_raw;
+static int s_cycle_replay_block_active;
 int psx_cycle_replay_begin(uint64_t start_cycle) {
     extern int g_ls_replay_active;
     if (!g_ls_replay_active || s_cycle_replay_active) return 0;
+    s_cycle_replay_block_raw = g_psx_cyc_block_raw;
+    s_cycle_replay_block_active = g_psx_cyc_block_active;
+    g_psx_cyc_block_raw = 0; g_psx_cyc_block_active = 0;
     s_cycle_replay_live = psx_cycle_count;
     psx_cycle_count = start_cycle;
     s_cycle_replay_active = 1;
@@ -180,6 +190,8 @@ int psx_cycle_replay_begin(uint64_t start_cycle) {
 uint64_t psx_cycle_replay_end(void) {
     uint64_t replay_cycle = psx_cycle_count;
     if (s_cycle_replay_active) {
+        g_psx_cyc_block_raw = s_cycle_replay_block_raw;
+        g_psx_cyc_block_active = s_cycle_replay_block_active;
         psx_cycle_count = s_cycle_replay_live;
         s_cycle_replay_active = 0;
     }
@@ -527,6 +539,9 @@ void psx_advance_cycles_slow(uint32_t cycles) {
 uint64_t psx_get_cycle_count(void) {
     uint64_t n = psx_cycle_count + (uint64_t)g_psx_cyc_batch;
     if (g_psx_cyc_local_acc) n += (uint64_t)(*g_psx_cyc_local_acc);
+    if (g_psx_cyc_block_raw) n += PSX_GCS_ACTIVE() ?
+        ((uint64_t)g_psx_cyc_block_raw * g_psx_gcs_recip_q16 + g_psx_gcs_frac) >> 16 :
+        g_psx_cyc_block_raw;
     return n;
 }
 
@@ -899,6 +914,7 @@ void psx_idle_note_check(CPUState *cpu, uint32_t check_pc) {
  * would try to replay a bogus gap. Re-anchor devices at the restored cycle and
  * force a fresh deadline on the next charge. */
 void psx_cycles_resync_after_restore(CPUState *cpu) {
+    g_psx_cyc_block_raw = 0; g_psx_cyc_block_active = 0;
     if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0;
     g_psx_cyc_local_acc    = NULL;
     g_psx_cyc_batch        = 0;
@@ -952,6 +968,7 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
 }
 
 void psx_cycles_reset_for_boot(void) {
+    g_psx_cyc_block_raw = 0; g_psx_cyc_block_active = 0;
     if (g_psx_cyc_local_acc) *g_psx_cyc_local_acc = 0;
     g_psx_cyc_local_acc    = NULL;
     g_psx_cyc_batch        = 0;
@@ -1035,8 +1052,8 @@ void psx_muldiv_stall(CPUState* cpu) {
         }
         uint32_t stall = (uint32_t)(cpu->muldiv_ts_done - psx_cycle_count);
         uint8_t w = cpu->read_absorb_which;          /* fixed during the stall */
-        uint32_t give = cpu->read_absorb[w];
-        cpu->read_absorb[w] = (uint8_t)(give > stall ? give - stall : 0u);  /* consume */
+        uint32_t give = cpu->read_absorb[w].value;
+        cpu->read_absorb[w].value = (uint8_t)(give > stall ? give - stall : 0u);  /* consume */
         psx_advance_cycles(stall);
     }
 }
@@ -1135,6 +1152,9 @@ static void freeze_save(PsxCycleFreeze *save) {
     save->cycle_count = psx_cycle_count;
     save->next_service = psx_next_service_cycle;
     save->fast_limit = g_psx_cycle_fast_limit;
+    save->block_raw = g_psx_cyc_block_raw;
+    save->block_active = g_psx_cyc_block_active;
+    g_psx_cyc_block_raw = 0; g_psx_cyc_block_active = 0;
     save->batch = g_psx_cyc_batch;
     save->batch_limit = g_psx_cyc_batch_limit;
     save->local_acc = g_psx_cyc_local_acc;
@@ -1154,6 +1174,8 @@ static void freeze_save(PsxCycleFreeze *save) {
 /* The interrupted code's deferred-charge state, which the frozen code never
  * owned, comes back in every case. */
 static void freeze_restore_deferred(const PsxCycleFreeze *save) {
+    g_psx_cyc_block_raw = save->block_raw;
+    g_psx_cyc_block_active = save->block_active;
     g_psx_cyc_batch = save->batch;
     g_psx_cyc_batch_limit = save->batch_limit;
     g_psx_cyc_local_acc = save->local_acc;

@@ -11,6 +11,12 @@
 #include <cstdio>
 #include <cstring>
 
+#ifdef PSX_PGXP_TEST_COMPILED
+#define psx_pgxp_load psx_pgxp_load_inline
+#define psx_pgxp_store psx_pgxp_store_inline
+#define psx_pgxp_alu psx_pgxp_alu_inline
+#endif
+
 static int g_failures = 0;
 #define CHECK(cond)                                                          \
     do {                                                                     \
