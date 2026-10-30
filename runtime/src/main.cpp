@@ -4586,7 +4586,7 @@ extern "C" int psx_audio_out_stats(double *fill_ms, double *target_ms,
     rab_stats st;
     s_drc.stats(&st);
     *fill_ms = st.last_fill_ms;
-    *target_ms = s_drc.cfg.target_ms;
+    *target_ms = s_drc.target_ms();
     *underruns = st.underrun_events;
     *overflow_drops = st.overflow_drops;
     *correction = st.last_correction;
@@ -5329,7 +5329,7 @@ static int sdl_audio_catchup_sink(int other_sink) {
     }
     s_drc.stats(&stats);
     const double fill_ms = s_drc.fill_ms();
-    const double target_ms = s_drc.cfg.target_ms;
+    const double target_ms = s_drc.target_ms();
     const int active = psx_audio_catchup_update(&state,
         psx_audio_sync_enabled() && !psx_netplay_active() && present_should_wall_pace(),
         other_sink || (g_turbo_audio_sink_active && !state.active),
@@ -18428,7 +18428,7 @@ int main(int argc, char** argv) {
     bool vulkan_offered = false; /* game.toml [video] offer_vulkan; developer opt-in for launcher visibility */
     /* Legacy single deadzone (<0 => keep per-slot / input.ini defaults). */
     int  resolved_deadzone = -1;
-    int  resolved_audio_buffer_ms = 50;
+    int  resolved_audio_buffer_ms = 60;
     /* Localization: the effective language (game.toml default -> settings.toml ->
      * launcher choice), applied to the translation layer AFTER the launcher runs.
      * lang_menu_options drives the launcher's "Localization" dropdown (empty =>
@@ -21729,7 +21729,7 @@ session_reboot:
                 cfg.source_rate = 44100.0;            /* SPU render rate */
                 cfg.host_rate   = (double)have.freq;  /* actual device rate */
                 cfg.target_ms   = (double)resolved_audio_buffer_ms;
-                if (s_drc.init(cfg) == 0) s_drc_ready = true;
+                if (s_drc.init(cfg, !(std::getenv("PSX_AUDIO_ADAPTIVE") && *std::getenv("PSX_AUDIO_ADAPTIVE")=='0')) == 0) s_drc_ready = true;
             }
             g_audio_host_rate = have.freq;
             audio_trace_set_tap_rate(AUDIO_TAP_HOST, (uint32_t)have.freq);
