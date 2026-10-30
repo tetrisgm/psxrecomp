@@ -3,84 +3,32 @@
 #include "packet_metadata.h"
 /* gpu_gl_renderer.c — hardware OpenGL renderer backend.
  *
- * ARCHITECTURE (v2 — GPU-authoritative VRAM)
- * -------------------------------------------
- * The FBO color texture (`s_hr_tex`, RGBA8, 1024*S x 512*S where S is the
- * internal-resolution scale from [video] supersampling) is the single
- * authoritative copy of VRAM during normal 15-bit rendering. Every mutation
- * goes through the GPU; depth24 scanout additionally keeps the CPU mirror
- * authoritative because packed RGB888 framebuffer uploads are not staged as
- * 1555 FBO pixels. GP0 clears/draws/copies must also update that mirror:
+ * Runtime guest-visible VRAM belongs to NativeRaster. Immutable frame packets
+ * bring native texture inputs and pre-copy sources to the render owner; guest
+ * reads, snapshots and HD keys do not read this renderer's OpenGL surfaces.
+ * R16UI texture pages and CLUTs receive native input versions through a bounded
+ * upload stream. Enhanced colour/depth are disposable presentation state.
  *
- *   - polys / rects / lines  -> rasterized into the hr FBO
- *   - GP0(02h) fills         -> scissored glClear (color + stencil)
- *   - VRAM->VRAM copies      -> hr FBO -> scratch texture blit, then a
- *                               masked quad draw back into the hr FBO
- *   - CPU->VRAM transfers    -> written to the CPU mirror immediately and
- *                               accumulated into a pending-upload rect; the
- *                               rect is flushed (staging texture + quad into
- *                               the hr FBO, plus a direct R16UI subimage)
- *                               before the next GPU op, preserving op order
+ * The region allocator and canonical coverage map distinguish valid VRAM
+ * pixels from wide reveal margins. Production allocates only display bands
+ * and touched offscreen tiles; full-VRAM targets exist only in reference tests.
+ * Copies gather retained
+ * enhanced regions plus native-only holes before applying masked writes.
  *
- * PS1 MASK BIT (bit15). The FBO alpha channel carries bit15 exactly
- * (1.0 = set), and a stencil buffer mirrors it (stencil bit0 == bit15):
- *   - "set mask"  -> fragment alpha + stencil write value
- *   - "check mask"-> stencil test (pass iff stored == 0). The stencil write
- *     value is coupled to the test reference in GL, so when checking we use
- *     GL_INVERT on pass to write a 1 (stored is known 0 when the test
- *     passes) and GL_KEEP to write a 0.
- *   - textured prims (and copies/uploads, whose pixels carry per-texel STP
- *     bits) are drawn in TWO passes split by the STP bit via discard, so
- *     each pass writes a single known stencil value. The same split already
- *     existed for semi-transparent texture blending.
- *   - blending uses glBlendFuncSeparate so the alpha (mask) channel is
- *     always REPLACED by the source fragment's mask bit, never blended.
- *
- * TEXTURE SAMPLING / RENDER-TO-TEXTURE. Textured prims sample a native-res
- * R16UI mirror (`s_raw_tex`) holding raw 1555 VRAM values (CLUT decode +
- * texture window + optional bilinear in the fragment shader). GPU draws
- * mark a native-coords dirty union; before any textured draw whose texture
- * page or CLUT intersects the union, a PACK pass re-encodes the dirty
- * region of the hr FBO into the raw mirror (point-sampled at native
- * coords). CPU->VRAM uploads update the raw mirror directly. So content
- * rendered by the GPU is immediately valid as a texture source.
- *
- * CPU READBACKS (VRAM->CPU transfers, GPUREAD, screenshots) in 15-bit mode
- * flush uploads + pack, then glReadPixels the raw mirror straight into CPU
- * VRAM (raw 1555, no conversion loop). Depth24 entry synchronizes once before
- * the first write; readback is then suppressed until 15-bit rendering resumes.
- *
- * PRESENT is deterministic: 15-bit frames always blit the display region
- * from the hr FBO into a 4:3 letterboxed rect (single path — no more
- * frame-to-frame alternation between FBO and CPU presents). 24-bit (FMV)
- * frames use the authoritative CPU mirror and quad-present, also letterboxed.
- * PSX_GL_FORCE_CPU_PRESENT=1 (read by main.cpp) forces the CPU path as a
- * diagnostic.
- *
- * Known divergences from the software rasterizer (accepted, documented):
- *   - GL triangle/line coverage rules differ from the PS1 DDA by ±1px on
- *     edges; lines use GL_LINES at 1x and, above 1x, a quad one native pixel
- *     thick that covers both endpoints (line_to_quad) instead of Bresenham.
- *   - No dithering (the software path doesn't dither either).
- *   - Gouraud interpolation happens at 8-bit precision instead of 5-bit
- *     (smoother gradients; readback re-quantizes to 5-bit).
- *   - VRAM-wrapping draws are clamped, except GP0(02h) fills which split
- *     into wrapped segments. Wrapping copies/draws are unused by real SDKs.
- *
- * INTERNAL SCALE LIMITS. S is clamped at init to the driver's texture,
- * renderbuffer and viewport limits and to a memory budget (gl_scale_limits.h),
- * and an FBO that still fails to allocate is retried one scale lower. A large
- * S therefore never costs the GL backend itself.
- *
- * Init is all-or-nothing: if any shader/FBO fails, gl_renderer_init_context
- * returns 0 and the runtime falls back to the pure software renderer — no
- * half-GL hybrid. */
+ * RGBA alpha carries PS1 bit15; stencil mirrors it for mask checks. Textured
+ * semi-transparency can require separate STP classes, but PGXP depth is written
+ * in the colour pass. Native uploads decode R16UI directly into the destination
+ * region. PGXP rasterization intentionally enhances native geometry; it is not
+ * the guest's pixel authority. Legacy diagnostic/direct-call pack and readback
+ * helpers remain separate from runtime frame-packet texture coherence.
+ */
 
 #include "host_overlay.h"
 #include "host_sampler.h"
 #include "gpu.h"
 #include "gpu_render.h"
 #include "gl_scale_limits.h"
+#include "gl_surface_coverage.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_fmv_hd.h"
 #include "gpu_gl_renderer.h"
@@ -949,14 +897,55 @@ static int s_selected_bank_live_clut, s_tb_bank_live_clut;
 static int s_selected_bank_failed;
 
 /* Authoritative VRAM: hr color texture + stencil (mask bit) FBO. */
-static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
-/* The scale s_hr_tex/s_hr_rb are allocated at (dynamic resolution
- * reallocates them at every step; see s_alloc_scale). */
-static int           s_hr_alloc = 0;
+/* Surface ownership travels with its coordinate domain. The draw aliases
+ * below describe the selected allocation, not a permanent VRAM image.
+ * Keeping handles and bounds together prevents a target switch from leaving
+ * a reader using the previous target's origin or allocation scale. */
+typedef struct GlRasterSurface {
+    GLuint tex,fbo,rb;
+    int x,y,w,h,allocation_scale;
+} GlRasterSurface;
+typedef struct GlSurfacePool {
+    GlCoverage coverage;
+    GlRasterSurface **surfaces;
+    size_t count,capacity;
+} GlSurfacePool;
+static GlSurfacePool s_region_pool;
+typedef struct GlDrawRegion {
+    GlRasterSurface *surface;
+    int x,y,w,h,direct;
+} GlDrawRegion;
+static GlDrawRegion *s_draw_regions;
+static size_t s_draw_region_count,s_draw_region_capacity;
+static int s_draw_region_clip;
+static GlCoverageRect s_draw_region_bounds;
+static int surface_draw_regions(const float *vertices,int count,int stride);
+static void surface_draw_region_begin(size_t index);
+static void surface_draw_regions_end(GlRasterSurface *previous);
+static void surface_depth_clear(void);
+static void surface_stencil_rebuild(void);
+static void surface_pool_copy(int sx,int sy,int dx,int dy,int w,int h);
+static int s_pool_wide_enabled;
+static void surface_wide_select(void);
+static GlRasterSurface s_primary_surface={0,0,0,0,0,VRAM_W,VRAM_H,0};
+static GlRasterSurface *s_draw_surface=&s_primary_surface;
+#define s_hr_tex (s_draw_surface->tex)
+#define s_hr_fbo (s_draw_surface->fbo)
+#define s_hr_rb (s_draw_surface->rb)
+#define s_hr_origin_x (s_draw_surface->x)
+#define s_hr_origin_y (s_draw_surface->y)
+#define s_hr_width (s_draw_surface->w)
+#define s_hr_height (s_draw_surface->h)
+#define s_hr_alloc (s_draw_surface->allocation_scale)
 /* Native raw-1555 sampling mirror + readback source. */
 static GLuint        s_raw_tex = 0, s_raw_fbo = 0;
-/* CPU->VRAM upload staging (native RGBA8). */
-static GLuint        s_up_tex = 0;
+static GLuint s_raw_pbo;
+static _Atomic uint64_t s_pack_gpu_draws,s_pack_native_uploads,s_pack_native_bytes;
+/* Complete neutral texture for the optional HD sampler when no replacement
+ * is bound. Native uploads no longer need a second RGBA8 staging image. */
+static GLuint s_hd_dummy_tex;
+static GLuint s_native_upload_prog;
+static GLint s_native_upload_origin,s_native_upload_scale,s_native_upload_pass;
 /* copy_rect staging (hr-sized RGBA8). */
 static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 static int           s_scratch_w = 0, s_scratch_h = 0;
@@ -1053,6 +1042,8 @@ static GLint s_uLimits = -1;
 static GLint s_geo_uXoff = -1, s_geo_uXhalf = -1;
 static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
 static GLint s_geo_uOrigin = -1, s_tex_uOrigin = -1;
+static GLint s_geo_uYhalf=-1,s_tex_uYhalf=-1,s_tex_uViewportOrigin=-1;
+static int s_raster_height=0;
 static GLint s_geo_uRasterGrid = -1, s_tex_uRasterGrid = -1;
 static GLint s_geo_uDepthProbe = -1, s_tex_uDepthProbe = -1;
 /* Native-wide 2D-backdrop x-stretch uniforms. The far 2D backdrop layer is a
@@ -1090,16 +1081,18 @@ static PrimRec s_ptrace[PTRACE_CAP]; static int s_ptrace_n = 0;
 PrimRec g_ptrace[PTRACE_CAP]; int g_ptrace_n = 0;   /* snapshot (extern) */
 /* BLIT program uniforms. */
 static GLint s_uBlitSrc = -1, s_uBlitPass = -1, s_uBlitMaskset = -1;
-static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1;
+static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1,s_uBlitTarget=-1;
 /* PACK program uniforms. */
 static GLint s_uPackHr = -1, s_uPackScale = -1;
 static GLint s_uStencilSrc = -1, s_uStencilOff = -1;
 
-static uint32_t     *s_conv = NULL;        /* RGBA8 staging for uploads      */
+static uint16_t *s_native_upload_scratch; /* densely packed native upload rows */
 static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
 
 /* Dirty-rect unions, native VRAM coords, inclusive bounds. */
 typedef struct { int x0, y0, x1, y1, set; } DirtyRect;
+static void surface_pool_upload(GlSurfacePool *pool,const DirtyRect *uploads,int count);
+static void surface_pool_fill_segment(GlSurfacePool *pool,int x,int y,int w,int h,uint16_t colour);
 static DirtyRect s_cpu_dirty; /* conservative GPU-written area not yet read into CPU VRAM */
 static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror */
 /* Native-coords union of primitive bboxes since the last stencil rebuild: the
@@ -1242,6 +1235,7 @@ uint64_t gl_renderer_wide_triangle_recovery_count(void) {
  * surface: local_x = vram_x - base_x + OFFSET. Same as SW wide_dx(). */
 static int view_enabled, view_shift, view_pad_left, view_pad_right;
 static inline int wide_dx(void) { return g_wide_off + view_shift - g_wide_cur_base; }
+static int direct_wide_target(void) { return g_wide_cur && g_wide_cur==s_hr_fbo; }
 
 /* Wide-surface mask stencil: the rect (wide-local native px, [x0,x1) x
  * [y0,y1)) where a surface's stencil may differ from its alpha (bit 15), per
@@ -2075,7 +2069,7 @@ static const char *GEO_VS =
     "uniform float u_depth_probe;\n"
     "uniform float u_raster_grid;\n"
     "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
-    "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
+    "uniform float u_yhalf; /* target clip half-height */\n"
     "noperspective out vec4 v_col;\n"
     "noperspective out float v_iw; noperspective out vec3 v_col_p;   /* perspective-correct colour (PGXP, G1.14) */\n"
     "flat out int v_cp;\n"
@@ -2085,8 +2079,7 @@ static const char *GEO_VS =
     "void main(){\n"
     "  v_npos = a_pos;\n"
     "  /* a_col.a carries the mask bit (0/1) and, for a PGXP 3D vertex, its\n"
-    "   * GTE SZ: a = mask + 2*(sz + 65536*cp), cp = perspective colour. A\n"
-    "   * negative a is a depth-clear vertex (beyond every SZ, inside the far plane). */\n"
+    "   * GTE SZ: a = mask + 2*(sz + 65536*cp), cp = perspective colour. */\n"
     "  float a = a_col.a, code = floor(a * 0.5), zn = 0.0, w = 1.0;\n"
     "  float m = a - 2.0 * code;\n"
     "  /* + 2*131072: the primitive is dither-eligible (GPU_GEO_DITHER_CODE). */\n"
@@ -2095,8 +2088,7 @@ static const char *GEO_VS =
     "  bool far_code = a < -1.5;\n"
     "  if (far_code) { uint bits = floatBitsToUint(-a); m = float(bits & 1u); cp = float((bits >> 1u) & 1u); dth = float((bits >> 2u) & 1u); sz = uintBitsToFloat(bits & 0xfffffff8u) - 2.0; }\n"
     "  v_dith = int(dth);\n"
-    "  if (a < 0.0 && !far_code) { m = 0.0; zn = 1.0; sz = 0.0; cp = 0.0; }\n"
-    "  else if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz * (1.0 - u_zbias) - (u_zbias > 0.0 ? 48.0 : 0.0), 1.0) + 256.0); if (cp > 0.5) w = sz / 1024.0; }\n"
+    "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz, 1.0) + 256.0); if (cp > 0.5) w = sz / 1024.0; }\n"
     "  v_col = vec4(a_col.rgb, m); v_col_p = a_col.rgb / w; v_iw = 1.0/w; v_cp = int(cp);\n"
     "  v_b3d = ((a >= 0.0 || far_code) && sz > 0.5) ? 1.0 : 0.0;\n"
     "  v_npos += sz > 0.5 ? u_origin : vec2(0.0);\n"
@@ -2107,9 +2099,9 @@ static const char *GEO_VS =
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
     "  } else if(u_xscale != 1.0) xb = (xb - xc)*u_xscale + xc;\n"
     "  zn -= 2.0*u_depth_probe;\n"
-    "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
+    "  vec2 rp = vec2(xb+u_shift,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
     "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
-    "  gl_Position = vec4(rp/vec2(u_xhalf,256.0)-1.0, zn, 1.0); }\n";
+    "  rp.x += u_xoff; gl_Position = vec4(rp/vec2(u_xhalf,u_yhalf)-1.0, zn, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; noperspective in float v_iw; noperspective in vec3 v_col_p; flat in int v_cp; out vec4 frag;\n"
@@ -2161,7 +2153,7 @@ static const char *TEX_VS =
     "uniform float u_depth_probe;\n"
     "uniform float u_raster_grid;\n"
     "uniform vec2 u_origin; /* translation-invariant PGXP raster origin */\n"
-    "uniform float u_zbias;  /* PGXP depth: relative near bias of the colour pass */\n"
+    "uniform float u_yhalf; /* target clip half-height */\n"
     "noperspective out vec2 g_uv; noperspective out vec4 g_col;\n"
     "noperspective out vec2 g_uv_p;  /* perspective-correct UV (used when g_persp!=0) */\n"
     "flat out int g_persp;\n"
@@ -2203,18 +2195,18 @@ static const char *TEX_VS =
     "  float pz = a_col.a < 0.0 ? -a_col.a : 0.0;\n"
     "  float cp = pz >= 65536.0 ? 1.0 : 0.0, sz = pz - 65536.0 * cp, zn = 0.0;\n"
     "  if (a_col.a > 1.5) { uint bits = floatBitsToUint(a_col.a); cp = float((bits >> 1u) & 1u); sz = uintBitsToFloat(bits & 0xfffffff8u) - 2.0; }\n"
-    "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz * (1.0 - u_zbias) - (u_zbias > 0.0 ? 48.0 : 0.0), 1.0) + 256.0); if (a_q <= 0.0 && cp > 0.5) w = sz / 1024.0; }\n"
+    "  if (sz > 0.5) { zn = 1.0 - 512.0 / (max(sz, 1.0) + 256.0); if (a_q <= 0.0 && cp > 0.5) w = sz / 1024.0; }\n"
     "  g_uv_p = a_uv/w; g_col_p = a_col.rgb/w; g_iw = 1.0/w; g_cp = int(cp); g_b3d = sz > 0.5 ? 1.0 : 0.0; g_npos += sz > 0.5 ? u_origin : vec2(0.0);\n"
     "  zn -= 2.0*u_depth_probe;\n"
-    "  vec2 rp = vec2(xb+u_shift+u_xoff,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
+    "  vec2 rp = vec2(xb+u_shift,(a_pos.y-(sz > 0.5 ? 0.0 : u_origin.y))+u_shift);\n"
     "  rp = floor(rp*u_raster_grid+0.5)/u_raster_grid;\n"
-    "  g_raster=rp*(u_raster_grid/256.0); vec2 ndc = rp/vec2(u_xhalf,256.0)-1.0;\n"
+    "  g_raster=rp*(u_raster_grid/256.0); rp.x += u_xoff; vec2 ndc = rp/vec2(u_xhalf,u_yhalf)-1.0;\n"
     "  gl_Position = vec4(ndc, zn, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
     "flat in vec2 t_pos[3]; flat in vec3 t_uvq[3]; flat in vec4 t_colq[3];\n"
-    "uniform vec2 u_origin; uniform float u_raster_grid;\n"
-    "vec3 local_weights(){ vec2 p=gl_FragCoord.xy-(u_origin*u_raster_grid/256.0)-t_pos[0];\n"
+    "uniform vec2 u_origin; uniform float u_raster_grid; uniform vec2 u_viewport_origin; uniform float u_xoff;\n"
+    "vec3 local_weights(){ vec2 p=gl_FragCoord.xy-u_viewport_origin-vec2(u_xoff*(u_raster_grid/256.0),0.0)-t_pos[0];\n"
     " vec2 a=t_pos[1]-t_pos[0],b=t_pos[2]-t_pos[0];float d=a.x*b.y-a.y*b.x;\n"
     " float y=(p.x*b.y-p.y*b.x)/d,z=(a.x*p.y-a.y*p.x)/d;return vec3(1.0-y-z,y,z); }\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
@@ -2522,9 +2514,9 @@ static const char *TEX_FS =
 static const char *BLIT_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;   /* native VRAM px */\n"
-    "uniform float u_shift;\n"
+    "uniform float u_shift; uniform vec4 u_target;\n"
     "void main(){\n"
-    "  gl_Position = vec4((a_pos.x+u_shift)/512.0 - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  gl_Position = vec4((a_pos+vec2(u_shift)-u_target.xy)/u_target.zw-1.0,0.0,1.0); }\n";
 /* The same blit into the windowed high-resolution surface: its viewport is the
  * window (W*S px), so x is translated by u_xoff and clipped at u_xhalf like
  * the native-wide passes. A separate program keeps BLIT_VS (the canonical
@@ -2577,6 +2569,17 @@ static const char *PACK_FS =
     "  o_pix = r | (g << 5) | (b << 10) | (c.a >= 0.5 ? 0x8000u : 0u);\n"
     "}\n";
 
+static const char *NATIVE_UPLOAD_FS =
+    "#version 330\n"
+    "uniform usampler2D u_src; uniform ivec2 u_origin; uniform int u_scale,u_pass;\n"
+    "out vec4 frag;\n"
+    "void main(){\n"
+    " uint p=texelFetch(u_src,(ivec2(gl_FragCoord.xy)/u_scale+u_origin)&ivec2(1023,511),0).r;\n"
+    " bool mask=(p&32768u)!=0u;\n"
+    " if((u_pass==0 && mask)||(u_pass==1 && !mask))discard;\n"
+    " frag=vec4(vec3(p&31u,(p>>5)&31u,(p>>10)&31u)*(8.0/255.0),mask?1.0:0.0);\n"
+    "}\n";
+
 /* Rebuild stencil bit 0 from a copied RGBA target's alpha. Color writes are
  * disabled while this shader runs; only alpha>=0.5 fragments replace stencil. */
 static const char *STENCIL_FS =
@@ -2618,13 +2621,6 @@ static GLuint build_program_ex(const char *vs, const char *fs, int dual_source, 
 }
 static GLuint build_program(const char *vs, const char *fs) {
     return build_program_ex(vs, fs, 0, NULL);
-}
-
-/* ---- pixel conversion (PS1 1555: bit15=mask, B[14:10] G[9:5] R[4:0]) ---- */
-static inline uint32_t conv_1555_to_rgba8(uint16_t p) {
-    uint32_t r = (p & 0x1F) << 3, g = ((p >> 5) & 0x1F) << 3, b = ((p >> 10) & 0x1F) << 3;
-    uint32_t a = (p >> 15) & 1 ? 0xFF : 0;
-    return r | (g << 8) | (b << 16) | (a << 24);   /* RGBA8 little-endian */
 }
 
 /* ---- mask-bit stencil --------------------------------------------------- *
@@ -2688,6 +2684,36 @@ static void apply_psx_blend(int mode) {
 }
 
 #include "pgxp_raster_audit.inc"
+#include "gl_vertex_stream.inc"
+
+/* One native sampling upload path for packet inputs and guest uploads.
+ * Pack narrow rows densely: reserving the intervening VRAM columns used to
+ * copy nearly 128 KiB for a single 8 KiB tile. s_native_upload_scratch is render-owner scratch
+ * shared by native inputs and guest uploads. */
+static void native_texture_upload_rect(int x,int y,int w,int h) {
+    if(w<=0 || h<=0)return;
+    const uint16_t *source=s_vram+(size_t)y*VRAM_W+x;
+    if(w!=VRAM_W && h>1) {
+        uint16_t *packed=s_native_upload_scratch;
+        for(int row=0;row<h;++row)
+            memcpy(packed+(size_t)row*w,source+(size_t)row*VRAM_W,(size_t)w*sizeof(uint16_t));
+        source=packed;
+    }
+    if(!s_raw_pbo)p_glGenBuffers(1,&s_raw_pbo);
+    const size_t bytes=(size_t)w*h*sizeof(uint16_t);
+    const size_t offset=buffer_stream_upload(&s_unpack_stream,PSXGL_PIXEL_UNPACK_BUFFER,
+        s_raw_pbo,VRAM_W*VRAM_H*sizeof(uint16_t),source,bytes);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D,s_raw_tex);
+    glPixelStorei(PSXGL_UNPACK_ROW_LENGTH,0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,2);
+    glTexSubImage2D(GL_TEXTURE_2D,0,x,y,w,h,PSXGL_RED_INTEGER,
+        GL_UNSIGNED_SHORT,(const void *)(uintptr_t)offset);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+    p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER,0);
+    ++s_pack_native_uploads;
+    atomic_fetch_add(&s_pack_native_bytes,bytes);
+}
 
 /* Keep precise vertices and seam arithmetic draw-area-local until rasterization.
  * A page translation must not discard 16.16 bits before reaching the GPU.
@@ -2695,18 +2721,50 @@ static void apply_psx_blend(int mode) {
  * precision reduction); the textured shader evaluates interpolation locally.
  * Blits/uploads use origin zero and retain their existing VRAM coordinates. */
 /* ---- hr FBO render-state bracket ---------------------------------------- */
-static void pgxp_raster_origin(int x, int y, int width, int scale) {
-    glViewport(x * scale, y * scale, width * scale, VRAM_H * scale);
+static void pgxp_raster_target(int x,int y,int width,int height,int scale,int target_x,int target_y) {
+    glViewport((x-target_x)*scale,(y-target_y)*scale,width*scale,height*scale);
+    const int changed=height!=s_raster_height;
+    s_raster_height=height;
     p_glUseProgram(s_geo_prog);
+    if(changed)p_glUniform1f(s_geo_uYhalf,height*.5f);
     p_glUniform2f(s_geo_uOrigin, (float)x, (float)y);
     p_glUniform1f(s_geo_uRasterGrid, (float)(scale*256));
     p_glUseProgram(s_tex_prog);
+    if(changed)p_glUniform1f(s_tex_uYhalf,height*.5f);
+    p_glUniform2f(s_tex_uViewportOrigin,(float)((x-target_x)*scale),(float)((y-target_y)*scale));
     p_glUniform2f(s_tex_uOrigin, (float)x, (float)y);
     p_glUniform1f(s_tex_uRasterGrid, (float)(scale*256));
 }
+static void pgxp_raster_origin(int x,int y,int width,int scale) {
+    pgxp_raster_target(x,y,width,VRAM_H,scale,0,0);
+}
 static void hr_begin(int clip_to_draw_area) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
-    pgxp_raster_origin(clip_to_draw_area ? s_area_x1 : 0, clip_to_draw_area ? s_area_y1 : 0, VRAM_W, s_hr_scale);
+    const int direct=clip_to_draw_area && direct_wide_target();
+    /* A tile is storage, not the primitive's clip volume. Keep the entire
+     * draw area's projection visible and translate its viewport into the
+     * allocation; ownership scissors select the destination pixels. */
+    int raster_w=s_hr_width,raster_h=s_hr_height;
+    if(clip_to_draw_area && s_draw_region_clip && !direct) {
+        if(raster_w<s_area_x2-s_area_x1+1)raster_w=s_area_x2-s_area_x1+1;
+        if(raster_h<s_area_y2-s_area_y1+1)raster_h=s_area_y2-s_area_y1+1;
+    }
+    pgxp_raster_target(clip_to_draw_area?s_area_x1:0,clip_to_draw_area?s_area_y1:0,
+        raster_w,raster_h,s_hr_scale,direct?s_area_x1:s_hr_origin_x,s_hr_origin_y);
+    if(s_hr_width!=VRAM_W || direct) {
+        p_glUseProgram(s_geo_prog);
+        p_glUniform1f(s_geo_uXoff,direct?s_area_x1-s_hr_origin_x:0);
+        p_glUniform1f(s_geo_uXhalf,raster_w*.5f);
+        p_glUseProgram(s_tex_prog);
+        p_glUniform1f(s_tex_uXoff,direct?s_area_x1-s_hr_origin_x:0);
+        p_glUniform1f(s_tex_uXhalf,raster_w*.5f);
+    }
+    if(!clip_to_draw_area) {
+        glViewport(0,0,s_hr_width*s_hr_scale,s_hr_height*s_hr_scale);
+        p_glUseProgram(s_blit_prog);
+        p_glUniform4f(s_uBlitTarget,(float)s_hr_origin_x,(float)s_hr_origin_y,
+            s_hr_width*.5f,s_hr_height*.5f);
+    }
     glEnable(GL_SCISSOR_TEST);
     if (clip_to_draw_area) {
         int ax1 = s_area_x1, ay1 = s_area_y1, ax2 = s_area_x2, ay2 = s_area_y2;
@@ -2716,13 +2774,27 @@ static void hr_begin(int clip_to_draw_area) {
             if (ax2 > s_pass_x + s_pass_w - 1) ax2 = s_pass_x + s_pass_w - 1;
             if (ay2 > s_pass_y + s_pass_h - 1) ay2 = s_pass_y + s_pass_h - 1;
         }
+        if(direct_wide_target()) {
+            ax1=s_hr_origin_x+view_pad_left;
+            ax2=s_hr_origin_x+s_hr_width-view_pad_right-1;
+        }
+        if(s_draw_region_clip) {
+            if(ax1<s_draw_region_bounds.x)ax1=s_draw_region_bounds.x;
+            if(ay1<s_draw_region_bounds.y)ay1=s_draw_region_bounds.y;
+            if(ax2>=s_draw_region_bounds.x+s_draw_region_bounds.w)ax2=s_draw_region_bounds.x+s_draw_region_bounds.w-1;
+            if(ay2>=s_draw_region_bounds.y+s_draw_region_bounds.h)ay2=s_draw_region_bounds.y+s_draw_region_bounds.h-1;
+        }
         int sw = ax2 - ax1 + 1, sh = ay2 - ay1 + 1;
         if (sw < 0) sw = 0; if (sh < 0) sh = 0;
-        glScissor(ax1 * s_hr_scale, ay1 * s_hr_scale,
+        glScissor((ax1-s_hr_origin_x) * s_hr_scale, (ay1-s_hr_origin_y) * s_hr_scale,
                   sw * s_hr_scale, sh * s_hr_scale);
     }
 }
 static void hr_end(void) {
+    if(s_hr_width!=VRAM_W || direct_wide_target()) {
+        p_glUseProgram(s_geo_prog);p_glUniform1f(s_geo_uXhalf,VRAM_W*.5f);p_glUniform1f(s_geo_uXoff,0);
+        p_glUseProgram(s_tex_prog);p_glUniform1f(s_tex_uXhalf,VRAM_W*.5f);p_glUniform1f(s_tex_uXoff,0);
+    }
     pgxp_raster_origin(0, 0, VRAM_W, s_hr_scale);
     glDisable(GL_BLEND);
     /* apply_psx_blend mode 2 leaves REVERSE_SUBTRACT armed; reset so later
@@ -2736,48 +2808,17 @@ static void hr_end(void) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
 }
 
-/* PGXP depth state for one draw (G1.14). 0: no depth (the default GL state
- * everywhere else), 1: opaque 3D polygon, 2: depth clear draw (always pass,
- * write the far clear depth, no colour or stencil).
- *
- * Mode 1 is two passes so that near-coplanar surfaces keep the PS1's
- * painter order (R4's lane markings and decals are separate polygons drawn
- * after the road, a hair off its plane once SZ is quantised per vertex): the
- * colour pass tests LEQUAL with its depth pulled toward the camera by a
- * relative tolerance (u_zbias, s_pgxp_depth_tol of the distance) and writes
- * no depth; depth_restore then lays down the true depth in a colourless
- * pass. A later polygon within the tolerance of what is already there wins,
- * as in painter order; anything clearly behind is still occluded.
- * DuckStation's depth buffer is a plain LEQUAL with no bias and has this
- * decal problem; this tolerance is our own. Every caller that applies 1 or 2
- * calls depth_restore after its draw (tex: textured program bound). */
-static GLint s_geo_uZbias = -1, s_tex_uZbias = -1;
-static float s_pgxp_depth_tol = -1.0f;
-static float pgxp_depth_tol(void) {
-    if (s_pgxp_depth_tol < 0.0f) {
-        const char *e = getenv("PSX_PGXP_DEPTH_TOL");
-        s_pgxp_depth_tol = e && *e ? (float)atof(e) : 0.02f;
-        if (s_pgxp_depth_tol < 0.0f) s_pgxp_depth_tol = 0.0f;
-        if (s_pgxp_depth_tol > 0.5f) s_pgxp_depth_tol = 0.5f;
-    }
-    return s_pgxp_depth_tol;
-}
+/* Opaque PGXP colour and unbiased geometric depth share one visibility test.
+ * Masked and transparent fragments must not write invisible depth. Diagnostic
+ * epsilon probes below are opt-in observations, never a production depth pass. */
 static void depth_apply_ex(int mode, int tex) {
     if (mode == 0) return;
     glEnable(GL_DEPTH_TEST);
-    if (mode == 2) {
-        glDepthMask(GL_TRUE);
-        glDepthFunc(GL_ALWAYS);
-        glDisable(GL_STENCIL_TEST);
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    } else {
-        glDepthMask(GL_FALSE);
-        glDepthFunc(GL_LEQUAL);
-        p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, pgxp_depth_tol());
-    }
+    (void)tex;
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_LEQUAL);
 }
-/* After the colour pass of mode 1: the depth-only pass (n vertices of the
- * bound buffer), then back to the default state. */
+/* Restore the host default after the single colour/depth draw. */
 static void depth_restore_ex(int mode, int tex, int n) {
     if (mode == 0) return;
     if (mode == 1) {
@@ -2797,21 +2838,41 @@ static void depth_restore_ex(int mode, int tex, int n) {
             s_ra_failed+=samples[0];if(samples[0]>=samples[1])s_ra_near+=samples[0]-samples[1];
             p_glUniform1f(tex?s_tex_uDepthProbe:s_geo_uDepthProbe,0.0f);
             glStencilMask((GLuint)write_mask);glDepthFunc(GL_LEQUAL);
+            glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
         }
-        p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, 0.0f);
-        GLboolean st = glIsEnabled(GL_STENCIL_TEST), bl = glIsEnabled(GL_BLEND);
-        glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-        glDepthMask(GL_TRUE);
-        if (tex) p_glUniform1i(s_uSemipass, 0);
-        glDrawArrays(GL_TRIANGLES, 0, n);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        if (st) glEnable(GL_STENCIL_TEST);
-        if (bl) glEnable(GL_BLEND);
+
     }
     glDepthMask(GL_TRUE);
     glDisable(GL_DEPTH_TEST);
-    if (mode == 2) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+}
+
+/* Seed/update any enhanced region directly from the native R16UI mirror.
+ * Neither CPU RGBA conversion nor a full-VRAM RGBA staging texture is needed.
+ * The two mask classes rebuild stencil exactly; depth is left untouched. */
+static void native_surface_upload(GLuint fbo,int x,int y,int w,int h,int scale,
+                                  const DirtyRect *rects,int count) {
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,fbo);
+    glViewport(0,0,w*scale,h*scale);
+    glEnable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+    p_glUseProgram(s_native_upload_prog);
+    p_glUniform2i(s_native_upload_origin,x,y);
+    p_glUniform1i(s_native_upload_scale,scale);
+    p_glActiveTexture(PSXGL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,s_raw_tex);
+    p_glBindVertexArray(s_empty_vao);
+    for(int i=0;i<count;++i) {
+        int x0=rects[i].x0>x?rects[i].x0:x,y0=rects[i].y0>y?rects[i].y0:y;
+        int x1=rects[i].x1+1<x+w?rects[i].x1+1:x+w;
+        int y1=rects[i].y1+1<y+h?rects[i].y1+1:y+h;
+        if(x1<=x0 || y1<=y0)continue;
+        glScissor((x0-x)*scale,(y0-y)*scale,(x1-x0)*scale,(y1-y0)*scale);
+        for(int mask=0;mask<2;++mask) {
+            plain_stencil(mask);p_glUniform1i(s_native_upload_pass,mask);
+            glDrawArrays(GL_TRIANGLES,0,3);
+        }
+    }
+    hr_end();
 }
 
 /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
@@ -2832,7 +2893,7 @@ static void flush_cpu_upload(void) {
     s_up_nrects = 0;
 
     /* Stage every rect's CPU data first (texture uploads outside the FBO
-     * bracket), then draw all the quads in one bracket. Only the exact
+     * bracket), then seed the enhanced regions. Only the exact
      * uploaded rects are painted — never the union bounding box (stale-CPU
      * flicker class bug, see s_up_rects). */
     for (int i = 0; i < nrects; i++) {
@@ -2842,60 +2903,18 @@ static void flush_cpu_upload(void) {
         if (diag) s_rt_up_diag[2] += (uint64_t)w * (uint64_t)h;
         coh_record(GL_COH_FLUSH, x, y, x + w - 1, y + h - 1);
 
-        /* RGBA8 staging for the hr quad draw. */
         uint64_t t0 = diag ? SDL_GetPerformanceCounter() : 0;
-        for (int row = 0; row < h; row++) {
-            const uint16_t *src = s_vram + (size_t)(y + row) * VRAM_W + x;
-            uint32_t *dst = s_conv + (size_t)row * w;
-            for (int col = 0; col < w; col++) dst[col] = conv_1555_to_rgba8(src[col]);
-        }
-        if (diag) s_rt_up_diag[3] += SDL_GetPerformanceCounter() - t0;
-        t0 = diag ? SDL_GetPerformanceCounter() : 0;
-        glBindTexture(GL_TEXTURE_2D, s_up_tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
-
-        /* Raw mirror takes the CPU data directly — current for this rect, so no
-         * pack is needed for uploaded content. */
-        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
-        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
-                        PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
-                        s_vram + (size_t)y * VRAM_W + x);
-        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
+        native_texture_upload_rect(x,y,w,h);
         if (diag) s_rt_up_diag[4] += SDL_GetPerformanceCounter() - t0;
     }
 
-    /* Quads into the hr FBO; two passes split by bit15 so the stencil mirror
-     * stays exact. gpu.c applied mask set/check per pixel already — no check
-     * here, the data is final. up_tex is VRAM-aligned: src texel = frag/S. */
     uint64_t draw_t0 = diag ? SDL_GetPerformanceCounter() : 0;
-    hr_begin(0);
-    glDisable(GL_BLEND);
-    p_glUseProgram(s_blit_prog);
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_up_tex);
-    p_glUniform1i(s_uBlitSrc, 0);
-    p_glUniform1i(s_uBlitMaskset, 0);
-    p_glUniform1i(s_uBlitSrcDiv, s_hr_scale);
-    p_glUniform2i(s_uBlitSrcOff, 0, 0);
-    p_glBindVertexArray(s_blit_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
-    for (int i = 0; i < nrects; i++) {
-        int x = rects[i].x0, y = rects[i].y0;
-        int w = rects[i].x1 - rects[i].x0 + 1;
-        int h = rects[i].y1 - rects[i].y0 + 1;
-        glScissor(x * s_hr_scale, y * s_hr_scale, w * s_hr_scale, h * s_hr_scale);
-        float fx0 = (float)x, fy0 = (float)y, fx1 = (float)(x + w), fy1 = (float)(y + h);
-        float verts[6 * 2] = {
-            fx0, fy0,  fx1, fy0,  fx0, fy1,
-            fx1, fy0,  fx0, fy1,  fx1, fy1,
-        };
-        p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
-        plain_stencil(0); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
-        plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
-    }
-    hr_end();
+    if(s_region_pool.coverage.rects)surface_pool_upload(&s_region_pool,rects,nrects);
+    else {
+    native_surface_upload(s_hr_fbo,s_hr_origin_x,s_hr_origin_y,s_hr_width,s_hr_height,
+                          s_hr_scale,rects,nrects);
     hiw_mirror_uploads(rects, nrects);
+    }
     if (diag) s_rt_up_diag[5] += SDL_GetPerformanceCounter() - draw_t0;
 }
 
@@ -3042,13 +3061,18 @@ static void rebuild_target_stencil_tiled(GLuint target_fbo, int target_w, int ta
 static void rebuild_mask_stencils(void) {
     if (s_stencil_valid || !s_raster_ok) return;
     hiw_flush_queue();
-    int hw = VRAM_W * s_hr_scale, hh = VRAM_H * s_hr_scale;
+    if(s_region_pool.coverage.rects) {
+        surface_stencil_rebuild();
+        rect_clear(&s_stencil_stale);s_stencil_valid=1;
+        return;
+    }
+    int hw = s_hr_width * s_hr_scale, hh = s_hr_height * s_hr_scale;
     if (s_out_scale <= 1) {
         /* Native: the historical whole-surface rebuild, unchanged. */
         rebuild_target_stencil(s_hr_fbo, hw, hh);
         for (int i = 0; i < WIDE_MAX_SURF; i++) {
             if (s_wide_fbo[i])
-                rebuild_target_stencil(s_wide_fbo[i], g_wide_w * s_out_scale, hh);
+                rebuild_target_stencil(s_wide_fbo[i], g_wide_w * s_out_scale, VRAM_H*s_out_scale);
             wst_clear(i);
         }
     } else {
@@ -3059,7 +3083,7 @@ static void rebuild_mask_stencils(void) {
         if (s_stencil_stale.set) {
             int S = s_hr_scale;
             rebuild_target_stencil_tiled(s_hr_fbo, hw, hh,
-                s_stencil_stale.x0 * S, s_stencil_stale.y0 * S,
+                (s_stencil_stale.x0-s_hr_origin_x)*S, (s_stencil_stale.y0-s_hr_origin_y)*S,
                 (s_stencil_stale.x1 - s_stencil_stale.x0 + 1) * S,
                 (s_stencil_stale.y1 - s_stencil_stale.y0 + 1) * S);
             for (int t = 0; hiw_on() && t < s_hiw_n; t++) {
@@ -3190,30 +3214,16 @@ static void blit_quad_verts(int x, int y, int w, int h) {
         fx0, fy0,  fx1, fy0,  fx0, fy1,
         fx1, fy0,  fx0, fy1,  fx1, fy1,
     };
-    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    vertex_stream_upload(2, verts, sizeof verts);
 }
 
-/* CPU->VRAM uploads into the tiles: the same staged native texels (s_up_tex,
- * VRAM-aligned) drawn at S, texel = frag/S + tile origin. */
+/* The same native sampling texture seeds resident enhanced tiles. */
 static void hiw_mirror_uploads(const DirtyRect *rects, int nrects) {
     if (!hiw_on() || nrects <= 0) return;
     hiw_flush_queue();
-    int S = s_out_scale;
     for (int t = 0; t < s_hiw_n; t++) {
         const HiwTile *T = &s_hiw_t[t];
-        int any = 0;
-        for (int i = 0; i < nrects; i++) {
-            int x0 = rects[i].x0 > T->x0 ? rects[i].x0 : T->x0;
-            int x1 = rects[i].x1 + 1 < T->x1 ? rects[i].x1 + 1 : T->x1;
-            if (x1 <= x0) continue;
-            if (!any) { hiw_blit_begin(T, s_up_tex, S, T->x0, 0, 0); any = 1; }
-            int y = rects[i].y0, h = rects[i].y1 - rects[i].y0 + 1;
-            glScissor((x0 - T->x0) * S, y * S, (x1 - x0) * S, h * S);
-            blit_quad_verts(x0, y, x1 - x0, h);
-            plain_stencil(0); p_glUniform1i(s_uBhPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
-            plain_stencil(1); p_glUniform1i(s_uBhPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
-        }
-        if (any) hr_end();
+        native_surface_upload(T->fbo,T->x0,0,T->x1-T->x0,VRAM_H,s_out_scale,rects,nrects);
     }
 }
 
@@ -3435,29 +3445,6 @@ static const HiwTile *hiw_ensure(int x0, int x1) {
 }
 
 /* ---- coherency: hr FBO -> raw mirror (pack) ------------------------------ */
-#ifndef PSXGL_PIXEL_UNPACK_BUFFER
-#define PSXGL_PIXEL_UNPACK_BUFFER 0x88EC
-#endif
-static GLuint s_raw_pbo = 0;
-/* On by default only on macOS, where the stall was measured (Apple's GL on
- * Metal); elsewhere opt-in until there is AMD/NVIDIA/Intel data (an AMD iGPU
- * on Windows showed no stall and no change). PSX_GL_PBO_UPLOAD=0/1 overrides
- * it on any platform. */
-#if defined(__APPLE__)
-#define PSXGL_PBO_UPLOAD_DEFAULT 1
-#else
-#define PSXGL_PBO_UPLOAD_DEFAULT 0
-#endif
-static int raw_upload_pbo_on(void) {
-    static int env = -1;
-    if (env < 0) {
-        const char *e = getenv("PSX_GL_PBO_UPLOAD");
-        env = (e && e[0]) ? (e[0] != '0') : PSXGL_PBO_UPLOAD_DEFAULT;
-    }
-    if (!env) return 0;
-    if (!s_raw_pbo) p_glGenBuffers(1, &s_raw_pbo);
-    return s_raw_pbo != 0;
-}
 static void pack_flush(void) {
     if (!s_raster_ok || !s_pack_dirty.set) return;
     /* A generated frame draws into its own surfaces: the raw mirror keeps
@@ -3470,33 +3457,15 @@ static void pack_flush(void) {
     rect_clear(&s_pack_dirty);
     coh_record(GL_COH_PACK, x, y, x + w - 1, y + h - 1);
 
-    if (s_hd_native_authority) {
+    if (s_region_pool.coverage.rects || s_hd_native_authority || s_rth_packet_replaying) {
         /* All pending draws consumed the previous raw version before this
          * refresh. Never encode the HD presentation image into native words. */
         p_glActiveTexture(PSXGL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
-        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-        if (raw_upload_pbo_on()) {
-            /* Through an orphaned pixel-unpack buffer: the copy into a
-             * texture the GPU is still sampling is queued on the GPU, where
-             * a client-memory upload makes the driver wait for those draws
-             * (Apple's GL: GLDShareGroupRec::waitUsage, about 40 % of the
-             * render thread's work in an R4 race with the HD HUD). Same
-             * bytes, same order. PSX_GL_PBO_UPLOAD=0 for the direct path. */
-            const size_t rows = (size_t)(y + h - 1) * VRAM_W + (size_t)x + (size_t)w;
-            const size_t first = (size_t)y * VRAM_W + (size_t)x;
-            const size_t bytes = (rows - first) * sizeof(uint16_t);
-            p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER, s_raw_pbo);
-            p_glBufferData(PSXGL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)bytes,
-                           s_vram + first, PSXGL_STREAM_DRAW);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, PSXGL_RED_INTEGER,
-                            GL_UNSIGNED_SHORT, (const void *)0);
-            p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER, 0);
-        } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, PSXGL_RED_INTEGER,
-                           GL_UNSIGNED_SHORT, s_vram + (size_t)y * VRAM_W + x);
-        }
-        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
+        /* Native inputs remain immutable in the upload ring until the GPU
+         * has consumed them. The same persistent/fixed-storage contract as
+         * vertex streams replaces both driver-managed orphaning and client
+         * memory uploads into a texture still being sampled. */
+        native_texture_upload_rect(x,y,w,h);
         return;
     }
 
@@ -3513,6 +3482,7 @@ static void pack_flush(void) {
     p_glUniform1i(s_uPackScale, s_hr_scale);
     p_glBindVertexArray(s_empty_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    ++s_pack_gpu_draws;
     p_glBindVertexArray(0);
     p_glUseProgram(0);
     glDisable(GL_SCISSOR_TEST);
@@ -3546,7 +3516,7 @@ static void flush_pack_if_sampling(int tpage_x, int tpage_y, int depth,
 static int s_depth24_skip_up = 0;
 static DirtyRect s_d24_skip_fb; /* union of skipped MDEC FB rects (VRAM halfwords) */
 static int cpu_vram_authoritative(void) {
-    return s_cpu_auth_dual || s_hd_native_authority || s_depth24_skip_up;
+    return s_cpu_auth_dual || s_hd_native_authority || s_depth24_skip_up || s_rth_packet_replaying;
 }
 
 static void ensure_cpu(void) {
@@ -3560,7 +3530,7 @@ static void ensure_cpu(void) {
     /* Dual-raster / netplay and depth24: CPU VRAM is written on every GP0.
      * Packed RGB888 movie uploads are deliberately absent from the FBO;
      * reading it back would overwrite the movie with stale 1555 words. */
-    if (cpu_vram_authoritative() || psx_netplay_active()) {
+    if (s_region_pool.coverage.rects || cpu_vram_authoritative() || psx_netplay_active()) {
         s_gpu_dirty = 0;
         rect_clear(&s_cpu_dirty);
         return;
@@ -3614,7 +3584,7 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
     if (y0 < s_area_y1) y0 = s_area_y1;
     if (x1 > s_area_x2) x1 = s_area_x2;
     if (y1 > s_area_y2) y1 = s_area_y2;
-    rect_add(&s_pack_dirty, x0, y0, x1, y1);
+    if(!s_rth_packet_replaying)rect_add(&s_pack_dirty, x0, y0, x1, y1);
     if (s_out_scale > 1) rect_add(&s_stencil_stale, x0, y0, x1, y1);
     if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, x0, y0, x1, y1);
     /* Dual-raster keeps CPU current via SW writes — do not mark GPU-ahead. */
@@ -3662,24 +3632,29 @@ static void wide_band_scissor_x(int x, int w) {
     int sy, sh;
     wide_band_rows(&sy, &sh);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(x * s_out_scale, sy * s_out_scale, w * s_out_scale, sh * s_out_scale);
+    glScissor(x*s_out_scale,(sy-(direct_wide_target()?s_hr_origin_y:0))*s_out_scale,
+        w*s_out_scale,sh*s_out_scale);
 }
 static void wide_band_scissor(void) { wide_band_scissor_x(0, g_wide_w); }
 static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
+    /* Wide targets span all native rows even after a cropped target. */
+    p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uYhalf : s_geo_uYhalf, VRAM_H*.5f);
     if (s_ws_ablate != 3)   /* ablate 3: no FBO rebind (draws land in hr — perf probe) */
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
     /* Windowed high-resolution mode: the wide surfaces are at s_out_scale while
      * the canonical pass ran at 1x, so they take the S sample-grid shift. */
     if (s_hiw)
         p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hi);
-    glViewport(s_area_x1 * s_out_scale, s_area_y1 * s_out_scale, g_wide_w*s_out_scale, VRAM_H*s_out_scale);
+    glViewport(0, s_area_y1 * s_out_scale, g_wide_w*s_out_scale, VRAM_H*s_out_scale);
     p_glUniform2f(uXoff == s_tex_uXoff ? s_tex_uOrigin : s_geo_uOrigin, (float)s_area_x1, (float)s_area_y1);
+    if(uXoff==s_tex_uXoff)p_glUniform2f(s_tex_uViewportOrigin,0,(float)(s_area_y1*s_out_scale));
     p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uRasterGrid : s_geo_uRasterGrid,(float)(s_out_scale*256));
     wide_band_scissor_x(view_pad_left, g_wide_w - view_pad_left - view_pad_right);
-    p_glUniform1f(uXoff, (float)dx);
+    p_glUniform1f(uXoff, (float)(dx+s_area_x1));
     p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);
 }
 static void wide_target_end(GLint uXoff, GLint uXhalf) {
+    p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uYhalf : s_geo_uYhalf, s_raster_height*.5f);
     if (s_hiw)
         p_glUniform1f(uXoff == s_tex_uXoff ? s_tex_uShift : s_geo_uShift, s_shift_hr);
     p_glUniform1f(uXoff, 0.0f);
@@ -3790,6 +3765,7 @@ void gl_renderer_pgxp_render_stats(uint64_t *depth_tris, uint64_t *depth_clears,
     if (seam_tris) *seam_tris = s_seam_tris;
 }
 static int wide_fast_center_valid(void) {
+    if(s_region_pool.coverage.rects)return 0;
     /* An explicitly stretched sky differs inside the canonical viewport too.
      * Keep the full composite for those scenes, including later foreground
      * draws. Tags are installed before DMA, so no earlier center draws skip. */
@@ -4025,7 +4001,7 @@ static void bind_textured_resources(GLuint source, GLuint palette, GLuint hd) {
     p_glActiveTexture(PSXGL_TEXTURE0 + 1);
     glBindTexture(GL_TEXTURE_2D, palette);
     p_glActiveTexture(PSXGL_TEXTURE0 + 2);
-    glBindTexture(GL_TEXTURE_2D, hd ? hd : s_up_tex);
+    glBindTexture(GL_TEXTURE_2D, hd ? hd : s_hd_dummy_tex);
     p_glActiveTexture(PSXGL_TEXTURE0);
     if (!sampler_units_once_on()) {
         p_glUniform1i(s_uVram, 0);
@@ -4094,7 +4070,7 @@ static GLint s_tex_uBcls = -1, s_geo_uBcls = -1, s_geo_uBadd = -1;
  * run per batch. The passes set what they need; the caller's draw state is
  * then put back from what the caller knows (bcls_end_geo / tex_bcls_end).
  * Depth writes need no care: mode-1 batches already have them off and
- * mode-0 batches have no depth test; mode-2 (depth clear) draws mark nothing. */
+ * mode-0 batches have no depth test. */
 static void bcls_begin(int tex, int additive) {
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     glDisable(GL_BLEND);
@@ -4136,7 +4112,7 @@ static int bcls_passes(int semi, int b3d) {
  * keeps glowing. */
 #define BCLS_DRAW(semi, dmode, mask, check, b3d, DRAW) do {                    \
         DRAW;                                                                 \
-        if (s_bcls_on && (dmode) != 2 && !s_fg_drawing) {                     \
+        if (s_bcls_on && !s_fg_drawing) {                     \
             const int bcls_p_ = bcls_passes((semi), (b3d));                   \
             bcls_begin(0, (semi) == 1 || (semi) == 3);                        \
             if (bcls_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }              \
@@ -4429,7 +4405,7 @@ static void hiw_replay_wide(void) {
             bound = c->wfbo;
             cur = 0;
         }
-        pgxp_raster_origin(c->ax0, c->ay0, g_wide_w, S);
+        pgxp_raster_target(c->ax0,c->ay0,g_wide_w,VRAM_H,S,c->ax0,0);
         cur = 0;
         glScissor(c->wsx * S, c->wsy * S, c->wsw * S, c->wsh * S);
         if (c->kind == HQ_TEX) {
@@ -4439,13 +4415,12 @@ static void hiw_replay_wide(void) {
                 p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
                 cur = HQ_TEX;
             }
-            p_glUniform1f(s_tex_uXoff, (float)c->wdx);
+            p_glUniform1f(s_tex_uXoff, (float)(c->wdx+c->ax0));
             p_glUniform1f(s_tex_uXscale, c->wscale);
             p_glUniform1f(s_tex_uXcenter, c->wcenter);
             bind_textured_resources(c->tex, c->palette, c->hd_tex);
             p_glUniform1i(s_uMaskset, c->mask);
-            p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
-                           s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+            vertex_stream_upload(1, s_hq_v + c->vfirst, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)));
             depth_apply_ex(c->depth, 1);
             tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, -1);
             depth_restore_ex(c->depth, 1, c->vcount);
@@ -4456,13 +4431,12 @@ static void hiw_replay_wide(void) {
                 p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
                 cur = HQ_GEO;
             }
-            p_glUniform1f(s_geo_uXoff, (float)c->wdx);
+            p_glUniform1f(s_geo_uXoff, (float)(c->wdx+c->ax0));
             p_glUniform1f(s_geo_uXscale, c->wscale);
             p_glUniform1f(s_geo_uXcenter, c->wcenter);
             if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);
             mask_stencil_ex(c->mask, c->check);
-            p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)),
-                           s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+            vertex_stream_upload(0, s_hq_v + c->vfirst, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)));
             depth_apply_ex(c->depth, 0);
             BCLS_DRAW(c->semi, c->depth, c->mask, c->check, -1, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
             depth_restore_ex(c->depth, 0, c->vcount);
@@ -4530,8 +4504,7 @@ static void hiw_flush_queue(void) {
                 }
                 bind_textured_resources(c->tex, c->palette, c->hd_tex);
                 p_glUniform1i(s_uMaskset, c->mask);
-                p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
-                               s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+                vertex_stream_upload(1, s_hq_v + c->vfirst, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)));
                 depth_apply_ex(c->depth, 1);
                 tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, -1);
                 depth_restore_ex(c->depth, 1, c->vcount);
@@ -4544,8 +4517,7 @@ static void hiw_flush_queue(void) {
                 }
                 if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);
                 mask_stencil_ex(c->mask, c->check);
-                p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)),
-                               s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+                vertex_stream_upload(0, s_hq_v + c->vfirst, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)));
                 depth_apply_ex(c->depth, 0);
                 BCLS_DRAW(c->semi, c->depth, c->mask, c->check, -1, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
                 depth_restore_ex(c->depth, 0, c->vcount);
@@ -4585,24 +4557,34 @@ static void flush_tex_batch_impl(void) {
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
 
     pgxp_raster_record(s_tb,nverts,TEXV);
+    GlRasterSurface *previous=s_draw_surface;
+    const int routed=surface_draw_regions(s_tb,nverts,TEXV);
+    p_glBindVertexArray(s_tex_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER,s_tex_vbo);
+    vertex_stream_upload(1,s_tb,(ptrdiff_t)(nverts*TEXV*sizeof(float)));
+    for(size_t target=0;target<(routed?s_draw_region_count:1);++target) {
+    if(routed)surface_draw_region_begin(target);
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
     bind_textured_resources(s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex,
         s_tb_bank_tex && !s_tb_bank_live_clut ? s_tb_bank_tex : s_raw_tex, s_tb_hd_tex);
     p_glUniform1i(s_uMaskset, s_tb_mask);
     p_glBindVertexArray(s_tex_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
-    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
 
+    if(direct_wide_target()){s_bd_gate=s_tb_gate;wide_set_bd_scale(s_tex_uXscale,s_tex_uXcenter);}
     depth_apply_ex(dmode, 1);
     tex_batch_draw_passes(nverts, semi);
     depth_restore_ex(dmode, 1, nverts);
+    if(direct_wide_target())wide_clear_bd_scale(s_tex_uXscale,s_tex_uXcenter);
+    if(routed)hr_end();
+    }
+    if(routed)surface_draw_regions_end(previous);
 
     /* Native-wide mirror — skipped for a batch fully inside the 4:3 frame (its
      * centre content comes from the present-time canonical blit; nothing to add
      * to the margins). A backdrop-stretched batch (s_tb_gate) widens past the
      * frame, so it is never treated as centre-only. */
-    int mirror = g_wide_cur && s_ws_ablate != 1 &&
+    int mirror = !routed && g_wide_cur && !direct_wide_target() && s_ws_ablate != 1 &&
                  !(s_tb_gate == 0 && mirror_batch_center_only(nverts));
     if (mirror) {   /* the stencil it may leave behind alpha */
         float sc, ce;
@@ -4613,7 +4595,7 @@ static void flush_tex_batch_impl(void) {
      * replayed in one render pass at the next sync point (see s_hq), with its
      * native-wide mirror. No-op unless that mode is engaged. */
     s_hq_depth_cur = dmode;
-    if ((hiw_on() || (mirror && wide_queue_live())) &&
+    if (!routed && (hiw_on() || (mirror && wide_queue_live())) &&
         hiw_enqueue_tex(nverts, semi, mirror, s_tb_gate)) mirror = 0;
     s_hq_depth_cur = 0;
 
@@ -4630,7 +4612,7 @@ static void flush_tex_batch_impl(void) {
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
         gl_perf_mirror_end();
     }
-    hr_end();
+    if(!routed)hr_end();
     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
     if (s_tbs_n > 0) {   /* the strips, as a batch of their own (same keys) */
         memcpy(s_tb, s_tbs, (size_t)s_tbs_n * TEXV * sizeof(float));
@@ -4733,21 +4715,30 @@ static void flush_flat_batch_impl(void) {
     s_fbl_n = 0;
 
     pgxp_raster_record(s_fb,nverts,6);
+    GlRasterSurface *previous=s_draw_surface;
+    const int routed=surface_draw_regions(s_fb,nverts,6);
+    p_glBindVertexArray(s_geo_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER,s_geo_vbo);
+    if(nl)memcpy(&s_fb[nverts*6],s_fbl,(size_t)nl*2*6*sizeof(float));
+    vertex_stream_upload(0,s_fb,(ptrdiff_t)((nverts+2*nl)*6*sizeof(float)));
+    for(size_t target=0;target<(routed?s_draw_region_count:1);++target) {
+    if(routed)surface_draw_region_begin(target);
     hr_begin(1);
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(mask);
     if (fmode == GL_LINES) glLineWidth((float)s_hr_scale);
     p_glUseProgram(s_geo_prog);
     p_glBindVertexArray(s_geo_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
-    if (nl) memcpy(&s_fb[nverts * 6], s_fbl, (size_t)nl * 2 * 6 * sizeof(float));
-    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((nverts + 2 * nl) * 6 * sizeof(float)),
-                   s_fb, PSXGL_STREAM_DRAW);
+    if(direct_wide_target()){s_bd_gate=s_fb_gate;wide_set_bd_scale(s_geo_uXscale,s_geo_uXcenter);}
     depth_apply_ex(dmode, 0);
     BCLS_DRAW(semi, dmode, mask, s_mask_check, b3d, if (nl) flat_batch_draw_hr_lines(nverts, nl);
                        else glDrawArrays(fmode, 0, nverts));
     depth_restore_ex(dmode, 0, nverts);
-    int mirror = g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+    if(direct_wide_target())wide_clear_bd_scale(s_geo_uXscale,s_geo_uXcenter);
+    if(routed)hr_end();
+    }
+    if(routed)surface_draw_regions_end(previous);
+    int mirror = !routed && g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate != 1 &&
                  !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts));
     if (mirror) {
         float sc, ce;
@@ -4755,7 +4746,7 @@ static void flush_flat_batch_impl(void) {
         wst_note_draw(g_wide_cur, s_fb, nverts, 6, wide_dx(), sc, ce, s_mask_check);
     }
     s_hq_depth_cur = dmode;
-    if ((hiw_on() || (mirror && fmode == GL_TRIANGLES && wide_queue_live())) &&
+    if (!routed && (hiw_on() || (mirror && fmode == GL_TRIANGLES && wide_queue_live())) &&
         hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate)) mirror = 0;
     s_hq_depth_cur = 0;
 
@@ -4772,7 +4763,7 @@ static void flush_flat_batch_impl(void) {
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
         gl_perf_mirror_end();
     }
-    hr_end();
+    if(!routed)hr_end();
     if (s_fbs_n > 0) {   /* the strips, as a batch of their own (same keys) */
         memcpy(s_fb, s_fbs, (size_t)s_fbs_n * 6 * sizeof(float));
         s_fb_n = s_fbs_n;
@@ -4876,7 +4867,7 @@ static float pgxp_vertex_code(float sz) {
  * carry a finite positive float (depth+2), with three low mantissa bits for
  * mask/colour/dither. Integer depths through 2^20 retain every depth bit;
  * larger depths lose at most seven float ULPs. Negative GEO / positive TEX
- * alpha distinguishes this format from legacy draws and depth-clear (-1). */
+ * alpha distinguishes this format from normal-range draws. */
 static float pgxp_far_vertex_code(float sz, int mask, int dither) {
     float value = sz + 2.0f;
     uint32_t bits;
@@ -4886,24 +4877,42 @@ static float pgxp_far_vertex_code(float sz, int mask, int dither) {
     return value;
 }
 
-/* The depth buffer is cleared (beyond every SZ, over the drawing area and
- * the native-wide margins) by a colourless depth-only draw through the flat
- * batch, so every surface a draw reaches (the hr surface, the high-resolution
- * window tiles, the wide surfaces) clears in painter order with it. */
+/* Clear exactly the current draw domain without submitting geometry. Flush
+ * queued surface work first so the clear stays in the guest's painter order.
+ * Colour and mask/stencil survive; only depth is disposable here. */
 static void depth_clear_now(void) {
     flush_flat_batch();
     flush_tex_batch();
-    const float x0 = (float)s_area_x1 - 1024.0f, x1 = (float)s_area_x2 + 1.0f + 1024.0f;
-    const float y0 = (float)s_area_y1, y1 = (float)s_area_y2 + 1.0f;
-    const float q[6][2] = { {x0, y0}, {x1, y0}, {x0, y1}, {x1, y0}, {x1, y1}, {x0, y1} };
-    s_fb_mode = GL_TRIANGLES; s_fb_semi = -1; s_fb_mask = (int)s_mask_set;
-    s_fb_gate = 0; s_fb_depth = 2;
-    for (int i = 0; i < 6; i++) {
-        float *v = &s_fb[i * 6];
-        v[0] = q[i][0]; v[1] = q[i][1]; v[2] = v[3] = v[4] = 0.0f; v[5] = -1.0f;
+    hiw_flush_queue();
+    glDepthMask(GL_TRUE);
+    glClearDepth(1.0);
+    if(s_region_pool.coverage.rects)surface_depth_clear();
+    else {
+    hr_begin(1);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    int y,h;
+    wide_band_rows(&y,&h);
+    for(int i=0;i<s_hiw_n;++i) {
+        const HiwTile *tile=&s_hiw_t[i];
+        int x0=s_area_x1>tile->x0?s_area_x1:tile->x0;
+        int x1=s_area_x2+1<tile->x1?s_area_x2+1:tile->x1;
+        if(s_pass_active) {
+            if(x0<s_pass_x)x0=s_pass_x;
+            if(x1>s_pass_x+s_pass_w)x1=s_pass_x+s_pass_w;
+        }
+        if(x1<=x0 || h<=0)continue;
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,tile->fbo);
+        glScissor((x0-tile->x0)*s_out_scale,y*s_out_scale,
+                  (x1-x0)*s_out_scale,h*s_out_scale);
+        glClear(GL_DEPTH_BUFFER_BIT);
     }
-    s_fb_n = 6;
-    flush_flat_batch();
+    if(g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate!=1) {
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,g_wide_cur);
+        wide_band_scissor_x(view_pad_left,g_wide_w-view_pad_left-view_pad_right);
+        glClear(GL_DEPTH_BUFFER_BIT);
+    }
+    hr_end();
+    }
     s_depth_clears++;
     s_depth_clear_reason[s_depth_need_reason]++;
     /* Seam snapping: the surfaces drawn so far have no depth any more, so a
@@ -5093,13 +5102,12 @@ static void snap_bary(const float x[3], const float y[3], const float cx[3], con
         }
 }
 /* A strip's depth: behind its own plane by more than the depth agreement
- * that paired the two surfaces (PGXP_SNAP_DEPTH_TOL) and the colour pass's
- * near tolerance (u_zbias, plus its 48-unit term), so it never wins against
+ * that paired the two surfaces (PGXP_SNAP_DEPTH_TOL), so it never wins against
  * either surface or anything near their plane -- a kerb face beside a road
  * row, the road under a lane mark -- and only shows where the gap really
  * opens onto what is behind. */
 static float snap_strip_depth(float z) {
-    return z * (1.0f + PGXP_SNAP_DEPTH_TOL + 1.5f * pgxp_depth_tol()) + 64.0f;
+    return z * (1.0f + PGXP_SNAP_DEPTH_TOL) + 64.0f;
 }
 static uint64_t s_snap_strip_tris = 0;
 /* The frame's edge index (allocated on first use, reset at every present).
@@ -5238,6 +5246,7 @@ static void seam_sz(const float B[3][3], float z[3]) {
 
 static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
                          const uint16_t *cs, int n, int semi) {
+    surface_wide_select();
     flush_tex_batch();   /* flat prim: drain textured draws first (order + program) */
     flush_cpu_upload();  /* also drains flat batch if an upload was pending */
     mark_prim_dirty(xs, ys, n, 0 /* flat */);
@@ -5352,6 +5361,13 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         if (is_line && s_hr_scale > 1) {
             draw_mode = GL_TRIANGLES; draw_verts = quad; draw_n = 6;
         }
+        if(s_region_pool.coverage.rects) {
+            s_fb_mode=draw_mode;s_fb_semi=semi;s_fb_mask=(int)s_mask_set;
+            s_fb_depth=0;s_fb_b3d=0;s_fb_gate=bd_prim_gate(xs,n,0);
+            memcpy(s_fb,draw_verts,(size_t)draw_n*6*sizeof(float));s_fb_n=draw_n;
+            flush_flat_batch();
+            return;
+        }
         wide_stencil_ready();   /* before any of this draw's GL state */
         if (draw_mode != GL_TRIANGLES && !hiw_on())
             hiw_flush_queue();  /* GL_LINES mirror at once: queued mirrors first */
@@ -5362,16 +5378,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         p_glUseProgram(s_geo_prog);
         p_glBindVertexArray(s_geo_vao);
         p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
-        p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(draw_n * 6 * sizeof(float)),
-                       draw_verts, PSXGL_STREAM_DRAW);
+        vertex_stream_upload(0, draw_verts, (ptrdiff_t)(draw_n * 6 * sizeof(float)));
+        if(direct_wide_target()) {
+            s_bd_gate=bd_prim_gate(xs,n,0);wide_set_bd_scale(s_geo_uXscale,s_geo_uXcenter);
+        }
         BCLS_DRAW(semi, 0, (int)s_mask_set, s_mask_check, -1, glDrawArrays(draw_mode, 0, draw_n));
+        if(direct_wide_target())wide_clear_bd_scale(s_geo_uXscale,s_geo_uXcenter);
         if (is_line && s_out_scale > 1 && draw_mode == GL_LINES) {
             /* windowed: hr drew a 1x line; the S surfaces take the quad */
-            p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(6 * 6 * sizeof(float)),
-                           quad, PSXGL_STREAM_DRAW);
+            vertex_stream_upload(0, quad, (ptrdiff_t)(6 * 6 * sizeof(float)));
             draw_mode = GL_TRIANGLES; draw_n = 6;
         }
-        int mirror = g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
+        int mirror = g_wide_cur && !direct_wide_target() && !s_wide_suppress && s_ws_ablate != 1 &&
                      !(!g_ws_bd_stretch_on && mirror_geo_center_only(xs, n));
         if (mirror) {
             float sc, ce;
@@ -5516,6 +5534,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const float *col, uint16_t texpage,
                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
                                   int semi, const int *lim) {
+    surface_wide_select();
     /* PS1 dithering: texture-modulated polygons only (never raw texels or
      * rectangles), while E1 bit 9 is set. */
     const int dither_tex = s_dither_mode && s_dither_bit && !rawtex && !s_prim_rect;
@@ -5729,25 +5748,30 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
      * overlay-width rect that canonically clips at a vertical double-buffer
      * band boundary paint the OTHER band's rows; u_xhalf = g_wide_w/2. */
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
-    glViewport(0, 0, g_wide_w * s_out_scale, VRAM_H * s_out_scale);
+    if(direct_wide_target())
+        pgxp_raster_target(0,s_area_y1,g_wide_w,s_hr_height,s_out_scale,0,s_hr_origin_y);
+    else glViewport(0,0,g_wide_w*s_out_scale,VRAM_H*s_out_scale);
     wide_band_scissor();
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(s_mask_set);
     p_glUseProgram(s_geo_prog);
     if (s_hiw) p_glUniform1f(s_geo_uShift, s_shift_hi);
+    p_glUniform1f(s_geo_uYhalf,(direct_wide_target()?s_hr_height:VRAM_H)*.5f);
     p_glUniform1f(s_geo_uXoff, 0.0f);
     p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
     p_glBindVertexArray(s_geo_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
-    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    vertex_stream_upload(0, verts, sizeof verts);
     BCLS_DRAW(semi, 0, (int)s_mask_set, s_mask_check, 0, glDrawArrays(GL_TRIANGLES, 0, 6));
     if (s_hiw) p_glUniform1f(s_geo_uShift, s_shift_hr);
+    p_glUniform1f(s_geo_uYhalf,s_raster_height*.5f);
     p_glUniform1f(s_geo_uXoff, 0.0f);
     p_glUniform1f(s_geo_uXhalf, 512.0f);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
 }
 
 static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
+    surface_wide_select();
     if (w <= 0 || h <= 0) return;
     /* Full-screen 2D overlay (pause gray-filter / load fade): a flat rect
      * spanning the whole 4:3 framebuffer must cover the whole wide surface too,
@@ -5773,8 +5797,10 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
         flush_tex_batch();
         s_wide_suppress = 1;
     }
-    gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
-    gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
+    if(!overlay || !direct_wide_target()) {
+        gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
+        gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
+    }
     if (overlay) {
         /* gpu_triangle queues flat geometry. Finish these two triangles while
          * their mirror remains suppressed, before the direct wide overlay. */
@@ -5821,12 +5847,12 @@ static void gpu_textured_rect(int x,int y,int w,int h,
  * segment is exactly this. */
 static void fill_segment(int x, int y, int w, int h, float r, float g, float b) {
     if (w <= 0 || h <= 0) return;
-    glScissor(x * s_hr_scale, y * s_hr_scale, w * s_hr_scale, h * s_hr_scale);
+    glScissor((x-s_hr_origin_x)*s_hr_scale,(y-s_hr_origin_y)*s_hr_scale,w*s_hr_scale,h*s_hr_scale);
     glClearColor(r, g, b, 0.0f);
     glClearStencil(0);
     glStencilMask(0xFF);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-    rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
+    if(!s_rth_packet_replaying)rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
     if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, x, y, x + w - 1, y + h - 1);
 }
 
@@ -5844,6 +5870,12 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
     if (x + w > VRAM_W) { w1 = VRAM_W - x; w2 = w - w1; }
     if (y + h > VRAM_H) { h1 = VRAM_H - y; h2 = h - h1; }
 
+    if(s_region_pool.coverage.rects) {
+        surface_pool_fill_segment(&s_region_pool,x,y,w1,h1,c);
+        if(w2)surface_pool_fill_segment(&s_region_pool,0,y,w2,h1,c);
+        if(h2)surface_pool_fill_segment(&s_region_pool,x,0,w1,h2,c);
+        if(w2 && h2)surface_pool_fill_segment(&s_region_pool,0,0,w2,h2,c);
+    } else {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glViewport(0, 0, VRAM_W * s_hr_scale, VRAM_H * s_hr_scale);
     glEnable(GL_SCISSOR_TEST);
@@ -5857,6 +5889,7 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
         if (h2)       hiw_clear_rect(x, 0, w1, h2, r, g, b, 0.0f, 0);
         if (w2 && h2) hiw_clear_rect(0, 0, w2, h2, r, g, b, 0.0f, 0);
     }
+    }
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     if (!cpu_vram_authoritative())
@@ -5867,7 +5900,93 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
 /* VRAM->VRAM copy: blit the source region to the scratch texture (resolves
  * overlap), then draw it back at the destination through the BLIT program so
  * mask set/check and the stencil mirror apply, exactly like sw_copy_rect. */
-static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+typedef struct GlCopyRegion {
+    GLuint fbo;
+    int x,y,w,h,scale;
+    /* Native units from the allocation origin to the valid VRAM region.
+     * A direct-wide target stores its canonical pixels after the left
+     * reveal margin; that margin is not neighbouring guest VRAM. */
+    int offset_x,offset_y;
+} GlCopyRegion;
+
+static void gpu_copy_rect_apply_at(GLuint source_tex,int sx,int sy,int dx,int dy,int w,int h,int staged_dx,int staged_dy) {
+    const int S=s_hr_scale;
+    hr_begin(0);   /* copies ignore the draw area */
+    glScissor((dx-s_hr_origin_x)*S,(dy-s_hr_origin_y)*S,w*S,h*S);
+    glDisable(GL_BLEND);
+    p_glUseProgram(s_blit_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source_tex);
+    p_glUniform1i(s_uBlitSrc, 0);
+    p_glUniform1i(s_uBlitMaskset, s_mask_set);
+    /* Scratch holds the source at its origin: texel = frag - dst*S. */
+    p_glUniform1i(s_uBlitSrcDiv, 1);
+    p_glUniform2i(s_uBlitSrcOff,(s_hr_origin_x-staged_dx)*S,(s_hr_origin_y-staged_dy)*S);
+    float fx0 = (float)dx, fy0 = (float)dy, fx1 = (float)(dx + w), fy1 = (float)(dy + h);
+    float verts[6 * 2] = {
+        fx0, fy0,  fx1, fy0,  fx0, fy1,
+        fx1, fy0,  fx0, fy1,  fx1, fy1,
+    };
+    p_glBindVertexArray(s_blit_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
+    vertex_stream_upload(2, verts, sizeof verts);
+    /* Two passes split by source bit15 so stencil tracks the copied mask. */
+    mask_stencil(s_mask_set); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
+    mask_stencil(1);          p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
+    hr_end();
+    if(!s_region_pool.coverage.rects)hiw_mirror_copy(sx, sy, dx, dy, w, h);   /* scratch still holds the 1x source */
+
+    if(!s_rth_packet_replaying)rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
+    if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, dx, dy, dx + w - 1, dy + h - 1);
+    if (!cpu_vram_authoritative())
+        s_gpu_dirty = 1;
+    coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
+    coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+}
+
+static void gpu_copy_rect_apply(GLuint source_tex,int sx,int sy,int dx,int dy,int w,int h) {
+    gpu_copy_rect_apply_at(source_tex,sx,sy,dx,dy,w,h,dx,dy);
+}
+
+static void gpu_copy_gather(const GlCopyRegion *sources,int source_count,int seed_native,
+                            int sx,int sy,int w,int h,int S) {
+    /* Stage the source at the scratch ORIGIN (not at its own hr coords), so
+     * the scratch only has to be as large as the biggest copy. The integer
+     * texelFetch in BLIT_FS makes the placement invisible in the result.
+     * w*S and h*S fit the GPU limit whenever the hr surface does; the
+     * high-resolution window stages its S-scaled source in a scratch of its
+     * own (hiw_mirror_copy), so this one never grows past the hr surface. */
+    if (!scratch_ensure(w * S, h * S)) return;
+    if(seed_native) {
+        native_texture_upload_rect(sx,sy,w,h);
+        DirtyRect source={0};rect_add(&source,sx,sy,sx+w-1,sy+h-1);
+        native_surface_upload(s_scratch_fbo,sx,sy,w,h,S,&source,1);
+    }
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
+    glDisable(GL_SCISSOR_TEST);
+    for(int i=0;i<source_count;++i) {
+        const GlCopyRegion *r=sources+i;
+        int x0=sx>r->x?sx:r->x,y0=sy>r->y?sy:r->y;
+        int x1=sx+w<r->x+r->w?sx+w:r->x+r->w;
+        int y1=sy+h<r->y+r->h?sy+h:r->y+r->h;
+        if(x1<=x0 || y1<=y0)continue;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,r->fbo);
+        p_glBlitFramebuffer((x0-r->x+r->offset_x)*r->scale,(y0-r->y+r->offset_y)*r->scale,
+                            (x1-r->x+r->offset_x)*r->scale,(y1-r->y+r->offset_y)*r->scale,
+                            (x0-sx)*S,(y0-sy)*S,(x1-sx)*S,(y1-sy)*S,
+                            GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    }
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+
+}
+
+/* Gather enhanced source regions before writing any destination. A copy may
+ * cross independently allocated RT tiles or overlap its own source. Sources
+ * are ordered back to front; the caller supplies complete coverage (native
+ * seed first, then any retained enhanced regions). */
+static void gpu_copy_rect_regions_seeded(const GlCopyRegion *sources,int source_count,int seed_native,
+                                        int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
     flush_flat_batch();
     flush_tex_batch();
@@ -5882,54 +6001,74 @@ static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     if (dy + h > VRAM_H) h = VRAM_H - dy;
     if (w <= 0 || h <= 0) return;
 
-    int S = s_hr_scale;
-    /* Stage the source at the scratch ORIGIN (not at its own hr coords), so
-     * the scratch only has to be as large as the biggest copy. The integer
-     * texelFetch in BLIT_FS makes the placement invisible in the result.
-     * w*S and h*S fit the GPU limit whenever the hr surface does; the
-     * high-resolution window stages its S-scaled source in a scratch of its
-     * own (hiw_mirror_copy), so this one never grows past the hr surface. */
-    if (!scratch_ensure(w * S, h * S)) return;
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_scratch_fbo);
-    glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(sx*S, sy*S, (sx+w)*S, (sy+h)*S,
-                        0, 0, w*S, h*S,
-                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
-    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    /* Only stage pixels consumed by this allocation. In particular, a
+     * native full-VRAM copy must not allocate a full-VRAM scaled scratch
+     * image for each small destination tile. Translate the source together
+     * with the destination so clipping never changes the copy mapping. */
+    int left=dx<s_hr_origin_x?s_hr_origin_x-dx:0;
+    int top=dy<s_hr_origin_y?s_hr_origin_y-dy:0;
+    dx+=left;sx+=left;w-=left;
+    dy+=top;sy+=top;h-=top;
+    if(dx+w>s_hr_origin_x+s_hr_width)w=s_hr_origin_x+s_hr_width-dx;
+    if(dy+h>s_hr_origin_y+s_hr_height)h=s_hr_origin_y+s_hr_height-dy;
+    if(w<=0 || h<=0)return;
 
-    hr_begin(0);   /* copies ignore the draw area */
-    glScissor(dx*S, dy*S, w*S, h*S);
-    glDisable(GL_BLEND);
-    p_glUseProgram(s_blit_prog);
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_scratch_tex);
-    p_glUniform1i(s_uBlitSrc, 0);
-    p_glUniform1i(s_uBlitMaskset, s_mask_set);
-    /* Scratch holds the source at its origin: texel = frag - dst*S. */
-    p_glUniform1i(s_uBlitSrcDiv, 1);
-    p_glUniform2i(s_uBlitSrcOff, -dx * S, -dy * S);
-    float fx0 = (float)dx, fy0 = (float)dy, fx1 = (float)(dx + w), fy1 = (float)(dy + h);
-    float verts[6 * 2] = {
-        fx0, fy0,  fx1, fy0,  fx0, fy1,
-        fx1, fy0,  fx0, fy1,  fx1, fy1,
-    };
-    p_glBindVertexArray(s_blit_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
-    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
-    /* Two passes split by source bit15 so stencil tracks the copied mask. */
-    mask_stencil(s_mask_set); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
-    mask_stencil(1);          p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
-    hr_end();
-    hiw_mirror_copy(sx, sy, dx, dy, w, h);   /* scratch still holds the 1x source */
+    gpu_copy_gather(sources,source_count,seed_native,sx,sy,w,h,s_hr_scale);
+    gpu_copy_rect_apply(s_scratch_tex,sx,sy,dx,dy,w,h);
+}
 
-    rect_add(&s_pack_dirty, dx, dy, dx + w - 1, dy + h - 1);
-    if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, dx, dy, dx + w - 1, dy + h - 1);
-    if (!cpu_vram_authoritative())
-        s_gpu_dirty = 1;
-    coh_record(GL_COH_COPY_SRC, sx, sy, sx + w - 1, sy + h - 1);
-    coh_record(GL_COH_COPY,     dx, dy, dx + w - 1, dy + h - 1);
+static void gpu_copy_rect_regions(const GlCopyRegion *sources,int source_count,
+                                 int sx,int sy,int dx,int dy,int w,int h) {
+    gpu_copy_rect_regions_seeded(sources,source_count,0,sx,sy,dx,dy,w,h);
+}
+
+static void gpu_copy_rect_coverage(const GlCoverage *coverage,
+                                   const GlRasterSurface *const *surfaces,
+                                   int sx,int sy,int dx,int dy,int w,int h) {
+    GlCopyRegion local[16];
+    GlCopyRegion *sources=coverage->count<=16?local:
+        (GlCopyRegion *)malloc(coverage->count*sizeof *sources);
+    if(!sources)abort();
+    int count=0;
+    int64_t covered=0;
+    for(size_t i=0;i<coverage->count;++i) {
+        const GlCoverageRect *r=coverage->rects+i;
+        if(!r->owner)continue;
+        int x0=sx>r->x?sx:r->x,y0=sy>r->y?sy:r->y;
+        int x1=sx+w<r->x+r->w?sx+w:r->x+r->w;
+        int y1=sy+h<r->y+r->h?sy+h:r->y+r->h;
+        if(x1<=x0 || y1<=y0)continue;
+        const GlRasterSurface *surface=surfaces[r->owner];
+        sources[count++]=(GlCopyRegion){surface->fbo,r->x,r->y,r->w,r->h,
+            surface->allocation_scale,r->x-surface->x,r->y-surface->y};
+        covered+=(int64_t)(x1-x0)*(y1-y0);
+    }
+    gpu_copy_rect_regions_seeded(sources,count,covered<(int64_t)w*h,sx,sy,dx,dy,w,h);
+    if(sources!=local)free(sources);
+}
+
+static void gpu_copy_rect_from(GLuint source_fbo,int source_x,int source_y,
+                              int sx,int sy,int dx,int dy,int w,int h) {
+    const GlCopyRegion source={source_fbo,source_x,source_y,
+        source_fbo==s_hr_fbo?s_hr_width:VRAM_W-source_x,
+        source_fbo==s_hr_fbo?s_hr_height:VRAM_H-source_y,s_hr_scale};
+    gpu_copy_rect_regions(&source,1,sx,sy,dx,dy,w,h);
+}
+
+static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+        surface_pool_copy(sx,sy,dx,dy,w,h);
+        return;
+    }
+    GlCoverageRect rect={s_hr_origin_x,s_hr_origin_y,s_hr_width,s_hr_height,1};
+    if(direct_wide_target()) {
+        rect.x=g_wide_cur_base;
+        rect.w=g_wide_w-2*g_wide_off;
+    }
+    const GlCoverage coverage={&rect,1,VRAM_W,VRAM_H};
+    const GlRasterSurface *surfaces[]={NULL,s_draw_surface};
+    gpu_copy_rect_coverage(&coverage,surfaces,sx,sy,dx,dy,w,h);
 }
 
 /* ---- backend vtable wrappers ------------------------------------------- */
@@ -6097,6 +6236,8 @@ static int cpu_raster_required(void) {
      * presents from the CPU mirror and keeps its write-through. */
     /* A generated (in-between) frame is presentation only, like a pass. */
     return !s_raster_ok || s_depth24_skip_up ||
+           (s_region_pool.coverage.rects && !rth_record_mode() && !s_rth_packet_replaying &&
+            !s_pass_active && !s_fg_drawing) ||
            ((s_cpu_auth_dual || s_hd_native_authority) && !s_pass_active && !s_fg_drawing);
 }
 /* Bracket each authoritative draw so a later netplay/session policy change
@@ -6202,6 +6343,12 @@ static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){
         int faithful = native_draw_begin();
         sw_fill_rect(x,y,w,h,c);
         native_draw_end(faithful);
+    } else if(s_region_pool.coverage.rects) {
+        /* Retain native-only regions for later on-demand allocation. This
+         * presentation shadow never feeds guest reads or snapshots. */
+        int rows=h<VRAM_H?h:VRAM_H,cols=w<VRAM_W?w:VRAM_W;
+        for(int row=0;row<rows;++row)for(int col=0;col<cols;++col)
+            s_vram[((y+row)&511)*VRAM_W+((x+col)&1023)]=c&0x7fff;
     }
     if (!s_raster_ok) return;
     gpu_fill(x,y,w,h,c);
@@ -6393,17 +6540,21 @@ static void depth24_clear_skipped_fb(void) {
     int x1 = s_d24_skip_fb.x1, y1 = s_d24_skip_fb.y1;
     int rw = x1 - x0 + 1, rh = y1 - y0 + 1;
     int S = s_hr_scale;
+    if(s_region_pool.coverage.rects) {
+        surface_pool_fill_segment(&s_region_pool,x0,y0,rw,rh,0);
+    } else {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
     glDisable(GL_BLEND);
     glDisable(GL_STENCIL_TEST);
     glEnable(GL_SCISSOR_TEST);
-    glViewport(0, 0, VRAM_W * S, VRAM_H * S);
-    glScissor(x0 * S, y0 * S, rw * S, rh * S);
+    glViewport(0, 0, s_hr_width * S, s_hr_height * S);
+    glScissor((x0-s_hr_origin_x)*S,(y0-s_hr_origin_y)*S,rw*S,rh*S);
     glClearColor(0.f, 0.f, 0.f, 0.f);
     glClearStencil(0);
     glStencilMask(0xFF);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     hiw_clear_rect(x0, y0, rw, rh, 0.f, 0.f, 0.f, 0.f, 0);
+    }
     if (s_raw_fbo) {
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
         glViewport(0, 0, VRAM_W, VRAM_H);
@@ -6702,12 +6853,16 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
     return 1;
 }
 
-/* A new hr surface (colour texture, depth-stencil RB, FBO) at scale S for a
- * dynamic-resolution step, depth and stencil cleared. 0 on failure (nothing
- * left allocated). */
-static int hr_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
+/* Allocate exactly one enhanced region, with no implicit VRAM-sized extent.
+ * Output targets and RT tiles share the same complete colour/depth/stencil
+ * ownership and failure cleanup. No allocation can silently lower scale. */
+static int raster_surface_alloc(int width,int height,int S,
+                                GLuint *tex,GLuint *rb,GLuint *fbo) {
+    *tex=*rb=*fbo=0;
+    if(width<=0 || height<=0 || S<=0 || width>INT_MAX/S || height>INT_MAX/S)return 0;
     while (glGetError() != GL_NO_ERROR) {}
-    int hw = VRAM_W * S, hh = VRAM_H * S;
+    int hw=width*S,hh=height*S;
+    if(s_gl_max_dim>0 && (hw>s_gl_max_dim || hh>s_gl_max_dim))return 0;
     *tex = make_tex(GL_RGBA8, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE);
     p_glGenRenderbuffers(1, rb);
     p_glBindRenderbuffer(PSXGL_RENDERBUFFER, *rb);
@@ -6720,8 +6875,11 @@ static int hr_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
         glDisable(GL_SCISSOR_TEST);
         glClearStencil(0);
         glClearDepth(1.0);
+        glClearColor(0,0,0,0);
         glStencilMask(0xFF);
-        glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glDepthMask(GL_TRUE);
+        glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
         ok = glGetError() == GL_NO_ERROR;
     }
@@ -6734,9 +6892,17 @@ static int hr_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
     return ok;
 }
 
+#include "gl_surface_pool.inc"
+#include "gl_surface_routing.inc"
+#include "gl_surface_copy.inc"
+
 /* Release the scale-dependent render targets (hr colour + depth-stencil +
  * copy scratch). Used when an allocation fails and init steps S down. */
 static void free_hr_targets(void) {
+    s_draw_surface=&s_primary_surface;
+    surface_pool_destroy(&s_region_pool);
+    free(s_draw_regions);s_draw_regions=NULL;s_draw_region_count=s_draw_region_capacity=0;
+    g_wide_cur=0;s_pool_wide_enabled=0;
     if (s_hr_fbo)      { p_glDeleteFramebuffers(1, &s_hr_fbo); s_hr_fbo = 0; }
     if (s_scratch_fbo) { p_glDeleteFramebuffers(1, &s_scratch_fbo); s_scratch_fbo = 0; }
     if (s_hr_rb)       { p_glDeleteRenderbuffers(1, &s_hr_rb); s_hr_rb = 0; }
@@ -6750,9 +6916,18 @@ static void free_hr_targets(void) {
  * surfaces as GL_INVALID_VALUE or GL_OUT_OF_MEMORY, not always as an
  * incomplete FBO). */
 static int alloc_hr_targets(int S) {
-    while (glGetError() != GL_NO_ERROR) {}
     int hw = VRAM_W * S, hh = VRAM_H * S;
-    s_hr_tex = make_tex(GL_RGBA8, hw, hh, GL_RGBA, GL_UNSIGNED_BYTE);
+    s_hr_alloc=0;
+    s_draw_surface=&s_primary_surface;
+#ifdef PSX_GL_LEGACY_SURFACE_TEST
+    if(!raster_surface_alloc(VRAM_W,VRAM_H,S,&s_hr_tex,&s_hr_rb,&s_hr_fbo))return 0;
+#else
+    /* Native VRAM stays in R16UI. Enhanced allocations begin only when a
+     * primitive or a display reader claims a rectangle. */
+    memset(&s_primary_surface,0,sizeof s_primary_surface);
+    s_primary_surface.w=VRAM_W;s_primary_surface.h=VRAM_H;
+    if(!surface_pool_init(&s_region_pool))return 0;
+#endif
     /* Copy/stencil scratch. Up to 2x it covers the whole surface as before
      * (<= 8 MiB); above that it starts at one tile and grows to the largest
      * copy on demand (scratch_ensure), instead of costing 4 MiB*S^2 up front. */
@@ -6762,12 +6937,7 @@ static int alloc_hr_targets(int S) {
         s_scratch_h = hh < GL_SCRATCH_TILE ? hh : GL_SCRATCH_TILE;
     }
     s_scratch_tex = make_tex(GL_RGBA8, s_scratch_w, s_scratch_h, GL_RGBA, GL_UNSIGNED_BYTE);
-    p_glGenRenderbuffers(1, &s_hr_rb);
-    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, s_hr_rb);
-    p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, hw, hh);
-    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
     int ok = glGetError() == GL_NO_ERROR;
-    if (ok) ok = make_fbo(&s_hr_fbo, s_hr_tex, s_hr_rb);
     if (ok) ok = make_fbo(&s_scratch_fbo, s_scratch_tex, 0);
     if (ok) ok = glGetError() == GL_NO_ERROR;
     if (!ok) free_hr_targets();
@@ -6798,6 +6968,7 @@ static int init_gpu_raster(void) {
             if (v > 0 && (s_gl_max_dim == 0 || v < s_gl_max_dim)) s_gl_max_dim = v;
         }
         s_vram_budget = psx_gl_budget_bytes_from_env(getenv("PSX_GL_VRAM_BUDGET_MB"));
+#ifdef PSX_GL_LEGACY_SURFACE_TEST
         s_out_scale = psx_gl_clamp_full_vram_scale(s_req_scale, GL_MAX_INTERNAL_SCALE,
                                                s_gl_max_dim, s_vram_budget,
                                                &s_scale_clamp_reason);
@@ -6842,6 +7013,12 @@ static int init_gpu_raster(void) {
                     (s_scale_clamp_reason & PSX_GL_SCALE_BUDGET) ? "memory budget " : "",
                     (s_scale_clamp_reason & PSX_GL_SCALE_CEILING) ? "ceiling " : "",
                     s_gl_max_dim, (unsigned long long)(s_vram_budget >> 20));
+#else
+        s_out_scale=psx_gl_clamp_window_scale(s_req_scale,GL_MAX_INTERNAL_SCALE,
+            s_gl_max_dim,s_vram_budget,320);
+        s_hr_scale=s_out_scale;s_hiw=0;s_hiw_n=0;
+        s_scale_clamp_reason=s_out_scale<s_req_scale?PSX_GL_SCALE_TEXTURE:0;
+#endif
         s_scale_alloc_retries = 0;
     }
 
@@ -6852,14 +7029,15 @@ static int init_gpu_raster(void) {
     s_blit_prog = build_program(BLIT_VS, BLIT_FS);
     s_blit_hi_prog = build_program(BLIT_VS_HI, BLIT_FS);
     s_pack_prog = build_program(PACK_VS, PACK_FS);
+    s_native_upload_prog=build_program(PACK_VS,NATIVE_UPLOAD_FS);
     s_stencil_prog = build_program(PACK_VS, STENCIL_FS);
     if (!s_geo_prog || !s_tex_prog || !s_blit_prog || !s_pack_prog || !s_stencil_prog ||
-        !s_blit_hi_prog) return 0;
+        !s_blit_hi_prog || !s_native_upload_prog) return 0;
 
-    s_conv = (uint32_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint32_t));
-    if (!s_conv) return 0;
+    s_native_upload_scratch = (uint16_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
+    if (!s_native_upload_scratch) return 0;
 
-    s_up_tex      = make_tex(GL_RGBA8, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE);
+    s_hd_dummy_tex = make_tex(GL_RGBA8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE);
     s_raw_tex     = make_tex(PSXGL_R16UI, VRAM_W, VRAM_H, PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT);
     /* Force the driver's first texture-upload allocation while the renderer is
      * initializing. NVIDIA otherwise defers it until the first MDEC frame,
@@ -6867,7 +7045,7 @@ static int init_gpu_raster(void) {
     {
         const uint32_t zero_rgba = 0;
         const uint16_t zero_raw = 0;
-        glBindTexture(GL_TEXTURE_2D, s_up_tex);
+        glBindTexture(GL_TEXTURE_2D, s_hd_dummy_tex);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1,
                         GL_RGBA, GL_UNSIGNED_BYTE, &zero_rgba);
         glBindTexture(GL_TEXTURE_2D, s_raw_tex);
@@ -6927,11 +7105,17 @@ static int init_gpu_raster(void) {
     s_tex_uBcls = p_glGetUniformLocation(s_tex_prog, "u_bcls");
     s_geo_uBcls = p_glGetUniformLocation(s_geo_prog, "u_bcls");
     s_geo_uBadd = p_glGetUniformLocation(s_geo_prog, "u_badd");
+    s_native_upload_origin=p_glGetUniformLocation(s_native_upload_prog,"u_origin");
+    s_native_upload_scale=p_glGetUniformLocation(s_native_upload_prog,"u_scale");
+    s_native_upload_pass=p_glGetUniformLocation(s_native_upload_prog,"u_pass");
+    p_glUseProgram(s_native_upload_prog);
+    p_glUniform1i(p_glGetUniformLocation(s_native_upload_prog,"u_src"),0);
     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
     s_uBlitSrcDiv  = p_glGetUniformLocation(s_blit_prog, "u_src_div");
     s_uBlitSrcOff  = p_glGetUniformLocation(s_blit_prog, "u_src_off");
+    s_uBlitTarget=p_glGetUniformLocation(s_blit_prog,"u_target");
     s_uPackHr    = p_glGetUniformLocation(s_pack_prog, "u_hr");
     s_uPackScale = p_glGetUniformLocation(s_pack_prog, "u_scale");
     s_uStencilSrc = p_glGetUniformLocation(s_stencil_prog, "u_src");
@@ -6948,8 +7132,14 @@ static int init_gpu_raster(void) {
     s_tex_uDepthProbe=p_glGetUniformLocation(s_tex_prog,"u_depth_probe");
     s_geo_uRasterGrid=p_glGetUniformLocation(s_geo_prog,"u_raster_grid");
     s_tex_uRasterGrid=p_glGetUniformLocation(s_tex_prog,"u_raster_grid");
+    s_hr_origin_x=s_hr_origin_y=0;s_hr_width=VRAM_W;s_hr_height=VRAM_H;
+    s_raster_height=0;
+    s_geo_uYhalf=p_glGetUniformLocation(s_geo_prog,"u_yhalf");
+    s_tex_uYhalf=p_glGetUniformLocation(s_tex_prog,"u_yhalf");
+    s_tex_uViewportOrigin=p_glGetUniformLocation(s_tex_prog,"u_viewport_origin");
     s_geo_uOrigin = p_glGetUniformLocation(s_geo_prog, "u_origin");
     s_tex_uOrigin = p_glGetUniformLocation(s_tex_prog, "u_origin");
+    pgxp_raster_target(0,0,VRAM_W,VRAM_H,s_hr_scale,0,0);
     s_geo_uXoff  = p_glGetUniformLocation(s_geo_prog, "u_xoff");
     s_geo_uXhalf = p_glGetUniformLocation(s_geo_prog, "u_xhalf");
     s_tex_uXoff  = p_glGetUniformLocation(s_tex_prog, "u_xoff");
@@ -6982,8 +7172,6 @@ static int init_gpu_raster(void) {
         s_geo_uDither = s_tex_uDither = -1;
         dither_apply_uniforms();
         s_tex_uShift = p_glGetUniformLocation(s_tex_prog, "u_shift");
-        s_geo_uZbias = p_glGetUniformLocation(s_geo_prog, "u_zbias");
-        s_tex_uZbias = p_glGetUniformLocation(s_tex_prog, "u_zbias");
         p_glUseProgram(s_geo_prog);
         p_glUniform1f(s_geo_uShift, shift);
         /* Native-wide projection defaults: x translation 0, clip half-extent
@@ -7042,6 +7230,7 @@ static int init_gpu_raster(void) {
     p_glGenVertexArrays(1, &s_empty_vao);
     p_glBindVertexArray(0);
 
+    if(!s_region_pool.coverage.rects) {
     /* Clear the authoritative surface (color + stencil) and queue a full
      * upload of whatever the CPU VRAM already holds (pre-context software
      * draws, BIOS logo state, ...). */
@@ -7052,6 +7241,7 @@ static int init_gpu_raster(void) {
     glStencilMask(0xFF);
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    }
     rect_clear(&s_pack_dirty);
     rect_clear(&s_stencil_stale);
     s_up_nrects = 0;
@@ -7114,8 +7304,8 @@ int gl_renderer_scale_info(GlScaleInfo *out) {
     out->clamp_reason = s_scale_clamp_reason;
     out->alloc_retries = s_scale_alloc_retries;
     out->budget_mib = (int)(s_vram_budget >> 20);
-    out->fbo_w = s_raster_ok ? VRAM_W * s_hr_alloc : 0;
-    out->fbo_h = s_raster_ok ? VRAM_H * s_hr_alloc : 0;
+    out->fbo_w = s_raster_ok && s_hr_fbo ? s_hr_width * s_hr_alloc : 0;
+    out->fbo_h = s_raster_ok && s_hr_fbo ? s_hr_height * s_hr_alloc : 0;
     out->hr_scale = s_raster_ok ? s_hr_scale : 0;
     out->windowed = s_hiw;
     {
@@ -7132,6 +7322,17 @@ int gl_renderer_scale_info(GlScaleInfo *out) {
         uint64_t b = 0;
         for (int t = 0; t < s_hiw_n; t++) b += hiw_tile_bytes(s_hiw_t[t].x0, s_hiw_t[t].x1);
         out->window_mib = (int)(b >> 20);
+    }
+    if(s_region_pool.coverage.rects) {
+        uint64_t bytes=0;out->window_tiles=0;
+        for(size_t i=1;i<s_region_pool.count;++i) {
+            const GlRasterSurface *surface=s_region_pool.surfaces[i];
+            if(!surface)continue;
+            ++out->window_tiles;
+            bytes+=(uint64_t)surface->w*surface->h*surface->allocation_scale*
+                surface->allocation_scale*8u;
+        }
+        out->window_mib=(int)(bytes>>20);
     }
     out->window_grows = s_hiw_grows;
     out->alloc_scale = s_raster_ok ? s_alloc_scale : 0;
@@ -7166,8 +7367,14 @@ static int gl_read_display_argb(int x, int y, int w, int h, uint32_t *out,
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
-    GLuint fbo = s_hr_fbo;
-    int rx = x;
+    GlRasterSurface *read_surface=s_draw_surface;
+    if(s_region_pool.coverage.rects) {
+        unsigned owner=surface_pool_acquire(&s_region_pool,x,y,w,h,x,y,w,h,S,0);
+        if(!owner)return 0;
+        read_surface=s_region_pool.surfaces[owner];
+    }
+    GLuint fbo = read_surface->fbo;
+    int rx = x-read_surface->x,ry=y-read_surface->y;
     if (s_hiw) {
         /* Windowed: the S-scaled pixels exist only inside the tiles. */
         hiw_flush_queue();
@@ -7175,6 +7382,9 @@ static int gl_read_display_argb(int x, int y, int w, int h, uint32_t *out,
         if (!T) return 0;
         fbo = T->fbo;
         rx = x - T->x0;
+        ry = y;
+    } else if(rx<0 || ry<0 || rx+w>read_surface->w || ry+h>read_surface->h) {
+        return 0;
     }
     if (!fbo) return 0;
     GLint read_fbo = 0, pack_buffer = 0, pack_row = 0, pack_align = 4;
@@ -7186,7 +7396,7 @@ static int gl_read_display_argb(int x, int y, int w, int h, uint32_t *out,
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
     glPixelStorei(PSXGL_PACK_ROW_LENGTH, pitch_bytes / 4);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(rx * S, y * S, W, H, GL_BGRA, GL_UNSIGNED_BYTE, out);
+    glReadPixels(rx * S, ry * S, W, H, GL_BGRA, GL_UNSIGNED_BYTE, out);
     glPixelStorei(PSXGL_PACK_ROW_LENGTH, pack_row);
     glPixelStorei(GL_PACK_ALIGNMENT, pack_align);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, (GLuint)read_fbo);
@@ -7382,12 +7592,15 @@ int gl_renderer_get_swap_interval(void) {
 
 static void pass_resources_release(void);
 
+static void packet_timer_reset(void);
 static void present_image_ring_gl_forget(void);
 static void fmv_hd_release(void);
 void gl_renderer_shutdown(void) {
     gl_renderer_render_thread_stop();   /* drains; the context comes back to this thread */
     rth_op_report();
     fmv_hd_release();
+    packet_timer_reset();
+    vertex_stream_reset();
     psx_host_set_hud_draw_cb(NULL, NULL);
     /* After the worker has stopped (it presents, and captures, on its own
      * thread) and before the context dies: forget the ring's GL names. */
@@ -7413,11 +7626,12 @@ void gl_renderer_shutdown(void) {
         /* The upload buffer belongs to this context: a lobby rematch
          * creates a new one, which must create its own. */
         if (s_raw_pbo) p_glDeleteBuffers(1, &s_raw_pbo);
+        free_hr_targets();
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
     }
     pgxp_raster_shutdown();
     s_raw_pbo = 0;
-    free(s_conv); s_conv = NULL;
+    free(s_native_upload_scratch); s_native_upload_scratch = NULL;
     s_hq_n = 0; s_hq_vn = 0;   /* queued window draws die with the context */
     s_raster_ok = 0;
     /* New context regenerates s_present_tex empty; a stale size makes
@@ -7662,6 +7876,12 @@ void gl_renderer_restage_vram_after_savestate(void) {
     restore_presentation_invalidate();
     gpu_hd_textures_restage();
     if (!s_raster_ok || !s_vram) return;
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();flush_tex_batch();
+        s_draw_surface=&s_primary_surface;g_wide_cur=0;
+        surface_pool_destroy(&s_region_pool);
+        if(!surface_pool_init(&s_region_pool))abort();
+    }
     /* Belt-and-suspenders after boot_state VRAM apply: force CPU mirror → FBO
      * even if a depth24 skip swallowed the restore, then re-arm scanout-band
      * clear so leaving FMV does not keep RGB888-as-1555 junk. */
@@ -7875,31 +8095,8 @@ static void wide_free_all(void) {
  * scale S, cleared to black with a zero stencil. 0 on failure (nothing left
  * allocated). */
 static int wide_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
-    int w = g_wide_w * S, h = VRAM_H * S;
     s_cw_fbo_creates++;
-    *tex = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
-    /* Depth-stencil RB, same as the hr FBO: the stencil carries the PSX
-     * mask-bit mirror for the wide surface, and (the hard lesson) a
-     * stencil-less FBO turns every stencil-enabled mirror draw into ~0.6ms of
-     * driver-side work — the 16:9 GL perf collapse. */
-    p_glGenRenderbuffers(1, rb);
-    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, *rb);
-    p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, w, h);
-    if (!make_fbo(fbo, *tex, *rb)) {
-        glDeleteTextures(1, tex); *tex = 0;
-        p_glDeleteRenderbuffers(1, rb); *rb = 0;
-        *fbo = 0;
-        return 0;
-    }
-    /* Clear to black so unwritten margins are clean (not stale). */
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, *fbo);
-    glDisable(GL_SCISSOR_TEST);
-    glClearColor(0, 0, 0, 0);
-    glClearStencil(0);
-    glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
-    return 1;
+    return raster_surface_alloc(g_wide_w,VRAM_H,S,tex,rb,fbo);
 }
 
 /* Lazily allocate (or find) the wide FBO+tex for base_x. Returns the FBO id, or
@@ -7981,13 +8178,22 @@ static void glb_wide_set_target(int base_x) {
     double t0 = cw_ms(); s_cw_wide_sets++;
     flush_flat_batch();  /* drain into the OLD target before switching */
     flush_tex_batch();
+    if(s_region_pool.coverage.rects) {
+        s_pool_wide_enabled=1;g_wide_cur_base=base_x;
+        g_wide_cur=0;s_draw_surface=&s_primary_surface;
+        s_cw_wide_ms+=cw_ms()-t0;
+        return;
+    }
     g_wide_cur = wide_fbo_for(base_x);
     g_wide_cur_base = base_x;
     s_cw_wide_ms += cw_ms() - t0;
 }
 
 /* Stop mirroring (offscreen draws that don't target a framebuffer). */
-static void glb_wide_disable_target(void) { flush_flat_batch(); flush_tex_batch(); g_wide_cur = 0; }
+static void glb_wide_disable_target(void) {
+    flush_flat_batch();flush_tex_batch();g_wide_cur=0;s_pool_wide_enabled=0;
+    if(s_region_pool.coverage.rects)s_draw_surface=&s_primary_surface;
+}
 
 /* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
  * surface for base_x, so the revealed margins are clean. Mirrors sw_wide_clear:
@@ -7997,6 +8203,26 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     double t0 = cw_ms(); s_cw_wide_clears++;
     flush_tex_batch();
     hiw_flush_queue();   /* queued wide mirrors land before the clear */
+    if(s_region_pool.coverage.rects) {
+        int bottom=(int)fmin((double)y+h,VRAM_H);
+        if(y<0)y=0;
+        h=bottom-y;
+        if(h<=0 || y>=VRAM_H || g_wide_w<=0)return;
+
+        flush_flat_batch();
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,base_x,y,
+            g_wide_w-2*g_wide_off,h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)abort();
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,surface->fbo);
+        glDisable(GL_SCISSOR_TEST);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        float r,g,b;c5_to_float(color,&r,&g,&b);
+        glClearColor(r,g,b,(color&32768)?1.f:0.f);
+        glStencilMask(255);glClearStencil((color>>15)&1);
+        glClear(GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+        s_cw_wide_ms+=cw_ms()-t0;
+        return;
+    }
     GLuint fbo = wide_fbo_for(base_x);
     if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
     gl_perf_mirror_begin();
@@ -8030,6 +8256,27 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     flush_flat_batch();
     flush_tex_batch();
     hiw_flush_queue();   /* queued wide mirrors land before the clear */
+    if(s_region_pool.coverage.rects) {
+        int bottom=(int)fmin((double)y+h,VRAM_H);
+        if(y<0)y=0;
+        h=bottom-y;
+        if(h<=0 || y>=VRAM_H || g_wide_w<=0)return;
+
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,base_x,y,
+            g_wide_w-2*g_wide_off,h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)abort();
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER,surface->fbo);
+        glEnable(GL_SCISSOR_TEST);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        float r,g,b;c5_to_float(color,&r,&g,&b);
+        glClearColor(r,g,b,(color&32768)?1.f:0.f);
+        glStencilMask(255);glClearStencil((color>>15)&1);
+        int S=surface->allocation_scale;
+        if(sides&1){glScissor(0,0,g_wide_off*S,h*S);glClear(GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);}
+        if(sides&2){glScissor((g_wide_w-g_wide_off)*S,0,g_wide_off*S,h*S);glClear(GL_COLOR_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);}
+        glDisable(GL_SCISSOR_TEST);p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+        s_cw_wide_ms+=cw_ms()-t0;
+        return;
+    }
     GLuint fbo = wide_fbo_for(base_x);
     if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
     gl_perf_mirror_begin();
@@ -8190,7 +8437,16 @@ static void glb_wide_feedback_rect(int src_base, int src_x, int src_y, int dst_x
 static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
                                    int disp_y, int disp_h) {
     if (!s_raster_ok || !s_ctx || g_wide_w <= 0) return 0;
+    flush_flat_batch();flush_tex_batch();flush_cpu_upload();
     GLuint fbo = 0;
+    int source_y=disp_y,source_h=VRAM_H;
+    if(s_region_pool.coverage.rects) {
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,base_x,disp_y,
+            g_wide_w-2*g_wide_off,disp_h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)return 0;
+        fbo=surface->fbo;source_y=disp_y-surface->y;source_h=surface->h;
+    }
+    if(!s_region_pool.coverage.rects)
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == base_x) { fbo = s_wide_fbo[i]; break; }
     if (!fbo) return 0;
@@ -8206,9 +8462,9 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     glFinish();
 
     int W = g_wide_w * s_out_scale;
-    int H = VRAM_H * s_out_scale;
+    int H = source_h * s_out_scale;
     int out_h = disp_h * s_out_scale;
-    int ry0 = disp_y * s_out_scale;
+    int ry0 = source_y * s_out_scale;
     if (ry0 < 0) ry0 = 0;
     if (ry0 + out_h > H) out_h = H - ry0;
     if (out_h <= 0) return 0;
@@ -8368,6 +8624,8 @@ static void gl_perf_yield(void) {
     if (s_pf_scene_active) { p_glEndQuery(GL_TIME_ELAPSED); s_pf_scene_active = 0; }
 }
 
+#include "gl_packet_timer.inc"
+
 static void gl_perf_init(void) {
 #ifdef PSX_NO_DEBUG_TOOLS
     return;
@@ -8417,6 +8675,7 @@ static void gl_perf_mirror_end(void) {
 
 /* Top of present (after flush_cpu_upload, before clear/blit). */
 static void gl_perf_present_enter(void) {
+    packet_timer_present_begin();
     pgxp_raster_frame_end();
     /* Per-frame boundary for the 2D-backdrop stretch — runs from BOTH present
      * paths (4:3 present_vram AND native-wide present_wide_fbo), before the
@@ -8454,6 +8713,7 @@ static void gl_perf_present_enter(void) {
 
 /* End of present (after SwapWindow). wide = native-wide path. */
 static void gl_perf_present_exit(int wide) {
+    packet_timer_present_end();
     if (!s_pf_on || rthf_owns_timer()) return;
     uint64_t now = SDL_GetPerformanceCounter();
     p_glEndQuery(GL_TIME_ELAPSED);   /* end present_q[b] */
@@ -9829,6 +10089,8 @@ size_t gl_renderer_pass_debug_capture(uint8_t *rgba,size_t capacity,
 static void pass_blit(GLuint src, GLuint dst, int sx, int sy, int dx, int dy,
                       int w, int h, GLbitfield mask) {
     hiw_flush_queue();   /* queued wide mirrors land before a copy reads or writes */
+    if(src==s_hr_fbo){sx-=s_hr_origin_x*s_hr_scale;sy-=s_hr_origin_y*s_hr_scale;}
+    if(dst==s_hr_fbo){dx-=s_hr_origin_x*s_hr_scale;dy-=s_hr_origin_y*s_hr_scale;}
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, src);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, dst);
     glDisable(GL_SCISSOR_TEST);
@@ -9848,7 +10110,7 @@ static void pass_verify_read(uint8_t **hr, size_t *hr_cap, uint8_t **raw,
     if (*raw_cap < rn) { free(*raw); *raw = (uint8_t *)malloc(rn); *raw_cap = *raw ? rn : 0; }
     if (!*hr || !*raw) return;
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
-    glReadPixels(s_pass_x * S, s_pass_y * S, s_pass_w * S, s_pass_h * S,
+    glReadPixels((s_pass_x-s_hr_origin_x)*S,(s_pass_y-s_hr_origin_y)*S,s_pass_w*S,s_pass_h*S,
                  GL_RGBA, GL_UNSIGNED_BYTE, *hr);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
     glReadPixels(s_pass_x, s_pass_y, s_pass_w, s_pass_h, PSXGL_RED_INTEGER,
@@ -11590,64 +11852,174 @@ static GLuint pt_target_fbo(void) {
     return s_pts_fbo[i];
 }
 
-/* Opt-in presenter-local receipt: one 8x8 downsample/readback, never an 8K
- * download. Changed sample hashes are a lower bound on distinct images. */
+/* Optional whole-image receipt. Every RGBA8 output pixel participates in a
+ * block hash; only signalled asynchronous PBOs are mapped. Repeated swaps
+ * do not count as distinct images. Hash collisions remain theoretically
+ * possible, as with any finite image signature. */
+#define PT_TRACE_SLOTS 8
+#define PT_TRACE_BLOCK 16
+static const char *PT_TRACE_FS =
+    "#version 330\n"
+    "uniform sampler2D u_image; out vec4 o_hash;\n"
+    "void main(){ ivec2 base=ivec2(gl_FragCoord.xy)*16;\n"
+    " ivec2 size=textureSize(u_image,0); uint h=2166136261u;\n"
+    " for(int y=0;y<16;++y)for(int x=0;x<16;++x){\n"
+    "  ivec2 p=base+ivec2(x,y); if(any(greaterThanEqual(p,size)))continue;\n"
+    "  uvec4 c=uvec4(texelFetch(u_image,p,0)*255.0+0.5);\n"
+    "  uint v=c.x|(c.y<<8)|(c.z<<16)|(c.w<<24);h=(h^v)*16777619u; }\n"
+    " o_hash=vec4(uvec4(h,h>>8,h>>16,h>>24)&255u)/255.0; }\n";
 static FILE *s_pt_trace;
 static int s_pt_trace_init;
-static GLuint s_pt_trace_tex,s_pt_trace_fbo;
-static uint64_t s_pt_trace_start,s_pt_trace_second,s_pt_trace_hash;
-static unsigned s_pt_trace_frames,s_pt_trace_changes;
+static GLuint s_pt_trace_tex,s_pt_trace_fbo,s_pt_trace_prog,s_pt_trace_vao;
+static int s_pt_trace_w,s_pt_trace_h;
+static StreamWait s_pt_trace_wait;
+static struct PtTraceRead {
+    GLuint pbo,query[2]; void *fence; PtTiming timing; uint64_t time; size_t bytes,capacity; unsigned width,height;
+} s_pt_reads[PT_TRACE_SLOTS];
+static uint64_t s_pt_trace_read,s_pt_trace_write,s_pt_trace_hash;
 static int s_pt_trace_has_hash;
-static int pt_trace_sample(int slot,uint64_t *hash) {
+static void pt_trace_emit(const PtTiming *t,uint64_t now,uint64_t hash,uint64_t hash_ns,int changed) {
+    fprintf(s_pt_trace,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%016llX,%llu,%d\n",
+        (unsigned long long)now,(unsigned long long)t->epoch,
+        (unsigned long long)t->generation,(unsigned long long)t->index,t->alpha_q16,
+        (unsigned long long)t->not_before_ns,(unsigned long long)t->expires_ns,
+        (unsigned long long)hash,(unsigned long long)hash_ns,changed);
+}
+static void pt_trace_resolve(void) {
+    GLint pack=0;glGetIntegerv(0x88ED /* PIXEL_PACK_BUFFER_BINDING */,&pack);
+    while(s_pt_trace_read<s_pt_trace_write) {
+        struct PtTraceRead *r=&s_pt_reads[s_pt_trace_read%PT_TRACE_SLOTS];
+        if(!r->time)break;
+        GLenum ready=s_pt_trace_wait(r->fence,0,0);
+        if(ready!=0x911A && ready!=0x911C)break;
+        uint64_t hash_ns=0;
+        if(r->query[0]) {
+            GLuint64 a=0,b=0;
+            p_glGetQueryObjectui64v(r->query[0],GL_QUERY_RESULT,&a);
+            p_glGetQueryObjectui64v(r->query[1],GL_QUERY_RESULT,&b);
+            if(b>=a)hash_ns=b-a;
+        }
+        p_glBindBuffer(0x88EB,r->pbo);
+        const uint8_t *pixels=p_glMapBuffer(0x88EB,0x88B8 /* READ_ONLY */);
+        if(pixels) {
+            uint64_t hash=(1469598103934665603ull^r->width)*1099511628211ull;
+            hash=(hash^r->height)*1099511628211ull;
+            for(size_t i=0;i<r->bytes;++i)hash=(hash^pixels[i])*1099511628211ull;
+            int changed=!s_pt_trace_has_hash || hash!=s_pt_trace_hash;
+            pt_trace_emit(&r->timing,r->time,hash,hash_ns,changed);
+            s_pt_trace_has_hash=1;s_pt_trace_hash=hash;
+            p_glUnmapBuffer(0x88EB);
+        } else pt_trace_emit(&r->timing,r->time,0,hash_ns,-1);
+        p_glDeleteSync(r->fence);r->fence=NULL;r->time=0;++s_pt_trace_read;
+    }
+    p_glBindBuffer(0x88EB,(GLuint)pack);
+}
+static int pt_trace_sample(int slot,uint64_t *token) {
     if(!s_pt_trace_init) {
         s_pt_trace_init=1;
         const char *path=getenv("PSX_PRESENT_TRACE");
-        if(path && *path) s_pt_trace=fopen(path,"wb");
-        if(s_pt_trace) fprintf(s_pt_trace,"time_ns,epoch,generation,index,alpha_q16,deadline_ns,expires_ns,sample_hash,changed\n");
+        s_pt_trace_wait=(StreamWait)SDL_GL_GetProcAddress("glClientWaitSync");
+        if(path && *path && s_pt_trace_wait && p_glMapBuffer && p_glUnmapBuffer)
+            s_pt_trace=fopen(path,"wb");
+        if(s_pt_trace) {
+            setvbuf(s_pt_trace,NULL,_IOFBF,256*1024);
+            fprintf(s_pt_trace,"time_ns,epoch,generation,index,alpha_q16,deadline_ns,expires_ns,image_hash,gpu_hash_ns,changed\n");
+        }
     }
-    if(!s_pt_trace) return 0;
-    GLint read=0,draw=0,tex=0,pack=0,row=0;
-    glGetIntegerv(0x8CAA,&read); glGetIntegerv(0x8CA6,&draw);
+    if(!s_pt_trace)return 0;
+    pt_trace_resolve();
+    if(s_pt_trace_write-s_pt_trace_read==PT_TRACE_SLOTS) {
+        PtTiming t={0};pt_present_timing((unsigned)slot,&t);
+        pt_trace_emit(&t,pt_clock_ns(),0,0,-1);
+        return 0;
+    }
+    GLint read=0,draw=0,tex=0,pack=0,row=0,pbo=0;
+    glGetIntegerv(0x8CAA,&read);glGetIntegerv(0x8CA6,&draw);
     glGetIntegerv(GL_TEXTURE_BINDING_2D,&tex);
-    glGetIntegerv(GL_PACK_ALIGNMENT,&pack); glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+    glGetIntegerv(GL_PACK_ALIGNMENT,&pack);glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+    glGetIntegerv(0x88ED,&pbo);
+    const int width=(s_pts_w[slot]+PT_TRACE_BLOCK-1)/PT_TRACE_BLOCK;
+    const int height=(s_pts_h[slot]+PT_TRACE_BLOCK-1)/PT_TRACE_BLOCK;
+    const size_t bytes=(size_t)width*height*4;
     if(!s_pt_trace_fbo) {
-        glGenTextures(1,&s_pt_trace_tex); glBindTexture(GL_TEXTURE_2D,s_pt_trace_tex);
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,8,8,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glGenTextures(1,&s_pt_trace_tex);
         p_glGenFramebuffers(1,&s_pt_trace_fbo);
-        p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
-        p_glFramebufferTexture2D(PSXGL_DRAW_FRAMEBUFFER,PSXGL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s_pt_trace_tex,0);
+        s_pt_trace_prog=build_program(PACK_VS,PT_TRACE_FS);
+        p_glGenVertexArrays(1,&s_pt_trace_vao);
     }
-    p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_ptp_fbo[slot]);
+    if(!s_pt_trace_prog) {
+        PtTiming t={0};pt_present_timing((unsigned)slot,&t);
+        pt_trace_emit(&t,pt_clock_ns(),0,0,-1);
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D,s_pt_trace_tex);
+    if(width!=s_pt_trace_w || height!=s_pt_trace_h) {
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        s_pt_trace_w=width;s_pt_trace_h=height;
+    }
     p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,s_pt_trace_fbo);
-    p_glBlitFramebuffer(0,0,s_pts_w[slot],s_pts_h[slot],0,0,8,8,GL_COLOR_BUFFER_BIT,GL_LINEAR);
+    p_glFramebufferTexture2D(PSXGL_DRAW_FRAMEBUFFER,PSXGL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s_pt_trace_tex,0);
+    struct PtTraceRead *r=&s_pt_reads[s_pt_trace_write%PT_TRACE_SLOTS];
+    if(!r->pbo)p_glGenBuffers(1,&r->pbo);
+    p_glBindBuffer(0x88EB,r->pbo);
+    if(bytes>r->capacity) {
+        p_glBufferData(0x88EB,bytes,NULL,0x88E1 /* STREAM_READ */);r->capacity=bytes;
+    }
+    r->bytes=bytes;r->width=s_pts_w[slot];r->height=s_pts_h[slot];
+    GLint program=0,vao=0,viewport[4],active=0,source_binding=0;
+    glGetIntegerv(0x8B8D,&program);glGetIntegerv(0x85B5,&vao);
+    glGetIntegerv(GL_VIEWPORT,viewport);glGetIntegerv(0x84E0,&active);
+    p_glActiveTexture(PSXGL_TEXTURE0);glGetIntegerv(GL_TEXTURE_BINDING_2D,&source_binding);
+    const GLenum caps[]={GL_BLEND,GL_DEPTH_TEST,GL_STENCIL_TEST,GL_SCISSOR_TEST,GL_DITHER,0x8DB9 /* FRAMEBUFFER_SRGB */};
+    GLboolean enabled[6],mask[4];glGetBooleanv(GL_COLOR_WRITEMASK,mask);
+    for(unsigned i=0;i<6;++i){enabled[i]=glIsEnabled(caps[i]);glDisable(caps[i]);}
+    glColorMask(1,1,1,1);glViewport(0,0,width,height);
+    p_glUseProgram(s_pt_trace_prog);p_glBindVertexArray(s_pt_trace_vao);
+    glBindTexture(GL_TEXTURE_2D,s_pts_tex[slot]);
+    p_glUniform1i(p_glGetUniformLocation(s_pt_trace_prog,"u_image"),0);
+    if(!r->query[0] && p_glGenQueries && p_glQueryCounter && p_glGetQueryObjectui64v)
+        p_glGenQueries(2,r->query);
+    if(r->query[0])p_glQueryCounter(r->query[0],GL_TIMESTAMP);
+    glDrawArrays(GL_TRIANGLES,0,3);
+    if(r->query[0])p_glQueryCounter(r->query[1],GL_TIMESTAMP);
+    glBindTexture(GL_TEXTURE_2D,(GLuint)source_binding);p_glActiveTexture((GLenum)active);
+    p_glUseProgram((GLuint)program);p_glBindVertexArray((GLuint)vao);
+    glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
+    glColorMask(mask[0],mask[1],mask[2],mask[3]);
+    for(unsigned i=0;i<6;++i)if(enabled[i])glEnable(caps[i]);
     p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,s_pt_trace_fbo);
-    glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
-    uint8_t pixels[8*8*4]; glReadPixels(0,0,8,8,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
-    *hash=1469598103934665603ull;
-    for(size_t i=0;i<sizeof pixels;i++) *hash=(*hash^pixels[i])*1099511628211ull;
-    glPixelStorei(GL_PACK_ALIGNMENT,pack); glPixelStorei(GL_PACK_ROW_LENGTH,row);
+    glPixelStorei(GL_PACK_ALIGNMENT,1);glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+    r->fence=p_glFenceSync(PT_SYNC_GPU_COMMANDS_COMPLETE,0);
+    pt_present_timing((unsigned)slot,&r->timing);r->time=0;
+    *token=s_pt_trace_write%PT_TRACE_SLOTS;++s_pt_trace_write;
+    p_glBindBuffer(0x88EB,(GLuint)pbo);
+    glPixelStorei(GL_PACK_ALIGNMENT,pack);glPixelStorei(GL_PACK_ROW_LENGTH,row);
     glBindTexture(GL_TEXTURE_2D,(GLuint)tex);
     p_glBindFramebuffer_raw(PSXGL_READ_FRAMEBUFFER,(GLuint)read);
     p_glBindFramebuffer_raw(PSXGL_DRAW_FRAMEBUFFER,(GLuint)draw);
     return 1;
 }
-static void pt_trace_record(int slot,uint64_t hash) {
-    PtTiming timing={0}; (void)pt_present_timing((unsigned)slot,&timing);
-    uint64_t now=pt_clock_ns();
-    if(!s_pt_trace_start) s_pt_trace_start=now;
-    uint64_t second=(now-s_pt_trace_start)/1000000000u;
-    if(second!=s_pt_trace_second) {
-        fprintf(stderr,"present_trace second=%llu presented=%u sample_changes=%u\n",
-                (unsigned long long)s_pt_trace_second,s_pt_trace_frames,s_pt_trace_changes);
-        fflush(s_pt_trace); s_pt_trace_frames=s_pt_trace_changes=0; s_pt_trace_second=second;
+static void pt_trace_record(int slot,uint64_t token) {
+    (void)slot;s_pt_reads[token].time=pt_clock_ns();
+}
+static void pt_trace_shutdown(void) {
+    if(s_pt_trace) {glFinish();pt_trace_resolve();fclose(s_pt_trace);s_pt_trace=NULL;}
+    for(unsigned i=0;i<PT_TRACE_SLOTS;++i) {
+        if(s_pt_reads[i].fence)p_glDeleteSync(s_pt_reads[i].fence);
+        if(s_pt_reads[i].pbo)p_glDeleteBuffers(1,&s_pt_reads[i].pbo);
+        if(s_pt_reads[i].query[0])p_glDeleteQueries(2,s_pt_reads[i].query);
     }
-    int changed=!s_pt_trace_has_hash || hash!=s_pt_trace_hash;
-    s_pt_trace_has_hash=1; s_pt_trace_hash=hash; s_pt_trace_frames++; s_pt_trace_changes+=changed;
-    fprintf(s_pt_trace,"%llu,%llu,%llu,%llu,%u,%llu,%llu,%016llX,%d\n",
-            (unsigned long long)now,(unsigned long long)timing.epoch,
-            (unsigned long long)timing.generation,(unsigned long long)timing.index,timing.alpha_q16,
-            (unsigned long long)timing.not_before_ns,(unsigned long long)timing.expires_ns,
-            (unsigned long long)hash,changed);
+    memset(s_pt_reads,0,sizeof s_pt_reads);
+    if(s_pt_trace_fbo)p_glDeleteFramebuffers(1,&s_pt_trace_fbo);
+    if(s_pt_trace_tex)glDeleteTextures(1,&s_pt_trace_tex);
+    if(s_pt_trace_prog)p_glDeleteProgram(s_pt_trace_prog);
+    if(s_pt_trace_vao)p_glDeleteVertexArrays(1,&s_pt_trace_vao);
+    s_pt_trace_prog=s_pt_trace_vao=0;s_pt_trace_w=s_pt_trace_h=0;
+    s_pt_trace_fbo=s_pt_trace_tex=0;s_pt_trace_init=0;
+    s_pt_trace_read=s_pt_trace_write=s_pt_trace_hash=0;s_pt_trace_has_hash=0;
 }
 static int pt_cb_ctx(void *user, int current) {
     (void)user;
@@ -11661,11 +12033,7 @@ static int pt_cb_ctx(void *user, int current) {
         s_ptp_fbo[i] = 0;
         s_ptp_gen[i] = 0;
     }
-    if(s_pt_trace) { fflush(s_pt_trace); fclose(s_pt_trace); s_pt_trace=NULL; }
-    if(s_pt_trace_fbo) p_glDeleteFramebuffers(1,&s_pt_trace_fbo);
-    if(s_pt_trace_tex) glDeleteTextures(1,&s_pt_trace_tex);
-    s_pt_trace_fbo=s_pt_trace_tex=0; s_pt_trace_init=0;
-    s_pt_trace_start=s_pt_trace_second=0; s_pt_trace_frames=s_pt_trace_changes=0; s_pt_trace_has_hash=0;
+    pt_trace_shutdown();
     glFinish();
     SDL_GL_MakeCurrent(s_win, NULL);
     return 1;
@@ -11835,7 +12203,9 @@ static void gl_present_swap(void) {
     }
     if (done) {
         rthf_gpu_gap(1);
+        packet_timer_wait_begin();
         p_glWaitSync(done,0,PT_TIMEOUT_IGNORED); p_glDeleteSync(done);
+        packet_timer_wait_end();
         rthf_gpu_gap(0);
     }
     /* Whatever is bound as the window now means the new slot. */
@@ -12327,9 +12697,17 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
      * window holding this display (grown to it on first sight). A display the
      * window cannot hold presents from the 1x surface without temporal
      * blending (whose captures assume the S-scaled source). */
+    if(s_region_pool.coverage.rects) {
+        unsigned owner=surface_pool_acquire(&s_region_pool,disp_x,disp_y,w,h,
+            disp_x,disp_y,w,h,s_out_scale,0);
+        if(!owner)return;
+        s_draw_surface=s_region_pool.surfaces[owner];s_hr_scale=s_out_scale;
+    }
     GLuint src_fbo = s_hr_fbo, src_tex = s_hr_tex, interp_fbo = s_hr_fbo;
-    int src_tw = VRAM_W, src_x = disp_x, src_scale = s_out_scale;
+    int src_tw=s_hr_width,src_th=s_hr_height,src_x=disp_x-s_hr_origin_x,
+        src_y=disp_y-s_hr_origin_y,src_scale=s_out_scale;
     if (s_hiw) {
+        src_x=disp_x;src_y=disp_y;src_tw=VRAM_W;src_th=VRAM_H;
         const HiwTile *T = hiw_ensure(disp_x, disp_x + w);
         s_hiw_last_x0 = disp_x; s_hiw_last_x1 = disp_x + w;
         if (T) {
@@ -12349,22 +12727,22 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
     }
     uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
-        interp_fbo, src_x, disp_y, w, h, linear, force_4_3, GL_PRES_VRAM,
+        interp_fbo, src_x, src_y, w, h, linear, force_4_3, GL_PRES_VRAM,
         disp_x, disp_y,
         present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1));
     if (interp_pair) {
         if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
-            float tw = (float)src_tw, th = (float)VRAM_H;
+            float tw = (float)src_tw, th = (float)src_th;
             if (src_tex == s_hr_tex) {
                 tw = present_alloc_extent(src_tw, s_hr_scale);
-                th = present_alloc_extent(VRAM_H, s_hr_scale);
+                th = present_alloc_extent(src_th, s_hr_scale);
             }
-            postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
+            postfx_note_source(src_fbo, src_tex, tw, th, src_x, src_y, w, h);
             postfx_capture_temporal_source(lx, ly, lw, lh);
         }
         /* Temporal blending owns this stock frame interval. Capture hold-last
          * before pacing; every blend and Swap remains on this context/thread. */
-        hold_capture_native_fbo(src_fbo, src_x, disp_y, w, h, force_4_3, linear);
+        hold_capture_native_fbo(src_fbo, src_x, src_y, w, h, force_4_3, linear);
         interp_present_source_interval();
         gl_perf_present_exit(0);
         present_dirty_rect(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1, 0);
@@ -12377,14 +12755,14 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
     {
         /* The hr surface may be allocated above the level it renders at
          * (dynamic resolution); window tiles never are. */
-        float tw = (float)src_tw, th = (float)VRAM_H;
+        float tw = (float)src_tw, th = (float)src_th;
         if (src_tex == s_hr_tex) {
             tw = present_alloc_extent(src_tw, s_hr_scale);
-            th = present_alloc_extent(VRAM_H, s_hr_scale);
+            th = present_alloc_extent(src_th, s_hr_scale);
         }
         present_target_quad(src_tex, tw, th,
-                            src_x, disp_y, w, h, linear, lx, ly, lw, lh, 1, 1, src_scale);
-        postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
+                            src_x, src_y, w, h, linear, lx, ly, lw, lh, 1, 1, src_scale);
+        postfx_note_source(src_fbo, src_tex, tw, th, src_x, src_y, w, h);
     }
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     gpu_timeline_note(GTL_PRESENT, GTL_PATH_VRAM_FBO,
@@ -12410,11 +12788,14 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
  * x-translated by the reveal offset. No-op when s_wide_fast is off (then the
  * mirror drew the full surface, as before). Shared by both present paths. */
 static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h) {
+    if(s_region_pool.coverage.rects)return; /* direct target already contains the complete image */
     if (!wide_center_is_canonical() || g_wide_w <= 0) return;
     int native_w = g_wide_w - 2 * g_wide_off;
     if (native_w <= 0) return;
     int S = s_out_scale;
-    (void)disp_y; (void)disp_h;
+    int y0=disp_y<0?0:disp_y;
+    int y1=disp_h>VRAM_H-y0?VRAM_H:disp_y+disp_h;
+    if(y1<=y0)return;
     /* The mask's bits (stencil bit 1) of the centre are not copied (a
      * depth-stencil blit costs the CPU milliseconds on macOS): the mask takes
      * them from the hr surface itself (postfx_note_center). The windowed
@@ -12422,15 +12803,10 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
      * tiles and the bits travel with it. */
     const GLbitfield bits = GL_COLOR_BUFFER_BIT | (s_bcls_on && s_hiw ? GL_STENCIL_BUFFER_BIT : 0);
     /* Colour only: the centre's stencil is left behind (see s_wst_*). */
-    wst_add(wide_index(wide_fbo), g_wide_off, 0, g_wide_off + native_w, VRAM_H);
-    /* Copy the canonical framebuffer column into the wide surface CENTRE over the
-     * FULL VRAM height, not just the current display band [disp_y, disp_y+disp_h].
-     * The wide surface holds BOTH vertical double-buffer bands (Ape flips
-     * display_y 0<->256), and the game's draw area / display band can differ per
-     * scene (the cityscape intro exposed rows outside disp_h). Copying the whole
-     * column makes the wide CENTRE bit-identical to what the full mirror would
-     * have drawn there for every band, so nothing the present reads is ever left
-     * black. The margins (x outside the centre) are untouched. */
+    wst_add(wide_index(wide_fbo),g_wide_off,y0,g_wide_off+native_w,y1);
+    /* Every reader names the band it consumes, including full-height debug
+     * captures. Other bands remain untouched and refresh on their own read.
+     * This avoids copying the unused double-buffer band at every present. */
     if (s_hiw) {
         /* Windowed high-resolution mode: the centre comes from a tile at S
          * (grown to it on first sight). Columns no tile holds are the 1x
@@ -12442,8 +12818,8 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
         p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
         if (!in) {
             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
-            p_glBlitFramebuffer(cx0 * R, 0, cx1 * R, VRAM_H * R,
-                                g_wide_off * S, 0, (g_wide_off + native_w) * S, VRAM_H * S,
+            p_glBlitFramebuffer(cx0 * R, y0 * R, cx1 * R, y1 * R,
+                                g_wide_off * S, y0 * S, (g_wide_off + native_w) * S, y1 * S,
                                 bits, GL_NEAREST);
         }
         for (int t = 0; t < s_hiw_n; t++) {
@@ -12451,9 +12827,9 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
             int h0 = cx0 > T->x0 ? cx0 : T->x0, h1 = cx1 < T->x1 ? cx1 : T->x1;
             if (h1 > h0) {
                 p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, T->fbo);
-                p_glBlitFramebuffer((h0 - T->x0) * S, 0, (h1 - T->x0) * S, VRAM_H * S,
-                                    (g_wide_off + h0 - cx0) * S, 0,
-                                    (g_wide_off + h1 - cx0) * S, VRAM_H * S,
+                p_glBlitFramebuffer((h0 - T->x0) * S, y0 * S, (h1 - T->x0) * S, y1 * S,
+                                    (g_wide_off + h0 - cx0) * S, y0 * S,
+                                    (g_wide_off + h1 - cx0) * S, y1 * S,
                                     bits, GL_NEAREST);
             }
             if (in) break;
@@ -12465,11 +12841,15 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, wide_fbo);
     glDisable(GL_SCISSOR_TEST);
-    p_glBlitFramebuffer(base_x * S, 0,
-                        (base_x + native_w) * S, VRAM_H * S,
-                        g_wide_off * S, 0,
-                        (g_wide_off + native_w) * S, VRAM_H * S,
-                        bits, GL_NEAREST);
+    int x0=base_x>s_hr_origin_x?base_x:s_hr_origin_x;
+    int x1=base_x+native_w<s_hr_origin_x+s_hr_width?base_x+native_w:s_hr_origin_x+s_hr_width;
+    if(y0<s_hr_origin_y)y0=s_hr_origin_y;
+    if(y1>s_hr_origin_y+s_hr_height)y1=s_hr_origin_y+s_hr_height;
+    if(x1>x0 && y1>y0)
+        p_glBlitFramebuffer((x0-s_hr_origin_x)*S,(y0-s_hr_origin_y)*S,
+                            (x1-s_hr_origin_x)*S,(y1-s_hr_origin_y)*S,
+                            (g_wide_off+x0-base_x)*S,y0*S,
+                            (g_wide_off+x1-base_x)*S,y1*S,bits,GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
 }
@@ -12491,7 +12871,16 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     }
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
     GLuint fbo = 0, tex = 0;
-    int wide_as = 0;
+    int wide_as = 0,source_y=disp_y,source_h=VRAM_H;
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+        GlRasterSurface *surface=surface_pool_display(&s_region_pool,disp_x,disp_y,
+            g_wide_w-2*g_wide_off,disp_h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        if(!surface)return 0;
+        fbo=surface->fbo;tex=surface->tex;wide_as=surface->allocation_scale;
+        source_y=disp_y-surface->y;source_h=surface->h;
+    }
+    if(!s_region_pool.coverage.rects)
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == disp_x) {
             fbo = s_wide_fbo[i]; tex = s_wide_tex[i]; wide_as = s_wide_as[i];
@@ -12541,22 +12930,22 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     }
     uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
-        fbo, 0, disp_y, g_wide_w, disp_h, linear, 0, GL_PRES_WIDE,
+        fbo, 0, source_y, g_wide_w, disp_h, linear, 0, GL_PRES_WIDE,
         disp_x, disp_y,
         present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1));
     if (interp_pair) {
         if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
             const float wext = (wide_as > s_out_scale && s_out_scale >= 1)
                                    ? (float)wide_as / (float)s_out_scale : 1.0f;
-            postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
-                               0, disp_y, g_wide_w, disp_h);
+            postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)source_h * wext,
+                               0, source_y, g_wide_w, disp_h);
             if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
-                postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
-                                   present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,
+                postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(s_hr_width, s_hr_scale),
+                                   present_alloc_extent(s_hr_height, s_hr_scale), disp_x-s_hr_origin_x, disp_y-s_hr_origin_y,
                                    g_wide_w - 2 * g_wide_off, disp_h, g_wide_off, g_wide_w);
             postfx_capture_temporal_source(lx, ly, lw, lh);
         }
-        hold_capture_native_fbo(fbo, 0, disp_y, g_wide_w, disp_h, 0, linear);
+        hold_capture_native_fbo(fbo, 0, source_y, g_wide_w, disp_h, 0, linear);
         interp_present_source_interval();
         gl_perf_present_exit(1);
         present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
@@ -12569,13 +12958,13 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     /* The surface is allocated at its own scale (s_wide_as), the level. */
     const float wext = (wide_as > s_out_scale && s_out_scale >= 1)
                            ? (float)wide_as / (float)s_out_scale : 1.0f;
-    present_target_quad(tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
-                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
-    postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
-                      0, disp_y, g_wide_w, disp_h);
+    present_target_quad(tex, (float)g_wide_w * wext, (float)source_h * wext,
+                        0, source_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
+    postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)source_h * wext,
+                      0, source_y, g_wide_w, disp_h);
     if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
-        postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
-                           present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,
+        postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(s_hr_width, s_hr_scale),
+                           present_alloc_extent(s_hr_height, s_hr_scale), disp_x-s_hr_origin_x, disp_y-s_hr_origin_y,
                            g_wide_w - 2 * g_wide_off, disp_h, g_wide_off, g_wide_w);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     gpu_timeline_note(GTL_PRESENT, GTL_PATH_WIDE_FBO,
@@ -12846,6 +13235,18 @@ static int dyn_apply(int snew) {
         s_dyn_stats.deferred++;
         return 0;
     }
+    if(s_region_pool.coverage.rects) {
+        flush_flat_batch();flush_tex_batch();flush_cpu_upload();
+        if(!surface_pool_rescale(&s_region_pool,snew)){s_dyn_stats.refused++;return 0;}
+        s_hr_scale=s_out_scale=snew;s_primary_surface.allocation_scale=snew;
+        s_shift_hr=s_shift_hi=0.5f/(float)snew-1.0f/64.0f;
+        p_glUseProgram(s_geo_prog);p_glUniform1f(s_geo_uShift,s_shift_hr);
+        p_glUseProgram(s_tex_prog);p_glUniform1f(s_tex_uShift,s_shift_hr);
+        p_glUseProgram(s_blit_prog);
+        p_glUniform1f(p_glGetUniformLocation(s_blit_prog,"u_shift"),s_shift_hr);
+        p_glUseProgram(0);
+        gl_renderer_invalidate_present();return 1;
+    }
     if (s_dyn_timing < 0) {
         const char *e = getenv("PSX_DYNRES_TIMING");
         s_dyn_timing = (e && e[0] && e[0] != '0') ? 1 : 0;
@@ -12929,7 +13330,7 @@ static int dyn_apply(int snew) {
      *    step down reseeds the old surface's corner in place; a step up past
      *    the old allocation is refused. */
     GLuint ntex = 0, nrb = 0, nfbo = 0;
-    if (!hr_alloc_surface(snew, &ntex, &nrb, &nfbo)) {
+    if (!raster_surface_alloc(s_hr_width,s_hr_height,snew,&ntex,&nrb,&nfbo)) {
         if (snew > s_hr_alloc) {
             s_dyn_stats.refused++;
             fprintf(stdout, "psxrecomp: dynamic resolution %dx -> %dx refused (the "
@@ -14458,7 +14859,7 @@ static int fg_surfaces_ensure(int wide) {
             s_fg_hr_fbo = s_fg_hr_tex = s_fg_hr_rb = 0;
         }
         s_fg_hr_S = 0;
-        if (!hr_alloc_surface(S, &s_fg_hr_tex, &s_fg_hr_rb, &s_fg_hr_fbo)) return 0;
+        if (!raster_surface_alloc(VRAM_W,VRAM_H,S,&s_fg_hr_tex,&s_fg_hr_rb,&s_fg_hr_fbo)) return 0;
         s_fg_hr_S = S;
         fg_surface_warm(s_fg_hr_fbo);
     }
@@ -17266,24 +17667,35 @@ static int rth_packet_seal(void *user,FrameOwner *owner) {
     }
     return 1;
 }
-/* Exact native pixels are for CPU-side texture keys/coherence. The enhanced
- * surfaces and their render-to-texture pack remain presentation-owned; do
- * not overwrite an enhanced render target with a native tile per primitive. */
+/* Exact native inputs own texture/CLUT sampling as well as texture keys.
+ * Updating this sampling mirror never overwrites an enhanced render target.
+ * Flush pending consumers only when the next draw actually samples a changed
+ * tile; compatible draws with unchanged inputs remain in their batch. */
+static uint64_t s_packet_input_versions[128];
+static void rth_packet_native_inputs_reset(void) {
+    memset(s_packet_input_versions,0,sizeof s_packet_input_versions);
+}
 static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source) {
     if(!source) return 1;
     NativeRasterTile tiles[128];
     int count=native_raster_inputs_get(inputs->draws,source,tiles,128);
     if(count<0) return 0;
     if(!count) return 1;
-    /* These tiles update CPU-side keys only. Already queued GPU geometry
-     * owns its texture/bank state; flushing it for each source destroys
-     * batching without adding a device dependency. Land pending CPU uploads
-     * before replacing their source pixels. */
+    /* A native input replaces CPU-side key/coherence bytes, not a GPU
+     * texture or render target. Pending actual uploads must consume their
+     * old CPU bytes first; an otherwise compatible primitive batch remains
+     * open. Texture mutation and render-to-texture hazards flush at their
+     * own ordered GPU operations. */
     flush_cpu_upload();
-    for(int t=0;t<count;++t)
+    for(int t=0;t<count;++t) {
+        const unsigned index=(tiles[t].y/64)*16+tiles[t].x/64;
+        if(s_packet_input_versions[index]==tiles[t].version)continue;
+        s_packet_input_versions[index]=tiles[t].version;
         for(unsigned row=0;row<64;++row)
             memcpy(s_rth_vram_priv+(tiles[t].y+row)*VRAM_W+tiles[t].x,
                    tiles[t].pixels+row*64,64*sizeof(uint16_t));
+        rect_add(&s_pack_dirty,tiles[t].x,tiles[t].y,tiles[t].x+63,tiles[t].y+63);
+    }
     const GpuHdTextureTracking *tracking=native_raster_inputs_metadata(inputs->draws,source);
     return !tracking || gpu_hd_textures_apply_tracking(tracking);
 }
@@ -17545,6 +17957,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     const RthPacketInputs *inputs=packet->attachment;
     const int saved_target=s_packet_display_target,saved_y=s_packet_display_y;
     if(t<0) {s_packet_display_target=s_packet_previous_target;s_packet_display_y=s_packet_previous_y;}
+    packet_timer_begin();
     s_rth_packet_replaying=1;s_rth_packet_view=packet;
     s_packet_drawing=packet_interpolation_rate()!=0;
     s_packet_present_payload=NULL;
@@ -17555,6 +17968,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     else packet_metadata_sample(packet_interpolation_stream_snapped()?1.0:t);
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();
     memcpy(s_rth_vram_priv,seed->pixels,sizeof seed->pixels);
+    rth_packet_native_inputs_reset();
     rth_rebind_vram(s_rth_vram_priv);
     sw_native_texture_load(&seed->cache);
     if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
@@ -17578,6 +17992,9 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     packet_metadata_end();
     s_packet_drawing=0;
     s_packet_sample=0;s_packet_vertex=s_packet_endpoint=NULL;
+    flush_flat_batch();flush_tex_batch();flush_cpu_upload();hiw_flush_queue();
+    packet_timer_end();
+    surface_pool_retire_unused();
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
 }
 static void rth_packet_execute(void *user,const FramePacketView *packet) {
@@ -17765,10 +18182,23 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
     if (k > 0 && (size_t)k < cap) k += snprintf(out + k, cap - (size_t)k, "],");
     if (k > 0 && (size_t)k < cap) k += snprintf(out+k,cap-(size_t)k,
         "\"frames_replaced\":%llu,\"frames_rejected\":%llu,\"owner_delay_ms\":%u,"
-        "\"packet_seed_ms\":%.3f,\"packet_seal_ms\":%.3f,\"packet_dispose_ms\":%.3f,",
+        "\"packet_seed_ms\":%.3f,\"packet_seal_ms\":%.3f,\"packet_dispose_ms\":%.3f,"
+        "\"gpu_pack_draws\":%llu,\"native_texture_uploads\":%llu,\"native_texture_bytes\":%llu,",
         (unsigned long long)st.frames_replaced,(unsigned long long)st.frames_rejected,st.owner_delay_ms,
         atomic_load(&s_rth_packet_seed_ns)*1e-6,atomic_load(&s_rth_packet_seal_ns)*1e-6,
-        atomic_load(&s_rth_packet_dispose_ns)*1e-6);
+        atomic_load(&s_rth_packet_dispose_ns)*1e-6,
+        (unsigned long long)atomic_load(&s_pack_gpu_draws),
+        (unsigned long long)atomic_load(&s_pack_native_uploads),
+        (unsigned long long)atomic_load(&s_pack_native_bytes));
+    uint64_t gpu[5];gl_renderer_packet_gpu_stats(gpu);
+    if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
+        "\"gpu_packet\":{\"samples\":%llu,\"total_ns\":%llu,\"present_ns\":%llu,\"max_ns\":%llu,\"dropped\":%llu,"
+        "\"slot_wait_ns\":%llu,\"slot_wait_dropped\":%llu,\"fence_retired\":%llu},",
+        (unsigned long long)gpu[0],(unsigned long long)gpu[1],(unsigned long long)gpu[2],
+        (unsigned long long)gpu[3],(unsigned long long)gpu[4],
+        (unsigned long long)atomic_load(&s_pkt_wait_ns),
+        (unsigned long long)atomic_load(&s_pkt_wait_dropped),
+        (unsigned long long)atomic_load(&s_pkt_fence_retired));
     if (k > 0 && (size_t)k < cap) k += gl_renderer_present_thread_json(out + k, cap - (size_t)k);
     return k;
 }

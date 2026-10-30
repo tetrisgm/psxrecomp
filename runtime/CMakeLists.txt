@@ -446,6 +446,50 @@ if(BUILD_TESTING)
                 --output "${CMAKE_CURRENT_BINARY_DIR}/gl-frame-packet-results")
         set_tests_properties(gl_frame_packet_test PROPERTIES
             LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_test(NAME gl_vertex_stream_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
+                --single
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_vertex_stream.c"
+                --cc "${CMAKE_C_COMPILER}" --cxx "${CMAKE_CXX_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-vertex-stream-results")
+        set_tests_properties(gl_vertex_stream_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_test(NAME gl_cropped_target_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
+                --single
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_cropped_target.c"
+                --cc "${CMAKE_C_COMPILER}" --cxx "${CMAKE_CXX_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-cropped-target-results")
+        set_tests_properties(gl_cropped_target_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_test(NAME gl_production_surfaces_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
+                --single
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_production_surfaces.c"
+                --cc "${CMAKE_C_COMPILER}" --cxx "${CMAKE_CXX_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-production-surfaces-results")
+        set_tests_properties(gl_production_surfaces_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
+        add_test(NAME gl_distinct_receipt_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
+                --single
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_distinct_receipt.c"
+                --cc "${CMAKE_C_COMPILER}" --cxx "${CMAKE_CXX_COMPILER}"
+                --sdl-include "${_gl_scale_sdl_inc}"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-distinct-receipt-results")
+        set_tests_properties(gl_distinct_receipt_test PROPERTIES
+            LABELS "gpu;opengl;hardware" TIMEOUT 180 SKIP_RETURN_CODE 77)
         add_test(NAME gl_async_expire_test
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_render_thread.py"
@@ -1860,6 +1904,15 @@ if(BUILD_TESTING)
                    src/stereo_shed_policy.c)
     target_include_directories(stereo_shed_policy_test PRIVATE include)
     add_test(NAME stereo_shed_policy_test COMMAND stereo_shed_policy_test)
+    add_executable(gl_surface_coverage_test tests/test_gl_surface_coverage.c)
+    target_compile_features(gl_surface_coverage_test PRIVATE c_std_11)
+    if(MSVC)
+        target_compile_options(gl_surface_coverage_test PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(gl_surface_coverage_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME gl_surface_coverage_test COMMAND gl_surface_coverage_test)
+
     add_executable(native_raster_test tests/test_native_raster.cpp
                    src/native_raster.cpp src/frame_packet.cpp src/gpu_sw_renderer.c src/gpu_vram_dirty.c)
     target_include_directories(native_raster_test PRIVATE include)
