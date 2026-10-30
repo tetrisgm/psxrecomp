@@ -161,6 +161,7 @@ static void rewind_packets() {
     auto dispose=[](void *v) { auto *a=static_cast<Attachment*>(v);++*a->disposed;delete a; };
     for(unsigned i=1;i<=5;i++) {
         assert(frame_packet_begin(q,i,&i,sizeof i));
+        frame_packet_stamp(q,i*16666667ull);
         assert(frame_packet_attach(q,new Attachment{&disposed,int(i)},sizeof(Attachment),dispose));
         auto *value=static_cast<unsigned*>(frame_packet_append(q,1,0,sizeof i));assert(value);*value=i*10;
         assert(frame_packet_publish(q));
@@ -176,6 +177,7 @@ static void rewind_packets() {
     frame_packet_release(q);
     FramePacketView reverse{};assert(frame_packet_acquire(q,&reverse));
     assert(reverse.sequence==6 && frame_packet_current(q,&reverse));
+    assert(reverse.guest_time_ns==3*16666667ull && held.guest_time_ns==5*16666667ull);
     assert(*static_cast<const unsigned*>(reverse.initial)==3);
     assert(static_cast<const Attachment*>(reverse.attachment)->value==3);
     auto *record=static_cast<const RtCmd*>(reverse.records);

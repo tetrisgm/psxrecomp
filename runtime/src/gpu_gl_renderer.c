@@ -1,5 +1,6 @@
 #include "packet_interpolation_stream.h"
 #include "packet_presenter.h"
+#include "interrupts.h"
 #include "packet_metadata.h"
 /* gpu_gl_renderer.c — hardware OpenGL renderer backend.
  *
@@ -17644,6 +17645,14 @@ static int rth_packet_begin(void *user,FrameOwner *owner,uint64_t sequence) {
 }
 static int rth_packet_seal(void *user,FrameOwner *owner) {
     (void)user;
+    /* Capture the last guest VBlank edge, excluding service overshoot. */
+    /* The frontend pacer runs before interrupts consumes the pending edge.
+     * Restore/rewind may also seal outside that callback. */
+    uint64_t since=interrupts_get_cycles_since_vblank();
+    if(since>=g_psx_vblank_cycles)since-=g_psx_vblank_cycles;
+    const uint64_t edge=psx_cycle_count>=since?psx_cycle_count-since:0;
+    frame_owner_stamp(owner,(edge/33868800ull)*1000000000ull+
+        (edge%33868800ull)*1000000000ull/33868800ull);
     const uint64_t start=s_rth_packet_trace_timing?pt_clock_ns():0;
     gr_flush_native_upload();
     NativeRasterInputs *draws=native_raster_inputs_seal(gr_native_raster());
@@ -17711,8 +17720,11 @@ static uint64_t s_packet_retiring_source,s_packet_retiring_applied_source;
 static const void *s_packet_present_payload;
 static uint16_t s_packet_present_op;
 static void rth_packet_draw(const FramePacketView *,double);
+static void rth_packet_prepare(const FramePacketView *,uint64_t);
 static uint64_t rth_packet_tick(void *user,uint64_t now) {
+    uint64_t delivery=packet_presenter_deliver(now,rth_packet_prepare);
     uint64_t next=packet_presenter_tick(now,rth_packet_draw);
+    if(delivery && (!next || delivery<next))next=delivery;
     uint64_t legacy=fg_tick(user,now);
     return !next?legacy:!legacy?next:next<legacy?next:legacy;
 }
@@ -17997,8 +18009,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     surface_pool_retire_unused();
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
 }
-static void rth_packet_execute(void *user,const FramePacketView *packet) {
-    (void)user;
+static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled) {
     if(packet->initial_bytes!=sizeof(RthPacketSeed) || !packet->attachment) return;
     const RthPacketInputs *inputs=packet->attachment;
     s_packet_vertex_count=0;s_packet_content=0;
@@ -18038,17 +18049,23 @@ static void rth_packet_execute(void *user,const FramePacketView *packet) {
         }
     }
     if(s_packet_vertex_count || !packet_interpolation_rate()) packet_metadata_pair(inputs->metadata,packet->epoch);
-    if(s_packet_vertex_count && packet_presenter_submit(packet,rt_now_ns(),
+    if(s_packet_vertex_count && packet_presenter_submit(packet,scheduled,
             atomic_load(&s_fg_guest_hz),rth_packet_draw)) {
-        const uint64_t next=packet_presenter_tick(rt_now_ns(),rth_packet_draw);
-        if(next) rt_tick_at(next);
+        /* The outer delivery tick samples once, after all due packets. */
     } else rth_packet_draw(packet,1.0);
+}
+static void rth_packet_execute(void *user,const FramePacketView *packet) {
+    const uint64_t now=rt_now_ns();
+    if(!packet_presenter_buffer(packet,now,atomic_load(&s_fg_guest_hz),rth_packet_prepare))
+        rth_packet_prepare(packet,now);
+    const uint64_t next=rth_packet_tick(user,rt_now_ns());
+    if(next)rt_tick_at(next);
 }
 static void rth_packet_reset(void *user,uint64_t epoch) {
     (void)user;(void)epoch;
     fg_invalidate();gl_renderer_invalidate_present();
     s_rth_packet_last_sequence=s_rth_packet_last_epoch=0;
-    packet_presenter_reset();packet_metadata_reset();
+    packet_presenter_buffer_reset();packet_presenter_reset();packet_metadata_reset();
     packet_interpolation_stream_reset();
 }
 
@@ -18110,7 +18127,7 @@ void gl_renderer_render_thread_stop(void) {
     if (!s_rth_on) return;
     rth_group_flush();
     rt_stop();                       /* drains; the context is current here again */
-    packet_presenter_reset();
+    packet_presenter_buffer_reset();packet_presenter_reset();
     packet_metadata_reset();
     native_raster_inputs_enable(gr_native_raster(),0);
     rth_packet_dispose(s_rth_packet_build);s_rth_packet_build=NULL;

@@ -167,6 +167,7 @@ extern "C" int frame_owner_attach(FrameOwner *owner,void *attachment,size_t byte
 extern "C" void *frame_owner_append(FrameOwner *owner,uint16_t op,uint16_t flags,uint32_t bytes) {
     return frame_packet_append(owner->queue,op,flags,bytes);
 }
+extern "C" void frame_owner_stamp(FrameOwner *o,uint64_t time) {frame_packet_stamp(o->queue,time);}
 extern "C" int frame_owner_publish(FrameOwner *owner) {
     guest_wait_trace::Scope trace(guest_wait_trace::Publish);
     const int result=frame_packet_publish(owner->queue);
