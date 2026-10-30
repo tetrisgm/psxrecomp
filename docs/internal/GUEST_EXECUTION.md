@@ -308,3 +308,13 @@ Receipt: analysis/guest-execution-interval-event.{json,txt} in R4 worktree.
 The previous G4 fields maximum was35.960ms and G1 was37.319ms; this integrated
 measurement also includes the fork's phase-3 surfaces, so it is not an isolated
 A/B attribution for every changed component.
+
+Second completed interval candidate: share precision-bearing bitwise propagation
+with snapshots inside the helper, retain inline no-precision operations, and
+give ordinary load/block paths compiler likelihood hints. Runtime159.091MB ->
+144.687MB; linked transform span147392 ->130944bytes. Build/13focused/22permitted
+R4/native/stamp/zero-miss40-step smoke pass. Exact480fingerprints and577170
+triangles on234complete frames. Supervisor fresh slot11:59.94harness/60.007
+cadence,0starved/packet allocations,max26.857ms,CPU16359.375/1803=9.073ms.
+Worst pacing0.0005ms/native completion0.0779ms. Improvement, not a20ms pass.
+Receipt: analysis/guest-execution-interval-layout.{json,txt}.

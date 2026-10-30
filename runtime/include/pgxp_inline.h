@@ -4,6 +4,12 @@
 #include "psx_memory.h"
 #include "mod_memory.h"
 #include <string.h>
+/* Keep the ordinary compiled path contiguous; exceptional observers still run. */
+#if defined(__GNUC__) || defined(__clang__)
+#define PGXP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define PGXP_LIKELY(x) (!!(x))
+#endif
 #if defined(_MSC_VER)
 #define PGXP_INLINE static __forceinline
 #elif defined(__GNUC__) || defined(__clang__)
@@ -15,7 +21,7 @@
  * explicitly armed diagnostics use the original journal/recording path. */
 PGXP_INLINE PGXPValue *pgxp_inline_ptr(uint32_t addr) {
     uint32_t m = addr & 0x1fffffffu;
-    if (m < PSX_MAIN_RAM_WINDOW_BYTES)
+    if (PGXP_LIKELY(m < PSX_MAIN_RAM_WINDOW_BYTES))
         return g_pgxp_cpu.ram ? &g_pgxp_cpu.ram[(m & g_psx_ram_mask) >> 2] : NULL;
     if (m - PSX_MOD_GPU_DMA_APERTURE_BASE < PSX_MOD_GPU_DMA_APERTURE_SIZE)
         return g_pgxp_cpu.ram ? &g_pgxp_cpu.ram[(PSX_MAIN_RAM_BACKING_BYTES >> 2) +
@@ -59,8 +65,8 @@ PGXP_INLINE int pgxp_inline_half_scalar(const PGXPValue *pv, uint32_t value, dou
 PGXP_INLINE void psx_pgxp_load_inline(struct CPUState *cpu, uint32_t instr,
                               uint32_t addr, uint32_t value) {
     (void)cpu;
-    if (!g_pgxp_cpu.active) return;
-    if (g_pgxp_cpu.checkpoint_depth) { psx_pgxp_load(cpu, instr, addr, value); return; }
+    if (!PGXP_LIKELY(g_pgxp_cpu.active)) return;
+    if (!PGXP_LIKELY(!g_pgxp_cpu.checkpoint_depth)) { psx_pgxp_load(cpu, instr, addr, value); return; }
     uint32_t rt = ((instr >> 16) & 31u);
     if (rt == 0) return;
     PGXPValue *dst = &g_pgxp_cpu.gpr[rt];
@@ -116,7 +122,7 @@ PGXP_INLINE void psx_pgxp_load_inline(struct CPUState *cpu, uint32_t instr,
 
 PGXP_INLINE void psx_pgxp_store_inline(struct CPUState *cpu, uint32_t instr,
                                        uint32_t addr, uint32_t value) {
-    if (!g_pgxp_cpu.active) return;
+    if (!PGXP_LIKELY(g_pgxp_cpu.active)) return;
     uint32_t rt = (instr >> 16) & 31u, op = instr >> 26;
     if (g_pgxp_cpu.checkpoint_depth || g_pgxp_cpu.store_trace ||
         (g_pgxp_cpu.cpu_mode && rt && g_pgxp_cpu.scalar[rt].gen == g_pgxp_cpu.gen)) {
@@ -285,9 +291,34 @@ PGXP_INLINE void pgxp_inline_half_snapshot(PGXPValue *out, uint32_t reg) {
         out->x16=out->y16=0; out->z=out->flags=0; out->value=out->gen=0;
     }
 }
+/* Precision-bearing bitwise propagation has no instruction-specific arithmetic.
+ * Share its precision decision tree instead of cloning it at every guest OR/AND.
+ * Snapshot the small consumed fields here, before an aliased destination resets. */
+#if defined(_MSC_VER)
+static __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+static __attribute__((noinline))
+#else
+static
+#endif
+void pgxp_compiled_bitwise(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2) {
+    uint32_t op = instr >> 26;
+    uint32_t rs = (instr >> 21) & 31u, rt = (instr >> 16) & 31u;
+    uint32_t dst = op ? rt : ((instr >> 11) & 31u);
+        PGXPValue a, b;
+        pgxp_inline_half_snapshot(&a, rs);
+        if (!op) pgxp_inline_half_snapshot(&b, rt);
+        PGXPValue *d = &g_pgxp_cpu.gpr[dst];
+        pgxp_inline_alu_bitwise(d, &a, s1, op ? NULL : &b, s2, result);
+        if (op == 0xd && !(d->flags & PGXP_F_VX) && !(s1 & 0xffffu)) {
+            d->x16 = (int32_t)((instr & 0xffffu) << 16); d->flags |= PGXP_F_VX;
+        }
+        if (g_pgxp_cpu.cpu_mode) g_pgxp_cpu.scalar[dst].gen = 0;
+        return;
+}
 PGXP_INLINE void psx_pgxp_alu_inline(struct CPUState *cpu, uint32_t instr,
                                      uint32_t result, uint32_t s1, uint32_t s2) {
-    if (!g_pgxp_cpu.active) return;
+    if (!PGXP_LIKELY(g_pgxp_cpu.active)) return;
     uint32_t op = instr >> 26, fn = instr & 63u;
     uint32_t rs = (instr >> 21) & 31u, rt = (instr >> 16) & 31u;
     uint32_t dst = op ? rt : ((instr >> 11) & 31u);
@@ -364,15 +395,7 @@ PGXP_INLINE void psx_pgxp_alu_inline(struct CPUState *cpu, uint32_t instr,
         return;
     }
     if ((op >= 0xc && op <= 0xe) || (!op && fn >= 0x24 && fn <= 0x27)) {
-        PGXPValue a, b;
-        pgxp_inline_half_snapshot(&a, rs);
-        if (!op) pgxp_inline_half_snapshot(&b, rt);
-        PGXPValue *d = &g_pgxp_cpu.gpr[dst];
-        pgxp_inline_alu_bitwise(d, &a, s1, op ? NULL : &b, s2, result);
-        if (op == 0xd && !(d->flags & PGXP_F_VX) && !(s1 & 0xffffu)) {
-            d->x16 = (int32_t)((instr & 0xffffu) << 16); d->flags |= PGXP_F_VX;
-        }
-        if (g_pgxp_cpu.cpu_mode) g_pgxp_cpu.scalar[dst].gen = 0;
+        pgxp_compiled_bitwise(instr, result, s1, s2);
         return;
     }
     psx_pgxp_alu(cpu, instr, result, s1, s2);
