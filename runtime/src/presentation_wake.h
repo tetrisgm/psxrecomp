@@ -24,6 +24,7 @@
 class PresentationWake {
 #ifdef _WIN32
     HANDLE event;
+    HANDLE timer;
 #else
 #ifdef __APPLE__
     dispatch_semaphore_t event;
@@ -37,6 +38,17 @@ public:
 #ifdef _WIN32
         event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
         if(!event) throw std::system_error(GetLastError(),std::system_category());
+        // Event wait timeouts use the system tick (often 15.625 ms), even
+        // though the presentation grid has nanosecond deadlines. An owned
+        // high-resolution timer supplies the deadline; event publication
+        // remains retained and can interrupt that wait without a mutex.
+        timer=CreateWaitableTimerExW(nullptr,nullptr,0x00000002,
+                                    TIMER_MODIFY_STATE|SYNCHRONIZE);
+        if(!timer) timer=CreateWaitableTimerW(nullptr,FALSE,nullptr);
+        if(!timer) {
+            const DWORD error=GetLastError();CloseHandle(event);
+            throw std::system_error(error,std::system_category());
+        }
 #elif defined(__APPLE__)
         event=dispatch_semaphore_create(0);
         if(!event) throw std::bad_alloc();
@@ -46,7 +58,7 @@ public:
     }
     ~PresentationWake() {
 #ifdef _WIN32
-        CloseHandle(event);
+        CloseHandle(timer);CloseHandle(event);
 #elif defined(__APPLE__)
         dispatch_release(event);
 #else
@@ -64,7 +76,14 @@ public:
     }
     void wait(uint64_t ns=0) {
 #ifdef _WIN32
-        WaitForSingleObject(event,ns?DWORD((ns+999999)/1000000):INFINITE);
+        if(!ns) {WaitForSingleObject(event,INFINITE);return;}
+        LARGE_INTEGER due;
+        due.QuadPart=-static_cast<LONGLONG>(ns/100+(ns%100!=0));
+        if(!SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE))
+            throw std::system_error(GetLastError(),std::system_category());
+        const HANDLE handles[2]={event,timer};
+        WaitForMultipleObjects(2,handles,FALSE,INFINITE);
+        CancelWaitableTimer(timer);
 #elif defined(__APPLE__)
         if(!dispatch_semaphore_wait(event,ns?dispatch_time(DISPATCH_TIME_NOW,ns):DISPATCH_TIME_FOREVER))
             pending.store(false,std::memory_order_release);
