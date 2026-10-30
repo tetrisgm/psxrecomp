@@ -6228,8 +6228,17 @@ static void glb_set_draw_offset(int x,int y) { flush_flat_batch(); flush_tex_bat
  * players can clear with tiles between movies without leaving depth24; those
  * clears must reach the CPU mirror the RGB888 presenter reads. */
 static void depth24_upload_policy(void);
+static _Atomic uint64_t s_packet_native_raster_requests;
 static int cpu_raster_required(void) {
     depth24_upload_policy();
+    if(s_rth_packet_replaying) {
+        if(s_hd_native_authority || s_cpu_auth_dual || s_depth24_skip_up)
+            ++s_packet_native_raster_requests;
+        /* Exact native pixels and texture-cache inputs came from the native
+         * worker. Re-rasterizing sampled geometry would overwrite that mirror
+         * with presentation-only results and repeat native work per output. */
+        return 0;
+    }
     /* A render pass admitted under dual-raster netplay (title opt-in,
      * render_pass_netplay_enabled) draws a presentation-only image into the
      * GPU surface. The CPU mirror stays the authoritative record of the real
@@ -6916,19 +6925,33 @@ static void free_hr_targets(void) {
  * target is complete and the driver reported no error (a too-large texture
  * surfaces as GL_INVALID_VALUE or GL_OUT_OF_MEMORY, not always as an
  * incomplete FBO). */
+static int legacy_surface_test(void) {
+#ifdef PSX_GL_LEGACY_SURFACE_TEST
+    return 1;
+#elif !defined(PSX_NO_DEBUG_TOOLS)
+    static int enabled=-1;
+    if(enabled<0) {const char *v=getenv("PSX_GL_LEGACY_SURFACE_TEST");enabled=v && *v=='1';}
+    return enabled;
+#else
+    return 0;
+#endif
+}
 static int alloc_hr_targets(int S) {
     int hw = VRAM_W * S, hh = VRAM_H * S;
     s_hr_alloc=0;
     s_draw_surface=&s_primary_surface;
-#ifdef PSX_GL_LEGACY_SURFACE_TEST
+if(legacy_surface_test()) {
+
     if(!raster_surface_alloc(VRAM_W,VRAM_H,S,&s_hr_tex,&s_hr_rb,&s_hr_fbo))return 0;
-#else
+} else {
+
     /* Native VRAM stays in R16UI. Enhanced allocations begin only when a
      * primitive or a display reader claims a rectangle. */
     memset(&s_primary_surface,0,sizeof s_primary_surface);
     s_primary_surface.w=VRAM_W;s_primary_surface.h=VRAM_H;
     if(!surface_pool_init(&s_region_pool))return 0;
-#endif
+}
+
     /* Copy/stencil scratch. Up to 2x it covers the whole surface as before
      * (<= 8 MiB); above that it starts at one tile and grows to the largest
      * copy on demand (scratch_ensure), instead of costing 4 MiB*S^2 up front. */
@@ -6969,7 +6992,8 @@ static int init_gpu_raster(void) {
             if (v > 0 && (s_gl_max_dim == 0 || v < s_gl_max_dim)) s_gl_max_dim = v;
         }
         s_vram_budget = psx_gl_budget_bytes_from_env(getenv("PSX_GL_VRAM_BUDGET_MB"));
-#ifdef PSX_GL_LEGACY_SURFACE_TEST
+if(legacy_surface_test()) {
+
         s_out_scale = psx_gl_clamp_full_vram_scale(s_req_scale, GL_MAX_INTERNAL_SCALE,
                                                s_gl_max_dim, s_vram_budget,
                                                &s_scale_clamp_reason);
@@ -7014,12 +7038,14 @@ static int init_gpu_raster(void) {
                     (s_scale_clamp_reason & PSX_GL_SCALE_BUDGET) ? "memory budget " : "",
                     (s_scale_clamp_reason & PSX_GL_SCALE_CEILING) ? "ceiling " : "",
                     s_gl_max_dim, (unsigned long long)(s_vram_budget >> 20));
-#else
+} else {
+
         s_out_scale=psx_gl_clamp_window_scale(s_req_scale,GL_MAX_INTERNAL_SCALE,
             s_gl_max_dim,s_vram_budget,320);
         s_hr_scale=s_out_scale;s_hiw=0;s_hiw_n=0;
         s_scale_clamp_reason=s_out_scale<s_req_scale?PSX_GL_SCALE_TEXTURE:0;
-#endif
+}
+
         s_scale_alloc_retries = 0;
     }
 
@@ -16735,7 +16761,10 @@ static void rth_packet_transform_record(const PGXPProjection *projection,const P
     if(!s_rth_on || rt_on_render_thread() || rt_held() || !packet_interpolation_stream_enabled()) return;
     packet_interpolation_transform(projection,affine);
 }
+static _Atomic uint64_t s_packet_produced_geometry;
+static int s_packet_producer_has_geometry;
 static void rth_packet_interpolation_record(const PacketInterpolationSource *source) {
+    s_packet_producer_has_geometry=1;
     if(!rth_record_mode() || !packet_interpolation_stream_enabled()) return;
     /* Provenance is setup for the following triangle, not a batch boundary.
      * Copy through aligned words; grouped records need not align a u64 field. */
@@ -17645,6 +17674,8 @@ static int rth_packet_begin(void *user,FrameOwner *owner,uint64_t sequence) {
 }
 static int rth_packet_seal(void *user,FrameOwner *owner) {
     (void)user;
+    if(s_packet_producer_has_geometry)++s_packet_produced_geometry;
+    s_packet_producer_has_geometry=0;
     /* Capture the last guest VBlank edge, excluding service overshoot. */
     /* The frontend pacer runs before interrupts consumes the pending edge.
      * Restore/rewind may also seal outside that callback. */
@@ -17719,6 +17750,7 @@ static int s_packet_retiring_target,s_packet_retiring_y;
 static uint64_t s_packet_retiring_source,s_packet_retiring_applied_source;
 static const void *s_packet_present_payload;
 static uint16_t s_packet_present_op;
+static _Atomic uint64_t s_packet_prepare_ns,s_packet_draw_ns,s_packet_draw_count,s_packet_snap_count,s_packet_no_present;
 static void rth_packet_draw(const FramePacketView *,double);
 static void rth_packet_prepare(const FramePacketView *,uint64_t);
 static uint64_t rth_packet_tick(void *user,uint64_t now) {
@@ -17965,6 +17997,9 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
 }
 static void rth_packet_draw(const FramePacketView *packet,double t) {
     if(!packet || !rt_packet_current(packet)) return;
+    const uint64_t draw_begin=rt_now_ns();
+    ++s_packet_draw_count;
+    if(t>=0 && t<1 && packet_interpolation_stream_snapped()) ++s_packet_snap_count;
     const RthPacketSeed *seed=packet->initial;
     const RthPacketInputs *inputs=packet->attachment;
     const int saved_target=s_packet_display_target,saved_y=s_packet_display_y;
@@ -18000,6 +18035,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
         s_rth_packet_last_sequence=packet->sequence;
     s_rth_packet_last_epoch=packet->epoch;
  done:
+    if(!s_packet_present_payload) ++s_packet_no_present;
     s_packet_display_target=saved_target;s_packet_display_y=saved_y;
     packet_metadata_end();
     s_packet_drawing=0;
@@ -18008,9 +18044,11 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     packet_timer_end();
     surface_pool_retire_unused();
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
+    atomic_fetch_add(&s_packet_draw_ns,rt_now_ns()-draw_begin);
 }
 static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled) {
     if(packet->initial_bytes!=sizeof(RthPacketSeed) || !packet->attachment) return;
+    const uint64_t prepare_begin=rt_now_ns();
     const RthPacketInputs *inputs=packet->attachment;
     s_packet_vertex_count=0;s_packet_content=0;
     const RthPacketSeed *seed=packet->initial;
@@ -18028,6 +18066,7 @@ static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled)
         }
         s_packet_collect=0;packet_interpolation_stream_end();
     }
+    atomic_fetch_add(&s_packet_prepare_ns,rt_now_ns()-prepare_begin);
     // Held-display VBlanks do not publish a new geometry endpoint. Presenting
     // their native endpoint between samples would jump forward then backward.
     if(!s_packet_vertex_count && !s_packet_content && packet_presenter_active()) {
@@ -18207,6 +18246,18 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
         (unsigned long long)atomic_load(&s_pack_gpu_draws),
         (unsigned long long)atomic_load(&s_pack_native_uploads),
         (unsigned long long)atomic_load(&s_pack_native_bytes));
+    if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
+        "\"packet_cpu\":{\"prepare_ns\":%llu,\"draw_ns\":%llu,\"draws\":%llu,\"snaps\":%llu,\"no_present\":%llu,\"native_raster_requests\":%llu,\"producer_geometry\":%llu},",
+        (unsigned long long)atomic_load(&s_packet_prepare_ns),(unsigned long long)atomic_load(&s_packet_draw_ns),
+        (unsigned long long)atomic_load(&s_packet_draw_count),(unsigned long long)atomic_load(&s_packet_snap_count),
+        (unsigned long long)atomic_load(&s_packet_no_present),(unsigned long long)atomic_load(&s_packet_native_raster_requests),(unsigned long long)atomic_load(&s_packet_produced_geometry));
+    if(s_op_profile==1 && k>0 && (size_t)k<cap) {
+        k+=snprintf(out+k,cap-(size_t)k,"\"ops\":[");
+        for(unsigned op=1;op<RTH_GROUP && k>0 && (size_t)k<cap;++op)
+            k+=snprintf(out+k,cap-(size_t)k,"%s[%u,%llu,%llu]",op==1?"":",",op,
+                (unsigned long long)s_op_count[op],(unsigned long long)s_op_ns[op]);
+        if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,"],");
+    }
     uint64_t gpu[5];gl_renderer_packet_gpu_stats(gpu);
     if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
         "\"gpu_packet\":{\"samples\":%llu,\"total_ns\":%llu,\"present_ns\":%llu,\"max_ns\":%llu,\"dropped\":%llu,"

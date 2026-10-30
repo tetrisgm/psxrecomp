@@ -155,6 +155,10 @@ extern "C" uint64_t packet_presenter_deliver(uint64_t now,PacketPresenterPrepare
 extern "C" int packet_presenter_buffer(const FramePacketView *packet,uint64_t now,
     double guest_hz,PacketPresenterPrepare prepare) {
     if(!packet || !prepare || !std::isfinite(guest_hz) || guest_hz<=0)return 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+    static const bool bypass=[] {const char *v=std::getenv("PSX_PRESENT_GUEST_CLOCK");return v && *v=='0';}();
+    if(bypass)return 0;
+#endif
     const unsigned hz=packet_interpolation_rate();
     if(!hz) {packet_presenter_buffer_reset();return 0;}
     if(delivery_rate!=hz) {packet_presenter_buffer_reset();packet_presenter_reset();delivery_rate=hz;}
