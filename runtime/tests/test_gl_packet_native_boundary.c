@@ -55,6 +55,16 @@ int main(void) {
     glReadPixels(0,0,1,1,GL_STENCIL_INDEX,GL_UNSIGNED_BYTE,&clear_stencil);
     check(clear_colour==0 && clear_depth==1 && clear_stencil==0,"reveal colour depth stencil match fresh allocation");
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);
+    const uint8_t rgba[4]={255,0,0,255};
+    GpuHdTextureImage image={0};image.rgba=rgba;image.width=image.height=1;
+    image.stride=4;image.source_width=image.source_height=1;image.cache_key=7;image.generation=19;
+    GLuint original=hd_gl_texture(&image);check(original!=0,"immutable HD image cached");
+    s_rth_packet_replaying=1;restore_presentation_invalidate();s_rth_packet_replaying=0;
+    check(hd_gl_texture(&image)==original,"packet invalidation retains immutable image");
+    image.generation=20;
+    check(hd_gl_texture(&image)!=original,"new pack generation cannot alias old image");
+    restore_presentation_invalidate();
+    check(hd_gl_find(image.cache_key,image.generation)<0,"external reconfiguration still clears images");
     printf("checks=%d failures=%d\n",checks,failures);
     gl_renderer_shutdown();SDL_DestroyWindow(win);SDL_Quit();return failures?1:0;
 }

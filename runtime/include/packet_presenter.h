@@ -10,6 +10,8 @@ extern "C" {
  * the current endpoint. Neither callback may execute guest code. */
 typedef void (*PacketPresenterDraw)(const FramePacketView *, double);
 void packet_presenter_reset(void);
+/* Optional render-owner trace: event 0=tick, 1=prepare, 2=draw, 3=arrival, 4=restage. */
+void packet_presenter_trace(unsigned event,uint64_t begin,uint64_t end);
 /* Render-owner bounded delivery buffer, before any pair/metadata preparation.
  * prepare receives the mapped deadline, not wall-clock arrival. */
 typedef void (*PacketPresenterPrepare)(const FramePacketView *,uint64_t);

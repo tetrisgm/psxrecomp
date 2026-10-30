@@ -38,8 +38,8 @@ static void surface_pool_clear_invalid(GlRasterSurface *surface) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);surface->invalid=0;
 }
 /* Call after flushing batches. Retain any front/back target handles still
- * used by the caller; otherwise allocations without canonical owners can
- * be deleted immediately (GL retains pending command references). */
+ * used by the caller. Unowned allocations survive a short reuse horizon;
+ * GL retains pending command references when obsolete storage is deleted. */
 static void surface_pool_collect(GlSurfacePool *pool,const unsigned *keep,size_t keep_count) {
     for(size_t i=1;i<pool->count;++i) {
         GlRasterSurface *s=pool->surfaces[i];
@@ -47,8 +47,8 @@ static void surface_pool_collect(GlSurfacePool *pool,const unsigned *keep,size_t
         int used=0;
         for(size_t j=0;j<keep_count;++j)used|=keep[j]==i;
         for(size_t j=0;j<pool->coverage.count && !used;++j)used=pool->coverage.rects[j].owner==i;
-        // Retain recently used allocations across the eight-packet delivery
-        // horizon. Obsolete bounds still retire automatically.
+        // Retain allocations for eight render retirements so alternating
+        // targets survive sequence gaps. Obsolete bounds still retire.
         if(used || pool->use_clock-s->last_use<=8)continue;
         p_glDeleteFramebuffers(1,&s->fbo);p_glDeleteRenderbuffers(1,&s->rb);glDeleteTextures(1,&s->tex);
         free(s);pool->surfaces[i]=NULL;

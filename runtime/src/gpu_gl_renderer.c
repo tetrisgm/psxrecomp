@@ -9718,7 +9718,12 @@ static void restore_presentation_invalidate(void) {
     DEPTH_REQUEST_CLEAR(DCLR_CONFIG);
     s_depth_used=0;s_depth_last_avg=0;
     if(s_snap)pgxp_snap_reset(s_snap);
-    gl_renderer_clear_hd_texture_cache();
+    // Packet restaging changes native residency, not immutable replacement
+    // image content. Cache keys include pack generation; preserve those GL
+    // images across skipped/rewound packets instead of re-uploading them.
+    const char *retain=getenv("PSX_PACKET_HD_CACHE");
+    if(!s_rth_packet_replaying || (retain && *retain=='0'))
+        gl_renderer_clear_hd_texture_cache();
     hold_invalidate();interp_reset_history();
 }
 
@@ -18027,7 +18032,9 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     sw_native_texture_load(&seed->cache);
     if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
     if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence>s_rth_packet_last_sequence+1) {
+        const uint64_t restage_begin=rt_now_ns();
         gl_renderer_restage_vram_after_savestate();fg_invalidate();
+        packet_presenter_trace(4,restage_begin,rt_now_ns());
     }
     rth_frame_state_apply(&seed->draw);
     const uint8_t *records=packet->records;
@@ -18051,6 +18058,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     packet_timer_end();
     surface_pool_retire_unused();
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
+    packet_presenter_trace(2,draw_begin,rt_now_ns());
     atomic_fetch_add(&s_packet_draw_ns,rt_now_ns()-draw_begin);
 }
 static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled) {
@@ -18073,6 +18081,7 @@ static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled)
         }
         s_packet_collect=0;packet_interpolation_stream_end();
     }
+    packet_presenter_trace(1,prepare_begin,rt_now_ns());
     atomic_fetch_add(&s_packet_prepare_ns,rt_now_ns()-prepare_begin);
     // Held-display VBlanks do not publish a new geometry endpoint. Presenting
     // their native endpoint between samples would jump forward then backward.
