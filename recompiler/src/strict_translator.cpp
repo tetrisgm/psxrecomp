@@ -1348,13 +1348,13 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
         // Faithful GTE: any COP2 register access stalls to the pending command
         // completion deadline (gte_execute arms it). Cost-free unless in flight.
         const std::string gte_stall =
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall_compiled(cpu);\n#endif\n    ";
         // MFC2/CFC2 (GPR-dest reads): stall to the GTE deadline AND hand the stall
         // amount to the next instruction(s) as a load-delay give-back (Beetle
         // MFC2/CFC2: LDAbsorb=gte_ts_done-ts, LDWhich=rt). §1+DO_LDS ran in the
         // function's per-instruction psx_cyc_step (COP2 is non-load).
         const std::string gte_read = fmt::format(
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", static_cast<int>(rt));
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read_compiled(cpu, {});\n#endif\n    ", static_cast<int>(rt));
 
         if (cop_op == 0x00) { // MFC2 — move from COP2 data register
             r.supported = true;
@@ -1434,7 +1434,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
         r.supported = true;
         // Faithful GTE: COP2 reg write stalls to the command deadline.
         const std::string gte_stall =
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall_compiled(cpu);\n#endif\n    ";
         // §1+DO_LDS charged by full_function_emitter's psx_cyc_step (op 0x32 is
         // non-load); the GTE deadline stall by psx_gte_stall; psx_cyc_lwc2_read does
         // the ReadMemory timing (completion +1, no LDWhich arm — dest is a GTE reg).
@@ -1468,7 +1468,7 @@ TranslateResult StrictTranslator::translate_impl(const PSXRecomp::DecodedInstruc
         r.supported = true;
         // Faithful GTE: COP2 reg read stalls to the command deadline.
         const std::string gte_stall =
-            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall_compiled(cpu);\n#endif\n    ";
         std::string value = PSXRecompGTERegisters::data_read_needs_helper(rt)
             ? fmt::format("gte_read_data(cpu, {})", static_cast<int>(rt))
             : fmt::format("cpu->gte_data[{}]", static_cast<int>(rt));

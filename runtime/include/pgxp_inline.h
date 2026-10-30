@@ -291,31 +291,13 @@ PGXP_INLINE void pgxp_inline_half_snapshot(PGXPValue *out, uint32_t reg) {
         out->x16=out->y16=0; out->z=out->flags=0; out->value=out->gen=0;
     }
 }
-/* Precision-bearing bitwise propagation has no instruction-specific arithmetic.
- * Share its precision decision tree instead of cloning it at every guest OR/AND.
- * Snapshot the small consumed fields here, before an aliased destination resets. */
-#if defined(_MSC_VER)
-static __declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-static __attribute__((noinline))
-#else
-static
+#ifdef __cplusplus
+extern "C" {
 #endif
-void pgxp_compiled_bitwise(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2) {
-    uint32_t op = instr >> 26;
-    uint32_t rs = (instr >> 21) & 31u, rt = (instr >> 16) & 31u;
-    uint32_t dst = op ? rt : ((instr >> 11) & 31u);
-        PGXPValue a, b;
-        pgxp_inline_half_snapshot(&a, rs);
-        if (!op) pgxp_inline_half_snapshot(&b, rt);
-        PGXPValue *d = &g_pgxp_cpu.gpr[dst];
-        pgxp_inline_alu_bitwise(d, &a, s1, op ? NULL : &b, s2, result);
-        if (op == 0xd && !(d->flags & PGXP_F_VX) && !(s1 & 0xffffu)) {
-            d->x16 = (int32_t)((instr & 0xffffu) << 16); d->flags |= PGXP_F_VX;
-        }
-        if (g_pgxp_cpu.cpu_mode) g_pgxp_cpu.scalar[dst].gen = 0;
-        return;
+void pgxp_compiled_bitwise(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2);
+#ifdef __cplusplus
 }
+#endif
 PGXP_INLINE void psx_pgxp_alu_inline(struct CPUState *cpu, uint32_t instr,
                                      uint32_t result, uint32_t s1, uint32_t s2) {
     if (!PGXP_LIKELY(g_pgxp_cpu.active)) return;

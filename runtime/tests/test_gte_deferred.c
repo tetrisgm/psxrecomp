@@ -4,6 +4,8 @@
 #include <stdio.h>
 int g_ls_replay_active = 0;
 int g_ls_mode = 0;
+int g_debug_cycle_hooks = 0;
+volatile int g_ds_recording = 0;
 int g_precise_mode = 0;
 int g_psx_call_bail = 0;
 int g_boot_state_cpu_timing_restored = 0; /* no restored boot state in this fixture */
@@ -109,6 +111,24 @@ int main(void) {
   CHECK(psx_cycle_count==1000+elapsed+stall);
   CHECK(cpu.ld_absorb==(read?stall:19) && cpu.ld_which_t==(read?7:32));
   CHECK(cpu.read_absorb[5].value==11 && g_psx_cyc_batch==0 && local==0);
+ }
+ /* Compare the compiled proof path with the publishing reference, including
+  * pending raw work, expired/in-flight deadlines, reads and conservative scale. */
+ for(unsigned lead=0;lead<=80;lead++)for(unsigned raw=0;raw<=64;raw++)
+ for(unsigned read=0;read<2;read++)for(unsigned scale=1;scale<=2;scale++) {
+  CPUState a={0},b; a.gte_ts_done=1000+lead;a.ld_absorb=19;a.ld_which_t=32;
+  a.read_absorb_which=5;a.read_absorb[5].value=11;b=a;
+  reset(0,7,0);psx_guest_cycle_scale_set(scale);g_psx_gcs_frac=0;psx_next_service_cycle=UINT64_MAX;
+  psx_cyc_block_begin(512);psx_cyc_charge(raw);
+  if(read)psx_gte_read(&a,7);else psx_gte_stall(&a);
+  psx_cyc_batch_flush();uint64_t at=psx_cycle_count;uint32_t frac=g_psx_gcs_frac;
+  reset(0,7,0);psx_guest_cycle_scale_set(scale);g_psx_gcs_frac=0;psx_next_service_cycle=UINT64_MAX;
+  psx_cyc_block_begin(512);psx_cyc_charge(raw);
+  if(read)psx_gte_read_compiled(&b,7);else psx_gte_stall_compiled(&b);
+  if(scale==1 && lead<=7+raw) CHECK(g_psx_cyc_block_active);
+  psx_cyc_batch_flush();
+  if (psx_cycle_count!=at || g_psx_gcs_frac!=frac || memcmp(&a,&b,sizeof a)) printf("lead=%u raw=%u read=%u scale=%u clock=%llu/%llu frac=%u/%u absorb=%u/%u\n",lead,raw,read,scale,(unsigned long long)psx_cycle_count,(unsigned long long)at,g_psx_gcs_frac,frac,b.ld_absorb,a.ld_absorb);
+  CHECK(psx_cycle_count==at && g_psx_gcs_frac==frac && !memcmp(&a,&b,sizeof a));
  }
  printf("PASS %u production GTE pending-charge/deadline checks\n",checks);return 0;
 }

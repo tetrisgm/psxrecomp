@@ -318,3 +318,21 @@ triangles on234complete frames. Supervisor fresh slot11:59.94harness/60.007
 cadence,0starved/packet allocations,max26.857ms,CPU16359.375/1803=9.073ms.
 Worst pacing0.0005ms/native completion0.0779ms. Improvement, not a20ms pass.
 Receipt: analysis/guest-execution-interval-layout.{json,txt}.
+
+Third completed interval candidate: compiled completed-GTE accesses retain an
+admitted block when there is no possible device event and no live GTE stall;
+all conservative/scaled/in-flight cases retain the publishing reference path.
+Direct memory timing uses the same proof; LWC2 static bound now includes its
+load latency.101921 GTE comparisons at O0/O2 and30000 load cases pass. The PGXP
+shared helper now has one runtime definition (fixes unused O0 COFF linkage).
+Opt-in QueryThreadCycleTime supplements quantized GetThreadTimes telemetry.
+
+Build,13 focused framework/22 permitted R4/3 emitter tests,native/stamp and
+40-step zero-miss smoke pass.480 exact fingerprints/581634 PGXP triangles on
+236 complete frames. Fresh slot11:60.00harness/60.006cadence,0starved/packet
+allocations,max25.822ms,CPU15312.5/1802=8.498ms. Worst interval114888694thread
+CPU cycles,0.0003ms pacing,0.0568ms native completion. Whole-window70897992312
+thread cycles/15312.5ms CPU gives4.630Mcycles/ms as an aggregate diagnostic;
+not a fixed-frequency guarantee. Remaining maxima are predominantly executing
+guest work rather than waiting on native completion. Target still not met.
+Receipt: analysis/guest-execution-interval-gte.{json,txt}.

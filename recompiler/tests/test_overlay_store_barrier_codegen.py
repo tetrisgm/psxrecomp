@@ -123,7 +123,7 @@ def main():
 
     # The SWC2-specific precision shadow must remain after the real write, with
     # the GTE completion stall and cycle publication ahead of both.
-    if not ordered(source, "psx_gte_stall(cpu);", "psx_store_cycle_barrier();",
+    if not ordered(source, "psx_gte_stall_compiled(cpu);", "psx_store_cycle_barrier();",
                    "psx_mem_write_word(cpu,", "gte_precision_store_word("):
         failures.append("SWC2 stall/barrier/write/precision ordering is wrong")
 

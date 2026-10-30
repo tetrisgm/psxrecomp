@@ -14,7 +14,7 @@ inline bool enabled() {
 // publish first, so their additional latency cannot escape this bound.
 inline uint32_t bound(uint32_t w) {
     const uint32_t op = w >> 26;
-    return (op >= 0x20 && op <= 0x26) ? 8u : 1u;
+    return (op >= 0x20 && op <= 0x26) ? 8u : op == 0x32 ? 7u : 1u;
 }
 inline bool pure(uint32_t w) {
     uint32_t op = w >> 26, fn = w & 63u;
