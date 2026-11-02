@@ -12958,6 +12958,9 @@ static void wide_blit_center(GLuint wide_fbo, int base_x, int disp_y, int disp_h
  * disp_y+disp_h] region into the letterbox, V-flipped like present_vram (FBO y
  * bottom-origin → window top). Returns 0 if there's no wide surface for base_x
  * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
+/* Set by a packet-gap restage; consumed by the next wide present. */
+static int s_packet_gap_restaged;
+static uint64_t s_packet_gap_holds;
 static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear) {
     if (rth_record_mode()) {
         /* Surface existence is decided by the owner after replay. A missing
@@ -12970,6 +12973,15 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
     GLuint fbo = 0, tex = 0;
     int wide_as = 0,source_y=disp_y,source_h=VRAM_H;
+    if(s_region_pool.coverage.rects && s_packet_gap_restaged) {
+        /* A dropped packet drew this buffer; the gap restage left only its
+         * native pixels. Keep the last enhanced image for this one present
+         * instead of showing a 1x canonical frame between wide frames. */
+        const GlRasterSurface *shown=surface_pool_display_peek(&s_region_pool,disp_x,disp_y,
+            disp_h,g_wide_w,g_wide_off,view_shift,s_out_scale);
+        s_packet_gap_restaged=0;
+        if(shown && shown->invalid) { ++s_packet_gap_holds; return 1; }
+    }
     if(s_region_pool.coverage.rects) {
         flush_flat_batch();flush_tex_batch();flush_cpu_upload();
         GlRasterSurface *surface=surface_pool_display(&s_region_pool,disp_x,disp_y,
@@ -18090,6 +18102,8 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
         const uint64_t restage_begin=rt_now_ns();
         packet_timer_restage_begin();
         gl_renderer_restage_vram_after_savestate();fg_invalidate();
+        /* A new epoch (load, rewind) must show its restored image. */
+        s_packet_gap_restaged=packet->epoch==s_rth_packet_last_epoch;
         packet_timer_restage_end();
         packet_presenter_trace(4,restage_begin,rt_now_ns());
     }
@@ -18320,10 +18334,10 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
         (unsigned long long)atomic_load(&s_pack_native_uploads),
         (unsigned long long)atomic_load(&s_pack_native_bytes));
     if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
-        "\"packet_cpu\":{\"prepare_ns\":%llu,\"draw_ns\":%llu,\"draws\":%llu,\"snaps\":%llu,\"no_present\":%llu,\"native_raster_requests\":%llu,\"producer_geometry\":%llu},",
+        "\"packet_cpu\":{\"prepare_ns\":%llu,\"draw_ns\":%llu,\"draws\":%llu,\"snaps\":%llu,\"no_present\":%llu,\"native_raster_requests\":%llu,\"producer_geometry\":%llu,\"gap_holds\":%llu},",
         (unsigned long long)atomic_load(&s_packet_prepare_ns),(unsigned long long)atomic_load(&s_packet_draw_ns),
         (unsigned long long)atomic_load(&s_packet_draw_count),(unsigned long long)atomic_load(&s_packet_snap_count),
-        (unsigned long long)atomic_load(&s_packet_no_present),(unsigned long long)atomic_load(&s_packet_native_raster_requests),(unsigned long long)atomic_load(&s_packet_produced_geometry));
+        (unsigned long long)atomic_load(&s_packet_no_present),(unsigned long long)atomic_load(&s_packet_native_raster_requests),(unsigned long long)atomic_load(&s_packet_produced_geometry),(unsigned long long)s_packet_gap_holds);
     if(s_op_profile==1 && k>0 && (size_t)k<cap) {
         k+=snprintf(out+k,cap-(size_t)k,"\"ops\":[");
         for(unsigned op=1;op<RTH_GROUP && k>0 && (size_t)k<cap;++op)

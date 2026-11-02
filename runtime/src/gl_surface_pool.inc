@@ -169,6 +169,18 @@ static unsigned surface_pool_acquire(GlSurfacePool *pool,
     if(!assigned)return 0;
     return owner;
 }
+/* The display allocation surface_pool_display would select, without
+ * acquiring, seeding or claiming coverage; NULL when none exists. */
+static GlRasterSurface *surface_pool_display_peek(GlSurfacePool *pool,
+    int base_x,int y,int h,int output_w,int offset,int shift,int scale) {
+    const int origin=base_x-offset-shift;
+    for(size_t i=1;i<pool->count;++i) {
+        GlRasterSurface *s=pool->surfaces[i];
+        if(s && s->x==origin && s->y==y && s->w==output_w && s->h==h && s->allocation_scale==scale)
+            return s;
+    }
+    return NULL;
+}
 /* Display bands have independent allocations even when vertical buffering
  * reuses the same X coordinate. View shifts move the physical coordinate
  * range; only its intersection with guest framebuffer pixels owns VRAM. */
