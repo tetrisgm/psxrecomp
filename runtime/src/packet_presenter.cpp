@@ -15,7 +15,7 @@ FramePacketLease *previous=nullptr;
 std::atomic<int> requested_sample{-1};
 std::atomic<unsigned> sampled_requests{0};
 #endif
-uint64_t start=0,period=0,index=0,last_sequence=0,last_epoch=0,last_guest=0,display_origin=0;
+uint64_t start=0,period=0,display_index=0,last_sequence=0,last_epoch=0,last_guest=0,display_origin=0;
 
 unsigned rate=0;
 std::atomic<uint64_t> submitted{0},generated{0},endpoints{0};
@@ -32,7 +32,7 @@ extern "C" void packet_presenter_trace(unsigned event,uint64_t begin,uint64_t en
     if(file)std::fprintf(file,"%u,%llu,%llu,%llu,%llu,%llu,%llu,%d\n",event,
         (unsigned long long)begin,(unsigned long long)end,(unsigned long long)last_sequence,
         (unsigned long long)period,(unsigned long long)start,
-        (unsigned long long)(rate?packet_interpolation_deadline(display_origin,index,rate,1):0),
+        (unsigned long long)(rate?packet_interpolation_deadline(display_origin,display_index,rate,1):0),
         packet_interpolation_stream_snapped());
 #else
     (void)event;(void)begin;(void)end;
@@ -44,7 +44,7 @@ extern "C" void packet_presenter_reset(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
     requested_sample.store(-1);
 #endif
-    start=period=index=last_sequence=last_epoch=last_guest=display_origin=last_motion=0;rate=0;
+    start=period=display_index=last_sequence=last_epoch=last_guest=display_origin=last_motion=0;rate=0;
 }
 extern "C" int packet_presenter_submit(const FramePacketView *packet,uint64_t now,
     double guest_hz,PacketPresenterDraw draw) {
@@ -66,7 +66,7 @@ extern "C" int packet_presenter_submit(const FramePacketView *packet,uint64_t no
     last_sequence=packet->sequence;last_epoch=packet->epoch;last_guest=packet->guest_time_ns;
     start=now;rate=hz;interval_ms.store(period/1e6);
     if(!continuous) {
-        display_origin=now;index=1;
+        display_origin=now;display_index=1;
         draw(frame_packet_lease_view(current),1.0);
     }
     ++submitted;
@@ -83,7 +83,7 @@ extern "C" uint64_t packet_presenter_tick(uint64_t now,PacketPresenterDraw draw)
     }
 #endif
     if(!current || !period || !draw || !packet_interpolation_rate()) return 0;
-    const uint64_t due=packet_interpolation_deadline(display_origin,index,rate,1);
+    const uint64_t due=packet_interpolation_deadline(display_origin,display_index,rate,1);
     if(now<due) return due;
     double t=now<=start?0.0:std::min(1.0,double(now-start)/double(period));
     // Cadence changes or replaced packets must never move displayed guest
@@ -104,10 +104,10 @@ extern "C" uint64_t packet_presenter_tick(uint64_t now,PacketPresenterDraw draw)
     last_motion=motion;
     if(t<1) ++generated;else ++endpoints;
     // Skip missed display deadlines: presentation never builds a backlog.
-    index=std::max(index+1,uint64_t(double(now-display_origin)*rate/1e9)+1);
-    if(packet_interpolation_deadline(display_origin,index,rate,1)<=now)++index;
+    display_index=std::max(display_index+1,uint64_t(double(now-display_origin)*rate/1e9)+1);
+    if(packet_interpolation_deadline(display_origin,display_index,rate,1)<=now)++display_index;
     if(t==1) {period=0;return 0;}
-    return packet_interpolation_deadline(display_origin,index,rate,1);
+    return packet_interpolation_deadline(display_origin,display_index,rate,1);
 }
 
 extern "C" int packet_presenter_json(char *out,size_t bytes) {
