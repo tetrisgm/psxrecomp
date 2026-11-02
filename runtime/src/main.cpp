@@ -12605,6 +12605,12 @@ session_reboot:
      * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
      * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+    /* HIDAPI's Steam Controller sub-driver is also OFF by default. Without it a
+     * Steam Controller is only usable when Steam Input wraps it as a virtual Xbox
+     * pad (game launched from Steam); launched directly it would fall back to
+     * its keyboard/mouse lizard mode. Enable it so both paths work. Under Steam
+     * Input, Steam hides the physical device from the game, so no duplicate. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1");
     if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
             std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
