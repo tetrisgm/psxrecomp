@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Execute the production host-pause presenter before and after a held frame."""
+"""Execute the production host-pause presenter before and after a held frame.
+
+Each GL pause present must also close the render-thread frame: presents are
+records in the open guest frame, which a paused guest never closes, so without
+the boundary the menu (whose draw consumes its input) never reaches the screen.
+"""
 import argparse
 from pathlib import Path
 import subprocess
@@ -12,12 +17,13 @@ PRELUDE = r"""
 int g_gl_active, g_vk_active, s_sw_hold_valid;
 void *sdl_renderer, *sdl_texture;
 int s_sw_hold_src, s_sw_hold_dst;
-static int held, holds, blanks, vk_blanks, ticks, suspended;
+static int held, holds, blanks, vk_blanks, ticks, suspended, boundaries;
 uint32_t SDL_GetTicks() { return 7; }
 void psx_rewind_present_tick(uint32_t t) { ticks += t == 7; }
 void gl_renderer_set_interpolation_suspended(int x) { suspended = x; }
 int gl_renderer_present_hold_last() { ++holds; return held; }
 void gl_renderer_present_blank() { ++blanks; }
+void gl_renderer_render_thread_frame_boundary() { ++boundaries; }
 void vk_renderer_present_blank() { ++vk_blanks; }
 void SDL_SetRenderDrawColor(void*,int,int,int,int) {}
 void SDL_RenderClear(void*) {}
@@ -33,11 +39,14 @@ int main() {
     if (holds != 1 || blanks != 1 || ticks != 1 || !suspended) {
         fprintf(stderr, "No held frame: menu draw must still get a blank present\n"); return 1;
     }
+    if (boundaries != 1) {
+        fprintf(stderr, "Pause present must close the render-thread frame\n"); return 4;
+    }
     held = 1; rewind_pause_present();
-    if (holds != 2 || blanks != 1 || ticks != 2) return 2;
+    if (holds != 2 || blanks != 1 || ticks != 2 || boundaries != 2) return 2;
     g_gl_active = 0; g_vk_active = 1; rewind_pause_present();
-    if (holds != 2 || blanks != 1 || vk_blanks != 1) return 3;
-    puts("host pause: first-frame fallback and existing held-frame path PASS");
+    if (holds != 2 || blanks != 1 || vk_blanks != 1 || boundaries != 2) return 3;
+    puts("host pause: first-frame fallback, held-frame path and frame close PASS");
     return 0;
 }
 """
@@ -50,9 +59,11 @@ def main():
     old=fixed.replace('if (!gl_renderer_present_hold_last()) gl_renderer_present_blank();',
                       '(void)gl_renderer_present_hold_last();')
     assert old != fixed
+    unclosed=fixed.replace('gl_renderer_render_thread_frame_boundary();','')
+    assert unclosed != fixed
     with tempfile.TemporaryDirectory() as folder:
         p=Path(folder)
-        for label,code in [('fixed',fixed),('before',old)]:
+        for label,code in [('fixed',fixed),('before',old),('unclosed',unclosed)]:
             cpp=p/(label+'.cpp');exe=p/(label+'.exe')
             cpp.write_text(PRELUDE+code+CHECKS,encoding='utf-8')
             subprocess.run([args.cxx,'-std=c++17',str(cpp),'-o',str(exe)],check=True)
@@ -60,8 +71,11 @@ def main():
             if label=='fixed':
                 assert r.returncode==0,r.stdout+r.stderr
                 print(r.stdout.strip())
-            else:
+            elif label=='before':
                 assert r.returncode==1,'Regression must reject the old missing fallback'
                 print('pre-fix presenter: regression rejects missing first-frame draw')
+            else:
+                assert r.returncode==4,'Regression must reject a pause present left in an open frame'
+                print('unclosed presenter: regression rejects a pause present that never leaves the frame')
 
 if __name__=='__main__':main()

@@ -8833,6 +8833,11 @@ static void rewind_pause_present(void) {
          * callback a blank host frame when no held frame exists, or input
          * handled during draw (including Resume) can never release pause. */
         if (!gl_renderer_present_hold_last()) gl_renderer_present_blank();
+        /* With the render thread, presents are records in the open guest
+         * frame, and a paused guest never closes it: close it here, as the
+         * rewind service does, so the held frame and its overlay (the menu,
+         * whose draw also consumes its input) reach the screen. */
+        gl_renderer_render_thread_frame_boundary();
     } else if (g_vk_active) {
         vk_renderer_present_blank();
     } else if (sdl_renderer) {

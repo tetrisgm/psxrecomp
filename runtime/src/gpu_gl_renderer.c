@@ -17988,7 +17988,8 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
            command->op==RTH_FLAT_TRI || command->op==RTH_GOURAUD_TRI || command->op==RTH_TEX_TRI ||
            command->op==RTH_SHADED_TEX_TRI || command->op==RTH_PROJ_TRI || command->op==RTH_LINE ||
            command->op==RTH_SHADED_LINE || command->op==RTH_FILL ||
-           command->op==RTH_PRESENT_CPU || command->op==RTH_PRESENT_BLANK) s_packet_content=1;
+           command->op==RTH_PRESENT_CPU || command->op==RTH_PRESENT_BLANK ||
+           command->op==RTH_PRESENT_HOLD) s_packet_content=1;
         return 1;
     }
     if(s_packet_retiring) {
