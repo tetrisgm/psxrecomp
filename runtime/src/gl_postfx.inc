@@ -236,12 +236,22 @@ static GLuint pfx_build_pass(const PfxPass *ps) {
     return prog;
 }
 
+/* Region-pool surfaces (retained presentation surfaces) present the wide
+ * image too; they carry their own depth-stencil and allocation scale. */
+static const GlRasterSurface *pfx_pool_surface(GLuint fbo) {
+    for (size_t i = 1; fbo && i < s_region_pool.count; i++)
+        if (s_region_pool.surfaces[i] && s_region_pool.surfaces[i]->fbo == fbo)
+            return s_region_pool.surfaces[i];
+    return NULL;
+}
 /* The depth-stencil renderbuffer of a presentable surface (0: unknown). */
 static GLuint pfx_surface_rb(GLuint fbo) {
     if (fbo == s_hr_fbo) return s_hr_rb;
     for (int i = 0; i < s_hiw_n; i++) if (s_hiw_t[i].fbo == fbo) return s_hiw_t[i].rb;
     const int wi = wide_index(fbo);
-    return wi >= 0 ? s_wide_rb[wi] : 0;
+    if (wi >= 0) return s_wide_rb[wi];
+    const GlRasterSurface *ps = pfx_pool_surface(fbo);
+    return ps ? ps->rb : 0;
 }
 /* A displayed rect of a surface in that surface's px (y0 = top row). */
 static void pfx_rect_px(GLuint fbo, GLuint tex, float tex_w, float tex_h, int x, int y, int w, int h, int out[4],
@@ -257,7 +267,12 @@ static void pfx_rect_px(GLuint fbo, GLuint tex, float tex_w, float tex_h, int x,
         known_dims = !e || *e != '0';
     }
     if (known_dims) {
-        if (fbo == s_hr_fbo && tex == s_hr_tex && s_hr_alloc > 0) {
+        /* Region-pool surfaces first: s_hr_fbo can name one of them, and its
+         * allocation is that surface, not the whole of VRAM. */
+        const GlRasterSurface *ps = pfx_pool_surface(fbo);
+        if (ps && tex == ps->tex && ps->allocation_scale > 0) {
+            tw = ps->w * ps->allocation_scale; th = ps->h * ps->allocation_scale;
+        } else if (fbo == s_hr_fbo && tex == s_hr_tex && s_hr_alloc > 0) {
             tw = VRAM_W * s_hr_alloc; th = VRAM_H * s_hr_alloc;
         } else {
             for (int i = 0; i < s_hiw_n; i++) {
