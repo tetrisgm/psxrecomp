@@ -136,6 +136,51 @@ struct Stream {
     std::unordered_map<uint64_t,std::unordered_map<uint64_t,std::vector<std::array<int16_t,3>>>> ordinals;
     std::unordered_map<uint64_t,std::vector<uint64_t>> model_invocations;
     std::unordered_set<uint32_t> staging_addresses;
+    // Instance identity across packets: an instance keeps the ordinal of the
+    // previous packet's instance at the same origin whose object translation
+    // is nearest, so culling or adding one billboard does not renumber the
+    // ones drawn after it. Keyed per identity base (source or model).
+    struct Instance { uint64_t ordinal; std::array<double,3> tr; bool valid; };
+    std::unordered_map<uint64_t,std::vector<Instance>> prev_instances,cur_instances;
+    std::unordered_map<uint64_t,std::unordered_map<uint64_t,uint64_t>> instance_ordinals;
+    std::array<double,3> record_tr{};bool record_tr_valid=false;
+    uint64_t instance_ordinal(uint64_t base,uint64_t transform,size_t fallback,bool record) {
+        auto& map=instance_ordinals[base];
+        auto found=map.find(transform);
+        if(found!=map.end()) return found->second;
+        if(!record) return 0;
+        auto& cur=cur_instances[base];
+        uint64_t ordinal=0;
+        if(record_tr_valid) {
+            const auto prev=prev_instances.find(base);
+            if(prev!=prev_instances.end()) {
+                double best=1e300;
+                for(const auto& candidate:prev->second) {
+                    if(!candidate.valid) continue;
+                    bool taken=false;
+                    for(const auto& used:cur) taken|=used.ordinal==candidate.ordinal;
+                    if(taken) continue;
+                    double d=0,n=0;
+                    for(unsigned k=0;k<3;++k) {
+                        d+=(candidate.tr[k]-record_tr[k])*(candidate.tr[k]-record_tr[k]);
+                        n+=record_tr[k]*record_tr[k];
+                    }
+                    // Per-packet object motion is a small fraction of its distance.
+                    if(d<best && d<std::max(64.0*64.0,0.04*n)) {best=d;ordinal=candidate.ordinal;}
+                }
+            }
+        }
+        if(!ordinal) {
+            uint64_t next=1u<<20;   // fresh ordinals never collide with matched ones
+            const auto prev=prev_instances.find(base);
+            if(prev!=prev_instances.end()) for(const auto& i:prev->second) next=std::max(next,i.ordinal+1);
+            for(const auto& i:cur) next=std::max(next,i.ordinal+1);
+            ordinal=record_tr_valid?next:(uint64_t(1)<<40)+fallback;
+        }
+        map[transform]=ordinal;
+        cur.push_back({ordinal,record_tr,record_tr_valid});
+        return ordinal;
+    }
     bool source_mode=false;
     uint64_t missing=0;
     bool failed=false;
@@ -174,7 +219,8 @@ FramePrimitiveIdentity model_identity(const PGXPProjection& v,bool record) {
         if(!record) return {};
         instances.push_back(v.transform);at=instances.end()-1;
     }
-    return {base,uint64_t(at-instances.begin())+1};
+    const uint64_t ordinal=stream.instance_ordinal(hash(base,1u),v.transform,size_t(at-instances.begin()),record);
+    return ordinal?FramePrimitiveIdentity{base,ordinal}:FramePrimitiveIdentity{};
 }
 FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
     uint64_t base=14695981039346656037ULL;
@@ -203,10 +249,12 @@ FramePrimitiveIdentity source_identity(const PGXPProjection& v,bool record) {
     // Real vertex addresses retain identity through animation; shared staging
     // addresses use the model-space point and reconstruct missing points from
     // the preceding whole invocation's matrix.
+    const uint64_t ordinal=stream.instance_ordinal(base,v.transform,size_t(at-instances.begin()),record);
+    if(!ordinal) return {};
     if(!record && stream.staging_addresses.count(v.source_vertex)) {
         for(int16_t coordinate:model) base=hash(base,uint16_t(coordinate));
     }
-    return {base,uint64_t(at-instances.begin())+1};
+    return {base,ordinal};
 }
 }
 extern "C" void packet_interpolation_transform(const PGXPProjection *p,const PGXPAffineTransform *affine) {
@@ -327,8 +375,11 @@ static void stream_end_impl(void) {
         for(const auto& source:stream.sources) for(const auto& p:source.projection)
             if(p.interpolation_valid) groups.insert(p.transform);
         stream.transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();
+        stream.instance_ordinals.clear();stream.cur_instances.clear();
         stream.each_history([&](const auto& raw) {
             if(!groups.count(raw.projection.transform)) return;
+            stream.record_tr_valid=raw.valid;
+            for(unsigned k=0;k<3;++k) stream.record_tr[k]=raw.affine.translation[k];
             (void)source_identity(raw.projection,true);
             (void)model_identity(raw.projection,true);
         });
@@ -434,6 +485,7 @@ static void stream_end_impl(void) {
             }
         }
     }
+    if(!stream.cur_instances.empty()) {stream.prev_instances.swap(stream.cur_instances);stream.cur_instances.clear();}
     stream.old_transforms.swap(stream.transforms);
     stream.transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();stream.source_mode=false;
     stream.older.swap(stream.current);stream.old_sources.swap(stream.sources);
@@ -451,6 +503,7 @@ extern "C" void packet_interpolation_stream_reset(void) {
     stream.clear_blocks();
     stream.union_geometry.clear();stream.retiring_indices.clear();stream.retiring_endpoints.clear();
     stream.staging_addresses.clear();
+    stream.prev_instances.clear();stream.cur_instances.clear();stream.instance_ordinals.clear();
     stream.transforms.clear();stream.old_transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();stream.history.clear();
     stream.old_sources.clear();stream.sources.clear();
     stream.older.clear();stream.current.clear();stream.old_epoch=stream.old_sequence=0;
