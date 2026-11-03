@@ -206,6 +206,19 @@ static void test_video(void) {
     b.renderer = 0;
     CHECK(psx_host_video_restart_bits(&a, &b) & PSX_VIDEO_RESTART_RENDERER);
     CHECK(psx_host_video_live_changes(NULL, &b) == 0 && psx_host_video_restart_bits(&a, NULL) == 0);
+    /* Image and PGXP renderer rows: live, never a relaunch. */
+    {
+        PsxHostVideoSettings c = a;
+        c.bloom = 1; c.anisotropic_filtering = 16;
+        CHECK(psx_host_video_live_changes(&a, &c) == PSX_VIDEO_LIVE_IMAGE);
+        c = a; c.texture_lod = 1; c.dithering = 2;
+        CHECK(psx_host_video_live_changes(&a, &c) == PSX_VIDEO_LIVE_IMAGE);
+        c = a; c.pgxp_depth_buffer = 1;
+        CHECK(psx_host_video_live_changes(&a, &c) == PSX_VIDEO_LIVE_PGXP);
+        c = a; c.pgxp_color_correction = 1; c.pgxp_seam = 2;
+        CHECK(psx_host_video_live_changes(&a, &c) == PSX_VIDEO_LIVE_PGXP);
+        CHECK(psx_host_video_restart_bits(&a, &c) == 0);
+    }
 }
 
 /* One texture-filter enum for settings, handoff and menu (xBR included). */

@@ -186,6 +186,12 @@ unsigned psx_host_video_live_changes(const PsxHostVideoSettings *a,
     if (a->internal_resolution != b->internal_resolution ||
         a->supersample_milli != b->supersample_milli)
         m |= PSX_VIDEO_LIVE_RESOLUTION;
+    if (a->bloom != b->bloom || a->texture_lod != b->texture_lod ||
+        a->anisotropic_filtering != b->anisotropic_filtering || a->dithering != b->dithering)
+        m |= PSX_VIDEO_LIVE_IMAGE;
+    if (a->pgxp_depth_buffer != b->pgxp_depth_buffer ||
+        a->pgxp_color_correction != b->pgxp_color_correction || a->pgxp_seam != b->pgxp_seam)
+        m |= PSX_VIDEO_LIVE_PGXP;
     return m;
 }
 

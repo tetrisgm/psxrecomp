@@ -143,10 +143,24 @@ void mask_user_settings(PSXRecompV4::UserSettings& us,
             us.has_frame_interpolation = false;
         } else if (k == "frame_interpolation_fps") {
             us.has_frame_interpolation_fps = false;
+        } else if (k == "bloom") {
+            us.has_bloom = false;
+        } else if (k == "texture_lod") {
+            us.has_texture_lod = false;
+        } else if (k == "anisotropic_filtering") {
+            us.has_anisotropic_filtering = false;
+        } else if (k == "dithering") {
+            us.has_dithering = false;
+        } else if (k == "pgxp_depth_buffer") {
+            us.has_pgxp_depth_buffer = false;
+        } else if (k == "pgxp_color_correction") {
+            us.has_pgxp_color_correction = false;
+        } else if (k == "pgxp_seam") {
+            us.has_pgxp_seam = false;
         }
-        /* The preset-only keys (PSXRecompV4::quality_key_supported) have no
-         * settings.toml form: the preset's value already stands. Any other
-         * key is rejected when game.toml loads. */
+        /* The remaining preset-only keys (PSXRecompV4::quality_key_supported)
+         * have no settings.toml form: the preset's value already stands. Any
+         * other key is rejected when game.toml loads. */
     }
 }
 
@@ -186,6 +200,13 @@ void copy_key(PSXRecompV4::UserSettings& d, const PSXRecompV4::UserSettings& s,
     } else if (k == "perspective_texturing") { QCOPY(perspective_texturing);
     } else if (k == "frame_interpolation") { QCOPY(frame_interpolation);
     } else if (k == "frame_interpolation_fps") { QCOPY(frame_interpolation_fps);
+    } else if (k == "bloom") { QCOPY(bloom);
+    } else if (k == "texture_lod") { QCOPY(texture_lod);
+    } else if (k == "anisotropic_filtering") { QCOPY(anisotropic_filtering);
+    } else if (k == "dithering") { QCOPY(dithering);
+    } else if (k == "pgxp_depth_buffer") { QCOPY(pgxp_depth_buffer);
+    } else if (k == "pgxp_color_correction") { QCOPY(pgxp_color_correction);
+    } else if (k == "pgxp_seam") { QCOPY(pgxp_seam);
     }
 #undef QCOPY
 }
@@ -203,7 +224,14 @@ Edit live_edit(const PsxHostVideoSettings& c, const PsxHostVideoSettings& n,
             (k == "present_thread" && c.present_thread != n.present_thread) ||
             ((k == "internal_resolution" || k == "supersampling") &&
              (c.internal_resolution != n.internal_resolution ||
-              c.supersampling != n.supersampling));
+              c.supersampling != n.supersampling)) ||
+            (k == "bloom" && c.bloom != n.bloom) ||
+            (k == "texture_lod" && c.texture_lod != n.texture_lod) ||
+            (k == "anisotropic_filtering" && c.anisotropic_filtering != n.anisotropic_filtering) ||
+            (k == "dithering" && c.dithering != n.dithering) ||
+            (k == "pgxp_depth_buffer" && c.pgxp_depth_buffer != n.pgxp_depth_buffer) ||
+            (k == "pgxp_color_correction" && c.pgxp_color_correction != n.pgxp_color_correction) ||
+            (k == "pgxp_seam" && c.pgxp_seam != n.pgxp_seam);
         if (diff) return Edit::GOVERNED_EDIT;
     }
     return Edit::NONE;

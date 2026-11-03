@@ -3291,6 +3291,41 @@ UserSettings load_user_settings(const fs::path& path) {
             s.perspective_texturing = toml::find<bool>(v, "perspective_texturing");
             s.has_perspective_texturing = true;
         });
+        // Image and PGXP renderer keys (the in-game menu's live rows), in the
+        // [video] spellings so a hand edit reads the same as game.toml.
+        if (v.contains("bloom")) try_get([&]{
+            const auto& b = toml::find(v, "bloom");
+            const double f = b.is_integer() ? static_cast<double>(b.as_integer()) : toml::get<double>(b);
+            if (f >= 0.0 && f <= 2.0) { s.bloom = f; s.has_bloom = true; }
+        });
+        if (v.contains("texture_lod")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "texture_lod");
+            if (m == "off" || m == "mipmap") { s.texture_lod = m == "mipmap" ? 1 : 0; s.has_texture_lod = true; }
+        });
+        if (v.contains("anisotropic_filtering")) try_get([&]{
+            const int n = toml::find<int>(v, "anisotropic_filtering");
+            if (n >= 1 && n <= 16) { s.anisotropic_filtering = n; s.has_anisotropic_filtering = true; }
+        });
+        if (v.contains("dithering")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "dithering");
+            if (m == "off") { s.dithering = 0; s.has_dithering = true; }
+            else if (m == "on" || m == "scaled") { s.dithering = 1; s.has_dithering = true; }
+            else if (m == "fine") { s.dithering = 2; s.has_dithering = true; }
+        });
+        if (v.contains("pgxp_depth_buffer")) try_get([&]{
+            s.pgxp_depth_buffer = toml::find<bool>(v, "pgxp_depth_buffer");
+            s.has_pgxp_depth_buffer = true;
+        });
+        if (v.contains("pgxp_color_correction")) try_get([&]{
+            s.pgxp_color_correction = toml::find<bool>(v, "pgxp_color_correction");
+            s.has_pgxp_color_correction = true;
+        });
+        if (v.contains("pgxp_seam")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "pgxp_seam");
+            if (m == "off") { s.pgxp_seam = 0; s.has_pgxp_seam = true; }
+            else if (m == "fine") { s.pgxp_seam = 1; s.has_pgxp_seam = true; }
+            else if (m == "wide") { s.pgxp_seam = 2; s.has_pgxp_seam = true; }
+        });
         if (v.contains("crt_filter")) try_get([&]{
             const auto m = toml::find<std::string>(v, "crt_filter");
             if (m == "raw")            { s.screen_kind = 0; s.has_screen_kind = true; }
@@ -3712,6 +3747,20 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     if (s.has_perspective_texturing)
         f << "perspective_texturing = "
           << (s.perspective_texturing ? "true" : "false") << "\n";
+    if (s.has_bloom)
+        f << "bloom             = " << s.bloom << "\n";
+    if (s.has_texture_lod)
+        f << "texture_lod       = \"" << (s.texture_lod ? "mipmap" : "off") << "\"\n";
+    if (s.has_anisotropic_filtering)
+        f << "anisotropic_filtering = " << s.anisotropic_filtering << "\n";
+    if (s.has_dithering)
+        f << "dithering         = \"" << (s.dithering == 0 ? "off" : s.dithering == 2 ? "fine" : "on") << "\"\n";
+    if (s.has_pgxp_depth_buffer)
+        f << "pgxp_depth_buffer = " << (s.pgxp_depth_buffer ? "true" : "false") << "\n";
+    if (s.has_pgxp_color_correction)
+        f << "pgxp_color_correction = " << (s.pgxp_color_correction ? "true" : "false") << "\n";
+    if (s.has_pgxp_seam)
+        f << "pgxp_seam         = \"" << (s.pgxp_seam == 0 ? "off" : s.pgxp_seam == 2 ? "wide" : "fine") << "\"\n";
     if (s.has_screen_kind) {
         const char* k = s.screen_kind == 1 ? "crt"
                       : s.screen_kind == 2 ? "composite"

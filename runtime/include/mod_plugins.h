@@ -478,6 +478,26 @@ int psx_mod_set_option_live(const char* package_id, const char* feature_id,
 /* 1 when the committed feature's plugin registered an option-changed callback
  * (so a live set can take effect now). Read-only; any thread. */
 int psx_mod_option_live_capable(const char* package_id, const char* feature_id);
+/*
+ * Live feature switches (in-game menu). A trusted plugin whose effect can be
+ * turned on and off on a running game registers a feature-toggled callback
+ * under its plugin id; it runs in that plugin's context and returns 1 if the
+ * switch took effect now. The committed plan is untouched: the plugin stays
+ * loaded with its hooks, and decides for itself what "off" means (stock
+ * output). Plugins that patch guest code or whose state the game reads back
+ * register nothing and keep waiting for the next start.
+ *
+ * psx_mod_feature_toggle_live notifies the committed feature's plugins.
+ * Returns 1 when one applied it live; 0 when the feature has no live-capable
+ * plugin (or is not in the plan); -1 when refused (netplay). Persisting the
+ * switch stays the mod provider's job (psx_mod_feature_enable + save).
+ */
+typedef int (*PSXModFeatureToggledCallback)(int enabled);
+int psx_mod_register_feature_toggled_plugin(const char* id,
+                                            PSXModFeatureToggledCallback callback);
+int psx_mod_feature_toggle_live(const char* package_id, const char* feature_id, int enabled);
+/* 1 when the committed feature's plugin registered a feature-toggled callback. */
+int psx_mod_feature_toggle_live_capable(const char* package_id, const char* feature_id);
 /* Write the player's current selection (feature switches and option values,
  * as edited through the launcher mod provider) to mods/state.toml now,
  * without re-resolving the running plan. Main thread. 1 on success. */

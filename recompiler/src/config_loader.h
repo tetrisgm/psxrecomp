@@ -1616,6 +1616,16 @@ struct UserSettings {
     // Both default off — the faithful floor — and are player-selectable.
     bool has_geometry_correction   = false; bool geometry_correction   = false;
     bool has_perspective_texturing = false; bool perspective_texturing = false;
+    // Image and PGXP renderer keys the in-game menu changes live
+    // (RuntimeConfig::video_* of the same names, same encodings). Written
+    // only once the player changed them.
+    bool has_bloom                 = false; double bloom                = 0.0;
+    bool has_texture_lod           = false; int    texture_lod          = 0;   // 0 off, 1 mipmap
+    bool has_anisotropic_filtering = false; int    anisotropic_filtering = 1;  // 1..16
+    bool has_dithering             = false; int    dithering            = 1;   // 0 off, 1 on, 2 fine
+    bool has_pgxp_depth_buffer     = false; bool   pgxp_depth_buffer    = false;
+    bool has_pgxp_color_correction = false; bool   pgxp_color_correction = false;
+    bool has_pgxp_seam             = false; int    pgxp_seam            = 0;   // 0 off, 1 fine, 2 wide
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
     // Scanline post-process (see RuntimeConfig::video_scanlines). Strength stored
     // 0..1; the launcher ABI carries it as an integer percent.

@@ -1286,6 +1286,9 @@ static int           g_video_scale = 1;     /* internal-resolution SSAA factor *
 static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_post_aa = 0;   /* [video] antialiasing_mode / PSX_AA_MODE (GL_POST_AA_*) */
 static float         g_video_bloom = 0.0f;  /* [video] bloom (PSX_BLOOM overrides) */
+/* The strength the menu's Bloom row switches back on: the title's configured
+ * [video] bloom, or 1.0 when it configured none. */
+static float         g_video_bloom_on = 1.0f;
 static std::string   g_video_post_shader;   /* [video] post_shader (PSX_POST_SHADER overrides) */
 static int           g_video_ss_milli = 1000; /* [video] supersample / PSX_SUPERSAMPLE */
 
@@ -1783,6 +1786,7 @@ static void quality_apply_video_globals(const PSXRecompV4::RuntimeConfig& r) {
     g_frame_interpolation_fps = r.video_frame_interpolation_fps;
     /* Preset-only keys (no settings.toml form): picking a preset applies them. */
     g_video_bloom        = r.video_bloom;
+    if (g_video_bloom > 0.0f) g_video_bloom_on = g_video_bloom;
     g_video_fmv_chroma   = r.video_fmv_chroma_smoothing ? 1 : 0;
     g_video_texture_lod  = r.video_texture_lod;
     g_video_aniso        = r.video_anisotropic_filtering;
@@ -10859,6 +10863,13 @@ extern "C" void psx_video_current(PsxHostVideoSettings *v) {
     v->render_thread = g_render_thread ? 1 : 0;
     v->present_thread = g_present_thread ? 1 : 0;
     v->supersample_milli = g_video_ss_milli;
+    v->bloom = g_video_bloom > 0.0f ? 1 : 0;
+    v->texture_lod = g_video_texture_lod;
+    v->anisotropic_filtering = g_video_aniso;
+    v->dithering = g_video_dithering;
+    v->pgxp_depth_buffer = g_video_pgxp_depth_buffer ? 1 : 0;
+    v->pgxp_color_correction = g_video_pgxp_color_correction ? 1 : 0;
+    v->pgxp_seam = g_video_pgxp_seam;
     video_res_refresh_capable();
     if (!g_video_boot_valid) {
         g_video_boot = *v; g_video_boot_valid = true;
@@ -10921,6 +10932,30 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
         g_frame_generation = next->frame_generation ? 1 : 0;
         gl_renderer_set_frame_generation(g_frame_generation);
     }
+    /* Image and PGXP renderer rows: the same setters the boot path and the
+     * debug server use, so the menu shows exactly the A/B keys' states. */
+    if (m & PSX_VIDEO_LIVE_IMAGE) {
+        g_video_bloom = next->bloom ? g_video_bloom_on : 0.0f;
+        if (next->texture_lod == 0 || next->texture_lod == 1) g_video_texture_lod = next->texture_lod;
+        if (next->anisotropic_filtering >= 1 && next->anisotropic_filtering <= 16)
+            g_video_aniso = next->anisotropic_filtering;
+        if (next->dithering >= 0 && next->dithering <= 2) g_video_dithering = next->dithering;
+        if (g_gl_active) {
+            gl_renderer_set_bloom(g_video_bloom);
+            gl_renderer_set_texture_lod(g_video_texture_lod, g_video_aniso);
+            gl_renderer_set_dithering(g_video_dithering);
+        }
+    }
+    if (m & PSX_VIDEO_LIVE_PGXP) {
+        g_video_pgxp_depth_buffer = next->pgxp_depth_buffer ? 1 : 0;
+        g_video_pgxp_color_correction = next->pgxp_color_correction ? 1 : 0;
+        if (next->pgxp_seam >= 0 && next->pgxp_seam <= 2) g_video_pgxp_seam = next->pgxp_seam;
+        if (g_gl_active) {
+            gl_renderer_set_pgxp_depth(g_video_pgxp_depth_buffer);
+            gl_renderer_set_pgxp_color_perspective(g_video_pgxp_color_correction);
+            gl_renderer_set_pgxp_seam(g_video_pgxp_seam);
+        }
+    }
     /* Persist everything the menu shows, live or not, like the launcher. */
     if (!g_overlay_settings_path.empty()) {
         try {
@@ -10940,6 +10975,14 @@ extern "C" unsigned psx_video_apply_live(const PsxHostVideoSettings *next) {
             us.internal_resolution = next->internal_resolution; us.has_internal_resolution = true;
             us.supersample_milli = next->supersample_milli;
             us.has_supersample = next->supersample_milli >= 1000;
+            us.bloom = g_video_bloom;                          us.has_bloom = true;
+            us.texture_lod = g_video_texture_lod;              us.has_texture_lod = true;
+            us.anisotropic_filtering = g_video_aniso;          us.has_anisotropic_filtering = true;
+            us.dithering = g_video_dithering;                  us.has_dithering = true;
+            us.pgxp_depth_buffer = g_video_pgxp_depth_buffer != 0; us.has_pgxp_depth_buffer = true;
+            us.pgxp_color_correction = g_video_pgxp_color_correction != 0;
+            us.has_pgxp_color_correction = true;
+            us.pgxp_seam = g_video_pgxp_seam;                  us.has_pgxp_seam = true;
             (void)quality_save_user_settings(g_overlay_settings_path, us);
         } catch (...) {
         }
@@ -17660,7 +17703,7 @@ int mh_mod_set(const char* p, const char* f, const char* o, const char* v) {
     if (psx_netplay_active()) return 0;  /* the plan is negotiated with peers */
     std::lock_guard<std::mutex> lk(g_ovl_mu);
     g_ovl_mod_posts.push_back({p, f, o ? o : "", v});
-    return o ? psx_mod_option_live_capable(p, f) : 0;
+    return o ? psx_mod_option_live_capable(p, f) : psx_mod_feature_toggle_live_capable(p, f);
 }
 void mh_reload_bindings(void) { g_ovl_reload_binds = 1; }
 void mh_request_exit(int how) {
@@ -17745,6 +17788,15 @@ PsxHostVideoSettings ovl_video_from(const RecompLauncherCSettings& ls) {
 #if defined(RECOMP_LAUNCHER_HAS_SUPERSAMPLE)
     if (ls.supersample_milli >= 1000) v.supersample_milli = ls.supersample_milli;
 #endif
+#if defined(RECOMP_LAUNCHER_HAS_IMAGE_SETTINGS)
+    v.bloom = ls.bloom ? 1 : 0;
+    v.texture_lod = ls.texture_lod ? 1 : 0;
+    v.anisotropic_filtering = ls.anisotropic_filtering;
+    v.dithering = ls.dithering;
+    v.pgxp_depth_buffer = ls.pgxp_depth_buffer ? 1 : 0;
+    v.pgxp_color_correction = ls.pgxp_color_correction ? 1 : 0;
+    v.pgxp_seam = ls.pgxp_seam;
+#endif
     return v;
 }
 void mh_launcher_settings_get(RecompLauncherCSettings* out) {
@@ -17775,6 +17827,15 @@ void mh_launcher_settings_get(RecompLauncherCSettings* out) {
     ls.internal_resolution = internal_resolution_for_launcher();
 #if defined(RECOMP_LAUNCHER_HAS_SUPERSAMPLE)
     ls.supersample_milli = v.supersample_milli;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_IMAGE_SETTINGS)
+    ls.bloom = v.bloom;
+    ls.texture_lod = v.texture_lod;
+    ls.anisotropic_filtering = v.anisotropic_filtering;
+    ls.dithering = v.dithering;
+    ls.pgxp_depth_buffer = v.pgxp_depth_buffer;
+    ls.pgxp_color_correction = v.pgxp_color_correction;
+    ls.pgxp_seam = v.pgxp_seam;
 #endif
 #if defined(RECOMP_LAUNCHER_HAS_QUALITY_PRESETS)
     /* Every row a preset governs, the hidden ones included, as the player
@@ -17829,6 +17890,9 @@ void mh_launcher_game_info(RecompLauncherCGameInfo* out) {
     gi.has_supersample = 1;              /* live with Internal resolution */
 #endif
     gi.has_render_pipeline = 1;
+#if defined(RECOMP_LAUNCHER_HAS_IMAGE_SETTINGS)
+    gi.has_image_settings = 1;           /* bloom, texture LOD, dithering, PGXP rows: live */
+#endif
     gi.has_vsync = 0;
     gi.has_rewind_depth = 0;
     gi.mods = PSXRecompV4::mod_runtime_launcher_provider();
@@ -18096,6 +18160,7 @@ static void host_pause_service(void) {
         for (const OvlModSet& m : mods) {
             if (m.o.empty()) {
                 (void)psx_mod_feature_enable(m.p.c_str(), m.f.c_str(), m.v == "true");
+                (void)psx_mod_feature_toggle_live(m.p.c_str(), m.f.c_str(), m.v == "true");
             } else {
                 (void)psx_mod_feature_set_option(m.p.c_str(), m.f.c_str(), m.o.c_str(), m.v.c_str());
                 (void)psx_mod_set_option_live(m.p.c_str(), m.f.c_str(), m.o.c_str(), m.v.c_str());
@@ -18696,6 +18761,7 @@ int main(int argc, char** argv) {
             g_video_aa         = gc.runtime.video_antialiasing;
             g_video_post_aa    = gc.runtime.video_antialiasing_mode;
             g_video_bloom      = gc.runtime.video_bloom;
+            if (g_video_bloom > 0.0f) g_video_bloom_on = g_video_bloom;
             {   /* UTF-8 bytes on every host (C++17: string, C++20: u8string) */
                 const auto u8 = gc.runtime.video_post_shader.u8string();
                 g_video_post_shader.assign(u8.begin(), u8.end());
@@ -19269,6 +19335,14 @@ int main(int argc, char** argv) {
             g_video_geometry_correction = us.geometry_correction ? 1 : 0;
         if (us.has_perspective_texturing)
             g_video_perspective_texturing = us.perspective_texturing ? 1 : 0;
+        /* The in-game menu's image and PGXP rows, saved by psx_video_apply_live. */
+        if (us.has_bloom)                 g_video_bloom = (float)us.bloom;
+        if (us.has_texture_lod)           g_video_texture_lod = us.texture_lod;
+        if (us.has_anisotropic_filtering) g_video_aniso = us.anisotropic_filtering;
+        if (us.has_dithering)             g_video_dithering = us.dithering;
+        if (us.has_pgxp_depth_buffer)     g_video_pgxp_depth_buffer = us.pgxp_depth_buffer ? 1 : 0;
+        if (us.has_pgxp_color_correction) g_video_pgxp_color_correction = us.pgxp_color_correction ? 1 : 0;
+        if (us.has_pgxp_seam)             g_video_pgxp_seam = us.pgxp_seam;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_scanlines)      g_video_scanlines = us.scanlines;
         if (us.has_scanline_strength)

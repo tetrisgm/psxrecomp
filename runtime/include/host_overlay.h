@@ -97,7 +97,20 @@ typedef struct PsxHostVideoSettings {
     int render_thread;         /* restart */
     int present_thread;        /* restart */
     int supersample_milli;     /* live: 1000 off, 1250, 1500, 2000 */
+    /* Image rows (PSX_VIDEO_LIVE_IMAGE), the [video] keys of the same names
+     * in their config encodings; every one applies live. bloom is on/off: on
+     * is the title's configured strength (1.0 when it configured none). */
+    int bloom;                 /* 0/1 */
+    int texture_lod;           /* 0 off, 1 mipmap */
+    int anisotropic_filtering; /* 1..16 */
+    int dithering;             /* 0 off, 1 native pattern, 2 fine */
+    /* PGXP renderer rows (PSX_VIDEO_LIVE_PGXP): the [video] pgxp_* keys. */
+    int pgxp_depth_buffer;     /* 0/1 */
+    int pgxp_color_correction; /* 0/1 */
+    int pgxp_seam;             /* 0 off, 1 fine, 2 wide */
 } PsxHostVideoSettings;
+/* The image and PGXP rows above exist (appended, ABI-compatible). */
+#define PSX_HOST_VIDEO_HAS_IMAGE_SETTINGS 1
 
 /* Texture filter values: PSX_TEXTURE_FILTER_* and psx_texture_filter_from_ui
  * (video_texture_filter.h, #655), shared with settings and the handoff. */
@@ -119,6 +132,10 @@ typedef struct PsxHostVideoSettings {
 #define PSX_VIDEO_LIVE_FRAME_GEN      (1u << 6)
 /* Internal resolution or supersampling: the scale moves at the next frame. */
 #define PSX_VIDEO_LIVE_RESOLUTION     (1u << 7)
+/* bloom, texture_lod, anisotropic_filtering, dithering. */
+#define PSX_VIDEO_LIVE_IMAGE          (1u << 8)
+/* pgxp_depth_buffer, pgxp_color_correction, pgxp_seam. */
+#define PSX_VIDEO_LIVE_PGXP           (1u << 9)
 
 /* Pure helpers (unit-tested): which live fields differ, and which restart
  * fields differ from the values the session booted with. */

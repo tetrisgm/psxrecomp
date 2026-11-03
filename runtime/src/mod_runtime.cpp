@@ -3148,6 +3148,52 @@ extern "C" int psx_mod_option_live_capable(const char* package_id, const char* f
     return 0;
 }
 
+/* Live feature switches: the same shape as live options, without a value to
+ * keep -- the plugin's own state is the only record for this session. */
+namespace {
+std::map<std::string, PSXModFeatureToggledCallback>& feature_toggled_plugins() {
+    static std::map<std::string, PSXModFeatureToggledCallback> m;
+    return m;
+}
+}  // namespace
+
+extern "C" int psx_mod_register_feature_toggled_plugin(const char* id,
+                                                       PSXModFeatureToggledCallback cb) {
+    if (!id || !*id || !cb) return 0;
+    feature_toggled_plugins()[id] = cb;
+    return 1;
+}
+
+extern "C" int psx_mod_feature_toggle_live(const char* package_id, const char* feature_id,
+                                           int enabled) {
+    using namespace PSXRecompV4;
+    if (!package_id || !feature_id) return 0;
+    if (psx_netplay_active()) return -1;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return 0;
+    int live = 0;
+    for (const ModResolution::Plugin& plugin : s.plan.plugins) {
+        if (plugin.package_id != package_id || plugin.feature_id != feature_id) continue;
+        auto it = feature_toggled_plugins().find(plugin.id);
+        if (it == feature_toggled_plugins().end()) continue;
+        PluginCallbackScope scope(s, &plugin);
+        if (it->second(enabled ? 1 : 0)) live = 1;
+    }
+    return live;
+}
+
+extern "C" int psx_mod_feature_toggle_live_capable(const char* package_id, const char* feature_id) {
+    using namespace PSXRecompV4;
+    if (!package_id || !feature_id) return 0;
+    RuntimeMods& s = state();
+    if (!s.initialized || !s.plan.ok) return 0;
+    for (const ModResolution::Plugin& plugin : s.plan.plugins)
+        if (plugin.package_id == package_id && plugin.feature_id == feature_id &&
+            feature_toggled_plugins().count(plugin.id))
+            return 1;
+    return 0;
+}
+
 extern "C" int psx_mod_save_selection(void) {
     using namespace PSXRecompV4;
     RuntimeMods& s = state();

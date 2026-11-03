@@ -24,6 +24,8 @@
  */
 #include "mod_plugins.h"
 #include "pgxp.h"
+#include "cpu_state.h"
+#include "gpu.h"
 
 #include <string.h>
 
@@ -40,7 +42,30 @@ static void builtin_pgxp_activate(void) {
                      pgxp_option_flag("pgxp", "culling"));
 }
 
+/* In-game menu switch: the session is already armed, so the engine's own
+ * live-safe setters (the ones the debug keys use) flip the correction on a
+ * running game. Off is the faithful picture; on restores what the arming
+ * chose from the options. The runtime refuses this during netplay. */
+static int builtin_pgxp_toggled(int enabled) {
+    gte_geometry_correction_set(enabled);
+    gpu_texture_correction_set(enabled);
+    pgxp_set_cpu_mode(enabled && pgxp_option_flag("pgxp", "cpu_mode"));
+    pgxp_set_culling(enabled && pgxp_option_flag("pgxp", "culling"));
+    return 1;
+}
+
+/* The options change live the same way (cpu_mode / culling). */
+static int builtin_pgxp_option_changed(const char* option_id, const char* value) {
+    const int on = value && strcmp(value, "true") == 0;
+    if (!gte_geometry_correction_enabled()) return 1;  /* applied when switched on */
+    if (strcmp(option_id, "cpu_mode") == 0) { pgxp_set_cpu_mode(on); return 1; }
+    if (strcmp(option_id, "culling") == 0) { pgxp_set_culling(on); return 1; }
+    return 0;
+}
+
 PSX_MOD_CONSTRUCTOR(psx_register_builtin_pgxp_plugin) {
     (void)psx_mod_register_activation_plugin("psx.pgxp",
                                              builtin_pgxp_activate);
+    (void)psx_mod_register_feature_toggled_plugin("psx.pgxp", builtin_pgxp_toggled);
+    (void)psx_mod_register_option_changed_plugin("psx.pgxp", builtin_pgxp_option_changed);
 }
