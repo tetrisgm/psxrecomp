@@ -3,7 +3,10 @@
 Owner request: evaluate the fork's performance/threading work separately and
 keep it on local branches. Tracked by `beads-r4recomp.2`.
 
-All branches below are **local only** in `F:/Projects/r4-psxrecomp-recovery`.
+All branches below were prepared in `F:/Projects/r4-psxrecomp-recovery` and
+are being published, at the owner's request, to the same named branches in
+[`tetrisgm/psxrecomp`](https://github.com/tetrisgm/psxrecomp). They remain
+**parked candidates**, separate from the recovered game.
 The six replayed candidates each start at the recovered game's frozen upstream
 engine, `c1f5cafd4102daa57b7342bec7c432aaca8981ce`. None is integrated into
 the game. Its engine pin, executable, settings, saves and running owner preview
@@ -114,7 +117,7 @@ GL trials must include PGXP depth and launcher/context transitions. A neutral
 result is acceptable; a reproducible per-game regression is not. Broader
 consumer qualification is required before shared-engine promotion.
 
-Keep these branches local until those decisions are supported. No performance
+Keep these branches separate until those decisions are supported. No performance
 candidate is accepted for the game or release on the strength of this component
 evaluation. The remaining gameplay qualification is tracked in the open issue.
 

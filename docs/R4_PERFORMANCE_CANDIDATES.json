@@ -106,7 +106,7 @@
   },
   "runtime_performance": "unmeasured for these candidates on current upstream",
   "gameplay_visual_qualification": "pending for these candidates; prior recovery evidence remains separate",
-  "integration": "none; local only; recovered game and owner preview untouched",
+  "integration": "none; owner-requested remote branch publication; recovered game and owner preview untouched",
   "remaining": [
     "matched built-game A/B for small candidates",
     "PGXP depth and launcher/context transitions",
@@ -114,5 +114,10 @@
     "CHD/mapped CD-DA/I/O and lifecycle qualification",
     "full draw-context caller/precision/order/hook coverage before any port",
     "representative consumer coverage before shared engine promotion"
-  ]
+  ],
+  "publication": {
+    "repository": "https://github.com/tetrisgm/psxrecomp",
+    "date": "2026-11-03",
+    "policy": "separate parked remote topic branches; not integrated into the game"
+  }
 }
