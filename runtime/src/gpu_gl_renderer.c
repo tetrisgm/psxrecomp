@@ -3484,6 +3484,12 @@ static const HiwTile *hiw_ensure(int x0, int x1) {
 }
 
 /* ---- coherency: hr FBO -> raw mirror (pack) ------------------------------ */
+/* Native input tiles a replayed packet changed since the last pack flush
+ * (64x64, row-major over VRAM). Uploading those tiles, not the bounding box
+ * of all of them, keeps a packet's raw-mirror traffic to what its draws
+ * actually touched: scattered texture pages span most of VRAM otherwise. */
+static uint8_t s_pack_dirty_tiles[(VRAM_W/64)*(VRAM_H/64)];
+static unsigned s_pack_dirty_tile_count;
 static void pack_flush(void) {
     if (!s_raster_ok || !s_pack_dirty.set) return;
     /* A generated frame draws into its own surfaces: the raw mirror keeps
@@ -3504,7 +3510,14 @@ static void pack_flush(void) {
          * has consumed them. The same persistent/fixed-storage contract as
          * vertex streams replaces both driver-managed orphaning and client
          * memory uploads into a texture still being sampled. */
-        native_texture_upload_rect(x,y,w,h);
+        if (s_pack_dirty_tile_count) {
+            for (unsigned i = 0; i < sizeof s_pack_dirty_tiles; i++) {
+                if (!s_pack_dirty_tiles[i]) continue;
+                s_pack_dirty_tiles[i] = 0;
+                native_texture_upload_rect((int)(i % (VRAM_W/64)) * 64, (int)(i / (VRAM_W/64)) * 64, 64, 64);
+            }
+            s_pack_dirty_tile_count = 0;
+        } else native_texture_upload_rect(x,y,w,h);
         return;
     }
 
@@ -5569,6 +5582,9 @@ static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int sem
  * stencil (mask) write value is constant within each pass; the semi pass is
  * also where PS1 blending applies. lim = uv sampling bounds (see
  * tri_uv_limits); NULL computes them from the vertices. */
+/* Inside a replayed textured triangle (packet_cpu.tri_ns): HD texture
+ * acquire, pack-sampling flush, batch append (seam strips included), draws. */
+static _Atomic uint64_t s_tri_phase_ns[4];
 static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const int *us, const int *vs,
                                   const float *col, uint16_t texpage,
@@ -5603,11 +5619,19 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
 
+#ifndef PSX_NO_DEBUG_TOOLS
+    uint64_t tri_at = s_rth_packet_replaying ? rt_now_ns() : 0;
+#define TRI_PHASE(i) do { if (tri_at) { const uint64_t now_ = rt_now_ns(); \
+        atomic_fetch_add(&s_tri_phase_ns[i], now_ - tri_at); tri_at = now_; } } while (0)
+#else
+#define TRI_PHASE(i) ((void)0)
+#endif
     flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
     if (!s_selected_bank_tex)
         flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);
     else if (s_selected_bank_live_clut)
         flush_pack_if_sampling(-1, 0, depth, clut_x, clut_y);
+    TRI_PHASE(1);
     GpuHdTextureImage hd = {0};
     GLuint hd_tex = 0;
     if (s_hd_native_authority && !s_selected_bank_tex) {
@@ -5620,6 +5644,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             else gpu_hd_textures_note_applied();
         }
     }
+    TRI_PHASE(0);
     mark_prim_dirty(xs, ys, 3, 1 /* textured */);
 
     /* Append to the textured batch. Flush first if this prim's blend/mask/twin
@@ -5663,6 +5688,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             s_batch_reason[reason]++;
             flush_tex_batch();
         }
+        TRI_PHASE(3);
         /* Room for this triangle and its seam snapping strips in one batch. */
         const int snap_on = tdmode == 1 && s_pgxp_seam && pgxp_tri_is_3d() &&
                             seam_snap_measure(xs, ys) > 0;
@@ -5761,9 +5787,12 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                 s_snap_strip_tris++;
             }
         }
+        TRI_PHASE(2);
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
+        TRI_PHASE(3);
     }
     gpu_hd_textures_release_image(&hd);
+#undef TRI_PHASE
 }
 
 /* Draw a flat-colored rect (GEO program) DIRECTLY into the active wide surface
@@ -17813,6 +17842,7 @@ static int rth_packet_native_input(const RthPacketInputs *inputs,uint64_t source
             memcpy(s_rth_vram_priv+(tiles[t].y+row)*VRAM_W+tiles[t].x,
                    tiles[t].pixels+row*64,64*sizeof(uint16_t));
         rect_add(&s_pack_dirty,tiles[t].x,tiles[t].y,tiles[t].x+63,tiles[t].y+63);
+        if(!s_pack_dirty_tiles[index]) {s_pack_dirty_tiles[index]=1;++s_pack_dirty_tile_count;}
     }
     const GpuHdTextureTracking *tracking=native_raster_inputs_metadata(inputs->draws,source);
     return !tracking || gpu_hd_textures_apply_tracking(tracking);
@@ -17829,6 +17859,9 @@ static uint64_t s_packet_retiring_source,s_packet_retiring_applied_source;
 static const void *s_packet_present_payload;
 static uint16_t s_packet_present_op;
 static _Atomic uint64_t s_packet_prepare_ns,s_packet_draw_ns,s_packet_draw_count,s_packet_snap_count,s_packet_no_present;
+/* Where a replayed packet's time goes (debug server packet_cpu.phase_ns):
+ * seed restore, gap restage, record replay, present, closing flushes. */
+static _Atomic uint64_t s_packet_phase_ns[5];
 static void rth_packet_draw(const FramePacketView *,double);
 static void rth_packet_prepare(const FramePacketView *,uint64_t);
 static uint64_t rth_packet_tick(void *user,uint64_t now) {
@@ -18077,6 +18110,9 @@ static int rth_packet_record(const RthPacketInputs *inputs,const RtCmd *command,
 static void rth_packet_draw(const FramePacketView *packet,double t) {
     if(!packet || !rt_packet_current(packet)) return;
     const uint64_t draw_begin=rt_now_ns();
+    uint64_t phase_at=draw_begin;
+#define PACKET_PHASE(i) do { const uint64_t now_=rt_now_ns(); \
+        atomic_fetch_add(&s_packet_phase_ns[i],now_-phase_at); phase_at=now_; } while(0)
     ++s_packet_draw_count;
     if(t>=0 && t<1 && packet_interpolation_stream_snapped()) ++s_packet_snap_count;
     const RthPacketSeed *seed=packet->initial;
@@ -18098,6 +18134,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     rth_rebind_vram(s_rth_vram_priv);
     sw_native_texture_load(&seed->cache);
     if(inputs->tracking && !gpu_hd_textures_apply_tracking(inputs->tracking)) goto done;
+    PACKET_PHASE(0);
     if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence>s_rth_packet_last_sequence+1) {
         const uint64_t restage_begin=rt_now_ns();
         packet_timer_restage_begin();
@@ -18107,6 +18144,7 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
         packet_timer_restage_end();
         packet_presenter_trace(4,restage_begin,rt_now_ns());
     }
+    PACKET_PHASE(1);
     rth_frame_state_apply(&seed->draw);
     const uint8_t *records=packet->records;
     for(size_t at=0;at<packet->record_bytes;) {
@@ -18114,8 +18152,10 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
         if(!rt_packet_current(packet) || !rth_packet_record(inputs,command,command+1)) goto done;
         at+=command->size;
     }
+    PACKET_PHASE(2);
     if(s_packet_present_payload && rt_packet_current(packet))
         rth_present_payload(s_packet_present_op,s_packet_present_payload);
+    PACKET_PHASE(3);
     if(packet->epoch!=s_rth_packet_last_epoch || packet->sequence>s_rth_packet_last_sequence)
         s_rth_packet_last_sequence=packet->sequence;
     s_rth_packet_last_epoch=packet->epoch;
@@ -18130,6 +18170,8 @@ static void rth_packet_draw(const FramePacketView *packet,double t) {
     surface_pool_retire_unused();
     s_rth_packet_view=NULL;s_rth_packet_replaying=0;
     packet_presenter_trace(2,draw_begin,rt_now_ns());
+    PACKET_PHASE(4);
+#undef PACKET_PHASE
     atomic_fetch_add(&s_packet_draw_ns,rt_now_ns()-draw_begin);
 }
 static void rth_packet_prepare(const FramePacketView *packet,uint64_t scheduled) {
@@ -18333,11 +18375,19 @@ int gl_renderer_render_thread_json(char *out, size_t cap) {
         (unsigned long long)atomic_load(&s_pack_gpu_draws),
         (unsigned long long)atomic_load(&s_pack_native_uploads),
         (unsigned long long)atomic_load(&s_pack_native_bytes));
+    uint64_t prep_cost[4];packet_interpolation_stream_cost(prep_cost);
     if(k>0 && (size_t)k<cap)k+=snprintf(out+k,cap-(size_t)k,
-        "\"packet_cpu\":{\"prepare_ns\":%llu,\"draw_ns\":%llu,\"draws\":%llu,\"snaps\":%llu,\"no_present\":%llu,\"native_raster_requests\":%llu,\"producer_geometry\":%llu,\"gap_holds\":%llu},",
+        "\"packet_cpu\":{\"prepare_ns\":%llu,\"draw_ns\":%llu,\"draws\":%llu,\"snaps\":%llu,\"no_present\":%llu,\"native_raster_requests\":%llu,\"producer_geometry\":%llu,\"gap_holds\":%llu,"
+        "\"phase_ns\":[%llu,%llu,%llu,%llu,%llu],\"tri_ns\":[%llu,%llu,%llu,%llu],\"prep_ns\":[%llu,%llu,%llu,%llu]},",
         (unsigned long long)atomic_load(&s_packet_prepare_ns),(unsigned long long)atomic_load(&s_packet_draw_ns),
         (unsigned long long)atomic_load(&s_packet_draw_count),(unsigned long long)atomic_load(&s_packet_snap_count),
-        (unsigned long long)atomic_load(&s_packet_no_present),(unsigned long long)atomic_load(&s_packet_native_raster_requests),(unsigned long long)atomic_load(&s_packet_produced_geometry),(unsigned long long)s_packet_gap_holds);
+        (unsigned long long)atomic_load(&s_packet_no_present),(unsigned long long)atomic_load(&s_packet_native_raster_requests),(unsigned long long)atomic_load(&s_packet_produced_geometry),(unsigned long long)s_packet_gap_holds,
+        (unsigned long long)atomic_load(&s_packet_phase_ns[0]),(unsigned long long)atomic_load(&s_packet_phase_ns[1]),
+        (unsigned long long)atomic_load(&s_packet_phase_ns[2]),(unsigned long long)atomic_load(&s_packet_phase_ns[3]),
+        (unsigned long long)atomic_load(&s_packet_phase_ns[4]),
+        (unsigned long long)atomic_load(&s_tri_phase_ns[0]),(unsigned long long)atomic_load(&s_tri_phase_ns[1]),
+        (unsigned long long)atomic_load(&s_tri_phase_ns[2]),(unsigned long long)atomic_load(&s_tri_phase_ns[3]),
+        (unsigned long long)prep_cost[0],(unsigned long long)prep_cost[1],(unsigned long long)prep_cost[2],(unsigned long long)prep_cost[3]);
     if(s_op_profile==1 && k>0 && (size_t)k<cap) {
         k+=snprintf(out+k,cap-(size_t)k,"\"ops\":[");
         for(unsigned op=1;op<RTH_GROUP && k>0 && (size_t)k<cap;++op)

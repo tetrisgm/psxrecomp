@@ -12,6 +12,19 @@
 #include <unordered_map>
 #include <algorithm>
 #include <unordered_set>
+#include <chrono>
+namespace {
+// Where the prepare pass spends its time (debug server packet_cpu.prep_ns):
+// append, history identities, retiring reconstruction and pairing, the rest.
+std::atomic<uint64_t> cost_ns[4];
+uint64_t clock_ns() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+}
+extern "C" void packet_interpolation_stream_cost(uint64_t out[4]) {
+    for(unsigned i=0;i<4;++i) out[i]=cost_ns[i].load(std::memory_order_relaxed);
+}
 #include <array>
 #include <memory>
 #include <thread>
@@ -316,7 +329,7 @@ extern "C" void packet_interpolation_stream_begin(uint64_t epoch,uint64_t sequen
     stream.missing=0;stream.failed=false;
 
 }
-extern "C" void packet_interpolation_stream_append(const PacketInterpolationSource *s) {
+static void append_impl(const PacketInterpolationSource *s) {
     if(!s || stream.failed) return;
     if(s->transform_only) {
         stream.source_mode=true;
@@ -362,11 +375,18 @@ extern "C" void packet_interpolation_stream_append(const PacketInterpolationSour
     try { stream.current.push_back(p);stream.sources.push_back(*s); }
     catch(...) { stream.failed=true;stream.current.clear(); }
 }
+extern "C" void packet_interpolation_stream_append(const PacketInterpolationSource *s) {
+    const uint64_t begin=clock_ns();
+    append_impl(s);
+    cost_ns[0].fetch_add(clock_ns()-begin,std::memory_order_relaxed);
+}
 static void stream_end_impl(void) {
     /* A VBlank packet without polygon records is not a new geometry sample.
      * R4's 30 Hz draw produces these between draws. Keep the previous sample
      * for the audit; this is not a policy for presenting blank/cleared frames. */
     if(stream.current.empty() && !stream.failed) return;
+    uint64_t lap_at=clock_ns();
+    const auto lap=[&](unsigned i) {const uint64_t now=clock_ns();cost_ns[i].fetch_add(now-lap_at,std::memory_order_relaxed);lap_at=now;};
     if(stream.source_mode) {
         // OT submission may follow transformation across a VBlank. Select the
         // complete transform groups referenced by this draw, including their
@@ -417,6 +437,7 @@ static void stream_end_impl(void) {
             return stream.sequence>r.sequence && stream.sequence-r.sequence>8;
         }),stream.history.end());
     }
+    lap(1);
     // Keep geometry culled at N until it actually leaves the interpolated
     // frustum. Both old-only and current faces use one canonical source table.
     retiring_unresolved=retiring_count=0;
@@ -462,6 +483,7 @@ static void stream_end_impl(void) {
     b.transforms=stream.transforms.data();b.transform_count=stream.transforms.size();
     a.source_mode=b.source_mode=stream.source_mode;
     if(!stream.failed && !packet_interpolation_pair(stream.pair,&a,&b,0.5)) stream.failed=true;
+    lap(2);
     {
         std::lock_guard<std::mutex> lock(stats_mutex);
         published=stream.failed?PacketInterpolationStats{}:packet_interpolation_stats(stream.pair);
@@ -490,6 +512,7 @@ static void stream_end_impl(void) {
     stream.transforms.clear();stream.invocations.clear();stream.model_invocations.clear();stream.ordinals.clear();stream.source_mode=false;
     stream.older.swap(stream.current);stream.old_sources.swap(stream.sources);
     stream.old_epoch=stream.epoch;stream.old_sequence=stream.sequence;
+    lap(3);
 }
 extern "C" void packet_interpolation_stream_end(void) {
     try {stream_end_impl();}
