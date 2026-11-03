@@ -213,6 +213,13 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-02 — local R4 performance/threading triage.** Separated six
+  upstream-based candidates and preserved the larger draw/presentation/rewind
+  implementations on local branches. Ring, HD, disc, hidden GL output and
+  historical worker checks pass within the scopes recorded in
+  `docs/R4_PERFORMANCE_CANDIDATES.md`. No candidate was integrated into the
+  recovered game; gameplay performance and visual qualification remain pending.
+
 - **2026-10-24 — scoped render-pass qualification.** The sandbox now compares
   shared RAM/register/clock/interrupt digests before and after an actual
   opted-in local temporal pass, discard, device-read abort, rollback refusal,

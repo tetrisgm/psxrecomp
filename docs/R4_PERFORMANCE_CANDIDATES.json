@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "issue": "beads-r4recomp.2",
+  "date": "2026-11-02",
+  "upstream_base": "c1f5cafd4102daa57b7342bec7c432aaca8981ce",
+  "repository": "F:\\Projects\\r4-psxrecomp-recovery",
+  "evaluation_worktree": "F:/Projects/r4-perf-evaluation",
+  "branches": {
+    "perf/r4-disc-prefetch-20261102": "81862e0a335f2d64263170edd479a24635c017c2",
+    "perf/r4-gl-samplers-20261102": "cc413ceb2b3bea333ba2247dc7f25b3ba8a94d0b",
+    "perf/r4-gl-state-cache-20261102": "d820cfb7a236a98c2427fdf0cc0db3ae6fdc2474",
+    "perf/r4-hd-miss-path-20261102": "b7f91c6e3f6547a75a7508ddf0bd29462a830008",
+    "perf/r4-presentation-workers-original-20261102": "84d6ca22259ad16d9dd5e13f390514e575cb8d10",
+    "perf/r4-render-checks-20261102": "e457f75a92a7650f988c47317ed763b16d8cadd8",
+    "perf/r4-render-priority-20261102": "c1523113d33b6eb5091230eb0c6e4b70620f6689",
+    "perf/r4-render-ring-20261102": "9ff9431045de9b2956b2c2fe4a14ba56a2cd5ef7",
+    "perf/r4-rewind-worker-original-20261102": "6cb8b57dc7fda4878067806aa16db5235c570bb7",
+    "perf/r4-threaded-contexts-original-20261102": "9f34cf894989caf15920936bb19cada4b4f1283a"
+  },
+  "source_changes": {
+    "render-ring": [
+      "f6d573e5:runtime/src/render_thread.c"
+    ],
+    "gl-state-cache": [
+      "f6d573e5:runtime/src/gpu_gl_renderer.c; sampler changes omitted"
+    ],
+    "gl-samplers": [
+      "6eead0f2"
+    ],
+    "disc-prefetch": [
+      "ed730388:runtime/src/iso_reader_c.cpp; new scoped regression test"
+    ],
+    "hd-miss-path": [
+      "dfc39ed6; fork-only tracking APIs omitted",
+      "78ce6940; palette-hash hunk only"
+    ],
+    "render-priority": [
+      "07dca860"
+    ]
+  },
+  "tests": {
+    "render-ring": {
+      "default_checks": 8843,
+      "per_record_checks": 8843,
+      "failures": 0
+    },
+    "render-priority": {
+      "checks": 8843,
+      "failures": 0,
+      "scheduling_benefit_measured": false
+    },
+    "disc-prefetch": {
+      "default_hits": 130,
+      "default_misses": 6,
+      "off_hits": 0,
+      "off_misses": 0,
+      "result": "pass",
+      "scope": "synthetic raw BIN/CUE bytes, seeks, EOF, media hook layering, close/reopen; not CHD or mapped CD-DA"
+    },
+    "hd-miss-path": {
+      "tracker_test": "pass",
+      "gpu_wrapper_compile": "pass",
+      "gameplay": "not run"
+    },
+    "gl-render-bundle": {
+      "result": "pass",
+      "synthetic_runs": 10,
+      "frames_per_run": 80,
+      "scales": [
+        1,
+        4
+      ],
+      "dynamic_scale": 4,
+      "threaded_vs_direct": true,
+      "individual_disable_controls_equal": true,
+      "all_disable_controls_equal": true,
+      "receipt": "probes/r4-perf-20261102/gl/rth-62tdx41y/qualified-receipt.json",
+      "scope": "readback, native VRAM, internal-resolution and widescreen digests; not R4 PGXP-depth or launcher transitions"
+    },
+    "historical-draw-pool": {
+      "result": "pass",
+      "scope": "four workers, backpressure, epochs, expiry, ownership"
+    },
+    "historical-call-gate": {
+      "result": "pass",
+      "scope": "ordering, payload lifetime, refusal, timeout, exceptions, close"
+    },
+    "historical-rewind-worker": {
+      "result": "pass",
+      "scope": "one outstanding job, 1000 reuses, teardown drain"
+    }
+  },
+  "binaries_sha256": {
+    "disc.exe": "1bf485c88ba171b126524845ae995b6de5c3f1f8e8e7bfe38cee1156564bd049",
+    "draw-gate.exe": "cb2de90ebaf854592179b18b612aceaf777f0431299391cae9ae2a69c54208f7",
+    "draw-workers.exe": "8e8ed995710f72531cf40ac5da0de2514d3e79ac073da5cb2a7b9f1d17351136",
+    "hd.exe": "418abbf1cf5e8f64f4ca23c3797c232fdb79a249a532ffc3c7280cffcd97c6ff",
+    "priority.exe": "b67d43cf84d2e6ad1c214e3896b18222a99f5e4fc3dc9e1cb709ea1c2b8ac5ab",
+    "rewind-worker.exe": "7395792ee673aaa490aac83c75c4cd7f47631cd8fdf38d2e022e79530b0e189a",
+    "ring.exe": "7f1cb5cc8d98d4fa8c274e09669e1142b7f8af188044f516df3b1287acc9b031"
+  },
+  "host": {
+    "name": "DESKTOP-HN15M1H",
+    "os": "Windows-11-10.0.26200-SP0",
+    "compiler": "gcc.exe (Rev9, Built by MSYS2 project) 15.2.0"
+  },
+  "runtime_performance": "unmeasured for these candidates on current upstream",
+  "gameplay_visual_qualification": "pending for these candidates; prior recovery evidence remains separate",
+  "integration": "none; local only; recovered game and owner preview untouched",
+  "remaining": [
+    "matched built-game A/B for small candidates",
+    "PGXP depth and launcher/context transitions",
+    "real HD HUD matches and moving visuals",
+    "CHD/mapped CD-DA/I/O and lifecycle qualification",
+    "full draw-context caller/precision/order/hook coverage before any port",
+    "representative consumer coverage before shared engine promotion"
+  ]
+}
