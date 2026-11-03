@@ -23,6 +23,18 @@ std::atomic<uint64_t> delivery_late{0},delivery_overflow{0},delivery_resyncs{0};
 std::atomic<double> delay_ms{0},interval_ms{0},motion_sum_ms{0},motion_sum_sq_ms{0};
 std::atomic<uint64_t> motion_steps{0};
 uint64_t last_motion=0;
+// Spacing, in published frames, of the most recent geometry packets. The
+// shortest spacing is the guest's own cadence (1 at 60 Hz, 2 at 30 Hz); a
+// longer pair crosses packets the mailbox replaced.
+std::array<uint8_t,64> recent_frames{};
+size_t recent_at=0;
+uint64_t cadence(uint64_t frames) {
+    if(!frames) return 0;
+    recent_frames[recent_at++%recent_frames.size()]=uint8_t(std::min<uint64_t>(frames,255));
+    uint8_t least=255;
+    for(uint8_t f:recent_frames) if(f && f<least) least=f;
+    return least;
+}
 }
 extern "C" void packet_presenter_trace(unsigned event,uint64_t begin,uint64_t end) {
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -45,6 +57,7 @@ extern "C" void packet_presenter_reset(void) {
     requested_sample.store(-1);
 #endif
     start=period=display_index=last_sequence=last_epoch=last_guest=display_origin=last_motion=0;rate=0;
+    recent_frames.fill(0);recent_at=0;
 }
 extern "C" int packet_presenter_submit(const FramePacketView *packet,uint64_t now,
     double guest_hz,PacketPresenterDraw draw) {
@@ -56,7 +69,10 @@ extern "C" int packet_presenter_submit(const FramePacketView *packet,uint64_t no
     if(!next) {packet_presenter_reset();return 0;}
     const uint64_t frames=packet->epoch==last_epoch && packet->sequence>last_sequence?
         packet->sequence-last_sequence:0;
-    period=frames && frames<=8 && packet->guest_time_ns>last_guest?
+    // In-between frames are drawn only across one guest frame. A pair spanning
+    // replaced packets, or more than three VBlanks, shows its endpoint instead:
+    // motion invented across lost frames swims and pops.
+    period=frames && frames<=cadence(frames) && frames<=3 && packet->guest_time_ns>last_guest?
         packet->guest_time_ns-last_guest:0;
     // Pair duration is measured in the guest domain. Arrivals never restart
     // either the mapping or the output grid. The delivery buffer already

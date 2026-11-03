@@ -45,6 +45,9 @@ void packet_interpolation_stream_append(const PacketInterpolationSource *source)
 void packet_interpolation_stream_end(void);
 void packet_interpolation_stream_reset(void);
 int packet_interpolation_stream_json(char *output,size_t capacity);
+/* Prepare-pass cost split (debug tools): append, history identities,
+ * retiring reconstruction and pairing, the rest; nanoseconds, cumulative. */
+void packet_interpolation_stream_cost(uint64_t out[4]);
 void packet_interpolation_capture_request(void);
 int packet_interpolation_capture_json(char *output,size_t capacity,int older,size_t start);
 #ifdef __cplusplus
