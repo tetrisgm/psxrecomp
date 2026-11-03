@@ -1555,6 +1555,21 @@ if(BUILD_TESTING)
     target_link_libraries(iso_reader_cdda_test PRIVATE chdr-static)
     add_test(NAME iso_reader_cdda_test COMMAND iso_reader_cdda_test)
 
+    add_executable(iso_prefetch_test
+        tests/test_iso_prefetch.cpp src/iso_reader_c.cpp
+        src/iso_reader.cpp src/cue_sheet.cpp)
+    target_include_directories(iso_prefetch_test PRIVATE include ${PSXRECOMP_ROOT}/recompiler/include)
+    target_link_libraries(iso_prefetch_test PRIVATE chdr-static Threads::Threads)
+    if(MSVC)
+        target_compile_options(iso_prefetch_test PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(iso_prefetch_test PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME iso_prefetch_test COMMAND iso_prefetch_test)
+    add_test(NAME iso_prefetch_off_test COMMAND iso_prefetch_test)
+    set_tests_properties(iso_prefetch_test PROPERTIES ENVIRONMENT "PSX_CD_PREFETCH=1" TIMEOUT 10)
+    set_tests_properties(iso_prefetch_off_test PROPERTIES ENVIRONMENT "PSX_CD_PREFETCH=0" TIMEOUT 10)
+
     # Cue PREGAP/POSTGAP (gaps the dump does not store) shift the disc layout.
     add_executable(iso_reader_pregap_test
         tests/test_iso_reader_pregap.cpp
