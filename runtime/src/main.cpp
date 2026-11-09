@@ -17434,13 +17434,17 @@ extern "C" int psx_debug_menu_host_json(char* out, size_t cap) {
         "\"paused\":%d,\"pause_depth\":%d,\"ui_capture\":%d,\"netplay\":%d,"
         "\"internal_resolution\":%d,\"fullscreen\":%d,"
         "\"render_thread\":%d,\"frame_generation\":%d,\"disc_count\":%d,\"disc_mounted\":%d,"
-        "\"volume\":%d,\"p1_deadzone\":%d,\"p2_device\":%d",
+        "\"volume\":%d,\"p1_deadzone\":%d,\"p2_device\":%d,"
+        "\"p1_cross_scancode\":%d,\"p1_cross_button\":%d",
         p && p->name ? p->name : "", g_ovl_on ? 1 : 0, g_menu_host.default_selection,
         ovl_open() ? 1 : 0, g_ovl_pause_held ? 1 : 0, psx_host_pause_depth(),
         psx_host_ui_capture_active(), mh_netplay_active(), v.internal_resolution,
         v.fullscreen, v.render_thread, v.frame_generation, mh_disc_count(),
         mh_disc_mounted(), host_volume_get(), g_players[0].deadzone,
-        g_players[1].adopted_pad ? 1 : g_players[1].kind);
+        g_players[1].adopted_pad ? 1 : g_players[1].kind,
+        (int)psx_keybinds_get()->player[0].cross,
+        controller_map[4].sources.empty() || controller_map[4].sources[0].kind != ControllerSource::Kind::Button
+            ? -1 : controller_map[4].sources[0].id);
 }
 
 #ifndef PSX_NO_DEBUG_TOOLS
