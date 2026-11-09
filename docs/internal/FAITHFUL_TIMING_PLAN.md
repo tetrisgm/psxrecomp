@@ -2012,3 +2012,12 @@ Guest-frame lookup merged multiple extra presentations and could not verify
 HUD stability. Added duplicate-frame/freeze/eviction regression coverage and
 retained legacy frame lookup. Six focused framework checks and all 21 title
 checks pass on Windows and Linux, and both runtime builds link successfully.
+
+### 2026-11-09: custom menu host restoration
+
+Restored provider save-state slots, current-disc verification metadata and live
+controller settings. Device edits retain seat locks and Steam adoption policy;
+volume persists as a host-only audio setting. Guest timing, native CPU spans,
+renderer batching and the existing HD/rewind repairs are unchanged. Integration
+evidence lives in the R4 custom-menu restoration receipt; no Windows execution
+or new performance claim is made.
