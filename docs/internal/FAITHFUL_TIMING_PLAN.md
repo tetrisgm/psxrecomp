@@ -2033,3 +2033,20 @@ HD scan/tracker and real-GL replacement tests pass; R4 Release and 29 CTests pas
 Alternating 4K grid runs improve mean guest cadence about 3%, still below full
 speed on the M4. Do not claim a complete 4K fix or Windows performance evidence.
 Game-side restoration receipt records remaining candidate dispositions.
+
+### 2026-11-10: R4 4K render critical path
+
+Adapted native-authority snapshot publication from `a1af76d0` (`7b93a5c8`),
+restored opt-in continuous debug readback for threaded rendering (`c7b69a3d`),
+and replaced queued depth-clear triangles with scissored hardware clears
+(`7f71774f`). The queue order, color/stencil and PGXP depth behavior remain.
+Real-GL depth attachment parity passes 72 full-surface and 86 window/tile checks
+at actual 1x/4x/9x; snapshot ordering/wrap/context ownership fixtures and HD
+hashes pass. R4 M4 moving fixed-9x race: 120 seconds at 59.936 VBlanks/s with
+full PGXP, Max Detail and existing UI/controller fixes. Historical four-fix
+baseline measured 46.293/49.885, snapshot-only 51.223/51.223 in alternating
+30-second runs; a separate depth-clear pair measured 59.973 versus 50.938.
+Hidden/dummy audio, VSync disabled only in test processes; not physical scanout
+or Windows hardware qualification. Detailed receipts live in the game repository
+`docs/recovery/PERFORMANCE_FIX_20261110.md` and local
+`analysis/performance-fix-20261110/`. No new renderer architecture was imported.
