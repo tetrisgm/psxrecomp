@@ -123,6 +123,7 @@ static struct {
     _Atomic uint64_t busy_ns, idle_ns;   /* consumer */
     RT_LINE _Atomic int render_sleeping; /* consumer */
     RT_LINE _Atomic int emu_sleeping;    /* producer */
+    _Atomic int emu_waiting_frame;       /* only a frame marker can satisfy this wait */
     _Atomic int      running;
 
     /* hand-off + lifecycle, guarded by mtx */
@@ -192,8 +193,11 @@ static inline uint64_t align_up(uint64_t n) {
 
 /* ---- consumer ------------------------------------------------------------ */
 
-static void wake_emu(void) {
+static void wake_emu(int frame_done) {
     if (atomic_load(&R.emu_sleeping)) {
+        /* Draw records cannot reduce the number of frames in flight. Avoid
+         * waking a frame-bound producer for every one of those records. */
+        if (!frame_done && atomic_load(&R.emu_waiting_frame)) return;
         mtx_lock(&R.mtx);
         cnd_bcast(&R.cv_emu);
         mtx_unlock(&R.mtx);
@@ -269,6 +273,7 @@ static void *render_main(void *arg)
         }
         if (!burst_n) burst_t0 = now_ns();
         const RtCmd *c = (const RtCmd *)(R.ring + (r & R.mask));
+        const int frame_done = c->op == OP_PAD && (c->flags & F_FRAME);
         if (c->op == OP_PAD) {
             if (c->flags & F_FRAME)
                 atomic_fetch_add(&R.frames_consumed, 1);
@@ -283,7 +288,7 @@ static void *render_main(void *arg)
             burst_t0 = t1;
             burst_n = 1;
         }
-        wake_emu();
+        wake_emu(frame_done);
     }
     if (have_ctx) R.ctx(R.user, 0);
     t_render = 0;
@@ -317,12 +322,14 @@ static void wake_render(int force) {
     }
 }
 
-/* Block until pred() holds; the render thread wakes us after every record. */
+/* Block until pred() holds. Frame-bound waits need only frame notifications. */
+static int pred_frames(uint64_t limit);
 typedef int (*Pred)(uint64_t arg);
 static void emu_wait(Pred pred, uint64_t arg) {
     if (pred(arg)) return;
     wake_render(1);
     mtx_lock(&R.mtx);
+    atomic_store(&R.emu_waiting_frame, pred == pred_frames);
     atomic_store(&R.emu_sleeping, 1);
     while (!pred(arg)) cnd_wait(&R.cv_emu, &R.mtx);
     atomic_store(&R.emu_sleeping, 0);
