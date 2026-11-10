@@ -2021,3 +2021,15 @@ volume persists as a host-only audio setting. Guest timing, native CPU spans,
 renderer batching and the existing HD/rewind repairs are unchanged. Integration
 evidence lives in the R4 custom-menu restoration receipt; no Windows execution
 or new performance claim is made.
+
+### 2026-11-09: qualify the preserved R4 performance candidates
+
+Restore the separately evaluated render-ring batching, blend/stencil cache,
+fixed sampler units and allocation-free HD miss path from MStan's November 2
+candidate ledger. R4's custom menu and Steam Controller adapter are unchanged.
+Ring tests pass 8,843 checks in both modes; six hidden GL cases have identical
+readback/native/high-resolution/wide digests with caches/batching on and off.
+HD scan/tracker and real-GL replacement tests pass; R4 Release and 29 CTests pass.
+Alternating 4K grid runs improve mean guest cadence about 3%, still below full
+speed on the M4. Do not claim a complete 4K fix or Windows performance evidence.
+Game-side restoration receipt records remaining candidate dispositions.
