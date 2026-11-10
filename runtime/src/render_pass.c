@@ -277,6 +277,65 @@ static RenderPassStats s_stats;
 static int s_verify = -1;
 static int s_open_generation;        /* next pass captures frame N's image */
 static uint32_t s_plan_period = 2;
+
+/* Queued passes add guest draw work to the emulation thread. Low pacer
+ * idle time alone is not an overrun: a pipelined renderer may still meet
+ * every deadline without sleeping. Shed only after three consecutive
+ * frames with passes both exhaust the margin and exceed their guest-frame
+ * period. The render queue independently rejects a two-frame backlog.
+ * Failed retries double the rest; sustained healthy frames reset it. */
+extern uint64_t psx_frame_pacer_wait_ticks(void);
+static double s_ms_per_tick;   /* defined with the pass timing below */
+#define RP_QUEUED_MARGIN_MS 0.3
+#define RP_QUEUED_REST_MIN  15u
+#define RP_QUEUED_REST_MAX  480u
+static uint64_t s_q_wait_mark;
+static double s_q_idle_ms, s_q_frame_ms;
+static uint64_t s_q_plan_ticks;
+static double   s_q_cost_ms;        /* emulation-thread ms per pass (EMA) */
+static int      s_q_ran_last, s_q_low;
+static uint32_t s_q_rest, s_q_backoff = RP_QUEUED_REST_MIN, s_q_good;
+static uint64_t s_q_shed, s_q_rests;
+static int queued_budget_allows(uint32_t period_vblanks) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    /* Diagnostic only: attribute the full redraw cost without shedding. */
+    const char *shed = getenv("PSX_RENDER_PASS_SHED");
+    if (shed && strcmp(shed, "0") == 0) return 1;
+#endif
+    const uint64_t w = psx_frame_pacer_wait_ticks();
+    if (s_ms_per_tick <= 0.0)
+        s_ms_per_tick = 1000.0 / (double)gl_renderer_perf_frequency();
+    const double idle_ms = s_ms_per_tick > 0.0 ? (double)(w - s_q_wait_mark) * s_ms_per_tick : 1e9;
+    const uint64_t now = gl_renderer_perf_ticks();
+    s_q_frame_ms = s_q_plan_ticks ? (now - s_q_plan_ticks) * s_ms_per_tick : 0.0;
+    s_q_plan_ticks = now;
+    s_q_idle_ms = idle_ms;
+    s_q_wait_mark = w;
+    if (s_q_ran_last) {
+        if (idle_ms < RP_QUEUED_MARGIN_MS &&
+            s_q_frame_ms > (double)period_vblanks * 1000.0 /
+                (g_psx_vblank_cycles ? 33868800.0 / g_psx_vblank_cycles : 60.0) + RP_QUEUED_MARGIN_MS) {
+            s_q_good = 0;
+            if (++s_q_low >= 3) {
+                s_q_low = 0;
+                s_q_rest = s_q_backoff;
+                s_q_rests++;
+                if (s_q_backoff < RP_QUEUED_REST_MAX) s_q_backoff *= 2u;
+            }
+        } else {
+            s_q_low = 0;
+            if (++s_q_good >= 600u) s_q_backoff = RP_QUEUED_REST_MIN;
+        }
+    }
+    if (s_q_rest > 0) {
+        s_q_rest--;
+        s_q_ran_last = 0;
+        s_q_shed++;
+        return 0;
+    }
+    s_q_ran_last = 1;
+    return 1;
+}
 /* The last pass's restore left the machine as it found it; while no guest
  * code runs (clock and store count unchanged) and the plan is the same, the
  * next pass may reuse that pass's VRAM backup. */
@@ -392,6 +451,11 @@ static int baseline_reuse_enabled(void) {
 void render_pass_get_stats(RenderPassStats *out) {
     if (!out) return;
     *out = s_stats;
+    out->queued_shed = s_q_shed;
+    out->queued_rests = s_q_rests;
+    out->queued_cost_ms = s_q_cost_ms;
+    out->queued_idle_ms = s_q_idle_ms;
+    out->queued_frame_ms = s_q_frame_ms;
     for (int i = 0; i < RENDER_PASS_DROP_CLASSES; i++)
         out->dropped[i] = g_render_pass_dropped_writes[i];
 }
@@ -403,6 +467,13 @@ void render_pass_reset_session(void) {
     s_netplay_allowed = 0;
     memset(&s_stats, 0, sizeof s_stats);
     memset(g_render_pass_dropped_writes, 0, sizeof g_render_pass_dropped_writes);
+    s_q_wait_mark = psx_frame_pacer_wait_ticks();
+    s_q_plan_ticks = 0;
+    s_q_cost_ms = s_q_idle_ms = s_q_frame_ms = 0.0;
+    s_q_ran_last = s_q_low = 0;
+    s_q_rest = s_q_good = 0;
+    s_q_backoff = RP_QUEUED_REST_MIN;
+    s_q_shed = s_q_rests = 0;
     s_open_generation = 0;
     s_device_read_fault = 0;
     s_restored_valid = 0;
@@ -547,6 +618,14 @@ uint32_t psx_mod_render_pass_plan(uint32_t period_vblanks,
     if (!passes_allowed()) return 0;
     n = gl_renderer_pass_plan(period_vblanks, shown_after_vblanks,
                               alpha_q16, max, &wanted);
+    if (gl_renderer_pass_queued()) {
+        if (n && !queued_budget_allows(period_vblanks)) {
+            n = 0;
+        } else if (!n) {
+            s_q_wait_mark = psx_frame_pacer_wait_ticks();
+            s_q_ran_last = 0;
+        }
+    }
     s_stats.wanted += wanted;
     if (!n) {
         if (wanted) s_stats.refused++;
@@ -1088,6 +1167,10 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
             ? s_stats.avg_pass_ms * 0.9 + ms * 0.1 : ms;
     }
     if (eye == RP_EYE_PASS) gl_renderer_pass_note_cost(t1 - t0);
+    if (eye == RP_EYE_PASS && gl_renderer_pass_queued()) {
+        const double ms = (double)(t1 - t0) * s_ms_per_tick;
+        s_q_cost_ms = s_q_cost_ms > 0.0 ? s_q_cost_ms * 0.875 + ms * 0.125 : ms;
+    }
     if (ok && eye == RP_EYE_LOCAL) {
         s_stats.local_views++;
         /* The peer's own image supersedes a crop of the canonical frame. */

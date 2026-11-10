@@ -48,6 +48,7 @@
 #include "local_mouse_sdl.h"
 #include "pad_external_input.h"
 #include "host_keymap.h"
+#include "present_thread.h"
 #include "png_write.h"       /* png_write_rgb — present_shot readback */
 #include "overlay_capture.h"
 #include "overlay_loader.h"
@@ -3979,8 +3980,11 @@ extern "C" void psx_display_timing_json(char *out, int cap) {
 
 static int present_should_wall_pace(void) {
     /* The single-context temporal-blend path subdivides this same stock frame
-     * interval. Do not run the outer pacer as well or guest timing doubles. */
+     * interval. Do not run the outer pacer as well or guest timing doubles.
+     * With the render thread presenting (queued render passes, one output
+     * per VBlank) nothing else paces the guest: keep the pacer. */
     if (g_frame_interpolation && g_gl_active &&
+        (!gl_renderer_render_thread_active() || rt_held()) &&
         gl_renderer_interpolation_owns_cadence())
         return 0;
     /* Run the pacer even when driver vsync is SUPPOSED to own the cadence.
@@ -4891,6 +4895,9 @@ static void openxr_ready_report_tick(uint64_t frames) {
     }
 }
 
+/* Host ticks the emulation thread has spent in the offline pacer: its idle
+ * time (render_pass.c budgets queued passes from it). */
+extern "C" uint64_t psx_frame_pacer_wait_ticks(void) { return g_frame_report_wait_ticks; }
 static void frame_report_tick(uint64_t frames) {
     static int interval_ms = -1;
     static uint64_t first_ticks = 0, last_ticks = 0, last_frames = 0;
@@ -4926,16 +4933,28 @@ static void frame_report_tick(uint64_t frames) {
     gl_renderer_frame_gen_counts(&gen, &real);
     GlDynresStats ds;
     gl_renderer_dynres_stats(&ds);
+    /* What the present thread really swapped this window, its longest
+     * present, and how long the guest waited on the render queue: a screen
+     * that stops while emulation runs shows up here, not in fps. */
+    PtStats pts;
+    pt_get_stats(&pts);
+    static uint64_t last_pt_presents, last_bp_ns;
+    const uint64_t pt_swaps = pts.presents - last_pt_presents;
+    const double bp_ms = (double)(rs.backpressure_ns + rs.ring_full_ns - last_bp_ns) * 1e-6;
+    last_pt_presents = pts.presents;
+    last_bp_ns = rs.backpressure_ns + rs.ring_full_ns;
     std::fprintf(stdout,
                  "psxrecomp: frames=%llu elapsed_ms=%llu fps=%.1f avg_fps=%.1f "
-                 "emu_busy=%.1f%% render_busy=%.1f%% dynres=%d load=%.2f gen_fps=%.1f real_fps=%.1f\n",
+                 "emu_busy=%.1f%% render_busy=%.1f%% dynres=%d load=%.2f gen_fps=%.1f real_fps=%.1f "
+                 "swaps=%llu present_max_ms=%.1f queue_wait_ms=%.1f\n",
                  (unsigned long long)frames,
                  (unsigned long long)(now - first_ticks),
                  win_s > 0.0 ? (double)(frames - last_frames) / win_s : 0.0,
                  all_s > 0.0 ? (double)frames / all_s : 0.0,
                  emu_busy, rt_busy, ds.level, g_dynres.rt.last_load,
                  pc_s > 0.0 ? (double)(gen - last_gen) / pc_s : 0.0,
-                 pc_s > 0.0 ? (double)(real - last_real) / pc_s : 0.0);
+                 pc_s > 0.0 ? (double)(real - last_real) / pc_s : 0.0,
+                 (unsigned long long)pt_swaps, pts.present_max_ns / 1e6, bp_ms);
     std::fflush(stdout);
     last_ticks = now;
     last_frames = frames;
@@ -10424,14 +10443,19 @@ static void render_thread_vblank(void) {
     if (!s_render_thread_tried) {
         s_render_thread_tried = 1;
         gl_renderer_set_present_thread(g_present_thread, g_present_thread_slots);
+        /* Temporal draw replay spans two guest VBlanks per source image.
+         * Keep two source images in flight so recording and rasterization
+         * overlap; preserve an explicit frame-bound override. */
+        const int render_frames = g_frame_interpolation &&
+            !std::getenv("PSX_RENDER_THREAD_FRAMES") ? 4 : g_render_thread_frames;
         if (g_gl_active && gr_backend() == GR_BACKEND_OPENGL &&
-            gl_renderer_render_thread_start(g_render_thread_frames)) {
+            gl_renderer_render_thread_start(render_frames)) {
             /* The NVIDIA policy only becomes eligible once the worker owns
              * GL. Update the actual driver interval at that transition. */
             apply_present_cadence();
             log_present_cadence();
             std::fprintf(stdout, "psxrecomp: render thread on (OpenGL, %d frame(s) in flight)\n",
-                         g_render_thread_frames);
+                         render_frames);
             if (g_frame_generation) {
                 gl_renderer_set_frame_generation_method(g_frame_generation_method);
                 gl_renderer_set_frame_generation(1);

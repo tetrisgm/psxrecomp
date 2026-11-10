@@ -307,6 +307,29 @@ int main(int argc, char **argv) {
     gl_renderer_set_swap_interval(0);
     if (!gl_renderer_init_context(win)) { fprintf(stderr, "FAIL context\n"); return 2; }
     check(gr_backend() == GR_BACKEND_OPENGL, "OpenGL backend");
+    /* Compare restoration with real GL state after every colour-pass branch,
+     * including mask-check, dual-source blending and bloom marking. */
+    for (int bloom = 0; bloom <= 1; ++bloom)
+    for (int tex = 0; tex <= 1; ++tex)
+    for (int semi = -1; semi <= (tex ? 4 : 3); ++semi)
+    for (int mask = 0; mask <= 1; ++mask)
+    for (int check_mask = 0; check_mask <= 1; ++check_mask) {
+        s_bcls_on = bloom;
+        p_glUseProgram(tex ? s_tex_prog : s_geo_prog);
+        p_glBindVertexArray(tex ? s_tex_vao : s_geo_vao);
+        depth_apply_ex(1, tex);
+        if (tex) tex_draw_passes_ex(0, semi, mask, check_mask, 0, -1, 1);
+        else {
+            if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+            mask_stencil_ex(mask, check_mask);
+            BCLS_DRAW(semi, 1, mask, check_mask, -1, glDrawArrays(GL_TRIANGLES, 0, 0));
+        }
+        GLboolean stencil = glIsEnabled(GL_STENCIL_TEST), blend = glIsEnabled(GL_BLEND);
+        depth_restore_ex(1, tex, 0, semi, mask, check_mask);
+        check(glIsEnabled(GL_STENCIL_TEST) == stencil, "depth pass restores stencil");
+        check(glIsEnabled(GL_BLEND) == blend, "depth pass restores blend");
+    }
+    s_bcls_on = 0;
     textures();
     gr_wide_configure(426, 53);
     if (threaded) {
@@ -421,6 +444,26 @@ int main(int argc, char **argv) {
     printf("hires=%016llx\n", (unsigned long long)hires);
     printf("wide=%016llx\n", (unsigned long long)wide);
     printf("checks=%d failures=%d\n", checks, failures);
+    if (threaded && !dynres) {
+        /* A saturated temporal queue must advance every flip/phase. Generic
+         * stale-frame suppression used to skip these before the tracker. */
+        gl_renderer_render_thread_stop();
+        gl_renderer_set_hd_texture_mode(0);
+        gl_renderer_set_interpolation(1,60.0,60.0,60.0,2);
+        gl_renderer_set_interpolation_source(1);
+        check(gl_renderer_render_thread_start(4),"temporal render thread starts");
+        uint64_t swaps=s_interp_swaps, stale=s_rth_presents_stale;
+        for(int i=0;i<120;i++) {
+            gl_renderer_present_vram(0,0,FRAME_W,FRAME_H,0,0);
+            gl_renderer_render_thread_frame_boundary();
+        }
+        gl_renderer_render_thread_sync("temporal phase check");
+        check(s_rth_presents_stale==stale,"temporal VBlanks never dropped before phase tracking");
+        check(s_interp_swaps-swaps==120,"every queued temporal VBlank selects an output");
+        RtStats phase_stats;rt_get_stats(&phase_stats);
+        check(phase_stats.backpressure_waits>0,"temporal phase check saturates the queue");
+        check(glGetError()==GL_NO_ERROR,"temporal phase GL error");
+    }
     gl_renderer_shutdown();
     check(!gl_renderer_render_thread_active(), "stopped by shutdown");
     SDL_DestroyWindow(win);

@@ -213,6 +213,16 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-10 — R4 temporal qualification (not accepted).** Preserve native
+  renderer fixes. Queued temporal presentation now observes every flip; pass
+  restoration includes depth attachments and PGXP depth-group state. Real-GL
+  depth/capture checks (132), bloom checks (187), exact threaded/reference
+  image hashes and render-thread core checks (8843) pass. Complete 4K redraw
+  still slows guest execution to approximately 34–35 VBlanks/s. Near-60 swap
+  counts with shed redraws are rejected as distinct-frame evidence. The game
+  feature remains off by default; no 60 FPS release qualification is claimed.
+
+
 - **2026-11-03 — HD replacement coverage.** Beetle-keyed RGBA artwork now
   supplies its own coverage instead of inheriting holes from native texels;
   native STP and guest VRAM remain authoritative for blending and simulation.

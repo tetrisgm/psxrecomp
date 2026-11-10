@@ -515,7 +515,8 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK, RTH_VRAM_SYNC_COPY
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK, RTH_VRAM_SYNC_COPY,
+    RTH_PASS_BEGIN, RTH_PASS_END
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
  * facade's vram_upload_open, emulation thread), tracked whatever the HD
@@ -725,6 +726,10 @@ static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
                                 int pw, int ph);
 static void pass_apply_promotion(void);
 static int pass_gen_present(uint64_t deadline);
+static int pass_queued_enabled(void);
+static int pass_vblank_locked_rate(void);
+static int pass_queued_presenter(void);
+static int pass_locked_present(void);
 static int stereo_present(int w, int h);
 static int xr_mirror_mode(void);
 static int xr_mirror_active(void);
@@ -2000,7 +2005,8 @@ static const char *TEX_FS =
     PSX_DITHER_GLSL
     "out vec4 frag; out vec4 blend_factor;\n"
     "noperspective in float v_b3d;\n"
-    "uniform int u_bcls;      /* bloom source pass (gl_postfx.inc): 0 off, 2 clear, 1 mark */\n"
+    "uniform int u_bcls;      /* 0 colour, 1 bloom mark, 2 bloom clear, 3 depth coverage */\n"
+    "uniform int u_coverage_fast;\n"
     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
     "flat in int v_depth;     /* 0=4bit 1=8bit 2=15bit */\n"
@@ -2175,6 +2181,7 @@ static const char *TEX_FS =
     "void main(){\n"
     "  int stp; vec3 rgb;\n"
     "  int fmode = v_filter & 15;\n"
+    "  bool need_color = u_bcls == 0 || u_coverage_fast == 0;\n"
     "  /* v_persp is 0 for every prim unless [video] perspective_texturing is on\n"
     "   * AND this prim's packet carried full GTE projection provenance, so the\n"
     "   * default is the PS1's affine (noperspective) mapping. */\n"
@@ -2227,10 +2234,12 @@ static const char *TEX_FS =
     "    int raw = stable_texel(ivec2(floor(uv)));\n"
     "    if (raw == 0) discard;\n"
     "    stp = (raw >> 15) & 1;\n"
-    "    rgb = xbr_sample(uv, raw, abs(dx) + abs(dy));\n"
+    "    rgb = need_color ? xbr_sample(uv, raw, abs(dx) + abs(dy)) : vec3(0.0);\n"
     "  } else if (fmode == 2) {\n"
     "    uv+=vec2(u_shift); int raw=stable_texel(ivec2(floor(uv)));\n"
     "    if(raw==0) discard; stp=(raw>>15)&1;\n"
+    "    rgb=vec3(0.0);\n"
+    "    if(need_color){\n"
     "    float lx=length(dx), ly=length(dy);\n"
     "    dx*=min(1.0,8.0/max(lx,0.001)); dy*=min(1.0,8.0/max(ly,0.001));\n"
     "    int nx=clamp(int(ceil(lx)),1,4), ny=clamp(int(ceil(ly)),1,4);\n"
@@ -2241,6 +2250,7 @@ static const char *TEX_FS =
     "      sum+=stable_bilinear(uv+offset,stp);\n"
     "    }\n"
     "    rgb=sum.a>0.00001 ? sum.rgb/sum.a : col5(raw);\n"
+    "    }\n"
     "  } else {\n"
     "    /* Bilinear, Beetle-PSX formulation: the NEAREST texel is the base\n"
     "     * (cutout + STP authority), the neighbours lie toward the sub-texel\n"
@@ -2269,7 +2279,7 @@ static const char *TEX_FS =
     "                + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
     "    stp = stpf >= 0.5 ? 1 : 0;\n"
     "  }\n"
-    "  if ((v_filter & 16) != 0 && v_hd_mode == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
+    "  if (need_color && (v_filter & 16) != 0 && v_hd_mode == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
     "  if (u_bcls != 0) {   /* 3D, or additive (modes 1 and 3) semi texels */\n"
     "    if (u_bcls == 1 && !(v_b3d > 0.999 || ((v_semi == 2 || v_semi == 4) && stp == 1))) discard;\n"
     "    if (u_bcls == 2 && v_semi != 0 && stp == 1) discard;   /* see-through: keeps what is under */\n"
@@ -2503,6 +2513,16 @@ static void hr_end(void) {
  * decal problem; this tolerance is our own. Every caller that applies 1 or 2
  * calls depth_restore after its draw (tex: textured program bound). */
 static GLint s_geo_uZbias = -1, s_tex_uZbias = -1;
+static GLint s_tex_uBcls = -1, s_geo_uBcls = -1, s_geo_uBadd = -1;
+static int coverage_fast_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_GL_COVERAGE_FAST");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+
 static float s_pgxp_depth_tol = -1.0f;
 static float pgxp_depth_tol(void) {
     if (s_pgxp_depth_tol < 0.0f) {
@@ -2529,16 +2549,32 @@ static void depth_apply_ex(int mode, int tex) {
 }
 /* After the colour pass of mode 1: the depth-only pass (n vertices of the
  * bound buffer), then back to the default state. */
-static void depth_restore_ex(int mode, int tex, int n) {
+static int depth_state_fast(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_GL_STATE_QUERY_FAST");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+static void depth_restore_ex_at(int mode, int tex, int n, int semi, int mask, int check, int first) {
     if (mode == 0) return;
     if (mode == 1) {
         p_glUniform1f(tex ? s_tex_uZbias : s_geo_uZbias, 0.0f);
-        GLboolean st = glIsEnabled(GL_STENCIL_TEST), bl = glIsEnabled(GL_BLEND);
+        /* The preceding colour pass establishes these states. Avoid two
+         * synchronous queries to the threaded driver for every depth batch. */
+        GLboolean st = !(tex && semi == 4 && !mask && !check), bl = semi >= 0;
+        if (!depth_state_fast()) {
+            st = glIsEnabled(GL_STENCIL_TEST); bl = glIsEnabled(GL_BLEND);
+        }
         glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
         glDepthMask(GL_TRUE);
         if (tex) p_glUniform1i(s_uSemipass, 0);
-        glDrawArrays(GL_TRIANGLES, 0, n);
+        /* Coverage keeps native/HD cutouts; colour filtering cannot affect depth. */
+        if (tex && coverage_fast_enabled()) p_glUniform1i(s_tex_uBcls, 3);
+        glDrawArrays(GL_TRIANGLES, first, n);
+        if (tex && coverage_fast_enabled()) p_glUniform1i(s_tex_uBcls, 0);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         if (st) glEnable(GL_STENCIL_TEST);
         if (bl) glEnable(GL_BLEND);
@@ -2546,6 +2582,10 @@ static void depth_restore_ex(int mode, int tex, int n) {
     glDepthMask(GL_TRUE);
     glDisable(GL_DEPTH_TEST);
     if (mode == 2) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+}
+
+static void depth_restore_ex(int mode,int tex,int n,int semi,int mask,int check) {
+    depth_restore_ex_at(mode,tex,n,semi,mask,check,0);
 }
 
 /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
@@ -2891,7 +2931,7 @@ static void hiw_clear_rect(int x, int y, int w, int h, float r, float g, float b
         glClearColor(r, g, b, a);
         glClearStencil(stencil);
         glStencilMask(0xFF);
-        glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
 }
 
@@ -3809,7 +3849,6 @@ void gl_renderer_batch_diag(uint64_t out[9]) {
  * Opaque 2D, sprites and the HUD therefore clear it wherever they draw,
  * painter ordered like the colour; semi-transparent texels and primitives
  * leave it as it was. Bloom off: none of this runs and no state changes. */
-static GLint s_tex_uBcls = -1, s_geo_uBcls = -1, s_geo_uBadd = -1;
 /* No glGet here: on a threaded driver every query is a round trip, and these
  * run per batch. The passes set what they need; the caller's draw state is
  * then put back from what the caller knows (bcls_end_geo / tex_bcls_end).
@@ -3849,6 +3888,23 @@ static int bcls_passes(int semi, int b3d) {
     if (b3d == 0) return BCLS_CLEAR;
     return BCLS_CLEAR | BCLS_SET;
 }
+static uint64_t s_bcls_fused_draws;
+/* Opaque, uniformly classified batches can write bloom bit 1 with their
+ * colour, also clearing mask bit 0 as the unfused colour draw does.
+ * Destination masking / set-mask and mixed
+ * or translucent batches keep the existing coverage passes. */
+static int bcls_fuse_begin(int semi, int dmode, int mask, int check, int b3d) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("PSX_GL_BLOOM_FUSE"); enabled = !e || e[0] != '0'; }
+    if (!enabled || !s_bcls_on || s_fg_drawing || semi >= 0 ||
+        dmode == 2 || mask || check || b3d < 0) return 0;
+    glEnable(GL_STENCIL_TEST);
+    glStencilMask(0x03);
+    glStencilFunc(GL_ALWAYS, b3d ? 0x02 : 0x00, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    s_bcls_fused_draws++;
+    return 1;
+}
 /* Mode 2 is the full draw-area depth rectangle emitted by depth_clear_now.
  * Its queued surface scissor already clips it to the same pixels. A hardware
  * clear writes the same far depth without shading two screen-sized triangles;
@@ -3862,9 +3918,11 @@ static int bcls_passes(int semi, int b3d) {
  * does not clear: what shows through it (a lamp under a fog or shade quad)
  * keeps glowing. */
 #define BCLS_DRAW(semi, dmode, mask, check, b3d, DRAW) do {                    \
+        const int bcls_fused_ = bcls_fuse_begin((semi), (dmode), (mask), (check), (b3d)); \
         if ((dmode) == 2) { glClearDepth(1.0); glClear(GL_DEPTH_BUFFER_BIT); } \
-        else { DRAW; }                                                         \
-        if (s_bcls_on && (dmode) != 2 && !s_fg_drawing) {                     \
+        else { DRAW; }                                                                 \
+        if (bcls_fused_) mask_stencil_ex((mask), (check));                    \
+        else if (s_bcls_on && (dmode) != 2 && !s_fg_drawing) {                \
             const int bcls_p_ = bcls_passes((semi), (b3d));                   \
             bcls_begin(0, (semi) == 1 || (semi) == 3);                        \
             if (bcls_p_ & BCLS_CLEAR) { bcls_pass(0, 2); DRAW; }              \
@@ -3878,19 +3936,21 @@ static int bcls_passes(int semi, int b3d) {
 /* tb_mask / check are the batch's set-mask and the mask-check state it was
  * drawn under; track_stencil lets the canonical pass record deferred stencil
  * (a replay into the high-resolution window must not touch that flag). */
-static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
-                               int track_stencil, int b3d) {
+static void tex_draw_passes_ex_at(int nverts, int semi, int tb_mask, int check,
+                               int track_stencil, int b3d, int dmode, int first) {
+    int fused = 0;
     p_glUniform1i(s_uSemimode, semi < 0 ? 0 : semi);
     if (semi < 0) {
         glDisable(GL_BLEND);
         mask_stencil_ex(tb_mask, check);
         p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
-        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        fused = bcls_fuse_begin(semi, dmode, tb_mask, check, b3d);
+        glDrawArrays(GL_TRIANGLES, first, nverts);
         if (check) {
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
             mask_stencil_ex(1, check);
             p_glUniform1i(s_uSemipass, 2);             /* STP=1 texels set the mask bit */
-            glDrawArrays(GL_TRIANGLES, 0, nverts);
+            glDrawArrays(GL_TRIANGLES, first, nverts);
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         } else if (!tb_mask) {
             /* Alpha is already exact; defer its duplicate stencil encoding
@@ -3907,23 +3967,24 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
         p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
         if (tb_mask) mask_stencil_ex(1, check); else glDisable(GL_STENCIL_TEST);
         p_glUniform1i(s_uSemipass, 0);
-        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        glDrawArrays(GL_TRIANGLES, first, nverts);
         if (!tb_mask && track_stencil) s_stencil_valid = 0;
     } else {
         glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
         mask_stencil_ex(tb_mask, check);
         p_glUniform1i(s_uSemipass, 1);
-        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        glDrawArrays(GL_TRIANGLES, first, nverts);
         apply_psx_blend(semi);                         /* Pass 2: STP=1 texels (blended) */
         mask_stencil_ex(1, check);
         p_glUniform1i(s_uSemipass, 2);
-        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        glDrawArrays(GL_TRIANGLES, first, nverts);
     }
-    if (s_bcls_on && !s_fg_drawing) {
+    if (fused) mask_stencil_ex(tb_mask, check);
+    else if (s_bcls_on && !s_fg_drawing) {
         const int bp = bcls_passes(semi, b3d);
         bcls_begin(1, 0);
-        if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, 0, nverts); }
-        if (bp & BCLS_SET)   { bcls_pass(1, 1); glDrawArrays(GL_TRIANGLES, 0, nverts); }
+        if (bp & BCLS_CLEAR) { bcls_pass(1, 2); glDrawArrays(GL_TRIANGLES, first, nverts); }
+        if (bp & BCLS_SET)   { bcls_pass(1, 1); glDrawArrays(GL_TRIANGLES, first, nverts); }
         /* Back to the state the branch above ended in. */
         p_glUniform1i(s_tex_uBcls, 0);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -3944,8 +4005,12 @@ static void tex_draw_passes_ex(int nverts, int semi, int tb_mask, int check,
         }
     }
 }
+static void tex_draw_passes_ex(int n,int semi,int mask,int check,int track,int b3d,int depth) {
+    tex_draw_passes_ex_at(n,semi,mask,check,track,b3d,depth,0);
+}
+
 static void tex_batch_draw_passes(int nverts, int semi) {
-    tex_draw_passes_ex(nverts, semi, s_tb_mask, s_mask_check, 1, s_tb_b3d);
+    tex_draw_passes_ex(nverts, semi, s_tb_mask, s_mask_check, 1, s_tb_b3d, s_tb_depth);
 }
 
 /* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
@@ -4014,6 +4079,7 @@ typedef struct {
     int8_t  semi;            /* tex: batch semi key; geo: blend mode, -1 opaque */
     uint8_t mask;            /* tex: batch set-mask; geo: stencil write value */
     uint8_t check;           /* mask-check state at draw time */
+    int8_t b3d;              /* uniform bloom-source classification, -1 mixed */
     GLuint  tex;             /* sampled texture (bank or raw mirror) */
     GLuint  palette, hd_tex;
     int     ax0, ay0, ax1, ay1;  /* draw area, inclusive */
@@ -4031,18 +4097,56 @@ static int     s_hq_n = 0, s_hq_cap = 0;
 static float  *s_hq_v = NULL;
 static size_t  s_hq_vn = 0, s_hq_vcap = 0;
 static uint64_t s_hq_flushes = 0, s_hq_cmds = 0;
+static uint64_t s_hq_uploads, s_hq_saved_uploads;
+static int hiw_upload_fast(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PSX_GL_QUEUE_UPLOAD_FAST");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+/* Each VAO retains its existing vertex layout/buffer. Upload the packed queue
+ * once to each used buffer, then reuse it for every tile and wide target.
+ * Entries start at a multiple of their stride, so DrawArrays can select them
+ * without changing attribute pointers or orphaning a buffer per batch. */
+static void hiw_upload_queue(void) {
+    if (!hiw_upload_fast()) return;
+    int used[3] = {0};
+    for (int i = 0; i < s_hq_n; ++i) used[s_hq[i].kind] = 1;
+    for (int kind = HQ_TEX; kind <= HQ_GEO; ++kind) {
+        if (!used[kind]) continue;
+        p_glBindBuffer(PSXGL_ARRAY_BUFFER, kind == HQ_TEX ? s_tex_vbo : s_geo_vbo);
+        p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(s_hq_vn * sizeof(float)),
+                       s_hq_v, PSXGL_STREAM_DRAW);
+        s_hq_uploads++;
+    }
+}
+static int hiw_upload_cmd(const HiCmd *c) {
+    int stride = c->kind == HQ_TEX ? TEXV : 6;
+    if (hiw_upload_fast()) {
+        s_hq_saved_uploads++;
+        return (int)(c->vfirst / (size_t)stride);
+    }
+    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * stride * sizeof(float)),
+                   s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+    s_hq_uploads++;
+    return 0;
+}
+
 
 static HiCmd *hiw_enqueue(int kind, const float *verts, int nverts, int stride) {
     size_t nf = (size_t)nverts * (size_t)stride;
+    size_t first = (s_hq_vn + stride - 1u) / stride * stride;
     if (s_hq_n == s_hq_cap) {
         int cap = s_hq_cap ? s_hq_cap * 2 : 256;
         HiCmd *q = (HiCmd *)realloc(s_hq, (size_t)cap * sizeof(HiCmd));
         if (!q) return NULL;
         s_hq = q; s_hq_cap = cap;
     }
-    if (s_hq_vn + nf > s_hq_vcap) {
+    if (first + nf > s_hq_vcap) {
         size_t cap = s_hq_vcap ? s_hq_vcap : 65536;
-        while (cap < s_hq_vn + nf) cap *= 2;
+        while (cap < first + nf) cap *= 2;
         float *v = (float *)realloc(s_hq_v, cap * sizeof(float));
         if (!v) return NULL;
         s_hq_v = v; s_hq_vcap = cap;
@@ -4050,10 +4154,11 @@ static HiCmd *hiw_enqueue(int kind, const float *verts, int nverts, int stride) 
     HiCmd *c = &s_hq[s_hq_n++];
     memset(c, 0, sizeof *c);
     c->kind = (uint8_t)kind;
-    c->vfirst = s_hq_vn;
+    c->vfirst = first;
     c->vcount = nverts;
-    memcpy(s_hq_v + s_hq_vn, verts, nf * sizeof(float));
-    s_hq_vn += nf;
+    memset(s_hq_v + s_hq_vn,0,(first-s_hq_vn)*sizeof(float));
+    memcpy(s_hq_v + first, verts, nf * sizeof(float));
+    s_hq_vn = first + nf;
     c->check = (uint8_t)s_mask_check;
     c->depth = (uint8_t)s_hq_depth_cur;
     c->ax0 = s_area_x1; c->ay0 = s_area_y1; c->ax1 = s_area_x2; c->ay1 = s_area_y2;
@@ -4109,6 +4214,7 @@ static int hiw_enqueue_tex(int nverts, int semi, int mirror, int gate) {
     HiCmd *c = hiw_enqueue(HQ_TEX, s_tb, nverts, TEXV);
     if (!c) { hiw_flush_queue(); return 0; }
     c->semi = (int8_t)semi;
+    c->b3d = (int8_t)s_tb_b3d;
     c->mask = (uint8_t)s_tb_mask;
     c->tex = s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex;
     c->palette = s_tb_bank_tex && !s_tb_bank_live_clut ? s_tb_bank_tex : s_raw_tex;
@@ -4118,12 +4224,13 @@ static int hiw_enqueue_tex(int nverts, int semi, int mirror, int gate) {
 }
 
 static int hiw_enqueue_geo(const float *verts, int nverts, int semi, int mask,
-                           int mirror, int gate) {
+                           int mirror, int gate, int b3d) {
     int wq = hiw_wide_queue_ok(mirror);
     if (!wq && !hiw_area_touches()) return 0;
     HiCmd *c = hiw_enqueue(HQ_GEO, verts, nverts, 6);
     if (!c) { hiw_flush_queue(); return 0; }
     c->semi = (int8_t)semi;
+    c->b3d = (int8_t)b3d;
     c->mask = (uint8_t)(mask ? 1 : 0);
     if (wq) hiw_wide_set(c, gate);
     return wq;
@@ -4170,11 +4277,10 @@ static void hiw_replay_wide(void) {
             p_glUniform1f(s_tex_uXcenter, c->wcenter);
             bind_textured_resources(c->tex, c->palette, c->hd_tex);
             p_glUniform1i(s_uMaskset, c->mask);
-            p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
-                           s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+            int first = hiw_upload_cmd(c);
             depth_apply_ex(c->depth, 1);
-            tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, -1);
-            depth_restore_ex(c->depth, 1, c->vcount);
+            tex_draw_passes_ex_at(c->vcount, c->semi, c->mask, c->check, 0, c->b3d, c->depth, first);
+            depth_restore_ex_at(c->depth, 1, c->vcount, c->semi, c->mask, c->check, first);
         } else {
             if (cur != HQ_GEO) {
                 p_glUseProgram(s_geo_prog);
@@ -4187,11 +4293,10 @@ static void hiw_replay_wide(void) {
             p_glUniform1f(s_geo_uXcenter, c->wcenter);
             if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);
             mask_stencil_ex(c->mask, c->check);
-            p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)),
-                           s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+            int first = hiw_upload_cmd(c);
             depth_apply_ex(c->depth, 0);
-            BCLS_DRAW(c->semi, c->depth, c->mask, c->check, -1, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
-            depth_restore_ex(c->depth, 0, c->vcount);
+            BCLS_DRAW(c->semi, c->depth, c->mask, c->check, c->b3d, glDrawArrays(GL_TRIANGLES, first, c->vcount));
+            depth_restore_ex_at(c->depth, 0, c->vcount, c->semi, c->mask, c->check, first);
         }
     }
     if (!any) return;
@@ -4210,6 +4315,7 @@ static void hiw_replay_wide(void) {
 static void hiw_flush_tail(void);
 static void hiw_flush_queue(void) {
     if (s_hq_n == 0) return;
+    hiw_upload_queue();
     if (!hiw_on()) {   /* native-wide mirrors only (wide_queue_live) */
         s_hq_flushes++;
         hiw_flush_tail();
@@ -4254,11 +4360,10 @@ static void hiw_flush_queue(void) {
                 }
                 bind_textured_resources(c->tex, c->palette, c->hd_tex);
                 p_glUniform1i(s_uMaskset, c->mask);
-                p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
-                               s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+                int first = hiw_upload_cmd(c);
                 depth_apply_ex(c->depth, 1);
-                tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0, -1);
-                depth_restore_ex(c->depth, 1, c->vcount);
+                tex_draw_passes_ex_at(c->vcount, c->semi, c->mask, c->check, 0, c->b3d, c->depth, first);
+                depth_restore_ex_at(c->depth, 1, c->vcount, c->semi, c->mask, c->check, first);
             } else {
                 if (cur != HQ_GEO) {
                     p_glUseProgram(s_geo_prog);
@@ -4268,11 +4373,10 @@ static void hiw_flush_queue(void) {
                 }
                 if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);
                 mask_stencil_ex(c->mask, c->check);
-                p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * 6 * sizeof(float)),
-                               s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+                int first = hiw_upload_cmd(c);
                 depth_apply_ex(c->depth, 0);
-                BCLS_DRAW(c->semi, c->depth, c->mask, c->check, -1, glDrawArrays(GL_TRIANGLES, 0, c->vcount));
-                depth_restore_ex(c->depth, 0, c->vcount);
+                BCLS_DRAW(c->semi, c->depth, c->mask, c->check, c->b3d, glDrawArrays(GL_TRIANGLES, first, c->vcount));
+                depth_restore_ex_at(c->depth, 0, c->vcount, c->semi, c->mask, c->check, first);
             }
         }
     }
@@ -4319,7 +4423,7 @@ static void flush_tex_batch_impl(void) {
 
     depth_apply_ex(dmode, 1);
     tex_batch_draw_passes(nverts, semi);
-    depth_restore_ex(dmode, 1, nverts);
+    depth_restore_ex(dmode, 1, nverts, semi, s_tb_mask, s_mask_check);
 
     /* Native-wide mirror — skipped for a batch fully inside the 4:3 frame (its
      * centre content comes from the present-time canonical blit; nothing to add
@@ -4348,7 +4452,7 @@ static void flush_tex_batch_impl(void) {
         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         depth_apply_ex(dmode, 1);
         if (s_ws_ablate != 2) tex_batch_draw_passes(nverts, semi);
-        depth_restore_ex(dmode, 1, nverts);
+        depth_restore_ex(dmode, 1, nverts, semi, s_tb_mask, s_mask_check);
         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
         gl_perf_mirror_end();
@@ -4460,7 +4564,7 @@ static void flush_flat_batch_impl(void) {
     depth_apply_ex(dmode, 0);
     BCLS_DRAW(semi, dmode, mask, s_mask_check, b3d, if (nl) flat_batch_draw_hr_lines(nverts, nl);
                        else glDrawArrays(fmode, 0, nverts));
-    depth_restore_ex(dmode, 0, nverts);
+    depth_restore_ex(dmode, 0, nverts, semi, mask, s_mask_check);
     int mirror = g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
                  !(!g_ws_bd_stretch_on && mirror_flat_batch_center_only(nverts));
     if (mirror) {
@@ -4470,7 +4574,7 @@ static void flush_flat_batch_impl(void) {
     }
     s_hq_depth_cur = dmode;
     if ((hiw_on() || (mirror && fmode == GL_TRIANGLES && wide_queue_live())) &&
-        hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate)) mirror = 0;
+        hiw_enqueue_geo(s_fb, nverts, semi, mask, mirror, s_fb_gate, b3d)) mirror = 0;
     s_hq_depth_cur = 0;
 
     if (mirror) {
@@ -4481,7 +4585,7 @@ static void flush_flat_batch_impl(void) {
         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         depth_apply_ex(dmode, 0);
         if (s_ws_ablate != 2) BCLS_DRAW(semi, dmode, mask, s_mask_check, b3d, glDrawArrays(fmode, 0, nverts));
-        depth_restore_ex(dmode, 0, nverts);
+        depth_restore_ex(dmode, 0, nverts, semi, mask, s_mask_check);
         wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
         gl_perf_mirror_end();
@@ -4872,7 +4976,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
         }
         if ((hiw_on() || (mirror && draw_mode == GL_TRIANGLES && wide_queue_live())) &&
             hiw_enqueue_geo(draw_mode == GL_TRIANGLES && is_line ? quad : verts,
-                            draw_n, semi, s_mask_set, mirror, bd_prim_gate(xs, n, 0)))
+                            draw_n, semi, s_mask_set, mirror, bd_prim_gate(xs, n, 0), -1))
             mirror = 0;
         if (mirror) {
             int dx = wide_dx();
@@ -5249,7 +5353,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b) 
     glClearColor(r, g, b, 0.0f);
     glClearStencil(0);
     glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     rect_add(&s_pack_dirty, x, y, x + w - 1, y + h - 1);
     if (!cpu_vram_authoritative()) rect_add(&s_cpu_dirty, x, y, x + w - 1, y + h - 1);
 }
@@ -5808,7 +5912,7 @@ static void depth24_clear_skipped_fb(void) {
     glClearColor(0.f, 0.f, 0.f, 0.f);
     glClearStencil(0);
     glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     hiw_clear_rect(x0, y0, rw, rh, 0.f, 0.f, 0.f, 0.f, 0);
     if (s_raw_fbo) {
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_raw_fbo);
@@ -6315,6 +6419,8 @@ static int init_gpu_raster(void) {
         p_glUniform1i(s_uHdTexture, 2);
     }
     s_tex_uBcls = p_glGetUniformLocation(s_tex_prog, "u_bcls");
+    p_glUseProgram(s_tex_prog);
+    p_glUniform1i(p_glGetUniformLocation(s_tex_prog, "u_coverage_fast"), coverage_fast_enabled());
     s_geo_uBcls = p_glGetUniformLocation(s_geo_prog, "u_bcls");
     s_geo_uBadd = p_glGetUniformLocation(s_geo_prog, "u_badd");
     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
@@ -6434,7 +6540,7 @@ static int init_gpu_raster(void) {
     glClearColor(0, 0, 0, 0);
     glClearStencil(0);
     glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     rect_clear(&s_pack_dirty);
     rect_clear(&s_stencil_stale);
@@ -7293,7 +7399,7 @@ static int wide_alloc_surface(int S, GLuint *tex, GLuint *rb, GLuint *fbo) {
     glClearColor(0, 0, 0, 0);
     glClearStencil(0);
     glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     return 1;
 }
@@ -7411,7 +7517,7 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     glClearColor(r, g, b, a);
     glClearStencil((color >> 15) & 1);   /* stencil mirrors bit15, like the color alpha */
     glStencilMask(0xFF);
-    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     gl_perf_mirror_end();
@@ -7451,11 +7557,11 @@ static void glb_wide_clear_margins(int base_x, int y, int h, uint16_t color, int
     glStencilMask(0xFF);
     if (sides & 1) {
         glScissor(0, y0, margin, y1 - y0);
-        glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
     if (sides & 2) {
         glScissor(W - margin, y0, margin, y1 - y0);
-        glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
@@ -8324,6 +8430,20 @@ static void interp_present_source_interval(void) {
             s_interp_phase_lo, s_interp_phase_hi))
         return;
     pass_apply_promotion();
+    if (pass_queued_presenter() && s_rth_on && rt_on_render_thread()) {
+        /* Queued passes: exactly one output for this guest VBlank, now. The
+         * guest's own pacer sets the cadence; the image is the one for this
+         * VBlank's place in the frame (phase k / period), never chosen from a
+         * wall-clock deadline that the render thread's own delay would skew. */
+        uint64_t d = 0;
+        float a = 1.0f;
+        while (frame_interpolation_schedule_next(&s_interp_schedule, now, &d, &a)) { }
+        latency_ring_mark(LAT_SWAP_BEGIN);
+        if (!pass_locked_present())
+            (void)interp_present(a);
+        latency_ring_mark(LAT_SWAP_END);
+        return;
+    }
 
     while (frame_interpolation_schedule_next(
                &s_interp_schedule, SDL_GetPerformanceCounter(),
@@ -8446,6 +8566,10 @@ static GLuint   s_pb_wide_src = 0;
 static int      s_pb_valid = 0;
 static int      s_pb_x = 0, s_pb_y = 0, s_pb_w = 0, s_pb_h = 0, s_pb_scale = 0;
 static uint64_t s_pb_reused = 0;
+/* Optional draws must not change the next native polygon's depth grouping. */
+static int s_pb_depth_need, s_pb_depth_used, s_pb_depth_reason;
+static float s_pb_depth_avg;
+
 static uint16_t *s_pb_cpu = NULL;
 static size_t   s_pb_cpu_cap = 0;
 static DirtyRect s_pb_cpu_dirty, s_pb_pack_dirty, s_pb_up_rects[UP_RECTS_MAX];
@@ -8468,6 +8592,60 @@ static double   s_present_cost_ema = 0.0;     /* host ticks per present */
 static uint32_t s_intervals_since_plan = 0;
 static int      s_pass_budget_pct = -1;
 static GLRenderPassPlanDiag s_pass_plan_diag;
+
+/* Queued passes (render thread on). The emulation thread records a pass's
+ * GL begin and end like any other draw call, and the render thread runs the
+ * whole GL side of the transaction (backup, the pass's own draws, capture,
+ * restore) in stream order. The emulation thread then pays only for the
+ * guest's draw code, instead of draining the render queue and rasterizing
+ * the pass itself while it holds the context. Results the guest side used to
+ * read back (begin refusals, out-of-rect leaks) are counted when the render
+ * thread reaches them; a refused begin drops that pass's records. Plans are
+ * locked to VBlanks (one output per guest VBlank, gl_renderer_pass_plan),
+ * so the presenter never sleeps on a wall-clock deadline in the render
+ * thread. PSX_RENDER_PASS_QUEUED=0 restores the synchronous handoff;
+ * PSX_RENDER_PASS_VERIFY=1 implies it (verification reads GL state back). */
+static int      s_pass_queued_env = -1;
+static int      s_pass_dead = 0;                 /* render thread */
+static uint32_t s_pass_leaks_at_begin = 0;       /* render thread */
+static uint32_t s_pgen_interval = 0;             /* render thread */
+static _Atomic uint32_t s_pass_q_leaks, s_pass_q_refused, s_pass_q_shed;
+static _Atomic uint32_t s_pass_q_intervals;
+
+static int pass_queued_enabled(void) {
+    if (s_pass_queued_env < 0) {
+        const char *e = getenv("PSX_RENDER_PASS_QUEUED");
+        const char *v = getenv("PSX_RENDER_PASS_VERIFY");
+        s_pass_queued_env = (e && e[0] == '0') || (v && v[0] && v[0] != '0') ? 0 : 1;
+    }
+    return s_pass_queued_env;
+}
+/* One presented output per guest VBlank: the only cadence queued passes
+ * schedule (an integer multiple would need presenter-side deadlines). */
+static int pass_vblank_locked_rate(void) {
+    return s_interp_source_hz > 0.0 &&
+           fabs(s_interp_target_hz - s_interp_source_hz) < 0.01;
+}
+/* Emulation thread: record this pass instead of taking the context. */
+static int pass_queued(void) {
+    return pass_queued_enabled() && s_rth_on && !rt_on_render_thread() &&
+           !rt_held() && pass_vblank_locked_rate();
+}
+int gl_renderer_pass_queued(void) { return pass_queued(); }
+/* The presenter queued passes need: flip source, hold blend, one output per
+ * guest VBlank. Only it keeps the render thread on with interpolation
+ * enabled; every other interpolation mode still renders on the emulation
+ * thread's context, as before. */
+static int pass_queued_presenter(void) {
+    return pass_queued_enabled() && s_interp_source == 1 && s_interp_hold &&
+           pass_vblank_locked_rate();
+}
+void gl_renderer_pass_queued_counts(uint64_t *backlog_shed, uint64_t *refused,
+                                    uint64_t *leaks) {
+    if (backlog_shed) *backlog_shed = atomic_load(&s_pass_q_shed);
+    if (refused) *refused = atomic_load(&s_pass_q_refused);
+    if (leaks) *leaks = atomic_load(&s_pass_q_leaks);
+}
 
 static int      s_pass_verify = -1;
 static uint8_t *s_pv_hr = NULL, *s_pv_raw = NULL;
@@ -8533,7 +8711,10 @@ static void pass_refusal_init(void) {
 }
 
 uint32_t gl_renderer_pass_unavailable(void) {
-    GL_RT_SYNC("pass_unavailable");
+    /* Queued: flags the emulation thread sets, plus the presenter's history
+     * count read without a drain (a stale value is refused at begin on the
+     * render thread). */
+    if (!pass_queued()) GL_RT_SYNC("pass_unavailable");
     pass_refusal_init();
     if (!s_ctx || !s_raster_ok || !s_interp_enabled || s_interp_suspended ||
         s_interp_source != 1 || !(s_interp_source_hz > 0.0))
@@ -8561,7 +8742,7 @@ uint32_t gl_renderer_pass_unavailable(void) {
 }
 
 int gl_renderer_pass_ready(void) {
-    GL_RT_SYNC("pass_ready");
+    if (!pass_queued()) GL_RT_SYNC("pass_ready");
     return gl_renderer_pass_unavailable() == PSX_MOD_RENDER_PASS_READY;
 }
 
@@ -8571,6 +8752,10 @@ static uint32_t pass_slot_cap(int tex_w, int tex_h) {
     uint32_t cap = bytes > 0.0 ? (uint32_t)((256.0 * 1024.0 * 1024.0) / bytes)
                                : PASS_SLOTS;
     if (cap > PASS_SLOTS) cap = PASS_SLOTS;
+    /* Queued passes keep a frame's own image and one in-between image per
+     * generation whatever the size: at 8K that is about 0.8 GiB of textures
+     * (three generations), allocated only when used. */
+    if (cap < 2 && pass_queued_enabled()) cap = 2;
     return cap;
 }
 
@@ -8578,6 +8763,40 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
                                uint32_t shown_after_vblanks,
                                uint32_t *alpha_q16, uint32_t max,
                                uint32_t *wanted) {
+    if (pass_queued()) {
+        /* VBlank-locked: frame N is shown for period_vblanks outputs, one per
+         * VBlank; output k shows phase k / period. Phase 0 is the game's own
+         * image, so passes are wanted at k = 1 .. period - 1. They are shed
+         * while the render thread is two frames behind (one is its normal
+         * pipelined state). */
+        uint32_t n = 0, cap;
+        const int live = atomic_exchange(&s_pass_q_intervals, 0) > 0;
+        if (wanted) *wanted = 0;
+        (void)shown_after_vblanks;
+        if (gl_renderer_pass_unavailable() != PSX_MOD_RENDER_PASS_READY || !live ||
+            !alpha_q16 || max == 0 || period_vblanks < 2)
+            return 0;
+        if (wanted) *wanted = period_vblanks - 1u;
+        int shed_backlog = rt_frames_ahead() >= 2;
+#ifndef PSX_NO_DEBUG_TOOLS
+        /* Full-cost diagnostics must bypass BOTH admission guards, not just
+         * the CPU idle budget, or swaps can hide missing intermediate images. */
+        const char *shed = getenv("PSX_RENDER_PASS_SHED");
+        if (shed && shed[0] == '0') shed_backlog = 0;
+#endif
+        if (shed_backlog) {
+            atomic_fetch_add(&s_pass_q_shed, 1);
+            return 0;
+        }
+        cap = pass_slot_cap(s_interp_w, s_interp_h);
+        for (uint32_t k = 1; k < period_vblanks && n < max && n + 1u < cap; k++)
+            alpha_q16[n++] = (uint32_t)(((uint64_t)k << 16) / period_vblanks);
+        s_pass_plan_diag.plans++;
+        s_pass_plan_diag.frame = s_frame_count;
+        s_pass_plan_diag.wanted = period_vblanks - 1u;
+        s_pass_plan_diag.planned = n;
+        return n;
+    }
     GL_RT_SYNC("pass_plan");
     RenderPassPlanInput in;
     double freq, sp, spare;
@@ -8663,6 +8882,7 @@ void gl_renderer_pass_plan_diag(GLRenderPassPlanDiag *out) {
 }
 
 void gl_renderer_pass_note_cost(uint64_t ticks) {
+    if (pass_queued()) return;   /* VBlank-locked plans carry no budget */
     GL_RT_SYNC("pass_note_cost");
     if (s_pass_cost_w != s_interp_w || s_pass_cost_h != s_interp_h) {
         memset(&s_pass_cost, 0, sizeof s_pass_cost);
@@ -8678,6 +8898,9 @@ void gl_renderer_pass_note_cost(uint64_t ticks) {
 }
 
 uint32_t gl_renderer_pass_leaks(void) {
+    /* Queued: counted when the render thread ends a pass, so a leak fails a
+     * later pass of the session rather than its own. */
+    if (pass_queued()) return atomic_load(&s_pass_q_leaks);
     GL_RT_SYNC("pass_leaks"); return s_pass_leaks; }
 int gl_renderer_pass_verify_vram(void) {
     GL_RT_SYNC("pass_verify_vram"); return s_pv_ok; }
@@ -8761,14 +8984,21 @@ static int pass_gen_reserve(int gi, uint32_t need, int w, int h) {
 
 /* Copy the rect as the presenter would see it into `tex`. Native-wide first
  * refreshes the band's canonical centre, as the wide present does. */
-static void pass_capture_into(GLuint tex, const PassGen *g) {
+static int pass_capture_fast(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    const char *e = getenv("PSX_RENDER_PASS_CAPTURE_FAST");
+    if (e && e[0] == '0') return 0;
+#endif
+    return 1;
+}
+static void pass_capture_into(GLuint tex, const PassGen *g, int center_ready) {
     int S = s_hr_scale;
     hiw_flush_queue();   /* queued wide mirrors land before the capture reads */
     if (g->source_path == GL_PRES_WIDE) {
         GLuint wf = pass_wide_fbo_for(g->x);
         int native_w = g_wide_w - 2 * g_wide_off;
         if (!wf) return;
-        if (wide_center_is_canonical() && native_w > 0) {
+        if (!center_ready && wide_center_is_canonical() && native_w > 0) {
             /* Colour only: the centre's stencil is left behind (s_wst_*). */
             wst_add(wide_index(wf), g_wide_off, g->y, g_wide_off + native_w, g->y + g->h);
             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
@@ -8898,7 +9128,7 @@ static int pass_journal_protect(int x, int y, int w, int h) {
     if (render_pass_journal_add(&s_pj_cpu, s_vram, VRAM_W, x, y, w, h) != i)
         return 0;
     pass_blit(s_hr_fbo, j->hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
-              GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+              GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     pass_blit(s_raw_fbo, j->raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
     s_pj_total++;
     return 1;
@@ -8911,7 +9141,7 @@ static void pass_journal_rollback(void) {
         int x = s_pj_cpu.x[i], y = s_pj_cpu.y[i];
         int w = s_pj_cpu.w[i], h = s_pj_cpu.h[i];
         pass_blit(j->hr_fbo, s_hr_fbo, 0, 0, x * S, y * S, w * S, h * S,
-                  GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                  GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
         pass_blit(j->raw_fbo, s_raw_fbo, 0, 0, x, y, w, h, GL_COLOR_BUFFER_BIT);
     }
     render_pass_journal_rollback(&s_pj_cpu, s_vram, VRAM_W);
@@ -8997,7 +9227,10 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         g->source_path = wide ? GL_PRES_WIDE : GL_PRES_VRAM;
         g->period = period_vblanks ? period_vblanks : 1u;
         g->shown = s_pass_flip_shown;
-        pass_capture_into(s_pgen_tex[gi][0], g);   /* the game's own image */
+        /* Pending flips capture phase zero at promotion, after any final HUD
+         * writes. The earlier copy is never presented and is redundant. */
+        if (g->shown || !pass_capture_fast())
+            pass_capture_into(s_pgen_tex[gi][0], g, 0);
         g->phase[0] = 0;
         g->n = 1;
         g->valid = 1;
@@ -9027,7 +9260,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
                              PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT))
         return pass_begin_refuse("backup_raw");
     pass_blit(s_hr_fbo, s_pb_hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
-              GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+              GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     pass_blit(s_raw_fbo, s_pb_raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
     s_pb_wide_src = g_wide_w > 0 ? pass_wide_fbo_for(x) : 0;
     if (s_pb_wide_src) {
@@ -9037,7 +9270,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
                                  h * S, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE))
             return pass_begin_refuse("backup_wide");
         pass_blit(s_pb_wide_src, s_pb_wide_fbo, 0, y * S, 0, 0, g_wide_w * S,
-                  h * S, GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+                  h * S, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
     if (s_pb_cpu_cap < (size_t)w * (size_t)h) {
         free(s_pb_cpu);
@@ -9062,6 +9295,10 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
     s_pb_x = x; s_pb_y = y; s_pb_w = w; s_pb_h = h; s_pb_scale = S;
 
 backed_up:
+    s_pb_depth_need = s_depth_need_clear;
+    s_pb_depth_used = s_depth_used;
+    s_pb_depth_reason = s_depth_need_reason;
+    s_pb_depth_avg = s_depth_last_avg;
     s_pass_x = x; s_pass_y = y; s_pass_w = w; s_pass_h = h;
     if (s_pass_verify < 0) {
         const char *e = getenv("PSX_RENDER_PASS_VERIFY");
@@ -9081,8 +9318,8 @@ backed_up:
  * colour (hr surface, native-wide band); everything else is put back. */
 static void transaction_restore_ex(int keep_color) {
     int S = s_hr_scale, gi = s_pgen_write;
-    const GLbitfield hr_bits = keep_color ? GL_STENCIL_BUFFER_BIT
-                                          : GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+    const GLbitfield hr_bits = keep_color ? GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT
+                                          : GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
     (void)gi;
     if (!s_pass_active) return;
     /* Roll the journal, then the rect back. */
@@ -9112,6 +9349,10 @@ static void transaction_restore_ex(int keep_color) {
     s_last_present_path = s_pb_last_path;
     s_last_dx = s_pb_last_dx; s_last_dy = s_pb_last_dy;
     s_last_dw = s_pb_last_dw; s_last_dh = s_pb_last_dh;
+    s_depth_need_clear = s_pb_depth_need;
+    s_depth_used = s_pb_depth_used;
+    s_depth_need_reason = s_pb_depth_reason;
+    s_depth_last_avg = s_pb_depth_avg;
     s_pass_active = 0;
     s_pass_local = 0;
     s_pb_valid = !keep_color;
@@ -9163,7 +9404,12 @@ int gl_renderer_local_view_end(int keep) {
 
 int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
                            uint32_t period, int reuse) {
+    if (pass_queued()) {
+        RTH_REC(RTH_PASS_BEGIN, 0, x, y, w, h, open_gen, (int32_t)period, reuse);
+        return 1;
+    }
     GL_RT_SYNC("pass_begin");
+    s_pass_dead = 0;
     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
 }
 int gl_renderer_stereo_begin(int x, int y, int w, int h, int reuse) {
@@ -9192,10 +9438,19 @@ uint32_t gl_renderer_local_pair_unavailable(void) {
         return PSX_MOD_RENDER_PASS_BACKEND;
     return PSX_MOD_RENDER_PASS_READY;
 }
+static void pass_end_now(uint32_t alpha_q16, int keep);
 void gl_renderer_pass_end(uint32_t alpha_q16, int keep) {
+    if (pass_queued()) {
+        RTH_REC(RTH_PASS_END, 0, (int32_t)alpha_q16, keep);
+        return;
+    }
     GL_RT_SYNC("pass_end");
+    pass_end_now(alpha_q16, keep);
+}
+static void pass_end_now(uint32_t alpha_q16, int keep) {
     int gi = s_pgen_write;
     PassGen *g = &s_pgen[gi];
+    s_pass_dead = 0;   /* however this pass ends, later records run */
     if (!s_pass_active) return;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
     if (keep && alpha_q16 && g->valid && !g->promoted && g->n < PASS_SLOTS &&
@@ -9203,7 +9458,7 @@ void gl_renderer_pass_end(uint32_t alpha_q16, int keep) {
         pass_gen_reserve(gi, g->n + 1u, g->tex_w, g->tex_h)) {
         uint32_t slot = g->n, at = g->n;
         GLuint t;
-        pass_capture_into(s_pgen_tex[gi][slot], g);
+        pass_capture_into(s_pgen_tex[gi][slot], g, 0);
         while (at > 1 && g->phase[at - 1] > alpha_q16) at--;
         t = s_pgen_tex[gi][slot];
         for (uint32_t i = slot; i > at; i--) {
@@ -9311,7 +9566,7 @@ int gl_renderer_stereo_end(uint32_t eye, int keep) {
         g.x = s_pass_x; g.y = s_pass_y; g.w = s_pass_w; g.h = s_pass_h;
         g.source_path = GL_PRES_VRAM;
         (void)pass_gl_errors(); /* distinguish this copy from preceding errors */
-        pass_capture_into(p->tex[eye], &g);
+        pass_capture_into(p->tex[eye], &g, 0);
         ok = pass_gl_errors() == 0;
         if (ok) p->mask |= 1u << eye;
     }
@@ -9749,16 +10004,20 @@ static int xr_mirror_active(void) {
 /* Draw two presented images crossfaded (t = weight of b) into the window. */
 static int interp_present_pair(GLuint a, GLuint b, float t, int blend_mode);
 
+static int pass_gen_present_at(double p, int locked);
 static int pass_gen_present(uint64_t deadline) {
+    PassGen *g = &s_pgen[s_pgen_cur];
+    if (!(g->t_len > 0.0)) return 0;
+    return pass_gen_present_at(((double)deadline - g->t_start) / g->t_len, 0);
+}
+static int pass_gen_present_at(double p, int locked) {
     PassGen *g = &s_pgen[s_pgen_cur];
     uint32_t lo = 0, hi = 0;
     float t = 0.0f;
-    double p;
-    if (!g->valid || !g->promoted || !(g->t_len > 0.0)) return 0;
+    if (!g->valid || !g->promoted || (!locked && !(g->t_len > 0.0))) return 0;
     if (g->source_path != s_interp_source_path || g->tex_w != s_interp_w ||
         g->tex_h != s_interp_h)
         return 0;
-    p = ((double)deadline - g->t_start) / g->t_len;
     /* Past phase 1 the next flip is late (a lagging tick): the newest image
      * holds until it comes. Only a game that stops flipping for several
      * frame lengths expires the generation. */
@@ -9779,7 +10038,14 @@ static int pass_gen_present(uint64_t deadline) {
     return 1;
 }
 
+static int pass_locked_present(void) {
+    const PassGen *g = &s_pgen[s_pgen_cur];
+    return g->period > 0 &&
+           pass_gen_present_at((double)s_pgen_interval / (double)g->period, 1);
+}
+
 void gl_renderer_pass_service_presents(void) {
+    if (pass_queued()) return;   /* the render thread presents at VBlanks */
     GL_RT_SYNC("pass_service_presents");
     uint64_t deadline;
     double sp;
@@ -9900,7 +10166,10 @@ static void pass_dump_generation(int gi) {
 
 static void pass_apply_promotion(void) {
     s_intervals_since_plan++;
+    atomic_fetch_add(&s_pass_q_intervals, 1);
+    s_pgen_interval++;
     if (s_pgen_promote<0) return;
+    s_pgen_interval = 0;
     s_pgen[s_pgen_cur].valid = 0;
     s_pgen[s_pgen_cur].promoted = 0;
     s_pgen_cur = s_pgen_promote;
@@ -9921,7 +10190,9 @@ static void pass_apply_promotion(void) {
          * FLIP_SHOWN generation's rect is not the one flipped to: it keeps
          * the image taken when it opened. */
         if (!g->shown) {
-            pass_capture_into(s_pgen_tex[s_pgen_cur][0], g);
+            /* interp_capture follows the native present's center refresh;
+             * no draw intervenes before this promotion. */
+            pass_capture_into(s_pgen_tex[s_pgen_cur][0], g, pass_capture_fast());
             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
         }
         s_pgen_promotions++;
@@ -10341,6 +10612,7 @@ static void pt_end(void) {
 }
 
 /* The swap: direct, or queued to the present thread. */
+static void rthf_gpu_gap(int open);
 static void gl_present_swap(void) {
     if (!s_pt_on) { gl_window_swap(); return; }
     (void)pt_target_fbo();   /* a frame that never bound 0 still has its slot */
@@ -10348,7 +10620,11 @@ static void gl_present_swap(void) {
     glFlush();
     void *done = NULL;
     (void)pt_submit(ready, &done, NULL);
-    if (done) { p_glWaitSync(done, 0, PT_TIMEOUT_IGNORED); p_glDeleteSync(done); }
+    if (done) {
+        rthf_gpu_gap(1);
+        p_glWaitSync(done, 0, PT_TIMEOUT_IGNORED); p_glDeleteSync(done);
+        rthf_gpu_gap(0);
+    }
     /* Whatever is bound as the window now means the new slot. */
     GLint d = 0, r = 0;
     glGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &d);
@@ -10835,11 +11111,21 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
         glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
     completed_image_cost_begin();
+    uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
         interp_fbo, src_x, disp_y, w, h, linear, force_4_3, GL_PRES_VRAM,
         disp_x, disp_y,
         present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1));
     if (interp_pair) {
+        if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
+            float tw = (float)src_tw, th = (float)VRAM_H;
+            if (src_tex == s_hr_tex) {
+                tw = present_alloc_extent(src_tw, s_hr_scale);
+                th = present_alloc_extent(VRAM_H, s_hr_scale);
+            }
+            postfx_note_source(src_fbo, src_tex, tw, th, src_x, disp_y, w, h);
+            postfx_capture_temporal_source(lx, ly, lw, lh);
+        }
         /* Temporal blending owns this stock frame interval. Capture hold-last
          * before pacing; every blend and Swap remains on this context/thread. */
         hold_publish_interpolated(interp_pair, src_fbo, src_x, disp_y, w, h, force_4_3, linear);
@@ -11019,11 +11305,23 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
         glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
     }
     completed_image_cost_begin();
+    uint64_t interp_captures_before = s_interp_captures;
     int interp_pair = interp_capture(
         fbo, 0, disp_y, g_wide_w, disp_h, linear, 0, GL_PRES_WIDE,
         disp_x, disp_y,
         present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1));
     if (interp_pair) {
+        if (s_interp_captures != interp_captures_before && (s_bcls_on || s_pfx_depth_on)) {
+            const float wext = (wide_as > s_out_scale && s_out_scale >= 1)
+                                   ? (float)wide_as / (float)s_out_scale : 1.0f;
+            postfx_note_source(fbo, tex, (float)g_wide_w*wext, (float)VRAM_H*wext,
+                               0, disp_y, g_wide_w, disp_h);
+            if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2*g_wide_off)
+                postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W,s_hr_scale),
+                                   present_alloc_extent(VRAM_H,s_hr_scale),disp_x,disp_y,
+                                   g_wide_w-2*g_wide_off,disp_h,g_wide_off,g_wide_w);
+            postfx_capture_temporal_source(lx,ly,lw,lh);
+        }
         hold_publish_interpolated(interp_pair, fbo, 0, disp_y, g_wide_w, disp_h, 0, linear);
         completed_image_cost_end();
         interp_present_source_interval();
@@ -11763,7 +12061,9 @@ static int gl_rth_eligible(void) {
     extern int psx_netplay_active(void);
     return s_raster_ok && s_ctx && !s_cpu_auth_dual && !s_depth24_skip_up &&
            !(s_hd_native_authority && s_rth_a0_open) &&
-           !gpu_display_is_depth24() && !s_interp_enabled && !s_pass_active &&
+           !gpu_display_is_depth24() &&
+           (!s_interp_enabled || pass_queued_presenter()) &&
+           (!s_pass_active || pass_queued_enabled()) &&
            !psx_netplay_active() && !psx_openxr_session_active() &&
            gr_backend() == GR_BACKEND_OPENGL;
 }
@@ -11851,7 +12151,11 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
 static void rth_present_payload(uint16_t op, const uint8_t *p);
 static void rth_replay_present(const RtCmd *c, const uint8_t *p) {
     static int skipped_last = 0;
-    const int stale = rt_frames_ahead() >= 2 && !skipped_last;
+    /* Temporal passes must observe every VBlank: skipping the flip tracker
+     * here loses the native/intermediate phase and can show an older image
+     * after a newer one. Their presenter owns output selection. */
+    const int stale = !pass_queued_presenter() &&
+                      rt_frames_ahead() >= 2 && !skipped_last;
     /* Frame generation schedules (or drops) presents itself. */
     if (s_fg_on && fg_on_present(c->op, p, c->payload, stale)) { skipped_last = 0; return; }
     if (stale) {
@@ -11989,6 +12293,28 @@ static void rthf_begin(void) {
 /* Frame generation draws between a frame's records: its work is not the
  * frame's. Pause ends the frame's GPU query and starts excluding wall time
  * (and its swaps); resume opens the next query segment. */
+/* Split the frame's GPU query around a wait that is not render work. */
+static int s_rthf_gap = 0;
+static void rthf_gpu_gap(int open) {
+    if (open) {
+        if (!rth_replaying() || !s_rthf_open || s_rthf_paused || !s_rthf_has_q ||
+            !pass_queued_presenter()) return;
+        p_glEndQuery(GL_TIME_ELAPSED);
+        s_rthf_gap = 1;
+        return;
+    }
+    if (!s_rthf_gap) return;
+    s_rthf_gap = 0;
+    {
+        const unsigned i = s_rthf_head % RTHF_Q;
+        if (s_rthf_nseg[i] < RTHF_SEG) {
+            p_glBeginQuery(GL_TIME_ELAPSED, s_rthf_q[i][s_rthf_nseg[i]++]);
+        } else {
+            s_rthf_taint = 1;
+            p_glBeginQuery(GL_TIME_ELAPSED, s_rthf_q[i][RTHF_SEG - 1]);
+        }
+    }
+}
 static void rthf_pause(void) {
     if (!s_rthf_open || s_rthf_paused) return;
     s_rthf_paused = 1;
@@ -14912,6 +15238,12 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
     s_rthx_tagged = (c->flags & RTHF_TAGGED) != 0;
     s_rthx_backdrop = (c->flags >> RTHF_BD_SHIFT) & 3;
+    /* A queued pass whose begin was refused has no backup: drop its draws. */
+    if (s_pass_dead && c->op != RTH_PASS_END && c->op != RTH_FRAME &&
+        c->op != RTH_PRESENT_VRAM && c->op != RTH_PRESENT_WIDE) {
+        s_rthx_prim = 0;
+        return;
+    }
     if (c->op == RTH_FRAME) { rthf_end(); return; }
     if (!s_rthf_open && (atomic_load_explicit(&s_rthf_want, memory_order_relaxed) || s_fg_on))
         rthf_begin();
@@ -15007,6 +15339,23 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         break;
     case RTH_VRAM_SYNC_COPY:
         memcpy(s_rth_vram_pub, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
+        break;
+    case RTH_PASS_BEGIN:
+        if (transaction_begin(v[0], v[1], v[2], v[3], v[4], (uint32_t)v[5], v[6], 0)) {
+            s_pass_leaks_at_begin = s_pass_leaks;
+        } else {
+            s_pass_dead = 1;
+            atomic_fetch_add(&s_pass_q_refused, 1);
+        }
+        break;
+    case RTH_PASS_END:
+        if (s_pass_dead) { s_pass_dead = 0; break; }
+        if (s_pass_leaks != s_pass_leaks_at_begin) {
+            atomic_fetch_add(&s_pass_q_leaks, s_pass_leaks - s_pass_leaks_at_begin);
+            pass_end_now(0, 0);
+        } else {
+            pass_end_now((uint32_t)v[0], v[1]);
+        }
         break;
     case RTH_PEEK: {
         uint64_t ptr = (uint64_t)(uint32_t)v[4] | ((uint64_t)(uint32_t)v[5] << 32);
