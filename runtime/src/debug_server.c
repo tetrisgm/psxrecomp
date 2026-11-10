@@ -9014,6 +9014,15 @@ static void handle_gl_interp(int id, const char *json)
 /* render_pass_stats: host-timed render passes (docs/RENDER_PASSES.md).
  * Counters are per mod session; `dropped` counts device stores a pass tried
  * to make (SPU key-ons, CD, timers, ...), which never reach the device. */
+static void handle_render_pass_stage_times(int id, const char *json) {
+    (void)json;
+    double ms[4]; uint64_t n[4]; char out[512];
+    gl_renderer_pass_stage_times(ms, n);
+    snprintf(out, sizeof out, "{\"id\":%d,\"ok\":true,\"serialized\":true,\"ms_total\":[%.6f,%.6f,%.6f,%.6f],\"counts\":[%llu,%llu,%llu,%llu]}", id,
+        ms[0],ms[1],ms[2],ms[3],(unsigned long long)n[0],(unsigned long long)n[1],(unsigned long long)n[2],(unsigned long long)n[3]);
+    debug_server_send_line(out);
+}
+
 static void handle_render_pass_stats(int id, const char *json)
 {
     (void)json;
@@ -16569,6 +16578,7 @@ static const CmdEntry s_commands[] = {
     { "gl_ws_ablate",      handle_gl_ws_ablate },
     { "gl_interp",         handle_gl_interp },
     { "render_pass_stats", handle_render_pass_stats },
+    { "render_pass_stage_times", handle_render_pass_stage_times },
     { "openxr_stats", handle_openxr_stats },
     { "openxr_views", handle_openxr_views },
     { "openxr_control", handle_openxr_control },

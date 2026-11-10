@@ -654,6 +654,9 @@ int  gl_renderer_fbo_peek_deferred(int x, int y, int w, int h, uint16_t *out);
 void gl_renderer_ring_capture(uint32_t frame, int wide, int base_x, int disp_y, int disp_h,
                               int cx, int cy, int cw, int ch);
 
+/* Diagnostic completion-fenced backup/draw/capture/restore totals. */
+void gl_renderer_pass_stage_times(double *ms, uint64_t *counts);
+
 #ifdef __cplusplus
 }
 #endif

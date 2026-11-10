@@ -9148,6 +9148,36 @@ static void pass_journal_rollback(void) {
 }
 
 /* kind: 0 temporal, 1 stereo, 2 netplay own view, 3 offline view pair. */
+/* Diagnostic attribution only: completion fences deliberately serialize GL.
+ * Never use these timings as an uninstrumented throughput result. */
+static uint64_t s_pass_stage_n[4], s_pass_stage_ticks[4];
+static int pass_stage_profile(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("PSX_RENDER_PASS_STAGE_TIME"); enabled = e && e[0] == '1'; }
+    return enabled;
+#else
+    return 0;
+#endif
+}
+static uint64_t s_pass_stage_mark;
+static void pass_stage_done(int stage) {
+    if (!pass_stage_profile()) return;
+    glFinish();
+    uint64_t now = SDL_GetPerformanceCounter();
+    s_pass_stage_ticks[stage] += now - s_pass_stage_mark;
+    s_pass_stage_n[stage]++;
+    s_pass_stage_mark = now;
+}
+void gl_renderer_pass_stage_times(double *ms, uint64_t *counts) {
+    GL_RT_SYNC("pass_stage_times");
+    double scale = 1000.0 / SDL_GetPerformanceFrequency();
+    for (int i = 0; i < 4; i++) {
+        counts[i] = s_pass_stage_n[i];
+        ms[i] = s_pass_stage_ticks[i] * scale;
+    }
+}
+
 static int transaction_begin(int x, int y, int w, int h, int open_gen,
                               uint32_t period_vblanks, int reuse_backup, int kind) {
     const int stereo = kind == 1 || kind == 3;
@@ -9189,6 +9219,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
+    if (pass_stage_profile()) { hiw_flush_queue(); glFinish(); s_pass_stage_mark = SDL_GetPerformanceCounter(); }
 
     wide = s_interp_source_path == GL_PRES_WIDE && g_wide_w > 0 &&
            pass_wide_fbo_for(x) != 0;
@@ -9311,6 +9342,7 @@ backed_up:
     s_pj_cpu.n = 0;
     s_pass_active = 1;
     s_pass_local = local;
+    pass_stage_done(0);
     return 1;
 }
 
@@ -9453,6 +9485,8 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
     s_pass_dead = 0;   /* however this pass ends, later records run */
     if (!s_pass_active) return;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
+    if (pass_stage_profile()) hiw_flush_queue();
+    pass_stage_done(1);
     if (keep && alpha_q16 && g->valid && !g->promoted && g->n < PASS_SLOTS &&
         g->n < pass_slot_cap(g->tex_w, g->tex_h) &&
         pass_gen_reserve(gi, g->n + 1u, g->tex_w, g->tex_h)) {
@@ -9467,7 +9501,9 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
         }
         s_pgen_tex[gi][at] = t; g->phase[at] = alpha_q16; g->n++;
     }
+    pass_stage_done(2);
     transaction_restore();
+    pass_stage_done(3);
 }
 
 uint32_t gl_renderer_stereo_unavailable(void) {

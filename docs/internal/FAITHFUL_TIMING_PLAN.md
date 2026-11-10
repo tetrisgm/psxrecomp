@@ -213,6 +213,12 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-10 — R4 completed-stage attribution.** Opt-in completion fences
+  isolate backup/draw/capture/restore: 9.19/17.85/1.88/6.87 ms at 9x. Splitting
+  blits does not materially help; copying full private surfaces removes restore
+  copies but worsens setup (18.41 ms). Both unsuccessful prototypes are excluded
+  from normal runtime. Diagnostic is `PSX_RENDER_PASS_STAGE_TIME=1` plus
+  `render_pass_stage_times`; disabled by default. No new 60 FPS qualification.
 - **2026-11-10 — R4 temporal qualification (not accepted).** Preserve native
   renderer fixes. Queued temporal presentation now observes every flip; pass
   restoration includes depth attachments and PGXP depth-group state. Real-GL
