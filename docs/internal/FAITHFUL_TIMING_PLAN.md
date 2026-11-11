@@ -213,6 +213,13 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-11 — R4 follow-up probes.** Removed single-target redraw (56.99
+  VBlanks/s, nonzero reference-pixel differences) and conservative wide
+  depth-clear bounds (99 GL checks and exact race pairs, but 51.46 VBlanks/s).
+  Standard 16:9/3834x2160 on the retained checkpoint measured 59.38 over
+  120 seconds with 54–56 FPS dips. No sustained 60, new package or connected
+  R4 scene producer. Evidence: R4 `docs/recovery/SEPARATE_RENDERER_20261111.md`.
+
 - **2026-11-11 — R4 presentation development.** Added immutable scene/texture
   snapshots, pre-projection interpolation/clipping and a private GPU backend;
   R4's scene producer is still missing, so this is not an integrated independent
