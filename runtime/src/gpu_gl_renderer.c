@@ -8116,6 +8116,13 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
                                    double source_hz, int blend_mode) {
     GL_RT_SYNC("set_interpolation");
     double effective_hz = target_hz > 0.0 ? target_hz : host_hz;
+    /* A nominal 60-Hz hold/redraw selection means one image per NTSC
+     * VBlank (59.94), including on a 75/120/144-Hz desktop. Treating the
+     * 0.1% label difference as resampling disables the queued renderer.
+     * Genuine rate conversion and temporal blending keep their exact rate. */
+    if (blend_mode == 2 && source_hz > 0.0 &&
+        fabs(effective_hz - source_hz) <= source_hz * 0.002)
+        effective_hz = source_hz;
     if (effective_hz < source_hz) effective_hz = source_hz;
     int active = (enabled && source_hz >= 1.0 && source_hz <= 1000.0 &&
                   effective_hz >= source_hz && effective_hz <= 1000.0) ? 1 : 0;

@@ -213,6 +213,14 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-11 — nominal NTSC redraw rate.** Native 75-Hz display testing
+  exposed a 60.0-versus-59.94 comparison that disabled queued redraw and both
+  rendering workers. Hold/redraw rates within 0.2% of the guest VBlank rate
+  now normalize to that exact rate. A GL regression covers 60-on-75-Hz NTSC,
+  actual 75-Hz conversion and unchanged linear interpolation. All 37 shipping
+  CTests pass. R4 qualification now defaults to real monitor timing; simulated
+  60 Hz is an explicit diagnostic, never a shipping-default qualification.
+
 - **2026-11-11 — unlocked desktop follow-up.** Visible 2160-line playback
   exposed intermittent stalls despite locked-desktop throughput near 60.
   A CPU profile identified synchronous rewind snapshots and per-primitive

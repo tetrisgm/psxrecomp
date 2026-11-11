@@ -514,3 +514,9 @@ pair before invoking either view callback. The title must handle that refusal;
 ordinary/shared-frame duplication is presentation fallback, not proof that two
 independent player views rendered. The admitted full-VRAM path, including the
 4x default, uses the same all-or-nothing two-view transaction.
+
+Nominal-rate hold presentation treats 60 FPS on a 59.94-Hz NTSC guest as
+one output per VBlank (within 0.2%). This retains the queued renderer on
+75/120/144-Hz desktops; genuine rate conversion and linear blending retain
+their explicit target. Qualification must use real monitor timing, not rely
+on `PSX_HOST_REFRESH_HZ=60` to make source and target numerically equal.

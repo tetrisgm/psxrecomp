@@ -70,6 +70,16 @@ int main(void) {
         transaction_depth_restore(scale);
         transaction_options=0;
         pending_capture(scale);
+        gl_renderer_set_interpolation_source(1);
+        gl_renderer_set_interpolation(1,75.0,60.0,59.94,2);
+        check(pass_vblank_locked_rate() && pass_queued_presenter(),
+              "nominal 60 on a 75-Hz display retains the queued NTSC presenter");
+        check(s_interp_target_hz == 59.94, "hold target follows exact NTSC VBlank rate");
+        gl_renderer_set_interpolation(1,75.0,75.0,59.94,2);
+        check(!pass_vblank_locked_rate(), "genuine 75-Hz conversion stays distinct");
+        gl_renderer_set_interpolation(1,75.0,60.0,59.94,0);
+        check(!pass_vblank_locked_rate(), "linear interpolation retains explicit 60-Hz target");
+        gl_renderer_set_interpolation(0,75.0,60.0,59.94,2);
         gl_renderer_shutdown();
     }
     printf("checks=%d failures=%d\n",checks,failures);
