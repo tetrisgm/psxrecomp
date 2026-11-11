@@ -78,12 +78,16 @@ static void transaction_depth_restore(int scale) {
     s_depth_need_reason=DCLR_THRESHOLD;
     uint64_t native=surface_hash(s_hr_fbo,VRAM_W*scale,VRAM_H*scale);
     uint64_t wide=surface_hash(g_wide_cur,g_wide_w*scale,VRAM_H*scale);
-    for(int keep=0;keep<2;++keep) {
-        check(gl_renderer_pass_begin(0,0,320,240,1,2,0),"temporal transaction opens");
+    for(int band=0;band<2;++band) for(int keep=0;keep<2;++keep) {
+        int y=band*240;
+        check(gl_renderer_pass_begin(0,y,320,240,1,2,0),"temporal transaction opens");
+        const char *fresh=getenv("PSX_RENDER_PASS_FRESH_TARGET");
+        if(fresh && fresh[0]=='1')
+            check(s_pass_private,"both display bands use the private target");
         GLuint targets[2]={s_hr_fbo,g_wide_cur};
         for(int k=0;k<2;++k) {
             p_glBindFramebuffer(PSXGL_FRAMEBUFFER,targets[k]);
-            glEnable(GL_SCISSOR_TEST);glScissor(0,0,(k?g_wide_w:320)*scale,240*scale);
+            glEnable(GL_SCISSOR_TEST);glScissor(0,y*scale,(k?g_wide_w:320)*scale,240*scale);
             glDepthMask(GL_TRUE);glStencilMask(0xff);glColorMask(1,1,1,1);
             glClearDepth(0.75);glClearStencil(0);glClearColor(1,0,0,1);
             glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
@@ -133,7 +137,10 @@ static void pending_capture(int scale) {
         gl_renderer_set_interpolation(0,60,60,60,2);
     }
 }
-int main(void) {
+#ifndef DEPTH_FIXTURE_MAIN
+#define DEPTH_FIXTURE_MAIN main
+#endif
+int DEPTH_FIXTURE_MAIN(void) {
     if(SDL_Init(SDL_INIT_VIDEO)!=0)return 2;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,3);

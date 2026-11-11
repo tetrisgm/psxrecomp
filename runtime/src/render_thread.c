@@ -322,6 +322,8 @@ static void wake_render(int force) {
     }
 }
 
+void rt_kick(void) { if (rt_running()) wake_render(1); }
+
 /* Block until pred() holds. Frame-bound waits need only frame notifications. */
 static int pred_frames(uint64_t limit);
 typedef int (*Pred)(uint64_t arg);

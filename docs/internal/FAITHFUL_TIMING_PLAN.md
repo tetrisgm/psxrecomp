@@ -213,6 +213,19 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-11 — R4 presentation development.** Added immutable scene/texture
+  snapshots, pre-projection interpolation/clipping and a private GPU backend;
+  R4's scene producer is still missing, so this is not an integrated independent
+  race renderer. Opaque HLE batches fuse color/bloom; ambient lighting uses
+  nonblocking GPU sampling. The opt-in fresh-target redraw handles both vertical
+  buffers and avoids native high-resolution backup/restore copies. Queued wide
+  draws now skip overwritten center pixels under the canonical-center contract.
+  Fixed-9x 21:9 race throughput improves from 36.33 to 47.38 to 55.41 VBlanks/s;
+  still no sustained 60 FPS qualification. Six full-resolution reference pairs
+  around the tunnel match exactly; bounded motion captures show intact seams,
+  sky, ground and HUD. R4's `docs/recovery/SEPARATE_RENDERER_20261111.md` holds
+  test receipts, rejected probes and remaining integration work.
+
 - **2026-11-10 — R4 completed-stage attribution.** Opt-in completion fences
   isolate backup/draw/capture/restore: 9.19/17.85/1.88/6.87 ms at 9x. Splitting
   blits does not materially help; copying full private surfaces removes restore

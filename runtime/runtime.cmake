@@ -423,6 +423,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/frame_pacing.c
     ${PSXRECOMP_ROOT}/runtime/src/frame_interpolation.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass.c
+    ${PSXRECOMP_ROOT}/runtime/src/presentation_scene.c
+    ${PSXRECOMP_ROOT}/runtime/src/presentation_draw.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass_plan.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass_motion.c
     ${PSXRECOMP_ROOT}/runtime/src/render_pass_projection.cpp
@@ -1511,6 +1513,7 @@ function(psxrt_resolve_memcard_slots out_var value)
 endfunction()
 
 function(psxrecomp_add_runtime_target target)
+    include("${PSXRECOMP_ROOT}/runtime/tests/presentation_tests.cmake")
     # PGXP: build this target's objects with -DPSX_PGXP=1 so the PGXP_*()
     # hook macros the emitter writes into ALL generated C become real calls
     # into the value-propagation engine (pgxp_hooks.h; docs/ENHANCEMENTS.md G1.10),

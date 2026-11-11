@@ -419,7 +419,7 @@ static int capture_wide_pass(GLuint tex,int fast){
  PassGen g;memset(&g,0,sizeof g);
  g.source_path=GL_PRES_WIDE;g.x=0;g.y=0;g.w=320;g.h=240;
  flush_flat_batch();flush_tex_batch();
- s_wide_fast=fast;pass_capture_into(tex,&g);s_wide_fast=1;
+ s_wide_fast=fast;pass_capture_into(tex,&g,0);s_wide_fast=1;
  return glGetError()==GL_NO_ERROR;
 }
 static void verify_anchored_pass_capture(int scale,int shift){

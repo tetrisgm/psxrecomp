@@ -22,6 +22,7 @@ psxrecomp_add_runtime_target(psx-runtime
 # the framework-dev validation surface for the PGXP value-propagation engine
 # (docs/ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/tests/presentation_tests.cmake")
 if(BUILD_TESTING)
     foreach(_native IN ITEMS 0 1)
         add_executable(host_deadline_${_native}_test tests/test_host_deadline.c)

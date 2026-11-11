@@ -80,6 +80,7 @@
 #include "gpu_sw_renderer.h"
 #include "gpu_fmv_hd.h"
 #include "gpu_gl_renderer.h"
+#include "presentation_gpu.h"
 #include "video_telemetry.h"
 #include "gpu_hd_textures.h"
 #include "mod_texture_banks.h"
@@ -515,7 +516,7 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK, RTH_VRAM_SYNC_COPY,
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK, RTH_VRAM_SYNC_COPY, RTH_PRESENTATION_CAPTURE,
     RTH_PASS_BEGIN, RTH_PASS_END
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
@@ -791,6 +792,10 @@ static GLuint s_selected_bank_tex;
 static int s_selected_bank_live_clut, s_tb_bank_live_clut;
 
 /* Authoritative VRAM: hr color texture + stencil (mask bit) FBO. */
+static void presentation_gpu_shutdown(void);
+static void ambient_shutdown(void);
+static void presentation_gpu_capture_record(const void *payload);
+
 static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
 /* The scale s_hr_tex/s_hr_rb are allocated at (dynamic resolution
  * reallocates them at every step; see s_alloc_scale). */
@@ -3640,6 +3645,8 @@ static void wide_clear_bd_scale(GLint uScale, GLint uCenter) {
 static float s_tb[TEXBATCH_MAXV * TEXV];
 static int   s_tb_n = 0;                    /* verts queued */
 static int   s_tb_semi = -2;
+static int   s_tb_has_semi;
+static int   s_opaque_batch_fast = -1;
 static int   s_tb_depth = 0;                /* PGXP depth mode (batch key) */
 static int   s_tb_b3d = 0;                  /* bloom on: 3D (bloom source) batch (key) */
 static int   s_tb_mask = 0, s_tb_filter = 0;
@@ -4090,6 +4097,7 @@ typedef struct {
     float   wscale, wcenter; /* its backdrop stretch (wide_bd_scale) */
     int     wsx, wsy, wsw, wsh;  /* its wide-surface scissor (native px) */
     uint8_t depth;           /* PGXP depth mode (depth_apply) */
+    uint8_t margins;         /* centre is supplied by the canonical surface */
 } HiCmd;
 static int s_hq_depth_cur = 0;   /* depth mode of the batch being queued */
 static HiCmd  *s_hq = NULL;
@@ -4180,6 +4188,8 @@ static int hiw_wide_queue_ok(int mirror) {
     return mirror && g_wide_cur && s_ws_ablate == 0;
 }
 static int s_wide_queue = -1;   /* PSX_GL_WIDE_QUEUE (default on) */
+static int s_wide_margins_only = -1; /* default on; 0 selects full replay */
+static int s_pass_private;
 static int wide_queue_live(void) {
     if (s_wide_queue < 0) {
         const char *e = getenv("PSX_GL_WIDE_QUEUE");
@@ -4189,7 +4199,19 @@ static int wide_queue_live(void) {
 }
 static void wide_band_rows(int *sy, int *sh);
 static void hiw_wide_set(HiCmd *c, int gate) {
+    if(s_wide_margins_only<0) {
+        const char *e=getenv("PSX_GL_WIDE_MARGINS_ONLY");
+        s_wide_margins_only = !(e && e[0] == '0');
+#ifndef PSX_NO_DEBUG_TOOLS
+        /* Pair with FRESH_TARGET=compare: reference full replay, then margins. */
+        if (e && strcmp(e, "compare") == 0) s_wide_margins_only = 2;
+#endif
+    }
     c->wfbo = g_wide_cur;
+    c->margins=(s_wide_margins_only == 1 ||
+                (s_wide_margins_only == 2 && s_pass_private)) &&
+               !s_hiw && wide_center_is_canonical() &&
+               g_wide_off>0 && g_wide_w>2*g_wide_off;
     c->wdx = wide_dx();
     wide_bd_scale(gate, &c->wscale, &c->wcenter);
     if (s_hiw) {   /* the window's replay: full width, the draw area's rows */
@@ -4203,6 +4225,21 @@ static void hiw_wide_set(HiCmd *c, int gate) {
         c->wsw = g_wide_w - view_pad_left - view_pad_right;
         wide_band_rows(&c->wsy, &c->wsh);
     }
+}
+
+/* The canonical-centre path replaces these columns before any completed wide
+ * image is consumed. Rasterize only the two disjoint reveal margins, keeping
+ * each margin's painter order and exact sample grid. Capture the predicate at
+ * enqueue time: an anchored view or full-composite backdrop must draw fully. */
+static int hiw_wide_scissor(const HiCmd *c,int band) {
+    int x0=c->wsx,x1=x0+c->wsw;
+    if(c->margins) {
+        if(band==0) { if(x1>g_wide_off)x1=g_wide_off; }
+        else if(x0<g_wide_w-g_wide_off)x0=g_wide_w-g_wide_off;
+    }
+    if(x1<=x0 || c->wsh<=0)return 0;
+    glScissor(x0*s_out_scale,c->wsy*s_out_scale,(x1-x0)*s_out_scale,c->wsh*s_out_scale);
+    return 1;
 }
 
 /* Queue a textured batch for the window, and its native-wide mirror when
@@ -4264,7 +4301,6 @@ static void hiw_replay_wide(void) {
             bound = c->wfbo;
             cur = 0;
         }
-        glScissor(c->wsx * S, c->wsy * S, c->wsw * S, c->wsh * S);
         if (c->kind == HQ_TEX) {
             if (cur != HQ_TEX) {
                 p_glUseProgram(s_tex_prog);
@@ -4278,9 +4314,12 @@ static void hiw_replay_wide(void) {
             bind_textured_resources(c->tex, c->palette, c->hd_tex);
             p_glUniform1i(s_uMaskset, c->mask);
             int first = hiw_upload_cmd(c);
-            depth_apply_ex(c->depth, 1);
-            tex_draw_passes_ex_at(c->vcount, c->semi, c->mask, c->check, 0, c->b3d, c->depth, first);
-            depth_restore_ex_at(c->depth, 1, c->vcount, c->semi, c->mask, c->check, first);
+            for(int band=0;band<(c->margins?2:1);++band) {
+                if (!hiw_wide_scissor(c, band)) continue;
+                depth_apply_ex(c->depth, 1);
+                tex_draw_passes_ex_at(c->vcount, c->semi, c->mask, c->check, 0, c->b3d, c->depth, first);
+                depth_restore_ex_at(c->depth, 1, c->vcount, c->semi, c->mask, c->check, first);
+            }
         } else {
             if (cur != HQ_GEO) {
                 p_glUseProgram(s_geo_prog);
@@ -4294,9 +4333,12 @@ static void hiw_replay_wide(void) {
             if (c->semi >= 0) apply_psx_blend(c->semi); else glDisable(GL_BLEND);
             mask_stencil_ex(c->mask, c->check);
             int first = hiw_upload_cmd(c);
-            depth_apply_ex(c->depth, 0);
-            BCLS_DRAW(c->semi, c->depth, c->mask, c->check, c->b3d, glDrawArrays(GL_TRIANGLES, first, c->vcount));
-            depth_restore_ex_at(c->depth, 0, c->vcount, c->semi, c->mask, c->check, first);
+            for(int band=0;band<(c->margins?2:1);++band) {
+                if (!hiw_wide_scissor(c, band)) continue;
+                depth_apply_ex(c->depth, 0);
+                BCLS_DRAW(c->semi, c->depth, c->mask, c->check, c->b3d, glDrawArrays(GL_TRIANGLES, first, c->vcount));
+                depth_restore_ex_at(c->depth, 0, c->vcount, c->semi, c->mask, c->check, first);
+            }
         }
     }
     if (!any) return;
@@ -4408,6 +4450,14 @@ static void flush_tex_batch_impl(void) {
     if (s_tb_n == 0) return;
     wide_stencil_ready();   /* before any of this batch's GL state */
     int nverts = s_tb_n, semi = s_tb_semi, dmode = s_tb_depth;
+    if (s_opaque_batch_fast < 0) {
+        const char *e=getenv("PSX_GL_OPAQUE_BATCH_FAST");
+        s_opaque_batch_fast=!(e && e[0]=='0');
+    }
+    /* HLE key 4 admits mixed opaque/translucent runs. If no translucent
+     * primitive actually joined this run, use the opaque draw: identical
+     * painter order and coverage, with fused bloom classification. */
+    if (s_opaque_batch_fast && semi==4 && !s_tb_has_semi) semi=-1;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
     double cw_t0 = cw_ms();
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
@@ -5172,6 +5222,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         }
         if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
+            s_tb_has_semi = 0;
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = filter; s_tb_gate = gate;
             s_tb_depth = tdmode;
             s_tb_b3d = s_bcls_on && pgxp_tri_is_3d();
@@ -5180,6 +5231,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             s_tb_hd_tex = hd_tex;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
         }
+        s_tb_has_semi |= semi >= 0;
         /* The prim's window, exact as a float (20 bits). */
         float twin = (float)(twx | (twy << 5) | (tox << 10) | (toy << 15));
         float *vp = &s_tb[s_tb_n * TEXV];
@@ -8756,6 +8808,10 @@ static uint32_t pass_slot_cap(int tex_w, int tex_h) {
      * generation whatever the size: at 8K that is about 0.8 GiB of textures
      * (three generations), allocated only when used. */
     if (cap < 2 && pass_queued_enabled()) cap = 2;
+#ifndef PSX_NO_DEBUG_TOOLS
+    const char *compare=getenv("PSX_RENDER_PASS_FRESH_TARGET");
+    if(compare && strcmp(compare,"compare")==0 && cap<3)cap=3;
+#endif
     return cap;
 }
 
@@ -9077,6 +9133,8 @@ static void pass_free_color_fbo(GLuint *tex, GLuint *rb, GLuint *fbo,
 /* Context teardown (gl_renderer_shutdown): free the pass images, backups
  * and journal, and forget their names so a new context makes fresh ones. */
 static void pass_resources_release(void) {
+    ambient_shutdown();
+    presentation_gpu_shutdown();
     psx_openxr_shutdown();
     if(s_ctx) {
         if(s_xr_color_prog && p_glDeleteProgram) p_glDeleteProgram(s_xr_color_prog);
@@ -9178,6 +9236,50 @@ void gl_renderer_pass_stage_times(double *ms, uint64_t *counts) {
     }
 }
 
+/* Development probe: the title redraws a complete image into fresh surfaces.
+ * Native textures remain in the small raw mirror. No high-resolution image is
+ * cloned. This is not suitable for partial-frame producers or old-image reads. */
+static int s_pass_private_wide = -1;
+static int s_private_wst[4];
+static DirtyRect s_private_stencil_stale;
+static int pass_private_requested(int kind,int y,int open_gen) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    const char *e = getenv("PSX_RENDER_PASS_FRESH_TARGET");
+    /* The private surfaces retain the full VRAM coordinate space, including
+     * both vertically stacked display buffers. Restricting this to y=0 would
+     * alternate full-size private targets and cropped backups every flip. */
+    (void)y;
+    return kind == 0 && !s_hiw && e &&
+           (e[0] == '1' || (!open_gen && strcmp(e,"compare")==0));
+#else
+    (void)kind; (void)y; (void)open_gen; return 0;
+#endif
+}
+static void pass_private_swap(void) {
+    GLuint t;
+#define PASS_SWAP(a,b) do { t=(a); (a)=(b); (b)=t; } while(0)
+    PASS_SWAP(s_hr_tex,s_pb_hr_tex);
+    PASS_SWAP(s_hr_fbo,s_pb_hr_fbo);
+    PASS_SWAP(s_hr_rb,s_pb_hr_rb);
+    if (s_pass_private_wide >= 0) {
+        int i = s_pass_private_wide;
+        GLuint old = s_wide_fbo[i];
+        PASS_SWAP(s_wide_tex[i],s_pb_wide_tex);
+        PASS_SWAP(s_wide_fbo[i],s_pb_wide_fbo);
+        PASS_SWAP(s_wide_rb[i],s_pb_wide_rb);
+        if (g_wide_cur == old) g_wide_cur = s_wide_fbo[i];
+    }
+#undef PASS_SWAP
+}
+static void pass_private_clear(GLuint fbo,int x,int y,int w,int h) {
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER,fbo);
+    glEnable(GL_SCISSOR_TEST);glScissor(x*s_hr_scale,y*s_hr_scale,w*s_hr_scale,h*s_hr_scale);
+    glDepthMask(GL_TRUE);glStencilMask(0xff);
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+    glClearDepth(1.0);glClearStencil(0);glClearColor(0,0,0,0);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
+}
+
 static int transaction_begin(int x, int y, int w, int h, int open_gen,
                               uint32_t period_vblanks, int reuse_backup, int kind) {
     const int stereo = kind == 1 || kind == 3;
@@ -9219,6 +9321,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
+    if (pass_private_requested(kind,y,open_gen)) pack_flush();
     if (pass_stage_profile()) { hiw_flush_queue(); glFinish(); s_pass_stage_mark = SDL_GetPerformanceCounter(); }
 
     wide = s_interp_source_path == GL_PRES_WIDE && g_wide_w > 0 &&
@@ -9272,17 +9375,20 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
 
     /* The previous pass of this frame restored exactly this backup and no
      * guest code ran since: VRAM and the coherency state already equal it. */
-    if (reuse_backup && s_pb_valid && s_pb_x == x && s_pb_y == y &&
+    if (!pass_private_requested(kind,y,open_gen) && reuse_backup && s_pb_valid && s_pb_x == x && s_pb_y == y &&
         s_pb_w == w && s_pb_h == h && s_pb_scale == S &&
         s_pb_wide_src == (g_wide_w > 0 ? pass_wide_fbo_for(x) : 0)) {
         s_pb_reused++;
         goto backed_up;
     }
     s_pb_valid = 0;
+    s_pass_private = pass_private_requested(kind,y,open_gen);
+    s_pass_private_wide = -1;
     /* Back up the rect: hr color + stencil, raw mirror, wide band, CPU rows. */
     s_pass_begin_diag.resource = "backup_hr";
     if (!pass_make_color_fbo(&s_pb_hr_tex, &s_pb_hr_rb, &s_pb_hr_fbo,
-                             &s_pb_hr_w, &s_pb_hr_h, w * S, h * S,
+                             &s_pb_hr_w, &s_pb_hr_h, (s_pass_private ? VRAM_W : w) * S,
+                             (s_pass_private ? VRAM_H : h) * S,
                              GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE))
         return pass_begin_refuse("backup_hr");
     s_pass_begin_diag.resource = "backup_raw";
@@ -9290,17 +9396,20 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
                              &s_pb_raw_w, &s_pb_raw_h, w, h, PSXGL_R16UI,
                              PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT))
         return pass_begin_refuse("backup_raw");
-    pass_blit(s_hr_fbo, s_pb_hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
+    if (s_pass_private) pass_private_clear(s_pb_hr_fbo,x,y,w,h);
+    else pass_blit(s_hr_fbo, s_pb_hr_fbo, x * S, y * S, 0, 0, w * S, h * S,
               GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-    pass_blit(s_raw_fbo, s_pb_raw_fbo, x, y, 0, 0, w, h, GL_COLOR_BUFFER_BIT);
+    pass_blit(s_raw_fbo,s_pb_raw_fbo,x,y,0,0,w,h,GL_COLOR_BUFFER_BIT);
     s_pb_wide_src = g_wide_w > 0 ? pass_wide_fbo_for(x) : 0;
     if (s_pb_wide_src) {
         s_pass_begin_diag.resource = "backup_wide";
         if (!pass_make_color_fbo(&s_pb_wide_tex, &s_pb_wide_rb, &s_pb_wide_fbo,
                                  &s_pb_wide_w, &s_pb_wide_h, g_wide_w * S,
-                                 h * S, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE))
+                                 (s_pass_private ? VRAM_H : h) * S, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE))
             return pass_begin_refuse("backup_wide");
-        pass_blit(s_pb_wide_src, s_pb_wide_fbo, 0, y * S, 0, 0, g_wide_w * S,
+        s_pass_private_wide = wide_index(s_pb_wide_src);
+        if (s_pass_private) pass_private_clear(s_pb_wide_fbo,0,y,g_wide_w,h);
+        else pass_blit(s_pb_wide_src, s_pb_wide_fbo, 0, y * S, 0, 0, g_wide_w * S,
                   h * S, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
     if (s_pb_cpu_cap < (size_t)w * (size_t)h) {
@@ -9339,6 +9448,16 @@ backed_up:
         pass_verify_read(&s_pv_hr, &s_pv_hr_cap, &s_pv_raw, &s_pv_raw_cap);
         s_pv_cpu_hash = pass_cpu_vram_hash();
     }
+    if (s_pass_private) {
+        s_private_stencil_stale=s_stencil_stale;
+        if(s_pass_private_wide>=0) {
+            int i=s_pass_private_wide;
+            s_private_wst[0]=s_wst_x0[i];s_private_wst[1]=s_wst_y0[i];
+            s_private_wst[2]=s_wst_x1[i];s_private_wst[3]=s_wst_y1[i];
+            wst_clear(i);
+        }
+        pass_private_swap();rect_clear(&s_stencil_stale);s_stencil_valid=1;
+    }
     s_pj_cpu.n = 0;
     s_pass_active = 1;
     s_pass_local = local;
@@ -9356,11 +9475,19 @@ static void transaction_restore_ex(int keep_color) {
     if (!s_pass_active) return;
     /* Roll the journal, then the rect back. */
     pass_journal_rollback();
-    pass_blit(s_pb_hr_fbo, s_hr_fbo, 0, 0, s_pass_x * S, s_pass_y * S,
+    if (s_pass_private) {
+        pass_private_swap();s_stencil_stale=s_private_stencil_stale;
+        if(s_pass_private_wide>=0) {
+            int i=s_pass_private_wide;
+            s_wst_x0[i]=s_private_wst[0];s_wst_y0[i]=s_private_wst[1];
+            s_wst_x1[i]=s_private_wst[2];s_wst_y1[i]=s_private_wst[3];
+        }
+    }
+    else pass_blit(s_pb_hr_fbo, s_hr_fbo, 0, 0, s_pass_x * S, s_pass_y * S,
               s_pass_w * S, s_pass_h * S, hr_bits);
     pass_blit(s_pb_raw_fbo, s_raw_fbo, 0, 0, s_pass_x, s_pass_y, s_pass_w,
               s_pass_h, GL_COLOR_BUFFER_BIT);
-    if (s_pb_wide_src && s_pb_wide_src == pass_wide_fbo_for(s_pass_x)) {
+    if (!s_pass_private && s_pb_wide_src && s_pb_wide_src == pass_wide_fbo_for(s_pass_x)) {
         pass_blit(s_pb_wide_fbo, s_pb_wide_src, 0, 0, 0, s_pass_y * S,
                   g_wide_w * S, s_pass_h * S, hr_bits);
         /* The backed-up stencil may predate a rebuild inside the pass. */
@@ -9387,7 +9514,8 @@ static void transaction_restore_ex(int keep_color) {
     s_depth_last_avg = s_pb_depth_avg;
     s_pass_active = 0;
     s_pass_local = 0;
-    s_pb_valid = !keep_color;
+    s_pb_valid = !keep_color && !s_pass_private;
+    s_pass_private = 0;
     if (keep_color) {
         /* The rect now differs from the backup and from the last present. */
         present_dirty_rect(s_pass_x, s_pass_y, s_pass_x + s_pass_w - 1,
@@ -15373,6 +15501,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         (void)dyn_apply(v[0]);
         s_dyn_rth_disp_valid = 0;
         break;
+    case RTH_PRESENTATION_CAPTURE: presentation_gpu_capture_record(payload); break;
     case RTH_VRAM_SYNC_COPY:
         memcpy(s_rth_vram_pub, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
         break;
@@ -15586,3 +15715,7 @@ static void rth_ring_capture_now(const int32_t *a) { (void)a; }
 #endif
 
 const GpuRenderBackend *gl_backend_get(void) { return s_rth_on ? &GL_RT_BACKEND : &GL_BACKEND; }
+
+#include "presentation_gpu.inc"
+
+#include "gpu_gl_ambient.inc"
