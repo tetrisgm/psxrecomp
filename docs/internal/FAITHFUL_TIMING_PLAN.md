@@ -213,6 +213,15 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-11 — unlocked desktop follow-up.** Visible 2160-line playback
+  exposed intermittent stalls despite locked-desktop throughput near 60.
+  A CPU profile identified synchronous rewind snapshots and per-primitive
+  whole-upload cleanup scans. Texture invalidation now compacts the upload
+  vector only when an upload was actually emptied; the existing spatial index
+  still selects and invalidates every intersecting fragment. Texture tracking
+  semantics and all 37 shipping CTests pass. Rewind-off was measured separately,
+  not silently substituted for the default workload. See the R4 Mac receipt.
+
 - **2026-11-11 — queued enhancement frame delivery.** Record the guest cycle
   in pass-begin and presentation commands: the render worker must not expire
   generations against the concurrently advancing/rolling-back live CPU clock.

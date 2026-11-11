@@ -1112,22 +1112,24 @@ void hd_texture_pack_invalidate(HdTexturePack* pack,
             upload.fragments.swap(next);
             upload.bounds = fragment_bounds(upload.fragments);
             if (upload.fragments.empty()) {
+                erased_upload = true;
                 upload_index_remove(pack, upload);
             } else {
                 upload_index_refresh(pack, upload);
             }
         }
     }
-    const auto old_size = pack->uploads.size();
+    /* Only this path empties tracked uploads. Avoid scanning every upload
+     * for each small primitive when the spatial index found no deletion. */
+    if (!erased_upload) return;
     pack->uploads.erase(
         std::remove_if(pack->uploads.begin(), pack->uploads.end(),
                        [](const Upload& upload) { return upload.fragments.empty(); }),
         pack->uploads.end());
-    erased_upload = old_size != pack->uploads.size();
     /* Vector erasure can move surviving Upload objects, invalidating the
      * pointer map.  Rebuild only on this uncommon path; ordinary primitive
      * invalidation updates only the few intersecting uploads. */
-    if (erased_upload) upload_index_rebuild(pack);
+    upload_index_rebuild(pack);
 }
 
 int hd_texture_pack_track_upload(HdTexturePack* pack,
