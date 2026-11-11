@@ -16,6 +16,10 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include <time.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 #include "debug_server.h"
 #include "debug_bulk_write.h"
 #include "host_launch_timing.h"
@@ -5039,6 +5043,22 @@ static void handle_ping(int id, const char *json)
              (unsigned long long)s_unknown_seq,
              s_unknown_unique_count,
              (unsigned long long)psx_segment_miss_total());
+}
+
+/* Executed by the emulation owner, not the lock-free ping/I/O path. */
+static void handle_host_qos(int id,const char *json)
+{
+#ifdef __APPLE__
+    qos_class_t qos=QOS_CLASS_UNSPECIFIED;
+    int relative=0;
+    const int main_thread=pthread_main_np();
+    (void)json;
+    int rc=pthread_get_qos_class_np(pthread_self(),&qos,&relative);
+    send_fmt("{\"id\":%d,\"ok\":%s,\"main_thread\":%d,\"class\":%u,\"relative_priority\":%d,\"interactive\":%d}",
+             id,rc?"false":"true",main_thread,(unsigned)qos,relative,qos==QOS_CLASS_USER_INTERACTIVE);
+#else
+    (void)json;send_err(id,"host_qos requires macOS");
+#endif
 }
 
 static void handle_frame(int id, const char *json)
@@ -16480,6 +16500,7 @@ static const CmdEntry s_commands[] = {
     { "lockstep",          handle_lockstep },
     { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
+    { "host_qos",          handle_host_qos },
     { "xlate",             handle_xlate },
     { "parity_dump",       handle_parity_dump },
     { "parity_ctl",        handle_parity_ctl },

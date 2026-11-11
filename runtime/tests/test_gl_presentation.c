@@ -66,6 +66,10 @@ int main(void) {
         setenv("PSX_RENDER_PASS_FRESH_TARGET","1",1);
         transaction_depth_restore(scale);
         unsetenv("PSX_RENDER_PASS_FRESH_TARGET");
+        transaction_options=GL_PASS_COMPLETE_IMAGE;
+        transaction_depth_restore(scale);
+        transaction_options=0;
+        pending_capture(scale);
         gl_renderer_shutdown();
     }
     printf("checks=%d failures=%d\n",checks,failures);

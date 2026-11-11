@@ -66,6 +66,7 @@ static void seed_surface(GLuint fbo) {
     glClearDepth(0.25);glClearColor(0.25,0.5,0.75,1);glClearStencil(3);
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT);
 }
+static int transaction_options;
 static void transaction_depth_restore(int scale) {
     if (s_hiw) return;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload(); hiw_flush_queue();
@@ -80,9 +81,9 @@ static void transaction_depth_restore(int scale) {
     uint64_t wide=surface_hash(g_wide_cur,g_wide_w*scale,VRAM_H*scale);
     for(int band=0;band<2;++band) for(int keep=0;keep<2;++keep) {
         int y=band*240;
-        check(gl_renderer_pass_begin(0,y,320,240,1,2,0),"temporal transaction opens");
+        check(gl_renderer_pass_begin(0,y,320,240,1,2,transaction_options),"temporal transaction opens");
         const char *fresh=getenv("PSX_RENDER_PASS_FRESH_TARGET");
-        if(fresh && fresh[0]=='1')
+        if((fresh && fresh[0]=='1') || (transaction_options & GL_PASS_COMPLETE_IMAGE))
             check(s_pass_private,"both display bands use the private target");
         GLuint targets[2]={s_hr_fbo,g_wide_cur};
         for(int k=0;k<2;++k) {
@@ -127,8 +128,14 @@ static void pending_capture(int scale) {
         if(!want||!got){check(0,"capture allocation");free(want);free(got);return;}
         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER,wide?g_wide_cur:s_hr_fbo);
         glReadPixels(0,0,width*scale,240*scale,GL_RGBA,GL_UNSIGNED_BYTE,want);
-        pass_note_new_frame(0,0,s_interp_source_path,width*scale,240*scale);
+        /* The emulation thread can be far ahead of this queued present.
+         * Only its recorded timestamp may decide generation freshness. */
+        const uint64_t recorded_cycle = s_pgen[s_pgen_write].created_cycle + g_psx_vblank_cycles;
+        const uint64_t live_cycle = psx_cycle_count;
+        psx_cycle_count = recorded_cycle + 20u*g_psx_vblank_cycles;
+        pass_note_new_frame(0,0,s_interp_source_path,width*scale,240*scale,recorded_cycle);
         pass_apply_promotion();
+        psx_cycle_count = live_cycle;
         check(s_pgen[s_pgen_cur].promoted,"pending generation promoted");
         glBindTexture(GL_TEXTURE_2D,s_pgen_tex[s_pgen_cur][0]);
         glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,got);

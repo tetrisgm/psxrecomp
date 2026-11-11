@@ -177,7 +177,11 @@ uint32_t gl_renderer_pass_plan(uint32_t p, uint32_t s, uint32_t *a,
     if (wanted) *wanted = 0;
     return 0;
 }
-static int s_open_passes, s_kept;
+uint32_t gl_renderer_pass_plan_full_rate(uint32_t p,uint32_t s,uint32_t *a,
+    uint32_t max,uint32_t *wanted) {
+    return gl_renderer_pass_plan(p,s,a,max,wanted);
+}
+static int s_open_passes, s_kept, s_pass_options;
 static uint32_t s_stereo_mask;
 static uint64_t s_stereo_published;
 void gl_renderer_pass_begin_diag(GLRenderPassBeginDiag *out) {
@@ -187,7 +191,7 @@ void gl_renderer_pass_set_flip_shown(int shown) { (void)shown; }
 int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
                            uint32_t period, int reuse_backup) {
     (void)x; (void)y; (void)w; (void)h; (void)open_gen; (void)period;
-    (void)reuse_backup;
+    s_pass_options = reuse_backup;
     s_open_passes++;
     return 1;
 }
@@ -661,6 +665,22 @@ int main(void) {
         CHECK(psx_mod_render_local_pair(&cpu,&frame,stereo_draw,NULL)==1,
               "local pair recovers after watchdog");
     }
+
+    /* Complete-image producers retain the same rollback and watchdog contract. */
+    render_pass_reset_session();
+    snap(&live);
+    CHECK(psx_mod_render_pass_complete(&cpu,&pass,pass_fn,&clean)==1,
+          "complete image publishes");
+    CHECK(s_pass_options & GL_PASS_COMPLETE_IMAGE,
+          "complete-image promise reaches the GPU transaction");
+    check_live(&live,"after complete image");
+    CHECK(psx_mod_render_pass_complete(&cpu,&pass,pass_fn,&runaway)==0,
+          "complete image watchdog discards the image");
+    CHECK(!s_open_passes,"complete image abort closes GPU transaction");
+    check_live(&live,"after complete image watchdog");
+    CHECK(psx_mod_render_pass(&cpu,&pass,pass_fn,&clean)==1 &&
+          !(s_pass_options & GL_PASS_COMPLETE_IMAGE),
+          "ordinary producers do not inherit the complete-image promise");
 
     printf(failures ? "FAILED (%d)\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;

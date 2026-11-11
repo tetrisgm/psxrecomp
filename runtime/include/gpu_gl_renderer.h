@@ -81,13 +81,17 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
                                uint32_t shown_after_vblanks,
                                uint32_t *alpha_q16, uint32_t max,
                                uint32_t *wanted);
+uint32_t gl_renderer_pass_plan_full_rate(uint32_t period,uint32_t shown,
+    uint32_t *alpha,uint32_t max,uint32_t *wanted);
 /* Open the VRAM transaction for rect; open_gen first captures the game's own
  * image of it as a new generation. reuse_backup: the caller guarantees that
  * no guest code ran since the previous pass ended (its restore left VRAM as
  * backed up), so the backup of that pass is reused when it covers the same
  * rect at the same scale. Returns 0 when refused (nothing changed). */
+enum { GL_PASS_REUSE_BACKUP = 1, GL_PASS_COMPLETE_IMAGE = 2 };
+/* Options: reusable backup lease and/or complete-image producer contract. */
 int      gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
-                                uint32_t period_vblanks, int reuse_backup);
+                                uint32_t period_vblanks, int options);
 /* Snapshot at the last begin attempt, never reconstructed by a TCP query.
  * Strings are static reason names; GL enums are raw numeric values. */
 typedef struct GLRenderPassBeginDiag {

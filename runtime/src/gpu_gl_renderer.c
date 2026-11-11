@@ -473,6 +473,10 @@ static int       s_rthx_prim = 0;         /* current record carries prim tags  *
 static int       s_rthx_tagged = 0, s_rthx_backdrop = 0;
 static int       s_rths_flat_bd = 0, s_rths_vp_w = 0, s_rths_bg_full = 0;
 static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread(); }
+/* Render-owner timeline from immutable present records, never the concurrently
+ * advancing (and transactionally restored) emulation-thread clock. */
+static uint64_t s_rth_present_cycle;
+
 /* Frame generation (defined with the render-thread code near the end). */
 static int       s_fg_on;
 static int       s_fg_drawing, s_fg_presenting, s_fg_broken, s_fg_capture_real;
@@ -724,7 +728,7 @@ static uint64_t      s_interp_duplicates = 0;
 static int           s_interp_hold = 0;
 static void pass_gens_invalidate(void);
 static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
-                                int pw, int ph);
+                                int pw, int ph, uint64_t guest_cycle);
 static void pass_apply_promotion(void);
 static int pass_gen_present(uint64_t deadline);
 static int pass_queued_enabled(void);
@@ -8290,7 +8294,8 @@ static int interp_capture(GLuint fbo, int x, int y, int w, int h,
             s_interp_duplicates++;
             return INTERP_REUSED;
         }
-        pass_note_new_frame(origin_x, origin_y, source_path, pw, ph);
+        pass_note_new_frame(origin_x, origin_y, source_path, pw, ph,
+                            rth_replaying() ? s_rth_present_cycle : psx_cycle_count);
     } else {
         s_interp_phase_lo = 0.0;
         s_interp_phase_hi = 1.0;
@@ -8815,44 +8820,47 @@ static uint32_t pass_slot_cap(int tex_w, int tex_h) {
     return cap;
 }
 
+static uint32_t pass_plan_queued(uint32_t period_vblanks,
+    uint32_t shown_after_vblanks,uint32_t *alpha_q16,uint32_t max,
+    uint32_t *wanted,int adaptive) {
+    /* VBlank-locked: frame N is shown for period_vblanks outputs, one per
+     * VBlank; output k shows phase k / period. Phase 0 is the game's own
+     * image, so passes are wanted at k = 1 .. period - 1. They are shed
+     * while the render thread is two frames behind (one is its normal
+     * pipelined state). */
+    uint32_t n = 0, cap;
+    const int live = atomic_exchange(&s_pass_q_intervals, 0) > 0;
+    if (wanted) *wanted = 0;
+    (void)shown_after_vblanks;
+    if (gl_renderer_pass_unavailable() != PSX_MOD_RENDER_PASS_READY || !live ||
+        !alpha_q16 || max == 0 || period_vblanks < 2)
+        return 0;
+    if (wanted) *wanted = period_vblanks - 1u;
+    int shed_backlog = adaptive && rt_frames_ahead() >= 2;
+    /* Full-cost diagnostics must bypass BOTH admission guards, including
+     * shipping builds without per-store tracing. */
+    const char *shed = getenv("PSX_RENDER_PASS_SHED");
+    if (shed && strcmp(shed, "0") == 0) shed_backlog = 0;
+    if (shed_backlog) {
+        atomic_fetch_add(&s_pass_q_shed, 1);
+        return 0;
+    }
+    cap = pass_slot_cap(s_interp_w, s_interp_h);
+    for (uint32_t k = 1; k < period_vblanks && n < max && n + 1u < cap; k++)
+        alpha_q16[n++] = (uint32_t)(((uint64_t)k << 16) / period_vblanks);
+    s_pass_plan_diag.plans++;
+    s_pass_plan_diag.frame = s_frame_count;
+    s_pass_plan_diag.wanted = period_vblanks - 1u;
+    s_pass_plan_diag.planned = n;
+    return n;
+}
+
 uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
                                uint32_t shown_after_vblanks,
                                uint32_t *alpha_q16, uint32_t max,
                                uint32_t *wanted) {
-    if (pass_queued()) {
-        /* VBlank-locked: frame N is shown for period_vblanks outputs, one per
-         * VBlank; output k shows phase k / period. Phase 0 is the game's own
-         * image, so passes are wanted at k = 1 .. period - 1. They are shed
-         * while the render thread is two frames behind (one is its normal
-         * pipelined state). */
-        uint32_t n = 0, cap;
-        const int live = atomic_exchange(&s_pass_q_intervals, 0) > 0;
-        if (wanted) *wanted = 0;
-        (void)shown_after_vblanks;
-        if (gl_renderer_pass_unavailable() != PSX_MOD_RENDER_PASS_READY || !live ||
-            !alpha_q16 || max == 0 || period_vblanks < 2)
-            return 0;
-        if (wanted) *wanted = period_vblanks - 1u;
-        int shed_backlog = rt_frames_ahead() >= 2;
-#ifndef PSX_NO_DEBUG_TOOLS
-        /* Full-cost diagnostics must bypass BOTH admission guards, not just
-         * the CPU idle budget, or swaps can hide missing intermediate images. */
-        const char *shed = getenv("PSX_RENDER_PASS_SHED");
-        if (shed && shed[0] == '0') shed_backlog = 0;
-#endif
-        if (shed_backlog) {
-            atomic_fetch_add(&s_pass_q_shed, 1);
-            return 0;
-        }
-        cap = pass_slot_cap(s_interp_w, s_interp_h);
-        for (uint32_t k = 1; k < period_vblanks && n < max && n + 1u < cap; k++)
-            alpha_q16[n++] = (uint32_t)(((uint64_t)k << 16) / period_vblanks);
-        s_pass_plan_diag.plans++;
-        s_pass_plan_diag.frame = s_frame_count;
-        s_pass_plan_diag.wanted = period_vblanks - 1u;
-        s_pass_plan_diag.planned = n;
-        return n;
-    }
+    if (pass_queued())
+        return pass_plan_queued(period_vblanks,shown_after_vblanks,alpha_q16,max,wanted,1);
     GL_RT_SYNC("pass_plan");
     RenderPassPlanInput in;
     double freq, sp, spare;
@@ -8931,6 +8939,12 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
         }
         return n;
     }
+}
+
+uint32_t gl_renderer_pass_plan_full_rate(uint32_t period,uint32_t shown,
+    uint32_t *alpha,uint32_t max,uint32_t *wanted) {
+    if(pass_queued())return pass_plan_queued(period,shown,alpha,max,wanted,0);
+    return gl_renderer_pass_plan(period,shown,alpha,max,wanted);
 }
 
 void gl_renderer_pass_plan_diag(GLRenderPassPlanDiag *out) {
@@ -9236,24 +9250,23 @@ void gl_renderer_pass_stage_times(double *ms, uint64_t *counts) {
     }
 }
 
-/* Development probe: the title redraws a complete image into fresh surfaces.
+/* Complete-image producers redraw into cleared private surfaces.
  * Native textures remain in the small raw mirror. No high-resolution image is
  * cloned. This is not suitable for partial-frame producers or old-image reads. */
 static int s_pass_private_wide = -1;
 static int s_private_wst[4];
 static DirtyRect s_private_stencil_stale;
-static int pass_private_requested(int kind,int y,int open_gen) {
+static int pass_private_requested(int kind,int open_gen,int complete_image) {
+    if(kind!=0 || s_hiw)return 0;
 #ifndef PSX_NO_DEBUG_TOOLS
-    const char *e = getenv("PSX_RENDER_PASS_FRESH_TARGET");
-    /* The private surfaces retain the full VRAM coordinate space, including
-     * both vertically stacked display buffers. Restricting this to y=0 would
-     * alternate full-size private targets and cropped backups every flip. */
-    (void)y;
-    return kind == 0 && !s_hiw && e &&
-           (e[0] == '1' || (!open_gen && strcmp(e,"compare")==0));
+    const char *e=getenv("PSX_RENDER_PASS_FRESH_TARGET");
+    if(e && e[0]=='0')return 0;
+    if(e && e[0]=='1')return 1;
+    if(e && strcmp(e,"compare")==0)return !open_gen;
 #else
-    (void)kind; (void)y; (void)open_gen; return 0;
+    (void)open_gen;
 #endif
+    return complete_image;
 }
 static void pass_private_swap(void) {
     GLuint t;
@@ -9281,7 +9294,9 @@ static void pass_private_clear(GLuint fbo,int x,int y,int w,int h) {
 }
 
 static int transaction_begin(int x, int y, int w, int h, int open_gen,
-                              uint32_t period_vblanks, int reuse_backup, int kind) {
+                              uint32_t period_vblanks, int reuse_backup, int kind, uint64_t guest_cycle) {
+    const int complete_image = (reuse_backup & GL_PASS_COMPLETE_IMAGE) != 0;
+    reuse_backup &= GL_PASS_REUSE_BACKUP;
     const int stereo = kind == 1 || kind == 3;
     const int local = kind == 2 || (kind == 3 && s_cpu_auth_dual);
     int S = s_hr_scale, gi, wide, tw, th;
@@ -9321,7 +9336,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
     flush_flat_batch();
     flush_tex_batch();
     flush_cpu_upload();
-    if (pass_private_requested(kind,y,open_gen)) pack_flush();
+    if (pass_private_requested(kind,open_gen,complete_image)) pack_flush();
     if (pass_stage_profile()) { hiw_flush_queue(); glFinish(); s_pass_stage_mark = SDL_GetPerformanceCounter(); }
 
     wide = s_interp_source_path == GL_PRES_WIDE && g_wide_w > 0 &&
@@ -9354,7 +9369,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
         if (!pass_gen_reserve(gi, 1u, tw, th))
             return pass_begin_refuse("generation_reserve");
         memset(g, 0, sizeof *g);
-        g->order=++s_pgen_order;g->created_cycle=psx_cycle_count;
+        g->order=++s_pgen_order;g->created_cycle=guest_cycle;
         g->x = cx; g->y = cy; g->w = cw; g->h = ch;
         g->rx = x; g->ry = y; g->rw = w; g->rh = h;
         g->tex_w = tw; g->tex_h = th;
@@ -9375,14 +9390,14 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
 
     /* The previous pass of this frame restored exactly this backup and no
      * guest code ran since: VRAM and the coherency state already equal it. */
-    if (!pass_private_requested(kind,y,open_gen) && reuse_backup && s_pb_valid && s_pb_x == x && s_pb_y == y &&
+    if (!pass_private_requested(kind,open_gen,complete_image) && reuse_backup && s_pb_valid && s_pb_x == x && s_pb_y == y &&
         s_pb_w == w && s_pb_h == h && s_pb_scale == S &&
         s_pb_wide_src == (g_wide_w > 0 ? pass_wide_fbo_for(x) : 0)) {
         s_pb_reused++;
         goto backed_up;
     }
     s_pb_valid = 0;
-    s_pass_private = pass_private_requested(kind,y,open_gen);
+    s_pass_private = pass_private_requested(kind,open_gen,complete_image);
     s_pass_private_wide = -1;
     /* Back up the rect: hr color + stencil, raw mirror, wide band, CPU rows. */
     s_pass_begin_diag.resource = "backup_hr";
@@ -9551,7 +9566,7 @@ uint32_t gl_renderer_local_view_unavailable(void) {
 }
 int gl_renderer_local_view_begin(int x, int y, int w, int h) {
     GL_RT_SYNC("local_view_begin");
-    return transaction_begin(x, y, w, h, 0, 0, 0, 2);
+    return transaction_begin(x, y, w, h, 0, 0, 0, 2, psx_cycle_count);
 }
 int gl_renderer_local_view_end(int keep) {
     GL_RT_SYNC("local_view_end");
@@ -9565,16 +9580,18 @@ int gl_renderer_local_view_end(int keep) {
 int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
                            uint32_t period, int reuse) {
     if (pass_queued()) {
-        RTH_REC(RTH_PASS_BEGIN, 0, x, y, w, h, open_gen, (int32_t)period, reuse);
+        const uint64_t cycle = psx_cycle_count;
+        RTH_REC(RTH_PASS_BEGIN, 0, x, y, w, h, open_gen, (int32_t)period, reuse,
+                (int32_t)(uint32_t)cycle, (int32_t)(uint32_t)(cycle >> 32));
         return 1;
     }
     GL_RT_SYNC("pass_begin");
     s_pass_dead = 0;
-    return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
+    return transaction_begin(x, y, w, h, open_gen, period, reuse, 0, psx_cycle_count);
 }
 int gl_renderer_stereo_begin(int x, int y, int w, int h, int reuse) {
     GL_RT_SYNC("stereo_begin");
-    return transaction_begin(x, y, w, h, 0, 0, reuse, 1);
+    return transaction_begin(x, y, w, h, 0, 0, reuse, 1, psx_cycle_count);
 }
 int gl_renderer_local_pair_begin(int x, int y, int w, int h, int reuse) {
     GL_RT_SYNC("local_pair_begin");
@@ -9584,7 +9601,7 @@ int gl_renderer_local_pair_begin(int x, int y, int w, int h, int reuse) {
      * dual raster already keeps this mirror current. */
     if (!s_pass_active && gl_renderer_local_pair_unavailable()==PSX_MOD_RENDER_PASS_READY)
         ensure_cpu();
-    return transaction_begin(x, y, w, h, 0, 0, reuse, 3);
+    return transaction_begin(x, y, w, h, 0, 0, reuse, 3, psx_cycle_count);
 }
 uint32_t gl_renderer_local_pair_unavailable(void) {
     GL_RT_SYNC("local_pair_unavailable");
@@ -10276,12 +10293,12 @@ void gl_renderer_pass_set_flip_shown(int shown) {
 /* FLIP source saw a new frame: it is the flip a pending generation was built
  * for (render_pass_gen_flip_matches) or a frame without passes. */
 static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
-                                int pw, int ph) {
+                                int pw, int ph, uint64_t guest_cycle) {
     uint64_t order[PASS_GENERATIONS];uint32_t matches=0;
     for(int i=0;i<PASS_GENERATIONS;++i) {
         PassGen* pend=&s_pgen[i];order[i]=pend->order;
         if(!pend->valid || pend->promoted)continue;
-        if(psx_cycle_count<pend->created_cycle || psx_cycle_count-pend->created_cycle>
+        if(guest_cycle<pend->created_cycle || guest_cycle-pend->created_cycle>
             (uint64_t)pend->period*g_psx_vblank_cycles*4u){pend->valid=0;continue;}
         if(render_pass_gen_flip_matches(pend->shown,pend->x,pend->y,
             pend->source_path,pend->tex_w,pend->tex_h,origin_x,origin_y,source_path,pw,ph))matches|=1u<<i;
@@ -12273,6 +12290,7 @@ static int rth_record_mode(void) {
 
 /* Present records carry the host overlays the emulation thread rasterized. */
 typedef struct RthOvHdr {
+    uint64_t guest_cycle;
     int32_t needs_present, has, w[4], h[4];
     float   slide;
     int32_t args[8], nargs;
@@ -12283,6 +12301,7 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
     int w[4] = { 0 }, h[4] = { 0 };
     RthOvHdr hd;
     memset(&hd, 0, sizeof hd);
+    hd.guest_cycle = psx_cycle_count;
     hd.needs_present = host_osd_needs_present();
     for (int i = 0; i < 4; i++) {
         if (ov_image(i, &px[i], &w[i], &h[i]) && px[i] && w[i] > 0 && h[i] > 0) {
@@ -12342,6 +12361,7 @@ static void rth_replay_present(const RtCmd *c, const uint8_t *p) {
 static void rth_present_payload(uint16_t op, const uint8_t *p) {
     RthOvHdr hd;
     memcpy(&hd, p, sizeof hd);
+    s_rth_present_cycle = hd.guest_cycle;
     const uint8_t *q = p + sizeof hd;
     memset(&s_rth_ov, 0, sizeof s_rth_ov);
     s_rth_ov.valid = 1;
@@ -15506,7 +15526,8 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         memcpy(s_rth_vram_pub, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
         break;
     case RTH_PASS_BEGIN:
-        if (transaction_begin(v[0], v[1], v[2], v[3], v[4], (uint32_t)v[5], v[6], 0)) {
+        if (transaction_begin(v[0], v[1], v[2], v[3], v[4], (uint32_t)v[5], v[6], 0,
+                (uint64_t)(uint32_t)v[7] | ((uint64_t)(uint32_t)v[8] << 32))) {
             s_pass_leaks_at_begin = s_pass_leaks;
         } else {
             s_pass_dead = 1;

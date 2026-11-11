@@ -736,6 +736,12 @@ typedef struct PSXModRenderPass {
 uint32_t psx_mod_render_pass_plan(uint32_t period_vblanks,
                                   uint32_t shown_after_vblanks,
                                   uint32_t* alpha_q16, uint32_t max);
+/* Prefer every requested motion sample over adaptive shedding on the queued
+ * presenter. Queue backpressure remains bounded; insufficient hardware can
+ * reduce game speed rather than silently repeat native images. Other backend
+ * paths retain ordinary planning. All availability/safety checks still apply. */
+uint32_t psx_mod_render_pass_plan_full_rate(uint32_t period_vblanks,
+    uint32_t shown_after_vblanks,uint32_t *alpha_q16,uint32_t max);
 /* Returns 1 when the pass ran and its image was queued, 0 when it was refused
  * or rolled back (state is restored either way).
  * A watchdog abort rolls the pass back by longjmp, past every frame between
@@ -747,6 +753,15 @@ uint32_t psx_mod_render_pass_plan(uint32_t period_vblanks,
  * partially updated plugin state) across guest code, or tolerate the abort. */
 int psx_mod_render_pass(struct CPUState* cpu, const PSXModRenderPass* pass,
                         PSXModRenderPassFn fn, void* user);
+/* Complete-image producer contract: fn repaints the entire display rectangle
+ * and does not sample prior framebuffer color/depth/stencil. Texture inputs
+ * remain ordinary VRAM textures. The backend may render to cleared private
+ * surfaces instead of cloning/restoring native high-resolution attachments.
+ * CPU/device rollback, image ordering and watchdog behavior are unchanged.
+ * Partial redraws and framebuffer-feedback producers must use render_pass. */
+int psx_mod_render_pass_complete(struct CPUState* cpu,const PSXModRenderPass* pass,
+                                 PSXModRenderPassFn fn,void* user);
+
 /* Isolated dual-matte draw/readback using the stereo-capable rollback
  * transaction. Draws two mattes of the same slice, the first into eye 0 of the
  * stage surface and the second into eye 1, so both planes of a frame cost one

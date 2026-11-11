@@ -51,6 +51,37 @@ flip, and a plugin that supplies passes normally selects
 `PSX_MOD_FRAME_INTERPOLATION_HOLD`, so wherever no pass image applies the
 newest game frame is repeated rather than crossfaded one frame late.
 
+### Full-rate planning
+
+`psx_mod_render_pass_plan_full_rate()` has the ordinary planner's arguments
+and safety/availability checks. With the queued presenter it asks for every
+requested phase, bypassing adaptive CPU-budget rests and backlog shedding.
+The render queue still applies its configured backpressure bound; insufficient
+rendering capacity can therefore reduce game speed. This is an explicit quality
+preference, not a performance guarantee. Nonqueued backends retain normal
+planning. Returning to adaptive planning starts from current timing.
+
+`PSX_RENDER_PASS_SHED=0` disables both admission guards for full-workload
+measurement in either debug or shipping builds. It is not needed by producers
+using the full-rate API. Measure motion and completed intermediate frames,
+not merely swaps; the latter can conceal missing motion samples.
+
+### Complete-image producers
+
+`psx_mod_render_pass_complete()` has the same arguments and rollback behavior
+as `psx_mod_render_pass()`. Its caller additionally guarantees that the callback
+repaints the complete display rectangle and does not depend on prior framebuffer
+color, depth or stencil. Ordinary VRAM texture inputs remain available. On the
+supported GL path this selects cleared private high-resolution attachments;
+the native attachments are retained instead of copied out and restored.
+Both vertically stacked display buffers keep their original coordinates.
+Partial redraws and old-framebuffer feedback must use the reference API.
+
+This does not replace the title's geometry producer or remove CPU/device
+rollback. Unsupported backend modes retain the ordinary transaction. Debug
+builds can select the reference with `PSX_RENDER_PASS_FRESH_TARGET=0` or run
+same-state pairs with `compare`; shipping builds use the explicit contract.
+
 ### When passes are unavailable
 
 `psx_mod_render_pass_status()` says why a plan would be empty, the host-time

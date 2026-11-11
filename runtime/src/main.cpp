@@ -8743,11 +8743,9 @@ static void rewind_host_pause_loop(void) {
     psx_local_mouse_reset();
     freeze_heartbeat_set_paused(1);
     while (psx_rewind_is_open()) {
-#ifndef PSX_NO_DEBUG_TOOLS
         /* The guest is frozen; keep the debug endpoint live so injected
          * input, screenshots and status reads can drive the filmstrip. */
         debug_server_poll();
-#endif
         if (g_headless) {
             rewind_poll_nav((uint32_t)SDL_GetTicks());
             starvation_watchdog_heartbeat();
@@ -8813,9 +8811,7 @@ static void host_pause_loop(void) {
     freeze_heartbeat_set_paused(1);
     psx_sdl_audio_set_paused(sdl_audio_device, 1);
     while (psx_host_pause_depth() > 0) {
-#ifndef PSX_NO_DEBUG_TOOLS
         debug_server_poll();
-#endif
         SDL_Event ev;
         while (!g_headless && SDL_PollEvent(&ev)) {
             (void)psx_local_mouse_event(ev);
@@ -8935,11 +8931,9 @@ static void savestate_menu_host_pause_loop(void) {
     psx_local_mouse_reset();
     freeze_heartbeat_set_paused(1);
     while (savestate_menu_open) {
-#ifndef PSX_NO_DEBUG_TOOLS
         /* The guest is paused here; keep loopback host controls and overlay
          * inspection alive just as the rewind pause loop does. */
         debug_server_poll();
-#endif
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             (void)psx_local_mouse_event(ev);
@@ -9276,18 +9270,17 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     debug_server_record_frame();
     debug_server_check_watchpoints();
 
-    /* Check debug server input override. */
-    int override = debug_server_get_input_override();
-    int override_p2 = debug_server_get_input_override_port2();
 #else
     /* Release keeps TCP commands available without per-frame trace recording.
      * An unrequested server has no mutex/thread and polling returns at once. */
     debug_server_poll();
     extern uint64_t s_frame_count;
     s_frame_count++;
-    int override = -1;
-    int override_p2 = -1;
 #endif
+    /* The opt-in TCP controller must also drive shipping binaries, so race
+     * qualification measures production code without per-store tracing. */
+    int override = debug_server_get_input_override();
+    int override_p2 = debug_server_get_input_override_port2();
     /* Always-on wall-time stamp for this guest frame (host_span_ring.h). */
     extern uint64_t s_frame_count;
     uint32_t stamp_static_checks = 0;

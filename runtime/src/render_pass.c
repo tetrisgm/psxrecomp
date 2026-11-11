@@ -297,11 +297,10 @@ static int      s_q_ran_last, s_q_low;
 static uint32_t s_q_rest, s_q_backoff = RP_QUEUED_REST_MIN, s_q_good;
 static uint64_t s_q_shed, s_q_rests;
 static int queued_budget_allows(uint32_t period_vblanks) {
-#ifndef PSX_NO_DEBUG_TOOLS
-    /* Diagnostic only: attribute the full redraw cost without shedding. */
+    /* Explicit diagnostics also work in shipping builds: tracing changes the
+     * workload, and admission must not hide missing intermediate images. */
     const char *shed = getenv("PSX_RENDER_PASS_SHED");
     if (shed && strcmp(shed, "0") == 0) return 1;
-#endif
     const uint64_t w = psx_frame_pacer_wait_ticks();
     if (s_ms_per_tick <= 0.0)
         s_ms_per_tick = 1000.0 / (double)gl_renderer_perf_frequency();
@@ -607,18 +606,26 @@ int psx_mod_run_guest_span(CPUState *cpu, uint32_t start_pc, uint32_t stop_pc) {
     return 0;
 }
 
-uint32_t psx_mod_render_pass_plan(uint32_t period_vblanks,
-                                  uint32_t shown_after_vblanks,
-                                  uint32_t *alpha_q16, uint32_t max) {
+static uint32_t render_pass_plan(uint32_t period_vblanks,
+    uint32_t shown_after_vblanks,uint32_t *alpha_q16,uint32_t max,int full_rate) {
     uint32_t wanted = 0, n;
     s_open_generation = 0;
     if (!alpha_q16 || max == 0 || period_vblanks == 0 || period_vblanks > 8 ||
         shown_after_vblanks > 8)
         return 0;
     if (!passes_allowed()) return 0;
-    n = gl_renderer_pass_plan(period_vblanks, shown_after_vblanks,
-                              alpha_q16, max, &wanted);
-    if (gl_renderer_pass_queued()) {
+    n = full_rate ? gl_renderer_pass_plan_full_rate(period_vblanks,shown_after_vblanks,
+                                                     alpha_q16,max,&wanted)
+                  : gl_renderer_pass_plan(period_vblanks,shown_after_vblanks,
+                                          alpha_q16,max,&wanted);
+    if (gl_renderer_pass_queued() && full_rate) {
+        /* A later adaptive producer must start from current timing, not a
+         * rest/debt inherited before this full-rate run. Keep cumulative stats. */
+        s_q_wait_mark = psx_frame_pacer_wait_ticks();
+        s_q_plan_ticks = gl_renderer_perf_ticks();
+        s_q_ran_last = s_q_low = s_q_rest = s_q_good = 0;
+        s_q_backoff = RP_QUEUED_REST_MIN;
+    } else if (gl_renderer_pass_queued()) {
         if (n && !queued_budget_allows(period_vblanks)) {
             n = 0;
         } else if (!n) {
@@ -637,6 +644,15 @@ uint32_t psx_mod_render_pass_plan(uint32_t period_vblanks,
     s_open_generation = 1;
     s_plan_period = period_vblanks;
     return n;
+}
+
+uint32_t psx_mod_render_pass_plan(uint32_t period,uint32_t shown,
+    uint32_t *alpha,uint32_t max) {
+    return render_pass_plan(period,shown,alpha,max,0);
+}
+uint32_t psx_mod_render_pass_plan_full_rate(uint32_t period,uint32_t shown,
+    uint32_t *alpha,uint32_t max) {
+    return render_pass_plan(period,shown,alpha,max,1);
 }
 
 /* FNV-1a step over 64-bit words, then the tail bytes. Each step is a
@@ -920,7 +936,7 @@ static int transaction_end(int eye, uint32_t alpha, int keep) {
 }
 
 static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass,
-                              PSXModRenderPassFn fn, void *user, int eye) {
+                              PSXModRenderPassFn fn, void *user, int eye, int complete_image) {
     uint64_t t0, t1, tb, tg, te, tr, hash_before = 0, hash_after = 0;
     uint64_t cycles_before;
     uint32_t leaks;
@@ -992,7 +1008,8 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
           : eye == RP_EYE_LOCAL ? gl_renderer_local_view_begin(pass->x, pass->y,
                                                                pass->w, pass->h)
                     : gl_renderer_pass_begin(pass->x, pass->y, pass->w,
-                                               pass->h, open, s_plan_period, reuse))) {
+                                               pass->h, open, s_plan_period, reuse |
+                            (complete_image ? GL_PASS_COMPLETE_IMAGE : 0)))) {
         gl_renderer_pass_begin_diag(&s_attempt.gl);
         s_stats.begin_refused++;
         return pass_refuse(s_attempt.gl.reason ? s_attempt.gl.reason : "gl_begin",
@@ -1196,7 +1213,7 @@ int psx_mod_render_local_view(struct CPUState *cpu, const PSXModRenderPass *rect
     }
     r = *rect;
     r.alpha_q16 = 0;
-    return render_transaction(cpu, &r, fn, user, RP_EYE_LOCAL);
+    return render_transaction(cpu, &r, fn, user, RP_EYE_LOCAL, 0);
 }
 
 uint32_t psx_mod_render_local_view_status(void) {
@@ -1205,7 +1222,12 @@ uint32_t psx_mod_render_local_view_status(void) {
 
 int psx_mod_render_pass(struct CPUState *cpu, const PSXModRenderPass *pass,
                         PSXModRenderPassFn fn, void *user) {
-    return render_transaction(cpu, pass, fn, user, -1);
+    return render_transaction(cpu, pass, fn, user, -1, 0);
+}
+
+int psx_mod_render_pass_complete(struct CPUState *cpu,const PSXModRenderPass *pass,
+                                 PSXModRenderPassFn fn,void *user) {
+    return render_transaction(cpu,pass,fn,user,RP_EYE_PASS,1);
 }
 
 typedef struct StereoCallback {
@@ -1320,7 +1342,7 @@ static int render_pair(CPUState *cpu, const PSXModStereoFrame *frame,
             ok = 0; s_stereo.last_failure = "checkpoint_changed"; break;
         }
         if (!render_transaction(cpu, &rect, stereo_eye_draw, &call,
-                                (int)call.eye + (local ? 2 : 0))) {
+                                (int)call.eye + (local ? 2 : 0), 0)) {
             ok = 0;
             if (!s_stereo.last_failure) s_stereo.last_failure =
                 s_stats.aborted != aborted ? "eye_abort" : "eye_refused_or_discarded";
@@ -1411,12 +1433,12 @@ int psx_mod_render_capture_rgba_pair(CPUState *cpu,const PSXModRenderPass *rect,
      * previous frame, which describes a machine the guest has since changed. */
     s_capture_only=1;s_capture_pair=1;s_baseline_ready=0;
     uint64_t cycle=psx_cycle_count,stores=g_guest_store_count;
-    int ok=render_transaction(cpu,&capture,fn,user_first,0);
+    int ok=render_transaction(cpu,&capture,fn,user_first,0,0);
     /* The second matte must draw from the state the first one's restore put
      * back. If the clock or the store count moved, that baseline no longer
      * describes it, so capture the machine again instead of reusing it. */
     if(psx_cycle_count!=cycle || g_guest_store_count!=stores)s_baseline_ready=0;
-    if(ok)ok=render_transaction(cpu,&capture,fn,user_second,1);
+    if(ok)ok=render_transaction(cpu,&capture,fn,user_second,1,0);
     s_capture_only=0;s_capture_pair=0;s_baseline_ready=0;
     uint64_t trace_t1=gl_renderer_perf_ticks();
     psx_frame_trace_add(PSX_TRACE_HUD_DRAW,

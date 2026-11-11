@@ -243,6 +243,10 @@ uint32_t gl_renderer_pass_plan(uint32_t p, uint32_t s, uint32_t *a,
     a[0] = 0x8000u;
     return 1;
 }
+uint32_t gl_renderer_pass_plan_full_rate(uint32_t p,uint32_t s,uint32_t *a,
+    uint32_t max,uint32_t *wanted) {
+    return gl_renderer_pass_plan(p,s,a,max,wanted);
+}
 static int s_open_passes, s_kept, s_begin_ok = 1, s_diag_null;
 void gl_renderer_pass_begin_diag(GLRenderPassBeginDiag *out) {
     memset(out, 0, sizeof *out);
@@ -1264,6 +1268,18 @@ static void test_queued_budget(void) {
     CHECK(zeros == 30, "queued budget: a failed retry doubles the rest");
     render_pass_get_stats(&st);
     CHECK(st.queued_rests == 2 && st.queued_shed == 45, "queued budget: stats count rests and shed frames");
+    for(i=0;i<60;++i) {
+        tick_bump(40u*ms);
+        CHECK(psx_mod_render_pass_plan_full_rate(2,1,a,4)==1,
+              "full-rate plans retain motion samples under measured overload");
+    }
+    render_pass_get_stats(&st);
+    CHECK(st.queued_shed==45,"full-rate planning does not add adaptive shedding");
+    CHECK(psx_mod_render_pass_plan_full_rate(0,1,a,4)==0,
+          "full-rate planning retains argument checks");
+    tick_bump(40u*ms);
+    CHECK(psx_mod_render_pass_plan(2,1,a,4)==1,
+          "returning to adaptive planning does not inherit an old rest");
     s_queued = 0;
     s_plan_one = 0;
 }

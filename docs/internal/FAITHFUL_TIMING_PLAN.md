@@ -213,6 +213,19 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-11 — queued enhancement frame delivery.** Record the guest cycle
+  in pass-begin and presentation commands: the render worker must not expire
+  generations against the concurrently advancing/rolling-back live CPU clock.
+  A GL regression advances the live clock independently of the recorded flip.
+  Added explicit complete-image/private-target and full-rate planner contracts;
+  ordinary adaptive passes retain their prior behavior. R4 GP owns the opt-in.
+  Optimized Release (tracing off, IPO on) with the presentation worker measured
+  60.03 VBlanks/s over 120 moving-race seconds at 3834x2160, with all 3,617
+  intermediate generations promoted and no unmatched flips. Shipping opt-in
+  TCP input and paused-menu polling now exercise the actual production binary.
+  This remains guest redraw with rollback, not the unconnected scene producer.
+  Final evidence: R4 `docs/recovery/MAC_60FPS_20261111.md`.
+
 - **2026-11-11 — R4 follow-up probes.** Removed single-target redraw (56.99
   VBlanks/s, nonzero reference-pixel differences) and conservative wide
   depth-clear bounds (99 GL checks and exact race pairs, but 51.46 VBlanks/s).
