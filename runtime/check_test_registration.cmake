@@ -53,6 +53,7 @@ function(psxrecomp_check_all_tests_registered)
     # ---- what the build systems say -------------------------------------
     set(_declared "")
     foreach(_cml "${_root}/runtime/CMakeLists.txt"
+                 "${_root}/runtime/tests/presentation_tests.cmake"
                  "${_root}/recompiler/CMakeLists.txt"
                  "${_root}/runtime/tests/playtest_diagnostics/CMakeLists.txt")
         if(NOT EXISTS "${_cml}")
