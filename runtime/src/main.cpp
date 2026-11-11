@@ -6785,12 +6785,9 @@ extern "C" int psx_mod_read_local_pad_sticks(uint32_t player,
 /* Debug host-pad layer (set_input {"layer":"host"}): a virtual P1 gamepad. */
 static int host_pad_layer(uint16_t* buttons, uint8_t st[4], uint8_t* lt,
                           uint8_t* rt) {
-#ifndef PSX_NO_DEBUG_TOOLS
+/* The server is opt-in in shipping builds. Its host layer must exercise
+     * the same shortcuts/navigation there as in instrumented builds. */
     return debug_server_get_host_pad(buttons, st, lt, rt);
-#else
-    (void)buttons; (void)st; (void)lt; (void)rt;
-    return 0;
-#endif
 }
 
 /* The host layer's PSX word expressed as the Xbox-layout SDL buttons a

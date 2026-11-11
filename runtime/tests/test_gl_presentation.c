@@ -5,6 +5,19 @@
 uint16_t gr_vram_read(int x,int y) { return glb_vram_read(x,y); }
 void gr_vram_write(int x,int y,uint16_t value) { glb_vram_write(x,y,value); }
 
+int present_image_ring_accepting(void) { return 0; }
+int present_image_ring_thumb_w(int w,int h) { (void)w;(void)h;return 0; }
+void present_image_ring_push(uint32_t f,const uint8_t *p,int w,int pitch,int flip) {
+    (void)f;(void)p;(void)w;(void)pitch;(void)flip;
+}
+void present_image_ring_push_argb(uint32_t f,const uint32_t *p,int w,int h,int pitch) {
+    (void)f;(void)p;(void)w;(void)h;(void)pitch;
+}
+static atomic_int snapshot_done;
+static void snapshot_completed(void *context) {
+    atomic_fetch_add_explicit((atomic_int *)context,1,memory_order_release);
+}
+
 int main(void) {
     if(SDL_Init(SDL_INIT_VIDEO)!=0)return 2;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);
@@ -80,6 +93,25 @@ int main(void) {
         gl_renderer_set_interpolation(1,75.0,60.0,59.94,0);
         check(!pass_vblank_locked_rate(), "linear interpolation retains explicit 60-Hz target");
         gl_renderer_set_interpolation(0,75.0,60.0,59.94,2);
+        {
+            static uint16_t snap_a[1024*512], snap_b[1024*512];
+            atomic_store(&snapshot_done,0);
+            gl_renderer_set_hd_texture_mode(1);
+            check(gl_renderer_render_thread_start(2),"snapshot fixture starts render worker");
+            rtb_fill_rect(64,64,16,1,0x001f);
+            rtb_snapshot_submit(snap_a,snapshot_completed,&snapshot_done);
+            rtb_fill_rect(64,64,16,1,0x03e0);
+            rtb_snapshot_submit(snap_b,snapshot_completed,&snapshot_done);
+            rtb_fill_rect(64,64,16,1,0x7c00);
+            rtb_snapshot_barrier();
+            check(atomic_load_explicit(&snapshot_done,memory_order_acquire)==2,
+                  "snapshot callbacks finish before the barrier returns");
+            check(snap_a[64*1024+64]==0x001f && snap_b[64*1024+64]==0x03e0,
+                  "queued snapshots retain their own command-boundary VRAM");
+            check(!rt_held(),"snapshot submit and barrier do not migrate the GL context");
+            gl_renderer_render_thread_stop();
+            gl_renderer_set_hd_texture_mode(0);
+        }
         gl_renderer_shutdown();
     }
     printf("checks=%d failures=%d\n",checks,failures);

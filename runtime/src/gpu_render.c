@@ -311,3 +311,14 @@ int gr_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_
         return g_b->wide_dump_full(out, cap_pixels, ow, oh, base_x);
     return 0;
 }
+
+void gr_snapshot_submit(uint16_t *vram, void (*complete)(void *), void *context) {
+    if (g_b->snapshot_submit) g_b->snapshot_submit(vram, complete, context);
+    else {
+        g_b->vram_transfer_out(0, 0, 1024, 512, vram);
+        complete(context);
+    }
+}
+void gr_snapshot_barrier(void) {
+    if (g_b->snapshot_barrier) g_b->snapshot_barrier();
+}

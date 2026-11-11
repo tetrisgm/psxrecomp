@@ -6,6 +6,7 @@
 #include "capture_ring.h"
 #include "cdrom.h"
 #include "gpu.h"
+#include "gpu_render.h"
 #include "gpu_hd_textures.h"
 #include "host_keymap.h"
 #include "host_osd.h"
@@ -19,11 +20,18 @@
 #include "savestate.h"
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 #if defined(PSX_HAS_RBENGINE_SNAP)
 #include "retcomm_rbengine/snap_ring.h"
+#endif
+
+#if PSX_NATIVE_CAPTURE_JOBS && defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define RW_ASYNC_CAPTURE 1
+#else
+#define RW_ASYNC_CAPTURE 0
 #endif
 
 #define RW_THUMB_W     128
@@ -203,6 +211,22 @@ static uint32_t s_load_tick;
 static int s_left_was, s_right_was, s_acc_was, s_can_was;
 static uint32_t s_rep_next;
 static int s_rep_dir;
+#if RW_ASYNC_CAPTURE
+/* One unpublished capture. The render owner fills only its VRAM and texture
+ * provenance; main owns CPU serialization, ring publication and thumbnails. */
+static struct {
+    uint8_t *data, *hd;
+    uint16_t vram[1024 * 512];
+    size_t capacity, size, vram_offset, hd_size;
+    uint32_t tick;
+    GpuDisplayInfo display;
+    int active;
+    atomic_int ready;
+} s_pending;
+static void pending_finish(int publish);
+static void pending_reset(void);
+#endif
+
 
 static uint32_t env_u32(const char *name, uint32_t def, uint32_t lo, uint32_t hi)
 {
@@ -368,11 +392,11 @@ static uint32_t rewind_resolve_resume_pc(const CPUState *cpu, uint32_t hint)
     return 0u;
 }
 
-static void capture_thumb(uint32_t *dst)
+static void capture_thumb(uint32_t *dst, const uint16_t *image, const GpuDisplayInfo *display)
 {
     GpuDisplayInfo di;
     uint32_t dw, dh, x, y;
-    gpu_get_display_info(&di);
+    if (display) di = *display; else gpu_get_display_info(&di);
     dw = di.width ? di.width : 320u;
     dh = di.height ? di.height : 240u;
     if (di.disabled) {
@@ -383,8 +407,14 @@ static void capture_thumb(uint32_t *dst)
         uint32_t sy = y * dh / RW_THUMB_H;
         for (x = 0; x < RW_THUMB_W; x++) {
             uint32_t sx = x * dw / RW_THUMB_W;
-            dst[y * RW_THUMB_W + x] =
-                gpu_display_pixel_argb(&di, sx, sy) | 0xFF000000u;
+            if (image) {
+                uint8_t r, g, b;
+                gpu_display_pixel_rgb_in(image, &di, sx, sy, &r, &g, &b);
+                dst[y * RW_THUMB_W + x] = 0xFF000000u | ((uint32_t)r << 16) |
+                                          ((uint32_t)g << 8) | b;
+            } else {
+                dst[y * RW_THUMB_W + x] = gpu_display_pixel_argb(&di, sx, sy);
+            }
         }
     }
 }
@@ -466,6 +496,46 @@ static void list_push(uint32_t tick, const uint32_t *thumb, uint8_t *hd, size_t 
     s_panel_dirty = 1;
 }
 
+#if RW_ASYNC_CAPTURE
+static void pending_ready(void *unused)
+{
+    (void)unused;
+    (void)gpu_hd_textures_residency_save(&s_pending.hd, &s_pending.hd_size);
+    atomic_store_explicit(&s_pending.ready, 1, memory_order_release);
+}
+static int pending_publish(void *unused, uint32_t tick, uint8_t **data,
+                           size_t *capacity, size_t *size)
+{
+    (void)unused; (void)tick;
+    uint8_t *spare = *data;
+    size_t spare_capacity = *capacity;
+    *data = s_pending.data; *capacity = s_pending.capacity; *size = s_pending.size;
+    s_pending.data = spare; s_pending.capacity = spare_capacity;
+    return 1;
+}
+static void pending_finish(int publish)
+{
+    uint32_t thumb[RW_THUMB_W * RW_THUMB_H];
+    if (!s_pending.active || !atomic_load_explicit(&s_pending.ready, memory_order_acquire)) return;
+    if (publish && s_ring) {
+        memcpy(s_pending.data + s_pending.vram_offset, s_pending.vram, sizeof s_pending.vram);
+        capture_thumb(thumb, s_pending.vram, &s_pending.display);
+        if (rbe_snap_ring_capture(s_ring, s_pending.tick, pending_publish, NULL)) {
+            list_push(s_pending.tick, thumb, s_pending.hd, s_pending.hd_size);
+            s_pending.hd = NULL;
+        }
+    }
+    free(s_pending.hd); s_pending.hd = NULL; s_pending.hd_size = 0;
+    s_pending.active = 0;
+}
+static void pending_reset(void)
+{
+    if (s_pending.active) gr_snapshot_barrier();
+    pending_finish(0);
+    free(s_pending.data); s_pending.data = NULL; s_pending.capacity = 0;
+}
+#endif
+
 void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 {
     if (!rewind_wanted())
@@ -496,6 +566,9 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 
 void psx_rewind_shutdown(void)
 {
+#if RW_ASYNC_CAPTURE
+    pending_reset();
+#endif
     list_clear();
     if (s_ring)
         rbe_snap_ring_destroy(s_ring);
@@ -516,6 +589,9 @@ void psx_rewind_shutdown(void)
 uint32_t psx_rewind_discard_history(void)
 {
     uint32_t dropped = s_count;
+#if RW_ASYNC_CAPTURE
+    pending_reset();
+#endif
     if (!s_configured || !s_ring) return 0;
     rbe_snap_ring_clear(s_ring);
     list_clear();
@@ -561,7 +637,7 @@ void psx_rewind_note_frame(void)
 
 static int do_capture(CPUState *cpu, uint32_t resume_pc)
 {
-#if !PSX_NATIVE_CAPTURE_JOBS
+#if !RW_ASYNC_CAPTURE
     uint8_t *blob = NULL;
     size_t len = 0;
 #endif
@@ -579,9 +655,20 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         return 0;
     snap = *cpu;
     snap.pc = pc;
-#if PSX_NATIVE_CAPTURE_JOBS
-    if (!psx_capture_ring_save(s_ring, tick, &snap, s_bios, s_entry))
-        return 0;
+#if RW_ASYNC_CAPTURE
+    if (s_pending.active) return 0;
+    if (!boot_state_capture_deferred_vram(&snap, s_bios, s_entry,
+            &s_pending.data, &s_pending.capacity, &s_pending.size,
+            &s_pending.vram_offset)) return 0;
+    s_pending.tick = tick;
+    gpu_get_display_info(&s_pending.display);
+    s_pending.active = 1;
+    atomic_store_explicit(&s_pending.ready, 0, memory_order_relaxed);
+    gr_snapshot_submit(s_pending.vram,
+                       pending_ready, NULL);
+    s_last_capture_frame = s_frame;
+    s_capture_due = 0;
+    return 1;
 #else
     if (!boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len) ||
         !blob || !len)
@@ -591,7 +678,7 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         return 0;
     }
 #endif
-    capture_thumb(thumb);
+    capture_thumb(thumb, NULL, NULL);
     (void)gpu_hd_textures_residency_save(&hd, &hd_size);
     list_push(tick, thumb, hd, hd_size);
     s_last_capture_frame = s_frame;
@@ -601,6 +688,10 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
 
 static int do_load(CPUState *cpu, uint32_t tick)
 {
+#if RW_ASYNC_CAPTURE
+    if (s_pending.active) gr_snapshot_barrier();
+    pending_finish(1);
+#endif
     size_t size = 0;
     const uint8_t *data;
     uint8_t *rollback = NULL;
@@ -661,6 +752,9 @@ static int do_load(CPUState *cpu, uint32_t tick)
 
 void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
 {
+#if RW_ASYNC_CAPTURE
+    pending_finish(1);
+#endif
     if (!psx_rewind_enabled())
         return;
     /* Keep capture/load requests staged until projected title callbacks have

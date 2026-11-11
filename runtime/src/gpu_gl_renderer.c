@@ -520,7 +520,7 @@ enum {
     RTH_WIDE_DISABLE, RTH_WIDE_CLEAR, RTH_WIDE_CLEAR_MARGINS, RTH_PROJ_TRI,
     RTH_WIDE_RECOVERY, RTH_INTERP_SUSPENDED, RTH_PRESENT_VRAM,
     RTH_PRESENT_WIDE, RTH_STATE, RTH_PEEK, RTH_RING_CAPTURE, RTH_DYN_STEP,
-    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK, RTH_VRAM_SYNC_COPY, RTH_PRESENTATION_CAPTURE,
+    RTH_FRAME, RTH_FG_SRC, RTH_DEPTH, RTH_HD_NOTE, RTH_DITHER, RTH_WIDE_FEEDBACK, RTH_VRAM_SYNC_COPY, RTH_SNAPSHOT, RTH_PRESENTATION_CAPTURE,
     RTH_PASS_BEGIN, RTH_PASS_END
 };
 /* GP0(A0) whose payload gpu.c is still streaming into its array (the
@@ -15284,6 +15284,37 @@ static void rtb_vram_upload_open(int open) {
 }
 static void rtb_hd_texture_note(int op, int x, int y, int w, int h, int sx, int sy) {
     RTH_DIRECT_OR(RTH_REC(RTH_HD_NOTE, 0, op, x, y, w, h, sx, sy)); hd_note_exec(op, x, y, w, h, sx, sy); }
+typedef struct RthSnapshot {
+    uint16_t *vram;
+    void (*complete)(void *);
+    void *context;
+} RthSnapshot;
+static void snapshot_now(const RthSnapshot *job) {
+    if (s_hd_native_authority)
+        memcpy(job->vram, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
+    else
+        glb_vram_transfer_out(0, 0, VRAM_W, VRAM_H, job->vram);
+    job->complete(job->context);
+}
+static void rtb_snapshot_submit(uint16_t *vram, void (*complete)(void *), void *context) {
+    RthSnapshot job = {vram, complete, context};
+    /* Only native-authority VRAM is complete on the render owner. Other
+     * modes keep the existing synchronized readback rather than copying a
+     * stale upload mirror (ensure_cpu deliberately skips render replay). */
+    if (s_hd_native_authority && rth_record_mode()) {
+        void *record = rt_cmd_begin(RTH_SNAPSHOT, 0, sizeof job);
+        if (record) {
+            memcpy(record, &job, sizeof job);
+            rt_cmd_commit();
+            return;
+        }
+    }
+    GL_RT_SYNC("snapshot_submit");
+    snapshot_now(&job);
+}
+static void rtb_snapshot_barrier(void) {
+    if (rth_record_mode()) rt_drain();
+}
 static void rtb_vram_transfer_out(int x, int y, int w, int h, uint16_t *d) {
     if (!d || w <= 0 || h <= 0) return;
     /* Under HD authority, native rasterization already produced the exact
@@ -15420,6 +15451,8 @@ static const GpuRenderBackend GL_RT_BACKEND = {
     .hd_texture_note = rtb_hd_texture_note,
     .vram_upload_open = rtb_vram_upload_open,
     .wide_feedback_rect = rtb_wide_feedback_rect,
+    .snapshot_submit = rtb_snapshot_submit,
+    .snapshot_barrier = rtb_snapshot_barrier,
 };
 
 /* ---- replay (render thread) ---------------------------------------------- */
@@ -15529,6 +15562,12 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
         s_dyn_rth_disp_valid = 0;
         break;
     case RTH_PRESENTATION_CAPTURE: presentation_gpu_capture_record(payload); break;
+    case RTH_SNAPSHOT: {
+        RthSnapshot job;
+        memcpy(&job, payload, sizeof job);
+        snapshot_now(&job);
+        break;
+    }
     case RTH_VRAM_SYNC_COPY:
         memcpy(s_rth_vram_pub, s_vram, (size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
         break;

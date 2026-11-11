@@ -228,6 +228,7 @@ typedef struct BsOut {
     uint8_t* data;    /* memory sink (owned by caller / save_buffer) */
     size_t   len;
     size_t   cap;
+    size_t *deferred_vram_offset; /* unpublished raw capture only */
     int      no_zlib; /* 1 => always raw sections (netplay snap ring) */
 } BsOut;
 
@@ -465,10 +466,13 @@ static int write_timer_section(BsOut* o) {
 static int write_vram_section_full(BsOut *o)
 {
 #if PSX_NATIVE_CAPTURE_JOBS && defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
-    if (!o->f && o->no_zlib && (o->len & 1u) == 0u) {
+    if (!o->f && o->no_zlib && ((o->len & 1u) == 0u || o->deferred_vram_offset)) {
         uint8_t *payload = bs_raw_payload(o, BS_SEC_VRAM, VRAM_SIZE);
         if (!payload) return 0;
-        gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, (uint16_t *)payload);
+        if (o->deferred_vram_offset)
+            *o->deferred_vram_offset = (size_t)(payload - o->data);
+        else
+            gr_vram_transfer_out(0, 0, VRAM_W, VRAM_H, (uint16_t *)payload);
         s_last_vram_dirty_rows = VRAM_H;
         s_last_vram_incremental = 0;
         return 1;
@@ -591,7 +595,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
     if (ok) {
         /* §96 incremental mirror only while RB dirty-tracking is on.
          * Offline / delay-sync / zlib disk: classic full transfer_out. */
-        if (o->no_zlib && gpu_vram_dirty_tracking()) {
+        if (o->no_zlib && !o->deferred_vram_offset && gpu_vram_dirty_tracking()) {
             ok = sync_vram_mirror_for_save();
             if (ok) {
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
@@ -797,6 +801,32 @@ int boot_state_capture_raw(const CPUState* cpu, uint32_t bios_checksum,
     *capacity = len;
     *out_len = len;
     return 1;
+#endif
+}
+
+/* CPU/device state is complete on return, but VRAM must be filled at the
+ * same renderer command boundary before publication. An offset survives any
+ * serializer reallocations. Only native raw little-endian captures use this. */
+int boot_state_capture_deferred_vram(const CPUState *cpu, uint32_t bios,
+        uint32_t entry, uint8_t **data, size_t *capacity, size_t *length,
+        size_t *vram_offset) {
+#if PSX_NATIVE_CAPTURE_JOBS && defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    BsOut o;
+    if (!data || !capacity || !length || !vram_offset || ((!*data) != (!*capacity))) return 0;
+    memset(&o, 0, sizeof o);
+    o.data = *data; o.cap = *capacity; o.no_zlib = 1;
+    *length = 0; *vram_offset = SIZE_MAX;
+    o.deferred_vram_offset = vram_offset;
+    int ok = boot_state_save_to(&o, cpu, bios, entry);
+    *data = o.data; *capacity = o.cap;
+    if (!ok || *vram_offset == SIZE_MAX || *vram_offset > o.len ||
+        o.len - *vram_offset < VRAM_SIZE) return 0;
+    *length = o.len;
+    return 1;
+#else
+    (void)cpu; (void)bios; (void)entry; (void)data; (void)capacity;
+    (void)length; (void)vram_offset;
+    return 0;
 #endif
 }
 

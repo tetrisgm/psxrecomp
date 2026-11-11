@@ -213,6 +213,15 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-11 — rewind remains required.** Owner rejected the rewind-off
+  diagnostic as a release preset. Added an unpublished raw snapshot path:
+  main serializes CPU/devices, a render-command-boundary job captures native
+  VRAM and HD provenance, then main publishes the completed point. One pending
+  slot reuses the ring spare; teardown/restore drains outstanding jobs. Same
+  wire format and capture interval, full thumbnails and history retained.
+  Qualification is pending rewind-on race/restore tests; no package is approved
+  by the earlier rewind-off throughput result.
+
 - **2026-11-11 — nominal NTSC redraw rate.** Native 75-Hz display testing
   exposed a 60.0-versus-59.94 comparison that disabled queued redraw and both
   rendering workers. Hold/redraw rates within 0.2% of the guest VBlank rate

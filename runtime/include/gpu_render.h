@@ -157,6 +157,13 @@ int  gr_render_wide_display(uint32_t *out, int pitch, int base_x,
  * A backend supplies the same set of functions.  gpu_gl_renderer.c (Phase 2)
  * provides gl_backend_get(); until it does, requesting OpenGL falls back to
  * software.  Members mirror the gr_* / sw_* signatures 1:1. */
+/* Queue an exact native VRAM snapshot at this command boundary. Destination
+ * and callback context remain owned by the caller until completion. Callback
+ * executes on the render owner; publish its results with release/acquire.
+ * barrier waits for submitted snapshots before teardown/restore. */
+void gr_snapshot_submit(uint16_t *vram, void (*complete)(void *), void *context);
+void gr_snapshot_barrier(void);
+
 typedef struct GpuRenderBackend {
     const char *name;
     void (*init)(uint16_t *vram);
@@ -247,6 +254,8 @@ typedef struct GpuRenderBackend {
     void (*wide_feedback_rect)(int src_base, int src_x, int src_y, int dst_x,
                                int dst_y, int w, int h, int r, int g, int b,
                                int raw, int semi);
+    void (*snapshot_submit)(uint16_t *, void (*)(void *), void *);
+    void (*snapshot_barrier)(void);
 } GpuRenderBackend;
 
 enum { GR_HD_NOTE_INVALIDATE = 0, GR_HD_NOTE_TRACK_UPLOAD = 1,

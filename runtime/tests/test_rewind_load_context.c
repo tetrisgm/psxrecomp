@@ -14,6 +14,22 @@ static int function_entry_active, provider_ready = 1, capture_fails;
 static int capture_calls, load_attempts, quiet_rollbacks, observations;
 static int frontend_restores, cycle_restores, gpu_present_resets, cd_restores, resumes;
 static uint32_t hd_live;
+#if PSX_NATIVE_CAPTURE_JOBS
+static void (*queued_complete)(void *);
+static void *queued_context;
+static uint32_t queued_value;
+static int in_gpu_callback;
+void gr_snapshot_submit(uint16_t *vram, void (*complete)(void *), void *context) {
+    assert(!queued_complete); memset(vram,0,1024*512*2);
+    queued_value=machine.gpr[4]; queued_complete=complete; queued_context=context;
+}
+void gr_snapshot_barrier(void) {
+    if(queued_complete) {
+        in_gpu_callback=1; queued_complete(queued_context); in_gpu_callback=0;
+        queued_complete=NULL;
+    }
+}
+#endif
 static size_t hd_blob_size = 8;
 static jmp_buf resumed;
 int g_cosim_dirty_pump_site, g_call_unit_depth, g_psx_dispatch_depth;
@@ -33,13 +49,23 @@ void gpu_get_display_info(GpuDisplayInfo *out) { memset(out,0,sizeof(*out)); out
 uint32_t gpu_display_pixel_argb(const GpuDisplayInfo *out,uint32_t x,uint32_t y) {
     (void)out; (void)x; (void)y; assert(0); return 0;
 }
+void gpu_display_pixel_rgb_in(const uint16_t *image,const GpuDisplayInfo *di,
+                              uint32_t x,uint32_t y,uint8_t *r,uint8_t *g,uint8_t *b) {
+    (void)image;(void)di;(void)x;(void)y;(void)r;(void)g;(void)b;assert(0);
+}
 void host_osd_push(const char *text,int ms) { (void)text; (void)ms; }
 void psx_cycles_resync_after_restore(CPUState *cpu) { assert(cpu==&machine); ++cycle_restores; }
 void cdrom_accelerate_after_savestate(void) { ++cd_restores; }
 void psx_frontend_on_savestate_loaded(void) { ++frontend_restores; hd_live=0; }
 int gpu_hd_textures_residency_save(uint8_t **data,size_t *size) {
     *data=malloc(hd_blob_size); assert(*data); *size=hd_blob_size;
-    memcpy(*data,&machine.gpr[4],sizeof(uint32_t)); return 1;
+#if PSX_NATIVE_CAPTURE_JOBS
+    uint32_t value=in_gpu_callback ? queued_value : machine.gpr[4];
+    memcpy(*data,&value,sizeof value);
+#else
+    memcpy(*data,&machine.gpr[4],sizeof(uint32_t));
+#endif
+    return 1;
 }
 int gpu_hd_textures_residency_load(const uint8_t *data,size_t size) {
     assert(data && size>=sizeof(uint32_t)); memcpy(&hd_live,data,sizeof(hd_live)); return 1;
@@ -60,9 +86,21 @@ int boot_state_save_buffer_raw(const CPUState *cpu,uint32_t bios,uint32_t entry,
     if(capture_fails)return 0;
     *data=machine_image(cpu->pc,cpu->gpr[4]); *len=8; return 1;
 }
+#if PSX_NATIVE_CAPTURE_JOBS
+int boot_state_capture_deferred_vram(const CPUState *cpu,uint32_t bios,uint32_t entry,
+        uint8_t **data,size_t *capacity,size_t *len,size_t *offset) {
+    assert(bios==123 && entry==0x801b0000u); ++capture_calls;
+    if(capture_fails)return 0;
+    size_t need=8+1024*512*2;
+    if(*capacity<need){*data=realloc(*data,need);assert(*data);*capacity=need;}
+    PstW w;pst_w_init(&w,*data,8);
+    assert(pst_w_u32(&w,cpu->pc) && pst_w_u32(&w,cpu->gpr[4]));
+    *len=need;*offset=8;return 1;
+}
+#endif
 static int restore_image(const uint8_t *data,size_t len,CPUState *cpu) {
     PstR r; uint32_t pc,value;
-    if(!data || len!=8)return 0;
+    if(!data || (len!=8 && len!=8+1024*512*2))return 0;
     pst_r_init(&r,data,len);
     if(!pst_r_u32(&r,&pc) || !pst_r_u32(&r,&value))return 0;
     cpu->pc=pc; cpu->gpr[4]=value; return 1;
@@ -83,6 +121,16 @@ static void capture(uint32_t tick,uint32_t value) {
     machine.pc=0x80025070u; machine.gpr[4]=value;
     s_frame=tick; s_capture_due=1;
     psx_rewind_poll(&machine,machine.pc);
+#if PSX_NATIVE_CAPTURE_JOBS
+    assert(s_pending.active && !atomic_load(&s_pending.ready));
+    uint32_t count=s_count;
+    machine.gpr[4]=0xdeadbeef; /* guest advances while render work is pending */
+    pending_finish(1); assert(s_count==count);
+    gr_snapshot_barrier();
+    pending_finish(1);
+    assert(machine.gpr[4]==0xdeadbeef);
+    machine.gpr[4]=value;
+#endif
     assert(!s_capture_due && s_last_capture_frame==tick && rbe_snap_ring_has(s_ring,tick));
 }
 static void choose_first(void) {
@@ -153,7 +201,15 @@ int main(void) {
     assert(psx_rewind_discard_history()==1 && s_hd_bytes==0 && s_count==0);
     hd_blob_size=8;
     capture(1020,808);
+#if PSX_NATIVE_CAPTURE_JOBS
+    s_frame=1030;s_capture_due=1;
+    psx_rewind_poll(&machine,machine.pc);
+    assert(s_pending.active && queued_complete);
+#endif
     psx_rewind_shutdown();
+#if PSX_NATIVE_CAPTURE_JOBS
+    assert(!s_pending.active && !queued_complete && !s_pending.data);
+#endif
     assert(s_hd_bytes==0);
     puts("rewind loads defer live host stacks and quietly undo rejected resume PCs");
     return 0;

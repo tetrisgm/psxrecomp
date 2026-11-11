@@ -153,6 +153,11 @@ int  boot_state_save_buffer_raw(const CPUState* cpu, uint32_t bios_checksum,
  * On either outcome the data/capacity remain caller-owned and free-compatible;
  * *out_len is zero on failure. Never pass a still-visible ring entry here.
  * No pointer into the allocation survives a subsequent capture. */
+/* Unpublished raw state; caller must fill the native VRAM payload at the
+ * current render-command boundary before publishing or loading the blob. */
+int boot_state_capture_deferred_vram(const CPUState *cpu, uint32_t bios,
+        uint32_t entry, uint8_t **data, size_t *capacity, size_t *length,
+        size_t *vram_offset);
 int boot_state_capture_raw(const CPUState* cpu, uint32_t bios_checksum,
                             uint32_t entry_pc, uint8_t** data,
                             size_t* capacity, size_t* out_len);

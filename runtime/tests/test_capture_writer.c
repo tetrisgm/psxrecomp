@@ -62,6 +62,17 @@ int main(void) {
         assert(data==previous && capacity==previous_capacity);
         assert(allocation_calls-before==(arena_bytes&1 && !tracked ? 1u : 0u));
 #endif
+#if PSX_NATIVE_CAPTURE_JOBS
+        {
+            uint8_t *deferred=NULL; size_t cap=0,n=0,offset=SIZE_MAX;
+            assert(boot_state_capture_deferred_vram(&cpu,123,0x801b0000,
+                    &deferred,&cap,&n,&offset));
+            assert(n==len && offset+n>=offset && offset+sizeof vram<=n);
+            memcpy(deferred+offset,vram,sizeof vram);
+            assert(memcmp(deferred,data,len)==0);
+            free(deferred);
+        }
+#endif
         digest=hash(digest,data,len);
         /* Failure retains the owned allocation and reports no partial blob. */
         previous=data;previous_capacity=capacity;
