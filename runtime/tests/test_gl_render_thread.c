@@ -38,7 +38,6 @@
 #include "gl_batch_policy_hle.c"
 #include "gl_batch_policy_select.c"
 /* gpu_render.c (the facade) observes draws for HD texture packs: no pack here. */
-int gpu_hd_textures_active(void){return 0;}
 int gpu_hd_textures_dump_enabled(void){return 0;}
 void gpu_hd_textures_observe_draw(uint16_t tp,uint16_t cx,uint16_t cy,const int l[4],
     uint32_t w,int semi){(void)tp;(void)cx;(void)cy;(void)l;(void)w;(void)semi;}

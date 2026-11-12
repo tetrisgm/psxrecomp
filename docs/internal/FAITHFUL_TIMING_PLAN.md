@@ -213,6 +213,28 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 rewind completion: exact ordered private-pass command history now
+redraws at current resolution with private native texture memory. No framebuffer
+history or fitted geometry. Measured 59.57 backward updates/s in a visible race;
+24 full internal images matched exactly and release RAM matched the selected
+tick with zero differing words. Release keeps the selected complete image until
+the first complete forward producer; native restages cannot leak to screen.
+Removed unused direct-playback thumbnails, bounded state anchors to four frames,
+and fixed fractional 60-Hz playback scheduling. R4 opts in at build time; other
+titles retain state playback. Long-hold release measured 0.38–0.51 s (including
+100-ms polling); this remains a limitation, not a sustained-60 guarantee.
+
+
+- **2026-11-11 — choppy rewind measured.** Visible state replay was10–20Hz.
+  Opt-in exact command/native texture history now measures~60 backward updates/s
+  with no resolution-dependent image cache. Private native texture mirrors avoid
+  full-hires VRAM backup; texture CRC batches preserve identity.1x/4x/9x GL exact
+  pixel/isolation checks pass. Clean race forward speed still dips (~53FPS mean).
+  Sampling finds full-state capture and unused legacy thumbnail-array eviction;
+  direct mode now skips thumbnails and uses four-frame restart anchors. Fresh
+  build/tests, exact race pixel/RAM proof, on-screen verification and sustained
+  timing pending. Command backend is not default; no release claim.
+
 - **2026-11-11 — state rewind presentation barrier.** Owner observed central
   native-resolution restage mixed with sharp wide margins. Track complete private
   redraw generations by guest tick, producer cycle and phase; reconstruct and

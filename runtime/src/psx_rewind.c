@@ -195,7 +195,7 @@ float psx_rewind_slide(void) { return 0.f; }
 
 typedef struct RwThumb {
     uint32_t tick;
-    uint32_t px[RW_THUMB_W * RW_THUMB_H];
+    uint32_t *px; /* only the legacy filmstrip owns a thumbnail */
     uint8_t *hd_residency, *host_state;
     size_t hd_size;
 } RwThumb;
@@ -276,9 +276,9 @@ static uint32_t s_panel[RW_PANEL_W * RW_PANEL_H];
 static int s_panel_dirty = 1;
 
 static void playback_finish(int commit);
-static int s_direct, s_seeking, s_preview_ready;
+static int s_direct, s_seeking, s_preview_ready, s_release_pending;
 static uint64_t s_play_key, s_play_tick;
-static uint32_t s_play_time, s_seek_target;
+static uint32_t s_play_time, s_play_steps, s_seek_target;
 static int s_load_pending;
 static uint32_t s_load_tick;
 
@@ -495,6 +495,7 @@ static void capture_thumb(uint32_t *dst, const uint16_t *image, const GpuDisplay
 
 static void release_hd(RwThumb *thumb)
 {
+    free(thumb->px);thumb->px=NULL;
     s_hd_bytes -= thumb->hd_size;
     free(thumb->hd_residency);
     free(thumb->host_state);thumb->host_state=NULL;
@@ -540,13 +541,21 @@ static void list_drop_after(uint32_t tick)
     s_panel_dirty = 1;
 }
 
+static void thumbnail_copy(RwThumb *entry,const uint32_t *pixels) {
+    entry->px=NULL;
+    if(!pixels)return;
+    size_t bytes=(size_t)RW_THUMB_W*RW_THUMB_H*sizeof(uint32_t);
+    entry->px=malloc(bytes);
+    if(entry->px)memcpy(entry->px,pixels,bytes);
+}
+
 static void list_push(uint32_t tick, const uint32_t *thumb, uint8_t *hd, size_t hd_size, uint8_t *host_state)
 {
     uint32_t i;
     for (i = 0; i < s_count; i++) {
         if (s_ticks[i] == tick) {
             release_hd(&s_thumbs[i]);
-            memcpy(s_thumbs[i].px, thumb, sizeof(s_thumbs[i].px));
+            thumbnail_copy(&s_thumbs[i],thumb);
             s_thumbs[i].tick = tick;
             s_thumbs[i].hd_residency = hd;
             s_thumbs[i].host_state = host_state;
@@ -562,7 +571,7 @@ static void list_push(uint32_t tick, const uint32_t *thumb, uint8_t *hd, size_t 
     }
     s_ticks[s_count] = tick;
     s_thumbs[s_count].tick = tick;
-    memcpy(s_thumbs[s_count].px, thumb, sizeof(s_thumbs[0].px));
+    thumbnail_copy(&s_thumbs[s_count],thumb);
     s_thumbs[s_count].hd_residency = hd;
     s_thumbs[s_count].host_state = host_state;
     s_thumbs[s_count].hd_size = hd_size;
@@ -598,12 +607,12 @@ static void pending_finish(int publish)
     if (!s_pending.active || !atomic_load_explicit(&s_pending.ready, memory_order_acquire)) return;
     if (publish && s_ring) {
         memcpy(s_pending.data + s_pending.vram_offset, s_pending.vram, sizeof s_pending.vram);
-        capture_thumb(thumb, s_pending.vram, &s_pending.display);
+        if(!s_playback.begin)capture_thumb(thumb, s_pending.vram, &s_pending.display);
 #if RW_COMPRESSED_HISTORY
         state_history_note(s_pending.tick,s_pending.data,s_pending.size);
 #endif
         if (rbe_snap_ring_capture(s_ring, s_pending.tick, pending_publish, NULL)) {
-            list_push(s_pending.tick, thumb, s_pending.hd, s_pending.hd_size,s_pending.host_state);
+            list_push(s_pending.tick, s_playback.begin?NULL:thumb, s_pending.hd, s_pending.hd_size,s_pending.host_state);
             s_pending.host_state=NULL;
             s_pending.hd = NULL;
         }
@@ -639,7 +648,10 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 #else
         s_depth=RW_MAX_DEPTH;raw_depth=s_depth;
 #endif
-        s_interval=1;
+        /* Command history supplies every backward image. Its state snapshots
+         * are only restart anchors, so retain frequent bounded anchors without
+         * serializing the entire machine for every displayed frame. */
+        s_interval=s_playback.state_only==2?(s_interval<4?s_interval:4):1;
     }
     s_ring = rbe_snap_ring_create(raw_depth);
     s_thumbs = (RwThumb *)calloc(s_depth, sizeof(RwThumb));
@@ -678,7 +690,7 @@ void psx_rewind_shutdown(void)
     free(s_state_decode);s_state_decode=NULL;
 #endif
     if(s_playback.configure)s_playback.configure(0);
-    s_direct=s_seeking=s_preview_ready=0;
+    s_direct=s_seeking=s_preview_ready=s_release_pending=0;
     list_clear();
     if (s_ring)
         rbe_snap_ring_destroy(s_ring);
@@ -709,7 +721,7 @@ uint32_t psx_rewind_discard_history(void)
 #endif
     list_clear();
     if(s_playback.configure){s_playback.configure(0);s_playback.configure(1);}
-    s_direct=s_seeking=s_open=0;
+    s_direct=s_seeking=s_open=s_release_pending=0;
     s_sel = 0;
     s_load_pending = 0;
     s_last_capture_frame = 0xffffffffu;
@@ -802,9 +814,9 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
         free(host_state);free(blob);
         return 0;
     }
-    capture_thumb(thumb, NULL, NULL);
+    if(!s_playback.begin)capture_thumb(thumb, NULL, NULL);
     (void)gpu_hd_textures_residency_save(&hd, &hd_size);
-    list_push(tick, thumb, hd, hd_size,host_state);
+    list_push(tick, s_playback.begin?NULL:thumb, hd, hd_size,host_state);
     s_last_capture_frame = s_frame;
     s_capture_due = 0;
     return 1;
@@ -908,7 +920,7 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
         s_anim_dir = s_direct ? 0 : -1;
         if(!do_load(cpu,tick) && s_direct) {
             if(s_playback.end)s_playback.end(s_play_key,s_seek_target,0);
-            s_direct=s_seeking=s_preview_ready=0;
+            s_direct=s_seeking=s_preview_ready=s_release_pending=0;
         }
         return;
     }
@@ -920,7 +932,7 @@ int psx_rewind_direct(void) { return s_direct; }
 int psx_rewind_seeking(void) { return s_seeking; }
 static void playback_finish(int commit) {
     if(s_playback.end)s_playback.end(s_play_key,s_seek_target,commit);
-    s_direct=s_seeking=s_preview_ready=0;
+    s_direct=s_seeking=s_preview_ready=s_release_pending=0;
 }
 int psx_rewind_replay_input(void) {
     if(!s_seeking)return 0;
@@ -944,7 +956,7 @@ int psx_rewind_after_present(void) {
         /* A presentation deadline can select the adjacent complete image,
          * but replay must never run beyond recorded input or indefinitely
          * chase a producer that cannot be reconstructed. */
-        if(s_frame-s_play_tick>=4 ||
+        if(s_release_pending || s_frame-s_play_tick>=4 ||
            !s_playback.inputs_available(s_frame+1,s_frame+1)) {
             s_open=0;playback_finish(0);
             host_osd_push("Rewind redraw unavailable",1800);
@@ -953,6 +965,10 @@ int psx_rewind_after_present(void) {
         s_seek_target=s_frame+1;s_seeking=1;return 0;
     }
     s_play_tick=s_play_key=s_frame;s_seek_target=s_frame;
+    if(s_release_pending) {
+        playback_finish(1);s_capture_due=1;s_last_capture_frame=0xffffffffu;
+        return 0;
+    }
     s_open=1;return 1;
 }
 static int rewind_seek_to(uint32_t target,uint32_t before) {
@@ -972,28 +988,34 @@ static int rewind_seek_to(uint32_t target,uint32_t before) {
 }
 void psx_rewind_playback_tick(uint32_t now_ms) {
     if(!s_open || !s_direct)return;
-    if(!s_play_time){s_play_time=now_ms;return;}
-    uint32_t steps=(now_ms-s_play_time)*60u/1000u;
+    if(!s_play_time){s_play_time=now_ms;s_play_steps=0;return;}
+    uint32_t due=(now_ms-s_play_time)*60u/1000u;
+    uint32_t steps=due-s_play_steps;
     if(!steps)return;
-    s_play_time+=steps*1000u/60u;
+    s_play_steps=due;
     if(steps>8)steps=8;
     uint64_t key=s_play_key>steps?s_play_key-steps:1,shown,tick;
     uint32_t oldest=s_count?s_ticks[0]:0;
     uint32_t warm=s_playback.warm_frames?s_playback.warm_frames:2;
     if(s_playback.state_only)oldest+=warm;
     if(s_playback.step(key,oldest,&shown,&tick)) {
-        if(s_playback.state_only && !rewind_seek_to((uint32_t)tick,(uint32_t)tick-warm))return;
+        if(s_playback.state_only==1 && !rewind_seek_to((uint32_t)tick,(uint32_t)tick-warm))return;
         s_play_key=shown;s_play_tick=tick;
     }
 }
 int psx_rewind_release(void) {
     if(!s_open || !s_direct)return 0;
-    if(s_playback.state_only) {
+    if(s_playback.state_only==1) {
         s_seek_target=s_frame;s_open=0;
         playback_finish(1);s_capture_due=1;s_last_capture_frame=0xffffffffu;
         return 1;
     }
-    if(!rewind_seek_to((uint32_t)s_play_tick,(uint32_t)s_play_tick)) {
+    uint32_t before=(uint32_t)s_play_tick;
+    if(s_playback.state_only==2) {
+        uint32_t warm=s_playback.warm_frames?s_playback.warm_frames:4;
+        before=before>warm?before-warm:0;s_release_pending=1;
+    }
+    if(!rewind_seek_to((uint32_t)s_play_tick,before)) {
         s_open=0;playback_finish(0);host_osd_push("Rewind history unavailable",1200);return 0;
     }
     return 1;
@@ -1183,6 +1205,7 @@ static void blit_thumb(uint32_t *dst, int dw, int x0, int y0, int tw, int th,
                 dst[dy * dw + dx] = border;
         }
     }
+    if(!src)return;
     for (y = 0; y < th; y++) {
         dy = y0 + y;
         if (dy < 0 || dy >= RW_PANEL_H)

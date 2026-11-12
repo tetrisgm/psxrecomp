@@ -8654,7 +8654,11 @@ static void rewind_playback_end(uint64_t key,uint32_t tick,int commit) {
             }
         }
         for(auto &row:rewind_inputs)if(row.valid && row.tick>tick)row.valid=false;
-        if(psx_rewind_state_playback()){gl_renderer_rewind_state_branch(tick);gl_renderer_rewind_video_freeze(0);}
+        if(psx_rewind_state_playback()){
+            gl_renderer_rewind_state_branch(tick);
+            if(psx_rewind_state_playback()==2)gl_renderer_rewind_draw_resume(tick);
+            else gl_renderer_rewind_video_freeze(0);
+        }
         else gl_renderer_rewind_video_resume(key,tick);
     } else gl_renderer_rewind_video_freeze(0);
     psx_sdl_audio_set_paused(sdl_audio_device,0);
@@ -8679,13 +8683,23 @@ static int rewind_state_step(uint64_t key,uint32_t oldest,uint64_t *shown,uint64
     if(!gl_renderer_rewind_state_select(key,oldest,shown,tick))return 0;
     gl_renderer_rewind_video_freeze(1);return 1;
 }
-static void rewind_state_ready(uint32_t tick) {
-    gl_renderer_rewind_video_resume(0,tick);
-}
 static const PsxRewindPlayback rewind_state_playback={
     rewind_state_configure,rewind_state_begin,rewind_state_step,
     rewind_inputs_available,rewind_apply_inputs,rewind_playback_end,
-    1,rewind_state_ready,gl_renderer_rewind_state_presented,4
+    1,nullptr,gl_renderer_rewind_state_presented,4
+};
+static int rewind_commands_begin(uint64_t *key,uint64_t *tick) {
+    if(!gl_renderer_rewind_draw_select(psx_rewind_frame(),0,key,tick))return 0;
+    gl_renderer_rewind_video_freeze(1);
+    if(!gl_renderer_rewind_draw_present(*key,0,key,tick)) {
+        gl_renderer_rewind_video_freeze(0);return 0;
+    }
+    psx_sdl_audio_set_paused(sdl_audio_device,1);return 1;
+}
+static const PsxRewindPlayback rewind_commands_playback={
+    rewind_state_configure,rewind_commands_begin,gl_renderer_rewind_draw_present,
+    rewind_inputs_available,rewind_apply_inputs,rewind_playback_end,
+    2,nullptr,gl_renderer_rewind_draw_presented,4
 };
 
 static int rewind_toggle_buttons_down(void) {
@@ -8949,7 +8963,7 @@ static void rewind_host_pause_loop(void) {
             rewind_pause_present();
         }
         starvation_watchdog_heartbeat();
-        SDL_Delay(8);
+        if(psx_rewind_is_open())SDL_Delay(psx_rewind_state_playback()==2?1:8);
     }
     freeze_heartbeat_set_paused(0);
     /* Swallow the still-held close press so it doesn't bleed into the game. */
@@ -21986,7 +22000,16 @@ session_reboot:
                             bios_token, openbios_ws);
         extern uint64_t s_frame_count;
         (void)psx_rewind_register_region(&s_frame_count,sizeof s_frame_count);
-        psx_rewind_set_playback(g_gl_active ? (std::getenv("PSX_REWIND_VIDEO") ? &rewind_video_playback : &rewind_state_playback) : nullptr);
+        /* Titles with complete private render producers can opt in at build
+         * time. Keep the faithful renderer's state backend available. */
+#ifndef PSX_REWIND_COMMANDS_DEFAULT
+#define PSX_REWIND_COMMANDS_DEFAULT 0
+#endif
+        const char *rewind_commands = std::getenv("PSX_REWIND_COMMANDS");
+        const bool use_rewind_commands = rewind_commands ?
+            std::strcmp(rewind_commands, "0") != 0 : PSX_REWIND_COMMANDS_DEFAULT != 0;
+        psx_rewind_set_playback(g_gl_active ? (std::getenv("PSX_REWIND_VIDEO") ? &rewind_video_playback :
+            use_rewind_commands ? &rewind_commands_playback : &rewind_state_playback) : nullptr);
         psx_rewind_set_enabled(g_rewind_enabled);
         psx_rewind_set_depth((uint32_t)g_rewind_depth);
         psx_rewind_set_interval((uint32_t)g_rewind_interval);

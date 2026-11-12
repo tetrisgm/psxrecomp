@@ -10,7 +10,8 @@ static struct {
     uint64_t resume_tick, presented_tick, complete_ticks[2048], complete_latest, held_incomplete;
     uint64_t complete_cycles[2048], forced_complete;
     uint32_t complete_phases[2048];
-    int state_enabled;
+    uint64_t draw_keys[2048], command_tick;
+    int state_enabled,resume_complete;
     RewindHistory *history;
     GLuint pbo[3], texture, fbo;
     void *fence[3];
@@ -21,7 +22,11 @@ static struct {
     size_t capacity;
     RvClientWait wait;
 } RV;
+static int rewind_state_reconstructing(void) {
+    return RV.state_enabled && RV.frozen && !RV.resume_complete;
+}
 static void rewind_video_shutdown(void) {
+    rewind_draw_shutdown();
     rewind_history_destroy(RV.history);RV.history=NULL;
     for(int i=0;i<3;i++)if(RV.fence[i]){p_glDeleteSync(RV.fence[i]);RV.fence[i]=NULL;}
     if(RV.pbo[0])p_glDeleteBuffers(3,RV.pbo);
@@ -106,7 +111,7 @@ void gl_renderer_rewind_video_enable(int enabled) {
 void gl_renderer_rewind_video_freeze(int frozen) {
     GL_RT_SYNC("rewind_video_freeze");RV.frozen=!!frozen;
     rewind_history_freeze(RV.history,frozen);
-    RV.resume_tick=0;RV.presented_tick=0;
+    RV.resume_tick=0;RV.presented_tick=0;RV.resume_complete=0;
     if(frozen)for(int i=0;i<3;i++)if(RV.fence[i]){p_glDeleteSync(RV.fence[i]);RV.fence[i]=NULL;}
 }
 void gl_renderer_rewind_video_clear(void) {
@@ -137,6 +142,7 @@ int gl_renderer_rewind_video_present_since(uint64_t key,uint32_t oldest,uint64_t
 void gl_renderer_rewind_video_stats(char *out,int capacity) {
     GL_RT_SYNC("rewind_video_stats");RewindHistoryStats s;rewind_history_stats(RV.history,&s);
     snprintf(out,(size_t)capacity,"\"enabled\":%d,\"state_enabled\":%d,\"complete_latest\":%llu,\"presented_tick\":%llu,\"held_incomplete\":%llu,\"forced_complete\":%llu,\"frozen\":%d,\"width\":%d,\"height\":%d,\"submitted\":%llu,\"completed\":%llu,\"dropped\":%llu,\"gpu_dropped\":%llu,\"map_failed\":%llu,\"bytes\":%llu,\"entries\":%u,\"pending\":%u",RV.enabled,RV.state_enabled,(unsigned long long)RV.complete_latest,(unsigned long long)RV.presented_tick,(unsigned long long)RV.held_incomplete,(unsigned long long)RV.forced_complete,RV.frozen,RV.w,RV.h,(unsigned long long)s.submitted,(unsigned long long)s.completed,(unsigned long long)s.dropped,(unsigned long long)RV.gpu_dropped,(unsigned long long)RV.map_failed,(unsigned long long)s.bytes,s.entries,s.pending);
+    int used=(int)strlen(out);if(used<capacity)rewind_draw_stats(out+used,capacity-used);
 }
 
 int gl_renderer_rewind_video_present(uint64_t key,uint64_t *shown,uint64_t *tick) {
@@ -145,13 +151,20 @@ int gl_renderer_rewind_video_present(uint64_t key,uint64_t *shown,uint64_t *tick
 void gl_renderer_rewind_video_resume(uint64_t key,uint32_t tick) {
     GL_RT_SYNC("rewind_video_resume");
     if(key)rewind_history_drop_after(RV.history,key);
+    else RV.presented_tick=0; /* release must validate the reconstructed producer */
     RV.resume_tick=tick;
 }
 static int rewind_video_hold(void) {
     if(!RV.frozen)return 0;
     extern uint32_t psx_rewind_frame(void);
-    uint64_t tick=rth_replaying()?s_rth_present_rewind_tick:psx_rewind_frame();
+    uint64_t tick=RV.command_tick?RV.command_tick:
+        (rth_replaying()?s_rth_present_rewind_tick:psx_rewind_frame());
     if(!RV.resume_tick || tick<RV.resume_tick)return 1;
+    if(RV.resume_complete) {
+        if(!s_rewind_complete_source){++RV.held_incomplete;return 1;}
+        RV.presented_tick=tick;RV.resume_tick=0;RV.resume_complete=0;RV.frozen=0;
+        rewind_history_freeze(RV.history,0);return 0;
+    }
     if(RV.state_enabled) {
         unsigned i=(unsigned)(tick%2048);
         if(!s_rewind_complete_source || RV.complete_ticks[i]!=tick ||
@@ -171,12 +184,15 @@ static void rewind_state_note_present(void) {
     if(tick) {
         unsigned i=(unsigned)(tick%2048);RV.complete_ticks[i]=tick;
         RV.complete_cycles[i]=s_rewind_complete_cycle;RV.complete_phases[i]=s_rewind_complete_phase;
+        RV.draw_keys[i]=s_rewind_complete_draw_key;
         RV.complete_latest=tick;
     }
 }
 void gl_renderer_rewind_state_enable(int enabled) {
     GL_RT_SYNC("rewind_state_enable");RV.state_enabled=!!enabled;
     memset(RV.complete_ticks,0,sizeof RV.complete_ticks);RV.complete_latest=0;
+    const char *commands=getenv("PSX_REWIND_COMMANDS");
+    rewind_draw_enable(enabled && commands && commands[0]=='1');
 }
 int gl_renderer_rewind_state_select(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick) {
     GL_RT_SYNC("rewind_state_select");

@@ -473,7 +473,8 @@ static uint16_t *s_rth_vram_priv = NULL;  /* render thread's upload source     *
 static int       s_rthx_prim = 0;         /* current record carries prim tags  */
 static int       s_rthx_tagged = 0, s_rthx_backdrop = 0;
 static int       s_rths_flat_bd = 0, s_rths_vp_w = 0, s_rths_bg_full = 0;
-static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread(); }
+static int s_rewind_command_replay;
+static inline int rth_replaying(void) { return s_rewind_command_replay || (s_rth_on && rt_on_render_thread()); }
 /* Render-owner timeline from immutable present records, never the concurrently
  * advancing (and transactionally restored) emulation-thread clock. */
 static uint64_t s_rth_present_cycle;
@@ -484,7 +485,14 @@ static void rewind_state_note_present(void);
 static int s_rewind_complete_source;
 static uint64_t s_rewind_complete_cycle;
 static uint32_t s_rewind_complete_phase;
+static uint64_t s_rewind_complete_draw_key;
 static void rewind_video_shutdown(void);
+static void rewind_draw_record(const RtCmd *cmd,const void *payload);
+static uint64_t rewind_draw_seal(uint32_t phase,GLuint texture,int w,int h);
+static void rewind_draw_enable(int enabled);
+static void rewind_draw_shutdown(void);
+static void rewind_draw_interrupt(void);
+static void rewind_draw_stats(char *out,int capacity);
 
 /* Frame generation (defined with the render-thread code near the end). */
 static int       s_fg_on;
@@ -797,6 +805,7 @@ static void interp_reset_history(void);
 static void completed_image_cost_reset(void);
 static int interp_present(float alpha);
 static void interp_present_source_interval(void);
+static int rewind_state_reconstructing(void);
 static void present_bezel(int ww, int wh, int lx, int ly, int lw, int lh);
 
 static int           s_raster_ok = 0;      /* full GPU pipeline available */
@@ -8498,6 +8507,16 @@ static void interp_present_source_interval(void) {
     uint64_t deadline;
     float alpha;
 
+    /* State replay reconstructs historical producer images off screen. Host
+     * deadlines belong to forward playback; waiting for each hidden VBlank
+     * turns one rewind step into several real-time frames. Promotion still
+     * runs, and the rewind barrier explicitly presents the matching complete
+     * generation once reconstruction reaches its requested guest boundary. */
+    if (rewind_state_reconstructing()) {
+        pass_apply_promotion();
+        return;
+    }
+
     if (!frame_interpolation_schedule_begin_phase(
             &s_interp_schedule, now, frequency,
             s_interp_source_hz, s_interp_target_hz,
@@ -8582,6 +8601,7 @@ typedef struct PassGen {
     int      source_path;         /* GL_PRES_VRAM or GL_PRES_WIDE */
     uint32_t n;                   /* images: [0] = the game's own */
     uint8_t complete[PASS_SLOTS]; /* independent full-image producer, never a VRAM restage */
+    uint64_t draw_key[PASS_SLOTS];
     uint32_t phase[PASS_SLOTS];   /* Q16, ascending */
     uint32_t period;              /* guest VBlanks the frame stays on screen */
     int      shown;               /* built for a frame already on screen */
@@ -9662,8 +9682,10 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
             s_pgen_tex[gi][i] = s_pgen_tex[gi][i - 1];
             g->phase[i] = g->phase[i - 1];
             g->complete[i] = g->complete[i - 1];
+            g->draw_key[i] = g->draw_key[i - 1];
         }
         g->complete[at] = s_pass_private != 0;
+        g->draw_key[at] = s_pass_private ? rewind_draw_seal(alpha_q16,t,g->tex_w,g->tex_h) : 0;
         s_pgen_tex[gi][at] = t; g->phase[at] = alpha_q16; g->n++;
     }
     pass_stage_done(2);
@@ -10229,6 +10251,7 @@ static int pass_gen_present_at(double p, int locked) {
     }
     s_rewind_complete_source=lo==hi && g->complete[lo];
     s_rewind_complete_cycle=g->created_cycle;s_rewind_complete_phase=g->phase[lo];
+    s_rewind_complete_draw_key=g->draw_key[lo];
     int presented=interp_present_pair(s_pgen_tex[s_pgen_cur][lo],
                              s_pgen_tex[s_pgen_cur][hi], t, s_interp_blend_mode);
     s_rewind_complete_source=0;
@@ -15480,6 +15503,7 @@ static const GpuRenderBackend GL_RT_BACKEND = {
 /* ---- replay (render thread) ---------------------------------------------- */
 static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
     (void)user;
+    if(!s_rewind_command_replay)rewind_draw_record(c,payload);
     const int32_t *v = (const int32_t *)payload;
     s_rthx_prim = (c->flags & RTHF_PRIM) != 0;
     s_rthx_tagged = (c->flags & RTHF_TAGGED) != 0;
@@ -15626,6 +15650,7 @@ static void gl_rth_ctx(void *user, int current) {
     if (current) {
         SDL_GL_MakeCurrent(s_win, s_ctx);
     } else {
+        rewind_draw_interrupt();
         if (rt_on_render_thread() && s_fg_on) {
             /* The emulation thread takes over (and may draw frames the lists
              * never see): show the waiting real frame now, and start the
@@ -15806,6 +15831,7 @@ static void rth_ring_capture_now(const int32_t *a) { (void)a; }
 const GpuRenderBackend *gl_backend_get(void) { return s_rth_on ? &GL_RT_BACKEND : &GL_BACKEND; }
 
 #include "rewind_video.inc"
+#include "rewind_draw.inc"
 #include "presentation_gpu.inc"
 
 #include "gpu_gl_ambient.inc"

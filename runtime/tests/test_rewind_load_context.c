@@ -226,6 +226,24 @@ static void test_compressed_state_playback(void) {
     assert(!rewind_history_contains(s_state_history,20));
     psx_rewind_shutdown();psx_rewind_set_playback(NULL);
 }
+static void test_command_playback(void) {
+    PsxRewindPlayback callbacks={NULL,playback_begin,playback_step,playback_inputs,playback_apply,playback_end,2,NULL,NULL,2};
+    psx_rewind_set_playback(&callbacks);s_depth=50;s_interval=15;
+    psx_rewind_configure(123,0x801b0000u);
+    assert(s_interval==4);
+    capture(10,101);capture(20,202);
+    assert(!s_thumbs[0].px && !s_thumbs[1].px);
+    assert(psx_rewind_toggle());psx_rewind_playback_tick(100);psx_rewind_playback_tick(200);
+    assert(s_open && !s_seeking && machine.gpr[4]==202 && s_frame==20);
+    assert(psx_rewind_release() && s_release_pending && s_load_tick==10);
+    if(setjmp(resumed)==0){psx_rewind_poll(&machine,machine.pc);assert(0);}
+    assert(machine.gpr[4]==101);
+    for(int n=0;n<3;n++){psx_rewind_note_frame();assert(psx_rewind_replay_input());}
+    assert(!psx_rewind_after_present() && !s_direct && !s_open && !s_release_pending);
+    assert(playback_commit && playback_target==13 && machine.gpr[4]==124);
+    psx_rewind_shutdown();psx_rewind_set_playback(NULL);
+}
+
 #endif
 
 int main(void) {
@@ -300,6 +318,7 @@ int main(void) {
     test_direct_playback();
 #if RW_COMPRESSED_HISTORY
     test_compressed_state_playback();
+    test_command_playback();
 #endif
     puts("rewind loads defer live host stacks and quietly undo rejected resume PCs");
     return 0;

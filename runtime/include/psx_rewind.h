@@ -68,7 +68,8 @@ typedef struct PsxRewindPlayback {
     int (*inputs_available)(uint32_t from, uint32_t through);
     void (*apply_inputs)(uint32_t tick);
     void (*end)(uint64_t key, uint32_t target_tick, int commit);
-    int state_only;
+    int state_only; /* 0: diagnostic pixels; 1: per-step state replay;
+                    * 2: exact draw commands, state replay only on release */
     void (*ready)(uint32_t target_tick);
     int (*presented)(uint32_t target_tick);
     uint32_t warm_frames;
