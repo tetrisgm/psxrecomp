@@ -8537,8 +8537,11 @@ static void interp_present_source_interval(void) {
             s_interp_phase_lo, s_interp_phase_hi))
         return;
     pass_apply_promotion();
-    if (pass_queued_presenter() && s_rth_on && rt_on_render_thread()) {
-        /* Queued passes: exactly one output for this guest VBlank, now. The
+    if (gl_renderer_rewind_resume_image_us()==UINT64_MAX ||
+        (pass_queued_presenter() && s_rth_on && rt_on_render_thread())) {
+        /* A frozen rewind preview needs no repeated timed swaps while the
+         * first complete producer is rebuilding. Queued passes likewise
+         * submit exactly one output for this guest VBlank, now. The
          * guest's own pacer sets the cadence; the image is the one for this
          * VBlank's place in the frame (phase k / period), never chosen from a
          * wall-clock deadline that the render thread's own delay would skew. */
@@ -12306,6 +12309,11 @@ static int gl_rth_eligible(void) {
     return s_raster_ok && s_ctx && !s_cpu_auth_dual && !s_depth24_skip_up &&
            !(s_hd_native_authority && s_rth_a0_open) &&
            !gpu_display_is_depth24() &&
+           /* Command rewind restores and reconstructs on the main thread.
+            * Keep its context until the transaction completes: handing it
+            * back at hidden VBlanks forces backup/restage to drain and acquire
+            * the worker again without any useful parallel rendering. */
+           !(psx_rewind_direct() && psx_rewind_state_playback() == 2) &&
            (!s_interp_enabled || pass_queued_presenter()) &&
            (!s_pass_active || pass_queued_enabled()) &&
            !psx_netplay_active() && !psx_openxr_session_active() &&

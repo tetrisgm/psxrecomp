@@ -213,6 +213,25 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 command-rewind ownership: macOS samples identified worker waits in
+rollback VRAM backup and frontend restaging. Command restoration now retains the
+main-thread GL context across hidden VBlanks, returning it at the first normal
+forward boundary. The real-GL fixture checks acquire, retain and release.
+Three actual R4 restores matched RAM exactly and 54 full-resolution rewind
+images matched; load work fell to 11–15 ms in the normal run, but complete
+release still took 171–259 ms. A follow-up sample identified direct preview
+texture uploads waiting on prior GPU use; those now use the existing orphaned
+unpack-buffer transport. Once the exact selected state commits, at most four
+unpaced guest VBlanks refill the first complete-image pipeline, stopping early
+when its atomic ready flag changes; canonical execution/input remain intact.
+The frozen preview also avoids timed duplicate swaps during that refill. A
+normal 30-second race averaged 60.05 VBlanks/s, backward playback 59.55–59.90/s,
+and three complete releases took 80/103/161 ms. Release and all 43 R4 tests pass.
+Final exact proof passed three successive branches with zero differing RAM
+words and 98 full-resolution image comparisons with zero mismatches. Signed
+package qualification remains in R4's receipt; these bounded measurements are
+not a locked-60 or zero-latency claim.
+
 2026-11-11 signed-bundle gate caught keyboard bindings still using argv[0],
 creating an unsealed keybinds.ini and loading the wrong player mapping. The
 keyboard module now honors the same host data directory as the launcher.

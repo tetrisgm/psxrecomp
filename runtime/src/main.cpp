@@ -8638,6 +8638,7 @@ static int rewind_playback_begin(uint64_t *key,uint64_t *tick) {
     psx_sdl_audio_set_paused(sdl_audio_device,1);
     return 1;
 }
+static unsigned rewind_resume_warmup_frames;
 static void rewind_playback_end(uint64_t key,uint32_t tick,int commit) {
     if(commit) {
         if(rewind_verify_state) {
@@ -8669,6 +8670,10 @@ static void rewind_playback_end(uint64_t key,uint32_t tick,int commit) {
     } else gl_renderer_rewind_video_freeze(0);
     psx_sdl_audio_set_paused(sdl_audio_device,0);
     present_session_reset();g_audio_cycle_resync=1;
+    /* Refill only the first complete-image pipeline; the exact selected
+     * state has already committed. Bound this so a missing producer can
+     * never turn a rewind release into ongoing fast-forward. */
+    rewind_resume_warmup_frames=commit && psx_rewind_state_playback()==2 ? 4u : 0u;
 }
 static const PsxRewindPlayback rewind_video_playback={
     rewind_playback_configure,rewind_playback_begin,
@@ -10045,8 +10050,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * peer's guest quantum. Self-check replay runs uncapped like netplay
      * resim. */
     if (!psx_netplay_active() && !psx_selfcheck_resim_active() && !psx_rewind_direct()) {
+        const bool resume_warming = rewind_resume_warmup_frames &&
+            gl_renderer_rewind_resume_image_us()==UINT64_MAX;
+        if(resume_warming) {
+            --rewind_resume_warmup_frames;
+            s_frame_pacer=FramePacer{0};
+        } else rewind_resume_warmup_frames=0;
         uint64_t perf_start = runtime_perf_section_begin();
-        if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
+        if (!resume_warming && !manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
             frame_pacer_wait(&s_frame_pacer, g_frame_period_ms);
             const uint64_t waited = SDL_GetPerformanceCounter() - dyn_t0;

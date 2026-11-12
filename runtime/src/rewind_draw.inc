@@ -206,7 +206,10 @@ int gl_renderer_rewind_draw_present(uint64_t key,uint32_t oldest,uint64_t *shown
     p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER,0);
     glPixelStorei(GL_UNPACK_ALIGNMENT,2);glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
     glPixelStorei(GL_UNPACK_SKIP_ROWS,0);glPixelStorei(GL_UNPACK_SKIP_PIXELS,0);
-    glTexSubImage2D(GL_TEXTURE_2D,0,0,0,VRAM_W,VRAM_H,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,RD.native);
+    /* The previous preview may still sample this texture. Stage through the
+     * existing orphaned unpack buffer rather than wait for CPU texture access. */
+    upload_texture_pixels(0,0,VRAM_W,VRAM_H,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,
+                          RD.native,(size_t)VRAM_W*VRAM_H*sizeof(uint16_t));
     int ok=s_pass_leaks==leaks;
     if(ok && h->hd_bytes)
         ok=gpu_hd_textures_residency_load(native+(size_t)VRAM_W*VRAM_H*2,h->hd_bytes);

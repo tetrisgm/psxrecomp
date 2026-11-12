@@ -82,6 +82,9 @@
  * Original source-owned scene; no retail payload. */
 #include "gpu_gl_renderer.c"
 uint32_t psx_rewind_frame(void) { return (uint32_t)s_frame_count; }
+static int test_rewind_direct, test_rewind_mode;
+int psx_rewind_direct(void) { return test_rewind_direct; }
+int psx_rewind_state_playback(void) { return test_rewind_mode; }
 #include "gl_postfx_projection_fixture.h"
 #include "gl_fmv_fixture.h"
 #include "gpu_hd_texture_stubs.inc"

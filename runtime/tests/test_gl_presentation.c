@@ -208,6 +208,14 @@ int main(void) {
             check(snap_a[64*1024+64]==0x001f && snap_b[64*1024+64]==0x03e0,
                   "queued snapshots retain their own command-boundary VRAM");
             check(!rt_held(),"snapshot submit and barrier do not migrate the GL context");
+            test_rewind_direct=1;test_rewind_mode=2;
+            gl_renderer_render_thread_frame_boundary();
+            check(rt_held(),"command rewind takes context for transactional restoration");
+            gl_renderer_render_thread_frame_boundary();
+            check(rt_held(),"hidden reconstruction VBlanks retain context ownership");
+            test_rewind_direct=0;test_rewind_mode=0;
+            gl_renderer_render_thread_frame_boundary();
+            check(!rt_held(),"normal forward rendering returns context to the worker");
             gl_renderer_render_thread_stop();
             gl_renderer_set_hd_texture_mode(0);
         }
