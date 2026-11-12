@@ -213,6 +213,14 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 PGXP read bookkeeping: a five-second Mac CPU sample places substantial
+main-thread cost in PGXP ALU/load/store and private draw generation. LW/LWC2
+previously journaled every source shadow even when its generation/value required
+no mutation. They now journal only a live shadow whose value differs, preserving
+validation and all precision fields. Regression coverage checks unchanged reads
+followed by mismatching reads and rollback for both CPU and COP2. Release and
+all 41 R4 CTests pass; this is not a claim of a measured frame-rate gain yet.
+
 2026-11-11 upload/restage follow-up: non-draining measurements exposed GPU-queue
 stalls in rollback backup and native VRAM restaging, beyond CPU replay time.
 Hidden command reconstruction now skips redundant display/postprocessing only;

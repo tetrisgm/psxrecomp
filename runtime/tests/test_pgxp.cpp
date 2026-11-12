@@ -394,6 +394,25 @@ int main(void) {
               PGXP_SRC_NATIVE);
     }
 
+    /* Both CPU and COP2 reads may invalidate a mismatching memory shadow.
+     * Unchanged reads followed by a mismatch still journal the ORIGINAL state. */
+    for (int cop2 = 0; cop2 < 2; ++cop2) {
+        produce_at(ADDR_A);
+        pgxp_checkpoint_begin();
+        if (cop2) {
+            psx_pgxp_cop2(nullptr, (0x32u << 26) | (14u << 16), PACKED, ADDR_A);
+            psx_pgxp_cop2(nullptr, (0x32u << 26) | (14u << 16), PACKED ^ 0x10001u, ADDR_A);
+        } else {
+            psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED);
+            psx_pgxp_load(nullptr, LW(1, 8), ADDR_A, PACKED ^ 0x10001u);
+        }
+        CHECK(lookup(ADDR_A, PACKED, 160, 80, nullptr, nullptr, nullptr) == PGXP_SRC_NATIVE);
+        pgxp_checkpoint_rollback();
+        int32_t x, y; uint16_t z;
+        CHECK(lookup(ADDR_A, PACKED, 160, 80, &x, &y, &z) == PGXP_SRC_DATAFLOW);
+        CHECK(x == X16 && y == Y16 && z == SZ3);
+    }
+
     /* --- in-place ops read their source before the destination is reset --- */
     pgxp_set_cpu_mode(1);
     produce_at(ADDR_A);

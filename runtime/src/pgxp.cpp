@@ -701,7 +701,10 @@ extern "C" void psx_pgxp_load(struct CPUState *cpu, uint32_t instr,
         lop = 0x23;
     switch (lop) {
     case 0x23: {                               /* LW                          */
-        PGXPValue *src = pgxp_ptr_w(addr);     /* validation may mutate it    */
+        PGXPValue *src = pgxp_ptr(addr);
+        /* An unchanged read does not mutate precision state. Journal only
+         * validation that actually changes the shadow, before changing it. */
+        if (src && src->gen == s_gen && src->value != value) ck_note(src, addr);
         if (src && src->gen == s_gen) {
             pv_validate(src, value);
             *dst = *src;
@@ -843,7 +846,10 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
 
     switch (f_op(instr)) {
     case 0x32: {                               /* LWC2: gte[rt] <- [addr]     */
-        PGXPValue *src = pgxp_ptr_w(addr);     /* validation may mutate it    */
+        PGXPValue *src = pgxp_ptr(addr);
+        /* An unchanged read does not mutate precision state. Journal only
+         * validation that actually changes the shadow, before changing it. */
+        if (src && src->gen == s_gen && src->value != value) ck_note(src, addr);
         PGXPValue *dst = &s_gte[f_rt(instr)];
         if (src && src->gen == s_gen) {
             pv_validate(src, value);
