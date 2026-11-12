@@ -191,8 +191,7 @@ static void rewind_state_note_present(void) {
 void gl_renderer_rewind_state_enable(int enabled) {
     GL_RT_SYNC("rewind_state_enable");RV.state_enabled=!!enabled;
     memset(RV.complete_ticks,0,sizeof RV.complete_ticks);RV.complete_latest=0;
-    const char *commands=getenv("PSX_REWIND_COMMANDS");
-    rewind_draw_enable(enabled && commands && commands[0]=='1');
+    rewind_draw_enable(enabled==2);
 }
 int gl_renderer_rewind_state_select(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick) {
     GL_RT_SYNC("rewind_state_select");

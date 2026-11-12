@@ -8672,7 +8672,7 @@ static const PsxRewindPlayback rewind_video_playback={
 
 static void rewind_state_configure(int enabled) {
     rewind_playback_configure(0);
-    gl_renderer_rewind_state_enable(enabled);
+    gl_renderer_rewind_state_enable(enabled?psx_rewind_state_playback():0);
 }
 static int rewind_state_begin(uint64_t *key,uint64_t *tick) {
     if(!gl_renderer_rewind_state_select(psx_rewind_frame(),0,key,tick))return 0;

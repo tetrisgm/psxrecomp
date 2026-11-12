@@ -48,7 +48,7 @@ static void command_rewind(int scale) {
     gl_renderer_set_interpolation_source(1);
     s_interp_valid=2;s_interp_w=320*scale;s_interp_h=240*scale;s_interp_source_path=GL_PRES_VRAM;
     gl_renderer_set_hd_texture_mode(1);
-    gl_renderer_rewind_state_enable(1);rewind_draw_enable(1);
+    gl_renderer_rewind_state_enable(2);
     glb_set_draw_area(0,0,319,239);glb_set_draw_offset(0,0);
     uint16_t texture[64*64];for(unsigned n=0;n<64*64;n++)texture[n]=(n&1)?0x7fff:0x7c00;
     glb_vram_transfer_in(640,256,64,64,texture);flush_cpu_upload();

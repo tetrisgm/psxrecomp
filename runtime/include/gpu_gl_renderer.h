@@ -254,6 +254,7 @@ int gl_renderer_present_hold_last(void);
  * packed RGB888 MDEC bytes in the CPU mirror (use flush_cpu_uploads instead). */
 /* Full drawable-resolution, lossless rewind presentation history. */
 void gl_renderer_rewind_video_enable(int enabled);
+/* 0 disables history; 1 records state provenance; 2 also records draw commands. */
 void gl_renderer_rewind_state_enable(int enabled);
 int gl_renderer_rewind_state_select(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick);
 int gl_renderer_rewind_state_presented(uint32_t tick);
