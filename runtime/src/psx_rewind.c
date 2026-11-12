@@ -1,6 +1,12 @@
 /* psx_rewind.c — local snap ring + filmstrip overlay. */
 
 #include "psx_rewind.h"
+#if defined(PSX_SDL3) && defined(PSX_HAS_RBENGINE_SNAP)
+#include "rewind_history.h"
+#define RW_COMPRESSED_HISTORY 1
+#else
+#define RW_COMPRESSED_HISTORY 0
+#endif
 
 #include "boot_state.h"
 #include "capture_ring.h"
@@ -117,6 +123,14 @@ static const uint8_t FONT8[59][8] = {
 /* Title block (psx_mod_set_rewind_blocked): set by the running title while
  * a mode it cannot rewind is live, cleared at every mod session start. */
 static int s_title_blocked;
+static PsxRewindPlayback s_playback;
+void psx_rewind_set_playback(const PsxRewindPlayback *callbacks) {
+    memset(&s_playback,0,sizeof s_playback);
+    if(callbacks)s_playback=*callbacks;
+}
+
+
+int psx_rewind_state_playback(void) { return s_playback.state_only; }
 
 int psx_rewind_title_blocked(void)
 {
@@ -127,6 +141,16 @@ int psx_rewind_title_blocked(void)
 
 void psx_rewind_set_title_blocked(int blocked) { s_title_blocked = blocked ? 1 : 0; }
 uint32_t psx_rewind_snap_count(void) { return 0; }
+uint32_t psx_rewind_frame(void) { return 0; }
+int psx_rewind_direct(void) { return 0; }
+int psx_rewind_seeking(void) { return 0; }
+int psx_rewind_after_present(void) { return 0; }
+void psx_rewind_storage_stats(char *out,int capacity) { snprintf(out,(size_t)capacity,"\"state_history_bytes\":0"); }
+int psx_rewind_register_region(void *state,uint32_t bytes) { return state && bytes; }
+void psx_rewind_playback_tick(uint32_t now_ms) { (void)now_ms; }
+int psx_rewind_release(void) { return 0; }
+int psx_rewind_replay_input(void) { return 0; }
+
 uint32_t psx_rewind_hd_residency_bytes(void) { return 0; }
 void psx_rewind_set_depth(uint32_t depth) { (void)depth; }
 void psx_rewind_set_interval(uint32_t interval) { (void)interval; }
@@ -172,9 +196,45 @@ float psx_rewind_slide(void) { return 0.f; }
 typedef struct RwThumb {
     uint32_t tick;
     uint32_t px[RW_THUMB_W * RW_THUMB_H];
-    uint8_t *hd_residency;
+    uint8_t *hd_residency, *host_state;
     size_t hd_size;
 } RwThumb;
+
+static struct { void *state; uint32_t bytes; } s_regions[32];
+static uint32_t s_region_count, s_region_bytes;
+static int s_regions_locked;
+int psx_rewind_register_region(void *state,uint32_t bytes) {
+    if(!state || !bytes || s_regions_locked || s_region_count==32 || bytes>1024u*1024u-s_region_bytes)return 0;
+    for(uint32_t i=0;i<s_region_count;i++)if(s_regions[i].state==state)return 0;
+    s_regions[s_region_count].state=state;s_regions[s_region_count++].bytes=bytes;
+    s_region_bytes+=bytes;return 1;
+}
+static uint8_t *capture_host_regions(void) {
+    if(!s_region_bytes)return NULL;
+    uint8_t *data=malloc(s_region_bytes);if(!data)return NULL;
+    size_t at=0;
+    for(uint32_t i=0;i<s_region_count;i++) {memcpy(data+at,s_regions[i].state,s_regions[i].bytes);at+=s_regions[i].bytes;}
+    return data;
+}
+static void restore_host_regions(const uint8_t *data) {
+    if(!data)return;
+    size_t at=0;
+    for(uint32_t i=0;i<s_region_count;i++) {memcpy(s_regions[i].state,data+at,s_regions[i].bytes);at+=s_regions[i].bytes;}
+}
+
+#if RW_COMPRESSED_HISTORY
+#define RW_STATE_CAPACITY (32u*1024u*1024u)
+static RewindHistory *s_state_history;
+static uint8_t *s_state_decode;
+static void state_history_note(uint32_t tick,const uint8_t *data,size_t bytes) {
+    if(!s_state_history)return;
+    int slot;void *raw=rewind_history_reserve(s_state_history,bytes,&slot);
+    if(!raw)return;
+    memcpy(raw,data,bytes);
+    RewindHistoryMeta meta={tick,tick,0,0};
+    rewind_history_submit(s_state_history,slot,&meta);
+}
+#endif
 
 static int s_enabled = -1;
 static uint32_t s_bios;
@@ -196,6 +256,16 @@ static uint32_t *s_ticks;
 static uint32_t s_count;
 static size_t s_hd_bytes;
 uint32_t psx_rewind_hd_residency_bytes(void) { return (uint32_t)s_hd_bytes; }
+void psx_rewind_storage_stats(char *out,int capacity) {
+    uint64_t bytes=0,dropped=0;uint32_t entries=0;
+#if RW_COMPRESSED_HISTORY
+    RewindHistoryStats stats;rewind_history_stats(s_state_history,&stats);
+    bytes=stats.bytes;entries=stats.entries;dropped=stats.dropped;
+#endif
+    snprintf(out,(size_t)capacity,"\"state_history_bytes\":%llu,\"state_history_entries\":%u,\"state_history_dropped\":%llu,\"snapshot_interval\":%u,\"host_state_bytes\":%llu",
+        (unsigned long long)bytes,entries,(unsigned long long)dropped,s_interval,(unsigned long long)s_region_bytes*s_count);
+}
+
 static int s_sel;
 
 static int s_open;
@@ -205,6 +275,10 @@ static int s_anim_dir; /* +1 opening, -1 closing, 0 idle */
 static uint32_t s_panel[RW_PANEL_W * RW_PANEL_H];
 static int s_panel_dirty = 1;
 
+static void playback_finish(int commit);
+static int s_direct, s_seeking, s_preview_ready;
+static uint64_t s_play_key, s_play_tick;
+static uint32_t s_play_time, s_seek_target;
 static int s_load_pending;
 static uint32_t s_load_tick;
 
@@ -215,7 +289,7 @@ static int s_rep_dir;
 /* One unpublished capture. The render owner fills only its VRAM and texture
  * provenance; main owns CPU serialization, ring publication and thumbnails. */
 static struct {
-    uint8_t *data, *hd;
+    uint8_t *data, *hd, *host_state;
     uint16_t vram[1024 * 512];
     size_t capacity, size, vram_offset, hd_size;
     uint32_t tick;
@@ -423,6 +497,7 @@ static void release_hd(RwThumb *thumb)
 {
     s_hd_bytes -= thumb->hd_size;
     free(thumb->hd_residency);
+    free(thumb->host_state);thumb->host_state=NULL;
     thumb->hd_residency = NULL;
     thumb->hd_size = 0;
 }
@@ -465,7 +540,7 @@ static void list_drop_after(uint32_t tick)
     s_panel_dirty = 1;
 }
 
-static void list_push(uint32_t tick, const uint32_t *thumb, uint8_t *hd, size_t hd_size)
+static void list_push(uint32_t tick, const uint32_t *thumb, uint8_t *hd, size_t hd_size, uint8_t *host_state)
 {
     uint32_t i;
     for (i = 0; i < s_count; i++) {
@@ -474,6 +549,7 @@ static void list_push(uint32_t tick, const uint32_t *thumb, uint8_t *hd, size_t 
             memcpy(s_thumbs[i].px, thumb, sizeof(s_thumbs[i].px));
             s_thumbs[i].tick = tick;
             s_thumbs[i].hd_residency = hd;
+            s_thumbs[i].host_state = host_state;
             s_thumbs[i].hd_size = hd_size;
             s_hd_bytes += hd_size;
             while (s_hd_bytes > RW_HD_BUDGET) list_drop_oldest();
@@ -488,10 +564,13 @@ static void list_push(uint32_t tick, const uint32_t *thumb, uint8_t *hd, size_t 
     s_thumbs[s_count].tick = tick;
     memcpy(s_thumbs[s_count].px, thumb, sizeof(s_thumbs[0].px));
     s_thumbs[s_count].hd_residency = hd;
+    s_thumbs[s_count].host_state = host_state;
     s_thumbs[s_count].hd_size = hd_size;
     s_hd_bytes += hd_size;
     s_count++;
-    while (s_hd_bytes > RW_HD_BUDGET) list_drop_oldest();
+    while (s_hd_bytes > RW_HD_BUDGET ||
+           (s_playback.state_only && s_count &&
+            (tick-s_ticks[0]>=s_depth || (uint64_t)s_region_bytes*s_count>128u*1024u*1024u)))list_drop_oldest();
     s_sel = (int)s_count - 1;
     s_panel_dirty = 1;
 }
@@ -520,11 +599,16 @@ static void pending_finish(int publish)
     if (publish && s_ring) {
         memcpy(s_pending.data + s_pending.vram_offset, s_pending.vram, sizeof s_pending.vram);
         capture_thumb(thumb, s_pending.vram, &s_pending.display);
+#if RW_COMPRESSED_HISTORY
+        state_history_note(s_pending.tick,s_pending.data,s_pending.size);
+#endif
         if (rbe_snap_ring_capture(s_ring, s_pending.tick, pending_publish, NULL)) {
-            list_push(s_pending.tick, thumb, s_pending.hd, s_pending.hd_size);
+            list_push(s_pending.tick, thumb, s_pending.hd, s_pending.hd_size,s_pending.host_state);
+            s_pending.host_state=NULL;
             s_pending.hd = NULL;
         }
     }
+    free(s_pending.host_state);s_pending.host_state=NULL;
     free(s_pending.hd); s_pending.hd = NULL; s_pending.hd_size = 0;
     s_pending.active = 0;
 }
@@ -543,16 +627,36 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
     psx_rewind_shutdown();
     s_bios = bios_checksum;
     s_entry = entry_pc;
-    s_ring = rbe_snap_ring_create(s_depth);
+    uint32_t raw_depth=s_depth;
+    if(s_playback.state_only) {
+#if RW_COMPRESSED_HISTORY
+        uint32_t horizon=s_depth*s_interval;
+        s_depth=horizon<900u?horizon:900u;
+        if(s_depth<50u)s_depth=50u;
+        s_state_history=rewind_history_create((size_t)1024*1024*1024,s_depth,RW_STATE_CAPACITY);
+        s_state_decode=malloc(RW_STATE_CAPACITY);
+        raw_depth=8;
+#else
+        s_depth=RW_MAX_DEPTH;raw_depth=s_depth;
+#endif
+        s_interval=1;
+    }
+    s_ring = rbe_snap_ring_create(raw_depth);
     s_thumbs = (RwThumb *)calloc(s_depth, sizeof(RwThumb));
     s_ticks = (uint32_t *)calloc(s_depth, sizeof(uint32_t));
-    if (!s_ring || !s_thumbs || !s_ticks) {
+    if (!s_ring || !s_thumbs || !s_ticks
+#if RW_COMPRESSED_HISTORY
+        || (s_playback.state_only && (!s_state_history || !s_state_decode))
+#endif
+    ) {
         psx_rewind_shutdown();
         fprintf(stderr, "psxrecomp: rewind alloc failed — disabled\n");
         s_enabled = 0;
         return;
     }
     s_configured = 1;
+    s_regions_locked = 1;
+    if(s_playback.configure)s_playback.configure(1);
     s_frame = 0;
     s_last_capture_frame = 0xffffffffu;
     s_count = 0;
@@ -569,6 +673,12 @@ void psx_rewind_shutdown(void)
 #if RW_ASYNC_CAPTURE
     pending_reset();
 #endif
+#if RW_COMPRESSED_HISTORY
+    rewind_history_destroy(s_state_history);s_state_history=NULL;
+    free(s_state_decode);s_state_decode=NULL;
+#endif
+    if(s_playback.configure)s_playback.configure(0);
+    s_direct=s_seeking=s_preview_ready=0;
     list_clear();
     if (s_ring)
         rbe_snap_ring_destroy(s_ring);
@@ -594,7 +704,12 @@ uint32_t psx_rewind_discard_history(void)
 #endif
     if (!s_configured || !s_ring) return 0;
     rbe_snap_ring_clear(s_ring);
+#if RW_COMPRESSED_HISTORY
+    rewind_history_clear(s_state_history);
+#endif
     list_clear();
+    if(s_playback.configure){s_playback.configure(0);s_playback.configure(1);}
+    s_direct=s_seeking=s_open=0;
     s_sel = 0;
     s_load_pending = 0;
     s_last_capture_frame = 0xffffffffu;
@@ -611,6 +726,8 @@ int psx_rewind_is_open(void)
 {
     return s_open;
 }
+
+uint32_t psx_rewind_frame(void) { return s_frame; }
 
 uint32_t psx_rewind_snap_count(void)
 {
@@ -629,6 +746,7 @@ void psx_rewind_note_frame(void)
         s_title_blocked)
         return;
     s_frame++;
+    if(s_direct)return;
     iv = rewind_capture_interval();
     if (s_last_capture_frame == 0xffffffffu ||
         s_frame - s_last_capture_frame >= iv)
@@ -660,6 +778,8 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
     if (!boot_state_capture_deferred_vram(&snap, s_bios, s_entry,
             &s_pending.data, &s_pending.capacity, &s_pending.size,
             &s_pending.vram_offset)) return 0;
+    s_pending.host_state=capture_host_regions();
+    if(s_region_bytes && !s_pending.host_state)return 0;
     s_pending.tick = tick;
     gpu_get_display_info(&s_pending.display);
     s_pending.active = 1;
@@ -673,17 +793,22 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
     if (!boot_state_save_buffer_raw(&snap, s_bios, s_entry, &blob, &len) ||
         !blob || !len)
         return 0;
+    uint8_t *host_state=capture_host_regions();
+    if(s_region_bytes && !host_state){free(blob);return 0;}
+#if RW_COMPRESSED_HISTORY
+    state_history_note(tick,blob,len);
+#endif
     if (!rbe_snap_ring_store(s_ring, tick, blob, len)) {
-        free(blob);
+        free(host_state);free(blob);
         return 0;
     }
-#endif
     capture_thumb(thumb, NULL, NULL);
     (void)gpu_hd_textures_residency_save(&hd, &hd_size);
-    list_push(tick, thumb, hd, hd_size);
+    list_push(tick, thumb, hd, hd_size,host_state);
     s_last_capture_frame = s_frame;
     s_capture_due = 0;
     return 1;
+#endif
 }
 
 static int do_load(CPUState *cpu, uint32_t tick)
@@ -707,6 +832,12 @@ static int do_load(CPUState *cpu, uint32_t tick)
         return 0;
     }
     data = rbe_snap_ring_peek(s_ring, tick, &size);
+#if RW_COMPRESSED_HISTORY
+    if(!data && s_state_history) {
+        RewindHistoryMeta meta;
+        if(rewind_history_decode_before(s_state_history,tick,s_state_decode,RW_STATE_CAPACITY,&size,&meta) && meta.key==tick)data=s_state_decode;
+    }
+#endif
     if (!data || !size)
         return 0;
     /* Dispatchability depends on the restored RAM. Hold the live machine
@@ -729,23 +860,28 @@ static int do_load(CPUState *cpu, uint32_t tick)
     free(rollback);
     if (!loaded) return 0;
     rbe_snap_ring_drop_after(s_ring, tick);
+#if RW_COMPRESSED_HISTORY
+    rewind_history_drop_after(s_state_history,tick);
+#endif
     list_drop_after(tick);
     s_frame = tick;
     s_last_capture_frame = tick;
     psx_cycles_resync_after_restore(cpu);
     interrupts_resync_after_restore();
-    cdrom_accelerate_after_savestate();
+    if(!s_seeking)cdrom_accelerate_after_savestate();
     psx_frontend_on_savestate_loaded();
     /* The frontend's VRAM restage clears draw tracking. Restore only after
      * it finishes; the existing API validates both pack and restored VRAM. */
     for (uint32_t i = 0; i < s_count; ++i) {
-        if (s_ticks[i] == tick && s_thumbs[i].hd_residency) {
-            (void)gpu_hd_textures_residency_load(s_thumbs[i].hd_residency,
+        if (s_ticks[i] == tick) {
+            restore_host_regions(s_thumbs[i].host_state);
+            if(s_thumbs[i].hd_residency)(void)gpu_hd_textures_residency_load(s_thumbs[i].hd_residency,
                                                s_thumbs[i].hd_size);
             break;
         }
     }
-    host_osd_push("Rewind loaded", 1200);
+    if(!s_direct)host_osd_push("Rewind loaded", 1200);
+    if(s_seeking && s_frame==s_seek_target)playback_finish(1);
     psx_scheduler_resume_at(cpu->pc);
     return 1; /* not reached on success */
 }
@@ -769,12 +905,98 @@ void psx_rewind_poll(CPUState *cpu, uint32_t resume_pc)
         uint32_t tick = s_load_tick;
         s_load_pending = 0;
         s_open = 0;
-        s_anim_dir = -1;
-        (void)do_load(cpu, tick);
+        s_anim_dir = s_direct ? 0 : -1;
+        if(!do_load(cpu,tick) && s_direct) {
+            if(s_playback.end)s_playback.end(s_play_key,s_seek_target,0);
+            s_direct=s_seeking=s_preview_ready=0;
+        }
         return;
     }
-    if (s_capture_due && !s_open && !psx_netplay_active() && !s_title_blocked)
+    if (s_capture_due && !s_open && !s_direct && !psx_netplay_active() && !s_title_blocked)
         (void)do_capture(cpu, resume_pc);
+}
+
+int psx_rewind_direct(void) { return s_direct; }
+int psx_rewind_seeking(void) { return s_seeking; }
+static void playback_finish(int commit) {
+    if(s_playback.end)s_playback.end(s_play_key,s_seek_target,commit);
+    s_direct=s_seeking=s_preview_ready=0;
+}
+int psx_rewind_replay_input(void) {
+    if(!s_seeking)return 0;
+    if(s_load_pending)return 1;
+    if(s_frame>=s_seek_target) {
+        if(s_playback.state_only) {
+            s_playback.apply_inputs(s_frame);
+            s_seeking=0;s_preview_ready=1;
+            if(s_playback.ready)s_playback.ready(s_seek_target);
+            return 1;
+        }
+        playback_finish(1);return 0;
+    }
+    s_playback.apply_inputs(s_frame);
+    return 1;
+}
+int psx_rewind_after_present(void) {
+    if(!s_preview_ready)return 0;
+    s_preview_ready=0;
+    if(s_playback.presented && !s_playback.presented(s_frame)) {
+        /* A presentation deadline can select the adjacent complete image,
+         * but replay must never run beyond recorded input or indefinitely
+         * chase a producer that cannot be reconstructed. */
+        if(s_frame-s_play_tick>=4 ||
+           !s_playback.inputs_available(s_frame+1,s_frame+1)) {
+            s_open=0;playback_finish(0);
+            host_osd_push("Rewind redraw unavailable",1800);
+            return 0;
+        }
+        s_seek_target=s_frame+1;s_seeking=1;return 0;
+    }
+    s_play_tick=s_play_key=s_frame;s_seek_target=s_frame;
+    s_open=1;return 1;
+}
+static int rewind_seek_to(uint32_t target,uint32_t before) {
+    int selected=-1;
+    for(uint32_t i=s_count;i>0;i--) {
+        uint32_t tick=s_ticks[i-1];
+        if(tick>before)continue;
+        int available=rbe_snap_ring_has(s_ring,tick);
+#if RW_COMPRESSED_HISTORY
+        available=available || rewind_history_contains(s_state_history,tick);
+#endif
+        if(available){selected=(int)i-1;break;}
+    }
+    if(selected<0 || !s_playback.inputs_available(s_ticks[selected]+1,target))return 0;
+    s_load_tick=s_ticks[selected];s_load_pending=1;s_seek_target=target;
+    s_seeking=1;s_open=0;s_capture_due=0;return 1;
+}
+void psx_rewind_playback_tick(uint32_t now_ms) {
+    if(!s_open || !s_direct)return;
+    if(!s_play_time){s_play_time=now_ms;return;}
+    uint32_t steps=(now_ms-s_play_time)*60u/1000u;
+    if(!steps)return;
+    s_play_time+=steps*1000u/60u;
+    if(steps>8)steps=8;
+    uint64_t key=s_play_key>steps?s_play_key-steps:1,shown,tick;
+    uint32_t oldest=s_count?s_ticks[0]:0;
+    uint32_t warm=s_playback.warm_frames?s_playback.warm_frames:2;
+    if(s_playback.state_only)oldest+=warm;
+    if(s_playback.step(key,oldest,&shown,&tick)) {
+        if(s_playback.state_only && !rewind_seek_to((uint32_t)tick,(uint32_t)tick-warm))return;
+        s_play_key=shown;s_play_tick=tick;
+    }
+}
+int psx_rewind_release(void) {
+    if(!s_open || !s_direct)return 0;
+    if(s_playback.state_only) {
+        s_seek_target=s_frame;s_open=0;
+        playback_finish(1);s_capture_due=1;s_last_capture_frame=0xffffffffu;
+        return 1;
+    }
+    if(!rewind_seek_to((uint32_t)s_play_tick,(uint32_t)s_play_tick)) {
+        s_open=0;playback_finish(0);host_osd_push("Rewind history unavailable",1200);return 0;
+    }
+    return 1;
 }
 
 int psx_rewind_toggle(void)
@@ -793,6 +1015,12 @@ int psx_rewind_toggle(void)
     if (s_title_blocked && !s_open) {
         host_osd_push("Rewind is off in this mode", 1500);
         return 0;
+    }
+    if(s_playback.begin) {
+        if(s_open)return psx_rewind_release();
+        if(!s_count || !s_playback.begin(&s_play_key,&s_play_tick))return 0;
+        s_direct=1;s_open=1;s_play_time=0;s_slide=0;s_anim_dir=0;
+        return 1;
     }
     if (s_open) {
         s_open = 0;
@@ -826,6 +1054,7 @@ void psx_rewind_set_title_blocked(int blocked)
 
 int psx_rewind_cancel(void)
 {
+    if(s_direct){s_open=0;playback_finish(0);return 1;}
     if (!s_open)
         return 0;
     s_open = 0;
@@ -1145,6 +1374,7 @@ static void rasterize_panel(void)
 
 int psx_rewind_overlay_image(const uint32_t **pixels, int *w, int *h)
 {
+    if(s_direct){if(pixels)*pixels=NULL;if(w)*w=0;if(h)*h=0;return 0;}
     if (!psx_rewind_needs_present() || s_slide <= 0.01f) {
         if (pixels) *pixels = NULL;
         if (w) *w = 0;

@@ -8358,16 +8358,36 @@ extern void sio_get_pad_negcon(int slot, uint8_t out[3]);
 extern int sio_get_pad_mode_locked(int slot);
 /* Local Rewind: enabled, panel open, title block (psx_mod_set_rewind_blocked)
  * and the snapshots held, so scripted runs can check capture and opening. */
+static void handle_rewind_video(int id, const char *json)
+{
+    char op[24]="",body[1024];
+    json_get_str(json,"op",op,sizeof op);
+    if(!strcmp(op,"freeze"))gl_renderer_rewind_video_freeze(1);
+    else if(!strcmp(op,"thaw"))gl_renderer_rewind_video_freeze(0);
+    else if(!strcmp(op,"present")) {
+        uint64_t shown=0,tick=0;
+        int key=json_get_int(json,"key",0);
+        int ok=gl_renderer_rewind_video_present(key>0?(uint64_t)key:UINT64_MAX,&shown,&tick);
+        send_fmt("{\"id\":%d,\"ok\":%s,\"key\":%llu,\"tick\":%llu}",id,ok?"true":"false",(unsigned long long)shown,(unsigned long long)tick);
+        return;
+    }
+    gl_renderer_rewind_video_stats(body,sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}",id,body);
+}
+
+extern void psx_frontend_rewind_proof(char *out,int capacity);
 static void handle_rewind_status(int id, const char *json)
 {
-    (void)json;
+    (void)json;char proof[512],storage[512];psx_frontend_rewind_proof(proof,sizeof proof);psx_rewind_storage_stats(storage,sizeof storage);
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"open\":%s,"
-             "\"title_blocked\":%s,\"snaps\":%u,\"hd_residency_bytes\":%u}\n",
+             "\"direct\":%d,\"state_playback\":%d,\"seeking\":%d,\"tick\":%u,"
+             "\"title_blocked\":%s,\"snaps\":%u,\"hd_residency_bytes\":%u,%s,%s}\n",
              id, psx_rewind_enabled() ? "true" : "false",
              psx_rewind_is_open() ? "true" : "false",
+             psx_rewind_direct(),psx_rewind_state_playback(),psx_rewind_seeking(),psx_rewind_frame(),
              psx_rewind_title_blocked() ? "true" : "false",
              (unsigned)psx_rewind_snap_count(),
-             (unsigned)psx_rewind_hd_residency_bytes());
+             (unsigned)psx_rewind_hd_residency_bytes(),proof,storage);
 }
 
 static void handle_overlay_status(int id, const char *json)
@@ -16767,6 +16787,7 @@ static const CmdEntry s_commands[] = {
     { "press",             handle_press },
     { "pad_status",        handle_pad_status },
     { "rewind_status",     handle_rewind_status },
+    { "rewind_video",      handle_rewind_video },
     { "overlay_status",    handle_overlay_status },
     { "overlay_image",     handle_overlay_image },
     { "clear_input",       handle_clear_input },

@@ -47,6 +47,7 @@ def main():
         sources.append(('xr',fw/'runtime/src/psx_openxr.c'))
     if (fw/'runtime/src/render_thread.c').exists():
         sources.append(('rth',fw/'runtime/src/render_thread.c'))
+    sources.append(('rwh',fw/'runtime/src/rewind_history.c'))
     if (fw/'runtime/src/present_thread.c').exists():
         sources.append(('pth',fw/'runtime/src/present_thread.c'))
     if (fw/'runtime/src/frame_gen.c').exists():
@@ -76,9 +77,9 @@ def main():
     elif platform.system()=='Darwin':
         from run_gl_scale_invariance import MAC_FRAMEWORKS
         for framework in MAC_FRAMEWORKS: libraries+=['-framework',framework]
-        libraries+=['-liconv','-Wl,-dead_strip']
+        libraries+=['-liconv','-lcompression','-Wl,-dead_strip']
     else: libraries+=['-lGL','-ldl','-lpthread']
-    if platform.system()!='Darwin': libraries+=['-Wl,--gc-sections']
+    if platform.system()!='Darwin': libraries+=['-Wl,--gc-sections','-lz']
     run([args.cxx if args.hd_pack else args.cc,*objects,args.sdl_library,'-o',exe,*libraries])
     if not args.build_only:
         arguments=list(args.argument)

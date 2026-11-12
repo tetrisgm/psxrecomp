@@ -8,8 +8,12 @@
 #include "psx_rewind.c"
 #include "pst_wire.h"
 #include <assert.h>
+#if defined(PSX_SDL3)
+#include "psx_sdl.h"
+#endif
 
 static CPUState machine;
+static uint32_t host_pacing;
 static int function_entry_active, provider_ready = 1, capture_fails;
 static int capture_calls, load_attempts, quiet_rollbacks, observations;
 static int frontend_restores, cycle_restores, gpu_present_resets, cd_restores, resumes;
@@ -39,6 +43,8 @@ int g_ls_suppress_record;
 int psx_mod_function_entry_active(void) { return function_entry_active; }
 int psx_mod_snapshot_ready(void) { return provider_ready; }
 int psx_netplay_active(void) { return 0; }
+int gpu_display_is_depth24(void) { return 0; }
+int mdec_recently_active(uint32_t frames) { (void)frames;return 0; }
 int psx_hle_scheduler_enabled(void) { return 1; }
 int psx_is_dispatchable(uint32_t pc) { return pc == 0x80025070u || pc == 0x80025074u; }
 uint32_t psx_netplay_rb_sticky_bb_pc(void) { return 0; }
@@ -118,12 +124,13 @@ int boot_state_load_buffer_quiet(const uint8_t *data,size_t len,uint32_t bios,
 }
 
 static void capture(uint32_t tick,uint32_t value) {
-    machine.pc=0x80025070u; machine.gpr[4]=value;
+    machine.pc=0x80025070u; machine.gpr[4]=value;host_pacing=value+1;
     s_frame=tick; s_capture_due=1;
     psx_rewind_poll(&machine,machine.pc);
 #if PSX_NATIVE_CAPTURE_JOBS
     assert(s_pending.active && !atomic_load(&s_pending.ready));
     uint32_t count=s_count;
+    host_pacing=0xabcdef;
     machine.gpr[4]=0xdeadbeef; /* guest advances while render work is pending */
     pending_finish(1); assert(s_count==count);
     gr_snapshot_barrier();
@@ -146,7 +153,85 @@ static void assert_deferred(void) {
     assert(capture_calls==2 && !load_attempts && !quiet_rollbacks && !observations && !resumes);
 }
 
+static int playback_ended, playback_commit, playback_available=1;
+static uint32_t playback_applied, playback_target;
+static int playback_begin(uint64_t *key,uint64_t *tick) {*key=20;*tick=20;return 1;}
+static int playback_step(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick) {
+    (void)key;assert(oldest==10 || oldest==12);*shown=13;*tick=13;return 1;
+}
+static int playback_inputs(uint32_t from,uint32_t through) {assert(from==11 && through==13);return playback_available;}
+static void playback_apply(uint32_t tick) {assert(tick>=11 && tick<=13);playback_applied++;if(tick<13)machine.gpr[4]+=tick;}
+static void playback_end(uint64_t key,uint32_t tick,int commit) {
+    assert(key==13);playback_ended++;playback_commit=commit;playback_target=tick;
+}
+static int missing_redraw(uint32_t tick) {(void)tick;return 0;}
+static int missing_input(uint32_t from,uint32_t through) {(void)from;(void)through;return 0;}
+static void test_redraw_failure_bound(void) {
+    PsxRewindPlayback callbacks={0};
+    callbacks.presented=missing_redraw;callbacks.inputs_available=missing_input;
+    callbacks.end=playback_end;
+    psx_rewind_set_playback(&callbacks);
+    s_direct=s_preview_ready=1;s_play_tick=s_frame=13;s_play_key=13;
+    assert(!psx_rewind_after_present() && !s_direct && !s_seeking && !playback_commit);
+    s_direct=s_preview_ready=1;s_play_tick=13;s_frame=17;
+    callbacks.inputs_available=NULL; /* bound must short-circuit input access */
+    psx_rewind_set_playback(&callbacks);
+    assert(!psx_rewind_after_present() && !s_direct && !playback_commit);
+    playback_ended=0;psx_rewind_set_playback(NULL);
+}
+static void test_direct_playback(void) {
+    psx_rewind_configure(123,0x801b0000u);capture(10,101);capture(20,202);
+    PsxRewindPlayback callbacks={NULL,playback_begin,playback_step,playback_inputs,playback_apply,playback_end};
+    psx_rewind_set_playback(&callbacks);
+    assert(psx_rewind_toggle() && psx_rewind_direct());
+    psx_rewind_playback_tick(100);psx_rewind_playback_tick(200);
+    playback_available=0;assert(!psx_rewind_release());
+    assert(!psx_rewind_direct() && playback_ended==1 && !playback_commit && machine.gpr[4]==202);
+    playback_available=1;assert(psx_rewind_toggle());
+    psx_rewind_playback_tick(100);psx_rewind_playback_tick(200);
+    assert(psx_rewind_release() && psx_rewind_seeking() && !psx_rewind_is_open());
+    int cd_before=cd_restores;
+    if(setjmp(resumed)==0){psx_rewind_poll(&machine,machine.pc);assert(0);}
+    assert(machine.gpr[4]==101 && s_frame==10 && cd_restores==cd_before);
+    psx_rewind_note_frame();assert(psx_rewind_replay_input());
+    psx_rewind_note_frame();assert(psx_rewind_replay_input());
+    psx_rewind_note_frame();assert(!psx_rewind_replay_input());
+    assert(playback_applied==2 && machine.gpr[4]==124 && playback_target==13);
+    assert(playback_ended==2 && playback_commit && !psx_rewind_direct());
+    assert(s_count==1 && !rbe_snap_ring_has(s_ring,20));
+    psx_rewind_shutdown();psx_rewind_set_playback(NULL);
+}
+
+#if RW_COMPRESSED_HISTORY
+static void test_compressed_state_playback(void) {
+    PsxRewindPlayback callbacks={NULL,playback_begin,playback_step,playback_inputs,playback_apply,playback_end,1,NULL};
+    psx_rewind_set_playback(&callbacks);s_depth=50;s_interval=15;
+    psx_rewind_configure(123,0x801b0000u);
+    for(uint32_t tick=10;tick<=100;tick+=10) {
+        capture(tick,tick==10?101:tick);
+        for(int tries=0;tries<1000 && !rewind_history_contains(s_state_history,tick);tries++)SDL_Delay(1);
+        assert(rewind_history_contains(s_state_history,tick));
+    }
+    assert(!rbe_snap_ring_has(s_ring,10) && s_count==10);
+    assert(psx_rewind_toggle());psx_rewind_playback_tick(100);psx_rewind_playback_tick(200);
+    assert(s_seeking && !s_open && s_load_tick==10);
+    if(setjmp(resumed)==0){psx_rewind_poll(&machine,machine.pc);assert(0);}
+    assert(machine.gpr[4]==101 && host_pacing==102);
+    psx_rewind_note_frame();assert(psx_rewind_replay_input());
+    psx_rewind_note_frame();assert(psx_rewind_replay_input());
+    psx_rewind_note_frame();assert(psx_rewind_replay_input());
+    assert(!s_seeking && !s_open && psx_rewind_after_present());
+    assert(s_open && machine.gpr[4]==124);
+    assert(psx_rewind_release() && !s_direct && playback_target==13);
+    assert(!rewind_history_contains(s_state_history,20));
+    psx_rewind_shutdown();psx_rewind_set_playback(NULL);
+}
+#endif
+
 int main(void) {
+    test_redraw_failure_bound();
+    assert(psx_rewind_register_region(&host_pacing,sizeof host_pacing));
+    assert(!psx_rewind_register_region(&host_pacing,sizeof host_pacing));
     s_enabled=1; /* Ignore the runner's optional rewind environment setting. */
     psx_rewind_configure(123,0x801b0000u);
     assert(psx_rewind_enabled());
@@ -170,6 +255,7 @@ int main(void) {
     assert(load_attempts==1 && capture_calls==3 && !quiet_rollbacks && observations==1 && resumes==1);
     assert(frontend_restores==1 && cycle_restores==1 && gpu_present_resets==1 && cd_restores==1);
     assert(s_frame==10 && s_count==1 && !rbe_snap_ring_has(s_ring,20));
+    assert(host_pacing==102);
     assert(hd_live==101 && s_hd_bytes==8); /* restore after frontend invalidation */
 
     /* Checked load changes the machine before it discovers a bad resume PC.
@@ -211,6 +297,10 @@ int main(void) {
     assert(!s_pending.active && !queued_complete && !s_pending.data);
 #endif
     assert(s_hd_bytes==0);
+    test_direct_playback();
+#if RW_COMPRESSED_HISTORY
+    test_compressed_state_playback();
+#endif
     puts("rewind loads defer live host stacks and quietly undo rejected resume PCs");
     return 0;
 }

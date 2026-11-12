@@ -1,4 +1,5 @@
 /* Private presentation targets must leave the native render surfaces intact. */
+#include <assert.h>
 #define DEPTH_FIXTURE_MAIN depth_reference_main
 #include "test_gl_depth_clear.c"
 #undef DEPTH_FIXTURE_MAIN
@@ -111,6 +112,49 @@ int main(void) {
             check(!rt_held(),"snapshot submit and barrier do not migrate the GL context");
             gl_renderer_render_thread_stop();
             gl_renderer_set_hd_texture_mode(0);
+        }
+        {
+            unsigned char expected[128*128*4], decoded[128*128*4];
+            gl_renderer_rewind_video_enable(1);
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER,0);glViewport(0,0,128,128);
+            glDisable(GL_SCISSOR_TEST);glColorMask(1,1,1,1);
+            glClearColor(.25,.5,.75,1);glClear(GL_COLOR_BUFFER_BIT);
+            p_glBindBuffer(RV_PIXEL_PACK_BUFFER,0);
+            glPixelStorei(GL_PACK_ALIGNMENT,4);glPixelStorei(GL_PACK_ROW_LENGTH,0);
+            glReadPixels(0,0,128,128,GL_RGBA,GL_UNSIGNED_BYTE,expected);
+            for(int i=0;i<4;i++){rewind_video_capture();glFinish();SDL_Delay(2);}
+            RewindHistoryStats history;
+            for(int i=0;i<100;i++){rewind_history_stats(RV.history,&history);if(history.completed>=2)break;SDL_Delay(2);}
+            gl_renderer_rewind_video_freeze(1);
+            size_t bytes=0;RewindHistoryMeta meta;
+            check(rewind_history_decode_before(RV.history,1,decoded,sizeof decoded,&bytes,&meta),
+                  "full-resolution PBO capture becomes an immutable rewind frame");
+            check(bytes==sizeof expected && meta.width==128 && meta.height==128 &&
+                  !memcmp(expected,decoded,sizeof expected),
+                  "lossless rewind pixels equal the complete drawable without downsampling");
+            gl_renderer_rewind_video_enable(0);
+            /* A restored VRAM center, even at the requested guest tick, must
+             * never satisfy state-rewind's full-image presentation barrier. */
+            gl_renderer_rewind_state_enable(1);
+            s_frame_count=100;s_rewind_complete_source=1;
+            s_rewind_complete_cycle=12345;s_rewind_complete_phase=32768;
+            rewind_state_note_present();
+            uint64_t shown=0,tick=0;
+            assert(gl_renderer_rewind_state_select(101,90,&shown,&tick) && tick==100);
+            gl_renderer_rewind_video_freeze(1);
+            gl_renderer_rewind_video_resume(0,100);
+            s_rewind_complete_source=0;assert(rewind_video_hold());
+            assert(!gl_renderer_rewind_state_presented(100));
+            s_rewind_complete_source=1;s_rewind_complete_cycle=12346;
+            assert(rewind_video_hold());
+            s_rewind_complete_cycle=12345;assert(!rewind_video_hold());
+            assert(RV.frozen && gl_renderer_rewind_state_presented(100));
+            assert(rewind_video_hold()); /* no unrelated following swap */
+            gl_renderer_rewind_state_branch(99);
+            assert(!gl_renderer_rewind_state_select(101,90,&shown,&tick));
+            gl_renderer_rewind_video_freeze(0);gl_renderer_rewind_state_enable(0);
+            s_rewind_complete_source=0;
+
         }
         gl_renderer_shutdown();
     }

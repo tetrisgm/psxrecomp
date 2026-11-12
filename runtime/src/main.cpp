@@ -1107,6 +1107,7 @@ extern "C" void psx_frontend_on_savestate_refused(int is_load, int slot,
 }
 
 extern "C" void psx_frontend_on_savestate_loaded(void) {
+    if(!psx_rewind_direct())psx_rewind_discard_history();
     ++s_fmv_timeline_epoch;
     psx_projection_reset_session();
     psx_local_mouse_reset();
@@ -5097,7 +5098,7 @@ static AudioGate s_audio_gate = AUDIO_GATE_NORMAL;
  * heard once) and during the FMV-skip mute advance the SPU but are not
  * queued for the host. */
 static int spu_output_suppressed(void) {
-    return psx_netplay_is_resimulating() || psx_selfcheck_resim_active() ||
+    return psx_netplay_is_resimulating() || psx_selfcheck_resim_active() || psx_rewind_direct() ||
            s_audio_gate == AUDIO_GATE_MUTED;
 }
 
@@ -6735,7 +6736,7 @@ static void apply_input_override_to_sio(int override_word) {
 }
 
 /* Local host sticks for presentation-only mods (mod_plugins.h). */
-extern "C" int psx_mod_read_local_pad_sticks(uint32_t player,
+static int read_local_pad_sticks_live(uint32_t player,
                                                uint8_t out[4]) {
     if (!out) return 0;
     out[0] = out[1] = out[2] = out[3] = 0x80;
@@ -6775,6 +6776,26 @@ extern "C" int psx_mod_read_local_pad_sticks(uint32_t player,
     psx_keybinds_sticks(keys, (int)player + 1, out);
     dev_any_controller_sticks(out);
     return 1;
+}
+
+/* Presentation mods read physical axes separately from the resolved SIO pad.
+ * Their VBlank hook precedes the frontend boundary counter increment. */
+static struct {
+    uint32_t tick;
+    int available, valid;
+    uint8_t sticks[4];
+} rewind_local_axes[1024][PSX_MAX_PLAYERS];
+extern "C" int psx_mod_read_local_pad_sticks(uint32_t player,uint8_t out[4]) {
+    if(!out || player>=PSX_MAX_PLAYERS)return 0;
+    const uint32_t tick=psx_rewind_frame()+1;
+    auto &row=rewind_local_axes[tick%1024][player];
+    if(psx_rewind_seeking()) {
+        if(!row.valid || row.tick!=tick){memset(out,0x80,4);return 0;}
+        memcpy(out,row.sticks,4);return row.available;
+    }
+    const int available=read_local_pad_sticks_live(player,out);
+    if(psx_rewind_enabled()) {row.tick=tick;row.valid=1;row.available=available;memcpy(row.sticks,out,4);}
+    return available;
 }
 
 /* Capture one SIO slot's PHYSICAL host pad into a netplay/local blob. Returns
@@ -8536,6 +8557,137 @@ static void savestate_menu_poll_nav(uint32_t now_ms) {
     }
 }
 
+/* Input history shares rewind's guest boundary counter, not wall time. */
+static struct RewindInputRow {
+    uint32_t tick, ram_crc;
+    bool valid;
+    PsxNetPad pads[PSX_MAX_PLAYERS];
+} rewind_inputs[1024];
+extern "C" uint8_t *memory_get_ram_ptr(void);
+static int rewind_verify_state;
+static struct { uint32_t tick; uint8_t *ram; } rewind_verify_ram[128];
+static uint32_t rewind_verify_diff_words,rewind_verify_first_address,rewind_verify_first_expected,rewind_verify_first_actual;
+static int rewind_verify_neighbor;
+
+static uint32_t rewind_verify_expected, rewind_verify_actual, rewind_verify_tick;
+static unsigned rewind_verify_runs;
+extern "C" void psx_frontend_rewind_proof(char *out,int capacity) {
+    snprintf(out,(size_t)capacity,"\"state_verification\":%d,\"resume_checks\":%u,\"resume_tick\":%u,\"expected_ram_crc\":%u,\"actual_ram_crc\":%u,\"different_words\":%u,\"first_difference\":%u,\"expected_word\":%u,\"actual_word\":%u,\"matching_neighbor\":%d",
+        rewind_verify_state,rewind_verify_runs,rewind_verify_tick,rewind_verify_expected,rewind_verify_actual,rewind_verify_diff_words,rewind_verify_first_address,rewind_verify_first_expected,rewind_verify_first_actual,rewind_verify_neighbor);
+}
+static SDL_Scancode rewind_held_key = SDL_SCANCODE_UNKNOWN;
+static bool rewind_focus_lost(const SDL_Event &event) {
+#if defined(PSX_SDL3)
+    return event.type==SDL_EVENT_WINDOW_FOCUS_LOST;
+#else
+    return event.type==SDL_WINDOWEVENT && event.window.event==SDL_WINDOWEVENT_FOCUS_LOST;
+#endif
+}
+
+static void rewind_record_inputs(void) {
+    if(!psx_rewind_enabled() || psx_rewind_direct())return;
+    const uint32_t tick=psx_rewind_frame();
+    auto &row=rewind_inputs[tick%1024];row.tick=tick;row.valid=true;
+    if(rewind_verify_state) {
+        auto &v=rewind_verify_ram[tick%128];v.tick=tick;
+        if(!v.ram)v.ram=(uint8_t*)malloc(memory_get_ram_bytes());
+        if(v.ram)memcpy(v.ram,memory_get_ram_ptr(),memory_get_ram_bytes());
+    }
+    for(int i=0;i<PSX_MAX_PLAYERS;i++) {
+        auto &p=row.pads[i];uint8_t axes[4];sio_get_pad_sticks(i,axes);
+        p.buttons=sio_get_pad_buttons_slot(i);p.analog=sio_get_pad_analog(i);
+        p.connected=sio_get_pad_connected(i);
+        p.lx=axes[0];p.ly=axes[1];p.rx=axes[2];p.ry=axes[3];
+        if(p.analog==SIO_PAD_NEGCON){uint8_t n[3];sio_get_pad_negcon(i,n);p.rx=n[0];p.ry=n[1];p.ly=n[2];}
+    }
+}
+static int rewind_inputs_available(uint32_t from,uint32_t through) {
+    if(through<from)return 1;
+    if(through-from>=1024)return 0;
+    for(uint32_t tick=from;tick<=through;tick++) {
+        const auto &row=rewind_inputs[tick%1024];
+        if(!row.valid || row.tick!=tick)return 0;
+    }
+    return 1;
+}
+static void rewind_apply_inputs(uint32_t tick) {
+    const auto &row=rewind_inputs[tick%1024];
+    for(int i=0;i<PSX_MAX_PLAYERS;i++) {
+        sio_set_pad_connected(i,row.pads[i].connected);
+        psx_pad_apply_to_sio(i,&row.pads[i]);
+    }
+}
+static void rewind_playback_configure(int enabled) {
+    memset(rewind_inputs,0,sizeof rewind_inputs);
+    memset(rewind_local_axes,0,sizeof rewind_local_axes);
+    rewind_verify_state=std::getenv("PSX_REWIND_VERIFY_STATE")!=nullptr;
+    for(auto &v:rewind_verify_ram){free(v.ram);v.ram=nullptr;v.tick=0;}
+    gl_renderer_rewind_video_enable(enabled);
+}
+static int rewind_playback_begin(uint64_t *key,uint64_t *tick) {
+    gl_renderer_rewind_video_freeze(1);
+    if(!gl_renderer_rewind_video_present(0,key,tick)) {
+        gl_renderer_rewind_video_freeze(0);return 0;
+    }
+    psx_sdl_audio_set_paused(sdl_audio_device,1);
+    return 1;
+}
+static void rewind_playback_end(uint64_t key,uint32_t tick,int commit) {
+    if(commit) {
+        if(rewind_verify_state) {
+            const auto &v=rewind_verify_ram[tick%128];
+            if(v.ram && v.tick==tick) {
+                const size_t bytes=memory_get_ram_bytes();
+                rewind_verify_expected=crc32_compute(v.ram,bytes);
+                rewind_verify_actual=crc32_compute(memory_get_ram_ptr(),bytes);
+                rewind_verify_diff_words=0;rewind_verify_neighbor=999;
+                const uint32_t *expected=(const uint32_t*)v.ram,*actual=(const uint32_t*)memory_get_ram_ptr();
+                for(size_t i=0;i<bytes/4;i++)if(expected[i]!=actual[i]) {
+                    if(!rewind_verify_diff_words){rewind_verify_first_address=i*4;rewind_verify_first_expected=expected[i];rewind_verify_first_actual=actual[i];}
+                    ++rewind_verify_diff_words;
+                }
+                for(int d=-2;d<=2;d++) {
+                    const auto &near=rewind_verify_ram[(tick+d)%128];
+                    if(near.ram && near.tick==tick+d && !memcmp(near.ram,actual,bytes))rewind_verify_neighbor=d;
+                }
+                rewind_verify_tick=tick;++rewind_verify_runs;
+            }
+        }
+        for(auto &row:rewind_inputs)if(row.valid && row.tick>tick)row.valid=false;
+        if(psx_rewind_state_playback()){gl_renderer_rewind_state_branch(tick);gl_renderer_rewind_video_freeze(0);}
+        else gl_renderer_rewind_video_resume(key,tick);
+    } else gl_renderer_rewind_video_freeze(0);
+    psx_sdl_audio_set_paused(sdl_audio_device,0);
+    present_session_reset();g_audio_cycle_resync=1;
+}
+static const PsxRewindPlayback rewind_video_playback={
+    rewind_playback_configure,rewind_playback_begin,
+    gl_renderer_rewind_video_present_since,rewind_inputs_available,
+    rewind_apply_inputs,rewind_playback_end
+};
+
+static void rewind_state_configure(int enabled) {
+    rewind_playback_configure(0);
+    gl_renderer_rewind_state_enable(enabled);
+}
+static int rewind_state_begin(uint64_t *key,uint64_t *tick) {
+    if(!gl_renderer_rewind_state_select(psx_rewind_frame(),0,key,tick))return 0;
+    gl_renderer_rewind_video_freeze(1);
+    psx_sdl_audio_set_paused(sdl_audio_device,1);return 1;
+}
+static int rewind_state_step(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick) {
+    if(!gl_renderer_rewind_state_select(key,oldest,shown,tick))return 0;
+    gl_renderer_rewind_video_freeze(1);return 1;
+}
+static void rewind_state_ready(uint32_t tick) {
+    gl_renderer_rewind_video_resume(0,tick);
+}
+static const PsxRewindPlayback rewind_state_playback={
+    rewind_state_configure,rewind_state_begin,rewind_state_step,
+    rewind_inputs_available,rewind_apply_inputs,rewind_playback_end,
+    1,rewind_state_ready,gl_renderer_rewind_state_presented,4
+};
+
 static int rewind_toggle_buttons_down(void) {
     return hotkey_shortcut_down(PSX_ASSIST_BIND_REWIND, g_hotkey_pad_rewind);
 }
@@ -8543,7 +8695,7 @@ static int rewind_toggle_buttons_down(void) {
 static void rewind_poll_toggle_buttons(void) {
     static int was_down;
     int down = rewind_toggle_buttons_down();
-    if (down && !was_down && !psx_rewind_is_open()) {
+    if (down && !was_down && !psx_rewind_is_open() && !psx_rewind_seeking()) {
         psx_local_mouse_reset();
         psx_rewind_toggle();
     }
@@ -8743,7 +8895,7 @@ static void rewind_host_pause_loop(void) {
         /* The guest is frozen; keep the debug endpoint live so injected
          * input, screenshots and status reads can drive the filmstrip. */
         debug_server_poll();
-        if (g_headless) {
+        if (g_headless && !psx_rewind_direct()) {
             rewind_poll_nav((uint32_t)SDL_GetTicks());
             starvation_watchdog_heartbeat();
             SDL_Delay(1);
@@ -8751,6 +8903,7 @@ static void rewind_host_pause_loop(void) {
         }
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            if(rewind_focus_lost(ev))rewind_held_key=SDL_SCANCODE_UNKNOWN;
             (void)psx_local_mouse_event(ev);
             if (ev.type == SDL_QUIT) {
                 psx_crash_trace_set_exit_origin("sdl_window_close");
@@ -8761,6 +8914,12 @@ static void rewind_host_pause_loop(void) {
             } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
                 close_controller();
                 refresh_player_devices();
+            } else if (ev.type == SDL_KEYUP) {
+#if defined(PSX_SDL3)
+                if(ev.key.scancode==rewind_held_key)rewind_held_key=SDL_SCANCODE_UNKNOWN;
+#else
+                if(ev.key.keysym.scancode==rewind_held_key)rewind_held_key=SDL_SCANCODE_UNKNOWN;
+#endif
             } else if (ev.type == SDL_KEYDOWN) {
 #if defined(PSX_SDL3)
                 const SDL_Keymod mod = ev.key.mod;
@@ -8776,18 +8935,25 @@ static void rewind_host_pause_loop(void) {
                 if (!repeat &&
                     host_keymap_match_event(HOST_KEYMAP_REWIND, (int)key,
                                             (int)scancode, (int)mod)) {
-                    psx_rewind_toggle();
+                    if(!psx_rewind_direct())psx_rewind_toggle();
                 }
             }
         }
-        rewind_poll_nav((uint32_t)SDL_GetTicks());
-        rewind_pause_present();
+        if(psx_rewind_direct()) {
+            SDL_GameControllerUpdate();
+            if(rewind_held_key==SDL_SCANCODE_UNKNOWN && !rewind_toggle_buttons_down())
+                psx_rewind_release();
+            else psx_rewind_playback_tick((uint32_t)SDL_GetTicks());
+        } else {
+            rewind_poll_nav((uint32_t)SDL_GetTicks());
+            rewind_pause_present();
+        }
         starvation_watchdog_heartbeat();
         SDL_Delay(8);
     }
     freeze_heartbeat_set_paused(0);
     /* Swallow the still-held close press so it doesn't bleed into the game. */
-    savestate_input_guard_arm();
+    if(!psx_rewind_direct())savestate_input_guard_arm();
 }
 
 /* Host pause (host_overlay.h, P1). Same freeze as the save-state menu: the
@@ -9085,6 +9251,7 @@ static void recover_disconnected_controllers() {
 static bool drain_host_events() {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
+        if(rewind_focus_lost(ev))rewind_held_key=SDL_SCANCODE_UNKNOWN;
         if (steam_desktop_echo_event(ev)) continue;
         if (psx_local_mouse_event(ev)) continue;
         /* In-game overlay provider sees events first (host_overlay.h P3). */
@@ -9112,6 +9279,12 @@ static bool drain_host_events() {
                 close_controller();
                 refresh_player_devices();
             }
+        } else if (ev.type == SDL_KEYUP) {
+#if defined(PSX_SDL3)
+            if(ev.key.scancode==rewind_held_key)rewind_held_key=SDL_SCANCODE_UNKNOWN;
+#else
+            if(ev.key.keysym.scancode==rewind_held_key)rewind_held_key=SDL_SCANCODE_UNKNOWN;
+#endif
         } else if (ev.type == SDL_KEYDOWN) {
 #if defined(PSX_SDL3)
             const SDL_Keymod mod = ev.key.mod;
@@ -9140,7 +9313,8 @@ static bool drain_host_events() {
                 host_keymap_match_event(HOST_KEYMAP_REWIND, (int)key,
                                         (int)scancode, (int)mod)) {
                 psx_local_mouse_reset();
-                psx_rewind_toggle();
+                rewind_held_key=scancode;
+                if(!psx_rewind_seeking())psx_rewind_toggle();
             }
             else if (!key_repeat &&
                      host_keymap_match_event(HOST_KEYMAP_SAVE_STATE_MENU,
@@ -9234,7 +9408,7 @@ static bool local_mouse_live(int override_word) {
     g.netplay_active = psx_netplay_active();
     g.netplay_resim = psx_netplay_is_resimulating();
     g.selfcheck_locked = psx_selfcheck_input_locked();
-    g.selfcheck_resim = psx_selfcheck_resim_active();
+    g.selfcheck_resim = psx_selfcheck_resim_active() || psx_rewind_direct();
     g.render_pass = g_psx_render_pass_active;
     g.savestate_menu_open = savestate_menu_open;
     g.rewind_open = psx_rewind_is_open();
@@ -9521,13 +9695,14 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         /* New frame: the low-latency re-sample later this frame reuses this
          * frame's mod controller source sample (callback runs once). */
         mod_controller_source_begin_frame();
-        if (!psx_selfcheck_replay_input()) {
+        if (!psx_rewind_replay_input() && !psx_selfcheck_replay_input()) {
             if (g_headless)
                 sample_headless_pad_into_sio(override);
             else
                 sample_pad_into_sio(override);
             apply_input_override_port2(override_p2);
             env_pad_hold_apply();
+            rewind_record_inputs();
         }
         /* Offline vblank boundary: record/replay/compare (PSX_RB_SELFCHECK).
          * Defer opening a window while multitap arming is still pending —
@@ -9544,7 +9719,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
 
     /* Post-savestate CD delay boost (ReadTOC/seek clamp window).
      * Skip during rollback resim — boost is host-local and not in the CD snap. */
-    if (!psx_netplay_is_resimulating() && !psx_selfcheck_resim_active())
+    if (!psx_netplay_is_resimulating() && !psx_selfcheck_resim_active() && !psx_rewind_seeking())
         cdrom_savestate_boost_vblank();
 
     /* Turbo-active test shared by the pacing/present gate below. */
@@ -9660,7 +9835,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * retains the hard mute because it deliberately fast-forwards a movie.
      * Rollback resim: skip host audio pump (uncapped frames) so SPU/CD audio
      * paths cannot fork peers during the episode window. */
-    if (!psx_netplay_is_resimulating() && !psx_selfcheck_resim_active()) {
+    if (!psx_netplay_is_resimulating() && !psx_selfcheck_resim_active() && !psx_rewind_direct()) {
         /* Drop host output only; the canonical SPU/CD simulation keeps running. */
         const int accelerated_audio_sink = (psx_audio_sync_enabled() &&
             (psx_bios_hle_boot_turbo_active() ||
@@ -9849,7 +10024,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * Netplay paces in the epilogue AFTER present so Swap overlaps the
      * peer's guest quantum. Self-check replay runs uncapped like netplay
      * resim. */
-    if (!psx_netplay_active() && !psx_selfcheck_resim_active()) {
+    if (!psx_netplay_active() && !psx_selfcheck_resim_active() && !psx_rewind_direct()) {
         uint64_t perf_start = runtime_perf_section_begin();
         if (!manual_turbo_active && !turbo_load_paced && present_should_wall_pace()) {
             const uint64_t dyn_t0 = SDL_GetPerformanceCounter();
@@ -9867,7 +10042,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
          * vsync-light box). Re-stamp the ring's input mark to measure from here.
          * Self-check record keeps pads boundary-latched (netplay tick
          * semantics) — the mid-frame re-sample would fork the resim. */
-        if (g_low_latency_input && !psx_selfcheck_input_locked()) {
+        if (g_low_latency_input && !psx_rewind_direct() && !psx_selfcheck_input_locked()) {
             SDL_GameControllerUpdate();  /* refresh pad state after the wait */
             if (psx_local_mouse_installed()) {
                 psx_local_mouse_begin(sdl_window, local_mouse_live(override));
@@ -9887,6 +10062,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             sample_pad_into_sio(override);
             apply_input_override_port2(override_p2);
             env_pad_hold_apply();
+            rewind_record_inputs();
             latency_ring_restamp_input();
         }
     }
@@ -11287,6 +11463,7 @@ static void sdl_vblank_present(void) {
     sync_guest_cadence_to_video_standard();
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
     render_thread_vblank();
+    if(psx_rewind_after_present())rewind_host_pause_loop();
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
      * on the same VBlank boundary (BB fast-poll tails forked #2 vs #3). */
@@ -21807,6 +21984,9 @@ session_reboot:
         savestate_configure(memcard_dir.string().c_str(),
                             memory_get_bios_checksum(), game_entry_pc,
                             bios_token, openbios_ws);
+        extern uint64_t s_frame_count;
+        (void)psx_rewind_register_region(&s_frame_count,sizeof s_frame_count);
+        psx_rewind_set_playback(g_gl_active ? (std::getenv("PSX_REWIND_VIDEO") ? &rewind_video_playback : &rewind_state_playback) : nullptr);
         psx_rewind_set_enabled(g_rewind_enabled);
         psx_rewind_set_depth((uint32_t)g_rewind_depth);
         psx_rewind_set_interval((uint32_t)g_rewind_interval);

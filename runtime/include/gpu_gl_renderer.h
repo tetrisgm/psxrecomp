@@ -252,6 +252,18 @@ int gl_renderer_present_hold_last(void);
  * a no-op). Screenshots and the debug server call this before reading CPU
  * VRAM. Do NOT use before 24-bit (FMV) scanout — a full readback can clobber
  * packed RGB888 MDEC bytes in the CPU mirror (use flush_cpu_uploads instead). */
+/* Full drawable-resolution, lossless rewind presentation history. */
+void gl_renderer_rewind_video_enable(int enabled);
+void gl_renderer_rewind_state_enable(int enabled);
+int gl_renderer_rewind_state_select(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick);
+int gl_renderer_rewind_state_presented(uint32_t tick);
+void gl_renderer_rewind_state_branch(uint32_t tick);
+void gl_renderer_rewind_video_freeze(int frozen);
+void gl_renderer_rewind_video_clear(void);
+int gl_renderer_rewind_video_present(uint64_t key, uint64_t *shown, uint64_t *tick);
+int gl_renderer_rewind_video_present_since(uint64_t key, uint32_t oldest, uint64_t *shown, uint64_t *tick);
+void gl_renderer_rewind_video_resume(uint64_t key, uint32_t tick);
+void gl_renderer_rewind_video_stats(char *out, int capacity);
 void gl_renderer_sync_cpu(void);
 
 /* Land pending CPU→VRAM uploads into the FBO without reading the FBO back.

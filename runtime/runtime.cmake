@@ -463,6 +463,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/video_telemetry.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_savestate_menu.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
+    ${PSXRECOMP_ROOT}/runtime/src/rewind_history.c
     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_disc_tray.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_runtime_menu.c
@@ -2044,6 +2045,9 @@ function(psxrecomp_add_runtime_target target)
     # fetch a pinned release when find_package fails (same pattern as SDL3).
     psxrecomp_ensure_zlib()
     target_link_libraries(${target} PRIVATE ZLIB::ZLIB)
+    if(APPLE)
+        target_link_libraries(${target} PRIVATE compression)
+    endif()
 
     # Build identity: stamp the psxrecomp commit into the binary so a crash report
     # can be correlated to an exact build (issue #1 user reports had no version).

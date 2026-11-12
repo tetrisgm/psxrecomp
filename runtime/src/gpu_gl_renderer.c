@@ -81,6 +81,7 @@
 #include "gpu_fmv_hd.h"
 #include "gpu_gl_renderer.h"
 #include "presentation_gpu.h"
+#include "rewind_history.h"
 #include "video_telemetry.h"
 #include "gpu_hd_textures.h"
 #include "mod_texture_banks.h"
@@ -476,6 +477,14 @@ static inline int rth_replaying(void) { return s_rth_on && rt_on_render_thread()
 /* Render-owner timeline from immutable present records, never the concurrently
  * advancing (and transactionally restored) emulation-thread clock. */
 static uint64_t s_rth_present_cycle;
+static uint64_t s_rth_present_rewind_tick;
+static void rewind_video_capture(void);
+static int rewind_video_hold(void);
+static void rewind_state_note_present(void);
+static int s_rewind_complete_source;
+static uint64_t s_rewind_complete_cycle;
+static uint32_t s_rewind_complete_phase;
+static void rewind_video_shutdown(void);
 
 /* Frame generation (defined with the render-thread code near the end). */
 static int       s_fg_on;
@@ -6941,6 +6950,7 @@ static void present_image_ring_gl_forget(void);
 static void fmv_hd_release(void);
 void gl_renderer_shutdown(void) {
     gl_renderer_render_thread_stop();   /* drains; the context comes back to this thread */
+    rewind_video_shutdown();
     fmv_hd_release();
     psx_host_set_hud_draw_cb(NULL, NULL);
     /* After the worker has stopped (it presents, and captures, on its own
@@ -8571,6 +8581,7 @@ typedef struct PassGen {
     int      tex_w, tex_h;        /* slot size (hr pixels; wide band if wide) */
     int      source_path;         /* GL_PRES_VRAM or GL_PRES_WIDE */
     uint32_t n;                   /* images: [0] = the game's own */
+    uint8_t complete[PASS_SLOTS]; /* independent full-image producer, never a VRAM restage */
     uint32_t phase[PASS_SLOTS];   /* Q16, ascending */
     uint32_t period;              /* guest VBlanks the frame stays on screen */
     int      shown;               /* built for a frame already on screen */
@@ -9650,7 +9661,9 @@ static void pass_end_now(uint32_t alpha_q16, int keep) {
         for (uint32_t i = slot; i > at; i--) {
             s_pgen_tex[gi][i] = s_pgen_tex[gi][i - 1];
             g->phase[i] = g->phase[i - 1];
+            g->complete[i] = g->complete[i - 1];
         }
+        g->complete[at] = s_pass_private != 0;
         s_pgen_tex[gi][at] = t; g->phase[at] = alpha_q16; g->n++;
     }
     pass_stage_done(2);
@@ -10214,9 +10227,12 @@ static int pass_gen_present_at(double p, int locked) {
         s_pgen_expired++;
         return 0;
     }
-    if (!interp_present_pair(s_pgen_tex[s_pgen_cur][lo],
-                             s_pgen_tex[s_pgen_cur][hi], t, s_interp_blend_mode))
-        return 0;
+    s_rewind_complete_source=lo==hi && g->complete[lo];
+    s_rewind_complete_cycle=g->created_cycle;s_rewind_complete_phase=g->phase[lo];
+    int presented=interp_present_pair(s_pgen_tex[s_pgen_cur][lo],
+                             s_pgen_tex[s_pgen_cur][hi], t, s_interp_blend_mode);
+    s_rewind_complete_source=0;
+    if(!presented)return 0;
     s_pgen_presents++;
     if (lo != hi) s_pgen_blends++;
     /* A frame's own last deadline falls at p = 1 (the end of its planned
@@ -10839,6 +10855,8 @@ static void gl_swap_now(int generated);
 static int  fg_keep_real(void);      /* frame generation */
 static void fg_note_swap(uint64_t ns);
 static void gl_swap_with_osd(void) {
+    rewind_state_note_present();
+    if(rewind_video_hold())return;
     openxr_present_native(); /* Copy guest content before host-only overlays. */
     s_native_surface_pending=0; /* Hold-last/resim cannot reuse a native source. */
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -10995,6 +11013,7 @@ static void gl_swap_with_osd(void) {
      * composed now (its buffer may be drawn over before it is shown) and
      * kept; fg_present_real swaps it later. */
     if (s_fg_capture_real && fg_keep_real()) return;
+    rewind_video_capture();
     gl_swap_now(s_fg_presenting);
 }
 
@@ -12297,7 +12316,7 @@ static int rth_record_mode(void) {
 
 /* Present records carry the host overlays the emulation thread rasterized. */
 typedef struct RthOvHdr {
-    uint64_t guest_cycle;
+    uint64_t guest_cycle, rewind_tick;
     int32_t needs_present, has, w[4], h[4];
     float   slide;
     int32_t args[8], nargs;
@@ -12309,6 +12328,8 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
     RthOvHdr hd;
     memset(&hd, 0, sizeof hd);
     hd.guest_cycle = psx_cycle_count;
+    extern uint32_t psx_rewind_frame(void);
+    hd.rewind_tick = psx_rewind_frame();
     hd.needs_present = host_osd_needs_present();
     for (int i = 0; i < 4; i++) {
         if (ov_image(i, &px[i], &w[i], &h[i]) && px[i] && w[i] > 0 && h[i] > 0) {
@@ -12369,6 +12390,7 @@ static void rth_present_payload(uint16_t op, const uint8_t *p) {
     RthOvHdr hd;
     memcpy(&hd, p, sizeof hd);
     s_rth_present_cycle = hd.guest_cycle;
+    s_rth_present_rewind_tick = hd.rewind_tick;
     const uint8_t *q = p + sizeof hd;
     memset(&s_rth_ov, 0, sizeof s_rth_ov);
     s_rth_ov.valid = 1;
@@ -15783,6 +15805,7 @@ static void rth_ring_capture_now(const int32_t *a) { (void)a; }
 
 const GpuRenderBackend *gl_backend_get(void) { return s_rth_on ? &GL_RT_BACKEND : &GL_BACKEND; }
 
+#include "rewind_video.inc"
 #include "presentation_gpu.inc"
 
 #include "gpu_gl_ambient.inc"

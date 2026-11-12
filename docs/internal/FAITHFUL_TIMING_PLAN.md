@@ -213,6 +213,23 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-11-11 — state rewind presentation barrier.** Owner observed central
+  native-resolution restage mixed with sharp wide margins. Track complete private
+  redraw generations by guest tick, producer cycle and phase; reconstruct and
+  present the matching full image before accepting a rewind point. Hidden R4
+  3840×2160 captures no longer show central pixelation; separate exact-resume
+  diagnostic reports zero RAM differences. On-screen verification remains
+  blocked by the locked Mac. Bound missing-redraw recovery to recorded input
+  and four guest boundaries; report failure rather than replay indefinitely.
+
+- **2026-11-11 — direct rewind correctness work.** Hold/release prototype and
+  exact-state diagnostic added. Actual R4 replay comparisons exposed missing
+  mutable enhancement state; process-local rewind regions now checkpoint stable
+  host objects along with CPU/device state and restore them after frontend cache
+  invalidation. No disk/wire format change. The owner requires state-based
+  rewind with ordinary full-quality rendering, independent of resolution;
+  the pixel-history prototype is diagnostic, not release acceptance.
+
 - **2026-11-11 — rewind remains required.** Owner rejected the rewind-off
   diagnostic as a release preset. Added an unpublished raw snapshot path:
   main serializes CPU/devices, a render-command-boundary job captures native

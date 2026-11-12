@@ -51,6 +51,38 @@ void psx_rewind_set_title_blocked(int blocked);
 int  psx_rewind_title_blocked(void);
 /* Snapshots in the ring (debug/status). */
 uint32_t psx_rewind_snap_count(void);
+uint32_t psx_rewind_frame(void);
+/* Process-local rewind state, never serialized to a file or sent over a wire.
+ * Register stable, pointer-free host objects before configure. A checkpoint
+ * copies their exact bytes at the CPU boundary and restores them after frontend
+ * cache invalidation. Regions remain alive for the process lifetime. Maximum
+ * 32 regions / 1 MiB total; duplicate or late registration is rejected. */
+int psx_rewind_register_region(void *state, uint32_t bytes);
+/* A frontend may supply full-quality direct playback. With callbacks present,
+ * opening rewind never falls back to the filmstrip. Input replay uses the
+ * same local tick as machine checkpoints and displayed frame metadata. */
+typedef struct PsxRewindPlayback {
+    void (*configure)(int enabled);
+    int (*begin)(uint64_t *key, uint64_t *tick);
+    int (*step)(uint64_t key, uint32_t oldest_tick, uint64_t *shown, uint64_t *tick);
+    int (*inputs_available)(uint32_t from, uint32_t through);
+    void (*apply_inputs)(uint32_t tick);
+    void (*end)(uint64_t key, uint32_t target_tick, int commit);
+    int state_only;
+    void (*ready)(uint32_t target_tick);
+    int (*presented)(uint32_t target_tick);
+    uint32_t warm_frames;
+} PsxRewindPlayback;
+void psx_rewind_set_playback(const PsxRewindPlayback *callbacks);
+int psx_rewind_direct(void);
+int psx_rewind_seeking(void);
+int psx_rewind_after_present(void);
+int psx_rewind_state_playback(void);
+void psx_rewind_storage_stats(char *out, int capacity);
+void psx_rewind_playback_tick(uint32_t now_ms);
+int psx_rewind_release(void);
+int psx_rewind_replay_input(void);
+
 /* Host texture-upload metadata, capped at 32 MiB across retained points. */
 uint32_t psx_rewind_hd_residency_bytes(void);
 int  psx_rewind_is_open(void);

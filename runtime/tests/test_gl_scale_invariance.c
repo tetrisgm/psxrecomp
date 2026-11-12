@@ -81,6 +81,7 @@
  *     3x as the nearest rescale of all their pixels, before any redraw.
  * Original source-owned scene; no retail payload. */
 #include "gpu_gl_renderer.c"
+uint32_t psx_rewind_frame(void) { return (uint32_t)s_frame_count; }
 #include "gl_postfx_projection_fixture.h"
 #include "gl_fmv_fixture.h"
 #include "gpu_hd_texture_stubs.inc"
