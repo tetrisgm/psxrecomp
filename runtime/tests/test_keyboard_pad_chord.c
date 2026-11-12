@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -130,6 +131,26 @@ int main(int argc, char **argv) {
         psx_keybinds_init("keyboard_pad_chord_fixture.v1/fixture");
         expect_scancode("extensionless executable saves and reloads", SDL_SCANCODE_V,
                         psx_keybinds_get_button(1, PSX_KB_UP));
+#ifdef _WIN32
+        _putenv_s("RECOMP_USER_DATA_DIR", "keyboard_pad_chord_fixture.v1");
+#else
+        setenv("RECOMP_USER_DATA_DIR", "keyboard_pad_chord_fixture.v1", 1);
+#endif
+        psx_keybinds_reset_player(1);
+        psx_keybinds_init("sealed-bundle/Contents/MacOS/game");
+        expect_scancode("bundle reads host player data", SDL_SCANCODE_V,
+                        psx_keybinds_get_button(1, PSX_KB_UP));
+        psx_keybinds_set_button(1, PSX_KB_UP, SDL_SCANCODE_B);
+        psx_keybinds_save();
+        psx_keybinds_reset_player(1);
+        psx_keybinds_init("sealed-bundle/Contents/MacOS/game");
+        expect_scancode("bundle persists in host player data", SDL_SCANCODE_B,
+                        psx_keybinds_get_button(1, PSX_KB_UP));
+#ifdef _WIN32
+        _putenv_s("RECOMP_USER_DATA_DIR", "");
+#else
+        unsetenv("RECOMP_USER_DATA_DIR");
+#endif
         remove("keyboard_pad_chord_fixture.v1/fixture");
         remove("keyboard_pad_chord_fixture.v1/keybinds.ini");
 #ifdef _WIN32

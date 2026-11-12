@@ -213,6 +213,14 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 signed-bundle gate caught keyboard bindings still using argv[0],
+creating an unsealed keybinds.ini and loading the wrong player mapping. The
+keyboard module now honors the same host data directory as the launcher.
+Its read/save/reload regression and PGXP propagation fixture are registered
+in the shared title test suite so title CTest actually exercises them; the
+previous 41-title-test pass did not include those standalone fixtures. Final
+43-test and signed-bundle verification are pending in the R4 release receipt.
+
 2026-11-11 PGXP read bookkeeping: a five-second Mac CPU sample places substantial
 main-thread cost in PGXP ALU/load/store and private draw generation. LW/LWC2
 previously journaled every source shadow even when its generation/value required

@@ -201,6 +201,13 @@ static int path_is_directory(const char *path) {
 /* Resolve keybinds.ini alongside exe_path. exe_path may be a file (argv[0] /
  * the exe) or a directory (the exe dir the launcher passes) — either works. */
 static void derive_ini_path(const char *exe_path) {
+    /* Match the launcher's host-selected player-data root. Signed app bundles
+     * must never create bindings alongside their sealed executable. */
+    const char *data_root = getenv("RECOMP_USER_DATA_DIR");
+    if (data_root && *data_root) {
+        snprintf(s_ini_path, sizeof(s_ini_path), "%s/keybinds.ini", data_root);
+        return;
+    }
     if (!exe_path || !*exe_path) {
         strcpy(s_ini_path, "keybinds.ini");
         return;

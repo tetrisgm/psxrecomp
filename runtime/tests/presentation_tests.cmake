@@ -38,7 +38,22 @@ if(BUILD_TESTING AND NOT TARGET psx-presentation-scene-test)
         target_compile_options(psx-bundle-storage-test PRIVATE -UNDEBUG)
         add_test(NAME psx_bundle_storage COMMAND psx-bundle-storage-test)
     endif()
+    add_executable(psx-pgxp-propagation-test
+        "${_presentation_runtime}/tests/test_pgxp.cpp"
+        "${_presentation_runtime}/tests/pgxp_test_mod_memory.cpp"
+        "${_presentation_runtime}/src/pgxp.cpp"
+        "${_presentation_runtime}/src/psx_ram_geometry.c")
+    target_include_directories(psx-pgxp-propagation-test PRIVATE "${_presentation_runtime}/include")
+    add_test(NAME psx_pgxp_propagation COMMAND psx-pgxp-propagation-test)
     if(APPLE AND Python3_Interpreter_FOUND AND TARGET SDL3::SDL3-static)
+        add_executable(psx-keyboard-pad-chord-test
+            "${_presentation_runtime}/tests/test_keyboard_pad_chord.c"
+            "${_presentation_runtime}/src/psx_keybinds.c"
+            "${_presentation_runtime}/src/host_keymap.c")
+        target_include_directories(psx-keyboard-pad-chord-test PRIVATE "${_presentation_runtime}/include")
+        target_compile_definitions(psx-keyboard-pad-chord-test PRIVATE SDL_MAIN_HANDLED PSX_SDL3=1)
+        target_link_libraries(psx-keyboard-pad-chord-test PRIVATE SDL3::SDL3-static)
+        add_test(NAME psx_keyboard_pad_chord COMMAND psx-keyboard-pad-chord-test)
         if(TARGET retcomm_rbengine)
             add_executable(psx-rewind-direct-test "${_presentation_runtime}/tests/test_rewind_load_context.c" "${_presentation_runtime}/src/rewind_history.c")
             target_include_directories(psx-rewind-direct-test PRIVATE "${_presentation_runtime}/include" "${_presentation_runtime}/src")
