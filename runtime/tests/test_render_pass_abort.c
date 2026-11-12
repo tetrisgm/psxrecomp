@@ -117,6 +117,8 @@ void gpu_ws_set_local_view_scope(int on) { s_local_scope=on; }
 int  psx_selfcheck_resim_active(void) { return 0; }
 int  psx_selfcheck_enabled(void) { return 0; }
 int  psx_rewind_is_open(void) { return 0; }
+int psx_rewind_state_playback(void) { return 0; }
+int psx_rewind_seeking(void) { return 0; }
 
 /* psx_cycles.c device side: nothing may advance inside a pass. */
 static uint64_t s_dev_cycles;

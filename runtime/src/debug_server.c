@@ -8378,7 +8378,7 @@ static void handle_rewind_video(int id, const char *json)
 extern void psx_frontend_rewind_proof(char *out,int capacity);
 static void handle_rewind_status(int id, const char *json)
 {
-    (void)json;char proof[512],storage[512];psx_frontend_rewind_proof(proof,sizeof proof);psx_rewind_storage_stats(storage,sizeof storage);
+    (void)json;char proof[512],storage[1024];psx_frontend_rewind_proof(proof,sizeof proof);psx_rewind_storage_stats(storage,sizeof storage);
     send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%s,\"open\":%s,"
              "\"direct\":%d,\"state_playback\":%d,\"seeking\":%d,\"tick\":%u,"
              "\"title_blocked\":%s,\"snaps\":%u,\"hd_residency_bytes\":%u,%s,%s}\n",

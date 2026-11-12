@@ -5,6 +5,8 @@
  * PBO fences are polled, never waited during racing. The compression worker
  * receives complete pixels; no disk or thumbnail path participates. */
 typedef GLenum (APIENTRY *RvClientWait)(void *,GLbitfield,uint64_t);
+static _Atomic uint64_t rewind_resume_image_us;
+static uint64_t rewind_resume_image_start_ns;
 static struct {
     int configured, enabled, frozen, w, h;
     uint64_t resume_tick, presented_tick, complete_ticks[2048], complete_latest, held_incomplete;
@@ -163,6 +165,7 @@ static int rewind_video_hold(void) {
     if(RV.resume_complete) {
         if(!s_rewind_complete_source){++RV.held_incomplete;return 1;}
         RV.presented_tick=tick;RV.resume_tick=0;RV.resume_complete=0;RV.frozen=0;
+        atomic_store(&rewind_resume_image_us,(rt_now_ns()-rewind_resume_image_start_ns)/1000u);
         rewind_history_freeze(RV.history,0);return 0;
     }
     if(RV.state_enabled) {

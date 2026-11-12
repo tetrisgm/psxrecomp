@@ -266,6 +266,12 @@ void gl_renderer_rewind_draw_resume(uint32_t tick) {
     /* Keep the exact command preview on screen while normal forward drawing
      * rebuilds its pipeline. Native-resolution restage cannot open this gate. */
     RV.frozen=1;RV.resume_tick=tick;RV.resume_complete=1;
+    rewind_resume_image_start_ns=rt_now_ns();
+    atomic_store(&rewind_resume_image_us,UINT64_MAX);
+}
+uint64_t gl_renderer_rewind_resume_image_us(void) {
+    /* Observing a release must not drain the renderer queue and alter pacing. */
+    return atomic_load(&rewind_resume_image_us);
 }
 static void rewind_draw_stats(char *out,int capacity) {
     RewindHistoryStats s;rewind_history_stats(RD.history,&s);

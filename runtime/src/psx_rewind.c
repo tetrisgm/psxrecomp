@@ -29,6 +29,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(PSX_HAS_RBENGINE_SNAP)
 #include "retcomm_rbengine/snap_ring.h"
@@ -256,6 +257,14 @@ static uint32_t *s_ticks;
 static uint32_t s_count;
 static size_t s_hd_bytes;
 uint32_t psx_rewind_hd_residency_bytes(void) { return (uint32_t)s_hd_bytes; }
+/* Debug-server attribution of a release transition, outside hot capture paths. */
+static uint64_t s_release_started, s_release_us, s_load_us[7];
+static uint32_t s_release_anchor, s_release_target;
+static uint64_t rewind_now_us(void) {
+    struct timespec t; timespec_get(&t,TIME_UTC);
+    return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u;
+}
+
 void psx_rewind_storage_stats(char *out,int capacity) {
     uint64_t bytes=0,dropped=0;uint32_t entries=0;
 #if RW_COMPRESSED_HISTORY
@@ -264,6 +273,13 @@ void psx_rewind_storage_stats(char *out,int capacity) {
 #endif
     snprintf(out,(size_t)capacity,"\"state_history_bytes\":%llu,\"state_history_entries\":%u,\"state_history_dropped\":%llu,\"snapshot_interval\":%u,\"host_state_bytes\":%llu",
         (unsigned long long)bytes,entries,(unsigned long long)dropped,s_interval,(unsigned long long)s_region_bytes*s_count);
+    size_t used=strlen(out);
+    if(used<(size_t)capacity)snprintf(out+used,(size_t)capacity-used,
+        ",\"release_us\":%llu,\"release_anchor\":%u,\"release_target\":%u,\"release_load_us\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu]",
+        (unsigned long long)s_release_us,s_release_anchor,s_release_target,
+        (unsigned long long)s_load_us[0],(unsigned long long)s_load_us[1],
+        (unsigned long long)s_load_us[2],(unsigned long long)s_load_us[3],
+        (unsigned long long)s_load_us[4],(unsigned long long)s_load_us[5],(unsigned long long)s_load_us[6]);
 }
 
 static int s_sel;
@@ -825,6 +841,8 @@ static int do_capture(CPUState *cpu, uint32_t resume_pc)
 
 static int do_load(CPUState *cpu, uint32_t tick)
 {
+    uint64_t measured=rewind_now_us(),stage=measured;
+    s_release_anchor=tick;
 #if RW_ASYNC_CAPTURE
     if (s_pending.active) gr_snapshot_barrier();
     pending_finish(1);
@@ -852,6 +870,7 @@ static int do_load(CPUState *cpu, uint32_t tick)
 #endif
     if (!data || !size)
         return 0;
+    s_load_us[0]=rewind_now_us()-stage;stage=rewind_now_us();
     /* Dispatchability depends on the restored RAM. Hold the live machine
      * first so a rejected resume PC cannot leave a half-applied rewind, and
      * keep diagnostic observers silent until the state is accepted. */
@@ -861,6 +880,7 @@ static int do_load(CPUState *cpu, uint32_t tick)
         return 0;
     }
     (void)gpu_hd_textures_residency_save(&rollback_hd, &rollback_hd_size);
+    s_load_us[1]=rewind_now_us()-stage;stage=rewind_now_us();
     loaded = boot_state_load_buffer_checked(data, size, s_bios, s_entry, cpu,
                                             resume_pc_ok);
     if (!loaded) {
@@ -871,6 +891,7 @@ static int do_load(CPUState *cpu, uint32_t tick)
     free(rollback_hd);
     free(rollback);
     if (!loaded) return 0;
+    s_load_us[2]=rewind_now_us()-stage;stage=rewind_now_us();
     rbe_snap_ring_drop_after(s_ring, tick);
 #if RW_COMPRESSED_HISTORY
     rewind_history_drop_after(s_state_history,tick);
@@ -881,7 +902,9 @@ static int do_load(CPUState *cpu, uint32_t tick)
     psx_cycles_resync_after_restore(cpu);
     interrupts_resync_after_restore();
     if(!s_seeking)cdrom_accelerate_after_savestate();
+    s_load_us[3]=rewind_now_us()-stage;stage=rewind_now_us();
     psx_frontend_on_savestate_loaded();
+    s_load_us[4]=rewind_now_us()-stage;stage=rewind_now_us();
     /* The frontend's VRAM restage clears draw tracking. Restore only after
      * it finishes; the existing API validates both pack and restored VRAM. */
     for (uint32_t i = 0; i < s_count; ++i) {
@@ -892,6 +915,8 @@ static int do_load(CPUState *cpu, uint32_t tick)
             break;
         }
     }
+    s_load_us[5]=rewind_now_us()-stage;
+    s_load_us[6]=rewind_now_us()-measured;
     if(!s_direct)host_osd_push("Rewind loaded", 1200);
     if(s_seeking && s_frame==s_seek_target)playback_finish(1);
     psx_scheduler_resume_at(cpu->pc);
@@ -932,6 +957,7 @@ int psx_rewind_direct(void) { return s_direct; }
 int psx_rewind_seeking(void) { return s_seeking; }
 static void playback_finish(int commit) {
     if(s_playback.end)s_playback.end(s_play_key,s_seek_target,commit);
+    if(s_release_started){s_release_us=rewind_now_us()-s_release_started;s_release_started=0;}
     s_direct=s_seeking=s_preview_ready=s_release_pending=0;
 }
 int psx_rewind_replay_input(void) {
@@ -996,7 +1022,7 @@ void psx_rewind_playback_tick(uint32_t now_ms) {
     if(steps>8)steps=8;
     uint64_t key=s_play_key>steps?s_play_key-steps:1,shown,tick;
     uint32_t oldest=s_count?s_ticks[0]:0;
-    uint32_t warm=s_playback.warm_frames?s_playback.warm_frames:2;
+    uint32_t warm=s_playback.state_only==2?1:(s_playback.warm_frames?s_playback.warm_frames:2);
     if(s_playback.state_only)oldest+=warm;
     if(s_playback.step(key,oldest,&shown,&tick)) {
         if(s_playback.state_only==1 && !rewind_seek_to((uint32_t)tick,(uint32_t)tick-warm))return;
@@ -1005,6 +1031,8 @@ void psx_rewind_playback_tick(uint32_t now_ms) {
 }
 int psx_rewind_release(void) {
     if(!s_open || !s_direct)return 0;
+    s_release_started=rewind_now_us();s_release_target=(uint32_t)s_play_tick;
+    s_release_us=0;memset(s_load_us,0,sizeof s_load_us);
     if(s_playback.state_only==1) {
         s_seek_target=s_frame;s_open=0;
         playback_finish(1);s_capture_due=1;s_last_capture_frame=0xffffffffu;
@@ -1012,8 +1040,11 @@ int psx_rewind_release(void) {
     }
     uint32_t before=(uint32_t)s_play_tick;
     if(s_playback.state_only==2) {
-        uint32_t warm=s_playback.warm_frames?s_playback.warm_frames:4;
-        before=before>warm?before-warm:0;s_release_pending=1;
+        /* The exact command image is already displayed. Reconstruct only
+         * machine state, from the nearest earlier checkpoint. One guest
+         * boundary is required because checkpoints are captured after input
+         * sampling; the selected point is the following sampled boundary. */
+        before=before?before-1:0;s_release_pending=1;
     }
     if(!rewind_seek_to((uint32_t)s_play_tick,before)) {
         s_open=0;playback_finish(0);host_osd_push("Rewind history unavailable",1200);return 0;

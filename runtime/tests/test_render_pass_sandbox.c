@@ -175,6 +175,9 @@ void gpu_ws_set_local_view_scope(int on) { s_ws_scope = on; }
 int  psx_selfcheck_resim_active(void) { return 0; }
 int  psx_selfcheck_enabled(void) { return 0; }
 int  psx_rewind_is_open(void) { return 0; }
+static int s_rewind_mode,s_rewind_seek;
+int psx_rewind_state_playback(void) { return s_rewind_mode; }
+int psx_rewind_seeking(void) { return s_rewind_seek; }
 static int s_fast_forward;
 int  psx_presentation_fast_forward(void) { return s_fast_forward; }
 
@@ -1280,6 +1283,16 @@ static void test_queued_budget(void) {
     tick_bump(40u*ms);
     CHECK(psx_mod_render_pass_plan(2,1,a,4)==1,
           "returning to adaptive planning does not inherit an old rest");
+    s_rewind_mode=2;s_rewind_seek=1;
+    CHECK(psx_mod_render_pass_plan_full_rate(2,1,a,4)==0,
+          "command resume suppresses hidden private redraws");
+    s_rewind_mode=1;
+    CHECK(psx_mod_render_pass_plan_full_rate(2,1,a,4)==1,
+          "state playback retains required image reconstruction");
+    s_rewind_mode=2;s_rewind_seek=0;
+    CHECK(psx_mod_render_pass_plan_full_rate(2,1,a,4)==1,
+          "forward complete producers resume immediately after reconstruction");
+    s_rewind_mode=0;
     s_queued = 0;
     s_plan_one = 0;
 }

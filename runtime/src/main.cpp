@@ -208,6 +208,10 @@ extern "C" void psx_game_codegen_forward_if_built(int argc, char** argv);
 #include <exception>
 #include <array>
 #include <filesystem>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include "macos_bundle_storage.h"
+#endif
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -2943,7 +2947,9 @@ static std::filesystem::path find_upward(std::filesystem::path start,
 // authoritative source (independent of argv[0], which can be relative/bare and
 // would otherwise get resolved against cwd by fs::absolute). $APPIMAGE and
 // argv[0] are non-Windows / fallback sources only.
+static std::filesystem::path g_bundle_data_root;
 static std::filesystem::path exe_dir_from_argv(const char* argv0) {
+    if(!g_bundle_data_root.empty())return g_bundle_data_root;
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path exe_dir;
@@ -8572,8 +8578,8 @@ static int rewind_verify_neighbor;
 static uint32_t rewind_verify_expected, rewind_verify_actual, rewind_verify_tick;
 static unsigned rewind_verify_runs;
 extern "C" void psx_frontend_rewind_proof(char *out,int capacity) {
-    snprintf(out,(size_t)capacity,"\"state_verification\":%d,\"resume_checks\":%u,\"resume_tick\":%u,\"expected_ram_crc\":%u,\"actual_ram_crc\":%u,\"different_words\":%u,\"first_difference\":%u,\"expected_word\":%u,\"actual_word\":%u,\"matching_neighbor\":%d",
-        rewind_verify_state,rewind_verify_runs,rewind_verify_tick,rewind_verify_expected,rewind_verify_actual,rewind_verify_diff_words,rewind_verify_first_address,rewind_verify_first_expected,rewind_verify_first_actual,rewind_verify_neighbor);
+    snprintf(out,(size_t)capacity,"\"state_verification\":%d,\"resume_checks\":%u,\"resume_tick\":%u,\"expected_ram_crc\":%u,\"actual_ram_crc\":%u,\"different_words\":%u,\"first_difference\":%u,\"expected_word\":%u,\"actual_word\":%u,\"matching_neighbor\":%d,\"resume_image_us\":%llu",
+        rewind_verify_state,rewind_verify_runs,rewind_verify_tick,rewind_verify_expected,rewind_verify_actual,rewind_verify_diff_words,rewind_verify_first_address,rewind_verify_first_expected,rewind_verify_first_actual,rewind_verify_neighbor,(unsigned long long)gl_renderer_rewind_resume_image_us());
 }
 static SDL_Scancode rewind_held_key = SDL_SCANCODE_UNKNOWN;
 static bool rewind_focus_lost(const SDL_Event &event) {
@@ -17867,6 +17873,23 @@ static void host_pause_service(void) {
 }
 
 int main(int argc, char** argv) {
+#if defined(__APPLE__)
+    try {
+        char executable[4096];uint32_t length=sizeof executable;
+        if(_NSGetExecutablePath(executable,&length)==0) {
+            const char *home=std::getenv("HOME"),*override_root=std::getenv("PSX_BUNDLE_DATA_DIR");
+            g_bundle_data_root=psx_bundle::prepare(std::filesystem::absolute(executable),
+                home?home:"",override_root?override_root:"");
+            if(!g_bundle_data_root.empty()) {
+                setenv("RECOMP_USER_DATA_DIR",g_bundle_data_root.string().c_str(),1);
+                std::filesystem::current_path(g_bundle_data_root);
+            }
+        }
+    } catch(const std::exception &error) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"Application data unavailable",error.what(),nullptr);
+        return 1;
+    }
+#endif
     g_main_argc = argc;
     g_main_argv = argv;
     const int regional_result = PSXRecompV4::regional::startup(argc, argv);

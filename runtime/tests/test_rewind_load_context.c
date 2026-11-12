@@ -157,9 +157,9 @@ static int playback_ended, playback_commit, playback_available=1;
 static uint32_t playback_applied, playback_target;
 static int playback_begin(uint64_t *key,uint64_t *tick) {*key=20;*tick=20;return 1;}
 static int playback_step(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick) {
-    (void)key;assert(oldest==10 || oldest==12);*shown=13;*tick=13;return 1;
+    (void)key;assert(oldest==10 || oldest==11 || oldest==12);*shown=13;*tick=13;return 1;
 }
-static int playback_inputs(uint32_t from,uint32_t through) {assert(from==11 && through==13);return playback_available;}
+static int playback_inputs(uint32_t from,uint32_t through) {assert((from==11 || from==13) && through==13);return playback_available;}
 static void playback_apply(uint32_t tick) {assert(tick>=11 && tick<=13);playback_applied++;if(tick<13)machine.gpr[4]+=tick;}
 static void playback_end(uint64_t key,uint32_t tick,int commit) {
     assert(key==13);playback_ended++;playback_commit=commit;playback_target=tick;
@@ -231,14 +231,14 @@ static void test_command_playback(void) {
     psx_rewind_set_playback(&callbacks);s_depth=50;s_interval=15;
     psx_rewind_configure(123,0x801b0000u);
     assert(s_interval==4);
-    capture(10,101);capture(20,202);
+    capture(10,101);capture(12,124);capture(20,202);
     assert(!s_thumbs[0].px && !s_thumbs[1].px);
     assert(psx_rewind_toggle());psx_rewind_playback_tick(100);psx_rewind_playback_tick(200);
     assert(s_open && !s_seeking && machine.gpr[4]==202 && s_frame==20);
-    assert(psx_rewind_release() && s_release_pending && s_load_tick==10);
+    assert(psx_rewind_release() && s_release_pending && s_load_tick==12);
     if(setjmp(resumed)==0){psx_rewind_poll(&machine,machine.pc);assert(0);}
-    assert(machine.gpr[4]==101);
-    for(int n=0;n<3;n++){psx_rewind_note_frame();assert(psx_rewind_replay_input());}
+    assert(machine.gpr[4]==124);
+    for(int n=0;n<1;n++){psx_rewind_note_frame();assert(psx_rewind_replay_input());}
     assert(!psx_rewind_after_present() && !s_direct && !s_open && !s_release_pending);
     assert(playback_commit && playback_target==13 && machine.gpr[4]==124);
     psx_rewind_shutdown();psx_rewind_set_playback(NULL);

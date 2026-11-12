@@ -260,6 +260,8 @@ int gl_renderer_rewind_state_select(uint64_t key,uint32_t oldest,uint64_t *shown
 int gl_renderer_rewind_state_presented(uint32_t tick);
 int gl_renderer_rewind_draw_presented(uint32_t tick);
 void gl_renderer_rewind_draw_resume(uint32_t tick);
+/* UINT64_MAX until the first complete forward image is ready; no GL sync. */
+uint64_t gl_renderer_rewind_resume_image_us(void);
 int gl_renderer_rewind_draw_select(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick);
 int gl_renderer_rewind_draw_present(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick);
 void gl_renderer_rewind_state_branch(uint32_t tick);

@@ -213,6 +213,24 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 proper Mac release follow-up: release attribution showed about20 ms
+loading and six replayed frames bringing the transition to102 ms. Command
+playback now resumes from the nearest earlier checkpoint and suppresses only
+rollback-isolated private redraws during hidden machine replay. State playback
+retains required reconstruction; canonical guest execution and forward private
+producers remain unchanged. Three successive history branches restored exact
+RAM (zero differing words) with74 exact full-resolution image comparisons.
+Internal transitions measured41–63 ms with expensive parity diagnostics enabled.
+Non-draining atomic observation now measures the first complete forward image
+without forcing a render-queue drain. Final sustained timing is in progress.
+
+Mac bundles now seed versioned defaults and keep player edits/saves in Application
+Support, with immutable resources outside MacOS. Standalone developer layouts
+remain unchanged. Tests cover upgrades, player edits, moved bundles and isolated
+state. Developer ID signing is available; notarization currently requires the
+owner to resolve Apple's pending/expired developer agreement (HTTP403).
+
+
 2026-11-11 rewind completion: exact ordered private-pass command history now
 redraws at current resolution with private native texture memory. No framebuffer
 history or fitted geometry. Measured 59.57 backward updates/s in a visible race;
