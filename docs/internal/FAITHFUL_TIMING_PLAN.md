@@ -213,6 +213,13 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-12 hidden GL fixture: a sampled locked-screen stall was in Cocoa's
+SwapWindow/display-link condition wait, not rewind or render-worker ownership.
+The pixel/state fixture now explicitly disables VSync, as isolated runtime
+checks already do. It does not assert monitor timing. All 44 title tests pass,
+including all three real-GL fixtures. No shipped runtime change.
+
+
 2026-11-11 Windows core-context compatibility: explicitly request the forward-
 compatible flag for the existing core profile. The Mac-hosted Windows PE then
 creates a 4.1 Metal context; Wine previously rejected the context because its

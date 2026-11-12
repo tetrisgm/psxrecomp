@@ -128,6 +128,9 @@ int main(void) {
         int scale=si==0?1:si==1?4:9;
         glb_init(vram);glb_set_scale(scale);
         if(!gl_renderer_init_context(win))return 2;
+        /* This hidden pixel/state fixture does not test display timing.
+         * Cocoa stops display-link ticks while locked; never wait for VSync. */
+        gl_renderer_set_swap_interval(0);
         gl_renderer_set_pgxp_depth(1);
         glb_wide_configure(560,120);glb_wide_set_target(0);
         flush_cpu_upload();flush_flat_batch();flush_tex_batch();hiw_flush_queue();
