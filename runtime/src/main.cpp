@@ -10137,6 +10137,13 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             s_netplay_present_sim_watermark = sim;
     }
 
+    /* Command rewind already displays its exact historical image. Hidden
+     * state reconstruction must not re-stage, post-process or swap canonical
+     * VRAM at every replay boundary. The outer VBlank still flushes renderer
+     * work and commits the selected state; the complete-forward-image gate
+     * then resumes ordinary presentation. State-only rewind needs its draws. */
+    if(psx_rewind_direct() && psx_rewind_state_playback()==2)return ep;
+
     /* ---- Display from our VRAM ---- */
     probe_reached = 1;
     uint32_t w = 0, h = 0, present_h = 0;

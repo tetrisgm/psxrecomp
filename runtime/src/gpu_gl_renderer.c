@@ -1186,6 +1186,9 @@ static int rect_intersects(const DirtyRect *r, int x0, int y0, int x1, int y1) {
 
 /* ---- exact pending-upload rect list (see s_up_rects comment) ------------- */
 static void flush_cpu_upload(void);   /* fwd: overflow flushes then re-adds */
+static void upload_texture_pixels(int x,int y,int w,int h,GLenum format,GLenum type,
+                                  const void *pixels,size_t bytes);
+
 
 /* Add an uploaded rect. Merges ONLY when the merge adds no uncovered pixels:
  * containment either way, or an extension within the same row-band / column-
@@ -2653,15 +2656,14 @@ static void flush_cpu_upload(void) {
         if (diag) s_rt_up_diag[3] += SDL_GetPerformanceCounter() - t0;
         t0 = diag ? SDL_GetPerformanceCounter() : 0;
         glBindTexture(GL_TEXTURE_2D, s_up_tex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
+        upload_texture_pixels(x,y,w,h,GL_RGBA,GL_UNSIGNED_BYTE,s_conv,(size_t)w*h*4);
 
         /* Raw mirror takes the CPU data directly — current for this rect, so no
          * pack is needed for uploaded content. */
         glBindTexture(GL_TEXTURE_2D, s_raw_tex);
         glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
-                        PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
-                        s_vram + (size_t)y * VRAM_W + x);
+        upload_texture_pixels(x,y,w,h,PSXGL_RED_INTEGER,GL_UNSIGNED_SHORT,
+            s_vram+(size_t)y*VRAM_W+x,((size_t)(h-1)*VRAM_W+w)*sizeof(uint16_t));
         glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
         if (diag) s_rt_up_diag[4] += SDL_GetPerformanceCounter() - t0;
     }
@@ -3258,6 +3260,18 @@ static int raw_upload_pbo_on(void) {
     if (!env) return 0;
     if (!s_raw_pbo) p_glGenBuffers(1, &s_raw_pbo);
     return s_raw_pbo != 0;
+}
+/* Preserve the same rects, pixel-store stride and command ordering. Orphaned
+ * unpack storage lets the driver consume bytes without blocking the CPU on a
+ * texture still referenced by prior draws (including full savestate restages). */
+static void upload_texture_pixels(int x,int y,int w,int h,GLenum format,GLenum type,
+                                  const void *pixels,size_t bytes) {
+    if(raw_upload_pbo_on()) {
+        p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER,s_raw_pbo);
+        p_glBufferData(PSXGL_PIXEL_UNPACK_BUFFER,(GLsizeiptr)bytes,pixels,PSXGL_STREAM_DRAW);
+        glTexSubImage2D(GL_TEXTURE_2D,0,x,y,w,h,format,type,(const void*)0);
+        p_glBindBuffer(PSXGL_PIXEL_UNPACK_BUFFER,0);
+    } else glTexSubImage2D(GL_TEXTURE_2D,0,x,y,w,h,format,type,pixels);
 }
 static void pack_flush(void) {
     if (!s_raster_ok || !s_pack_dirty.set) return;

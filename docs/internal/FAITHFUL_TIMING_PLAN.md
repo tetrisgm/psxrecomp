@@ -213,6 +213,16 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 upload/restage follow-up: non-draining measurements exposed GPU-queue
+stalls in rollback backup and native VRAM restaging, beyond CPU replay time.
+Hidden command reconstruction now skips redundant display/postprocessing only;
+canonical execution and the outer VBlank commit remain intact. The existing
+Mac unpack-PBO transport also handles CPU upload/restage rectangles, preserving
+pixel-store stride and ordering. Release build and all 41 R4 CTests pass.
+Three repeated actual-game releases restore identical RAM; 77 full internal
+rewind image comparisons have zero mismatches. Normal foreground timing remains
+under measurement; diagnostic timings are not a sustained-performance claim.
+
 2026-11-11 proper Mac release follow-up: release attribution showed about20 ms
 loading and six replayed frames bringing the transition to102 ms. Command
 playback now resumes from the nearest earlier checkpoint and suppresses only
@@ -227,8 +237,8 @@ without forcing a render-queue drain. Final sustained timing is in progress.
 Mac bundles now seed versioned defaults and keep player edits/saves in Application
 Support, with immutable resources outside MacOS. Standalone developer layouts
 remain unchanged. Tests cover upgrades, player edits, moved bundles and isolated
-state. Developer ID signing is available; notarization currently requires the
-owner to resolve Apple's pending/expired developer agreement (HTTP403).
+state. Developer ID signing and the existing Keychain notarization profile are
+now verified; the owner resolved Apple's developer agreement requirement.
 
 
 2026-11-11 rewind completion: exact ordered private-pass command history now
