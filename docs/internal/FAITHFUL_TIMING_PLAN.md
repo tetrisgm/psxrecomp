@@ -213,6 +213,14 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 Windows core-context compatibility: explicitly request the forward-
+compatible flag for the existing core profile. The Mac-hosted Windows PE then
+creates a 4.1 Metal context; Wine previously rejected the context because its
+macOS WGL backend requires this flag. No renderer fallback or PGXP changes.
+The title's final graphics checks await an unlocked desktop; the 44-test run
+passed 41 non-graphics cases before being stopped at the locked-screen GL test.
+
+
 2026-11-11 Windows release portability: llvm-mingw's Release/LTO build exposed
 Windows' `near` macro colliding with a rewind-verification local; renamed the
 local without changing behavior. The shared Mac test suite now exercises the

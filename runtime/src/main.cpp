@@ -2365,6 +2365,10 @@ static void update_adaptive_widescreen() {
  * teardown resets them and macOS otherwise supplies a legacy 2.1 context. */
 static void configure_core_gl_context_attributes() {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    /* The core renderer uses no deprecated GL features. Explicitly request
+     * forward compatibility so macOS-backed WGL implementations can honor
+     * the same core context contract as native Windows and Cocoa. */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
     int major = 3, minor = 3;
 #if defined(PSX_OPENXR)
     /* Opt-in headset context (docs/OPENXR_RENDERING.md). Ordinary GL launches
