@@ -1044,10 +1044,27 @@ int hd_texture_pack_has_texture(const HdTexturePack* pack, uint32_t texture_hash
 
 uint32_t hd_texture_crc32_words_le(const uint16_t* words, size_t word_count) {
     if (!words && word_count != 0) return 0;
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < word_count; ++i) {
-        crc = crc_byte(crc, static_cast<uint8_t>(words[i] & 0xFFu));
-        crc = crc_byte(crc, static_cast<uint8_t>(words[i] >> 8));
+    /* Four words at once break the serial byte dependency. Extract bytes
+     * from word values explicitly: pack identity is little-endian on every
+     * host, including big-endian machines. Local-static initialization is
+     * synchronized for capture and texture worker callers. */
+    static const std::array<std::array<uint32_t,256>,8> tables=[] {
+        std::array<std::array<uint32_t,256>,8> t{};t[0]=crc_table();
+        for(unsigned k=1;k<8;k++)for(unsigned n=0;n<256;n++)
+            t[k][n]=t[0][t[k-1][n]&255]^(t[k-1][n]>>8);
+        return t;
+    }();
+    uint32_t crc=0xFFFFFFFFu;size_t i=0;
+    for(;word_count-i>=4;i+=4) {
+        const uint32_t a=(uint32_t)words[i]|((uint32_t)words[i+1]<<16);
+        const uint32_t b=(uint32_t)words[i+2]|((uint32_t)words[i+3]<<16);
+        const uint32_t v=a^crc;
+        crc=tables[7][v&255]^tables[6][(v>>8)&255]^tables[5][(v>>16)&255]^tables[4][v>>24]
+           ^tables[3][b&255]^tables[2][(b>>8)&255]^tables[1][(b>>16)&255]^tables[0][b>>24];
+    }
+    for(;i<word_count;i++) {
+        crc=crc_byte(crc,static_cast<uint8_t>(words[i]));
+        crc=crc_byte(crc,static_cast<uint8_t>(words[i]>>8));
     }
     return crc ^ 0xFFFFFFFFu;
 }

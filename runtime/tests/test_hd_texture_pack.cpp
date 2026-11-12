@@ -236,6 +236,19 @@ void test_crc_exact_little_endian() {
           "CRC32 is IEEE/zlib over explicit little-endian word bytes");
     check(hd_texture_crc32_words_le(nullptr, 0) == 0,
           "empty CRC32 is the IEEE empty-buffer value");
+    std::vector<uint16_t> words(1024*512+4);uint32_t random=0x12345678;
+    for(auto &word:words){random=random*1664525u+1013904223u;word=(uint16_t)(random>>8);}
+    const size_t sizes[]={1,2,3,4,5,7,8,9,63,64,65,1024*512};
+    for(size_t offset=0;offset<4;offset++)for(size_t n:sizes) {
+        uint32_t reference=0xffffffffu;
+        for(size_t i=0;i<n;i++)for(unsigned byte=0;byte<2;byte++) {
+            reference^=(words[offset+i]>>(byte*8))&255u;
+            for(unsigned bit=0;bit<8;bit++)reference=(reference>>1)^((reference&1)?0xedb88320u:0);
+        }
+        check(hd_texture_crc32_words_le(words.data()+offset,n)==(reference^0xffffffffu),
+              "batched texture CRC equals independent bitwise reference across lengths and alignment");
+    }
+
 }
 
 void test_scan_mapping(Fixture& fixture) {
