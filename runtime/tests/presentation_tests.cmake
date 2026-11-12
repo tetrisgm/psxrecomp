@@ -71,6 +71,16 @@ if(BUILD_TESTING AND NOT TARGET psx-presentation-scene-test)
         target_compile_options(psx-rewind-history-test PRIVATE -UNDEBUG)
         target_link_libraries(psx-rewind-history-test PRIVATE SDL3::SDL3-static compression)
         add_test(NAME psx_rewind_history COMMAND psx-rewind-history-test)
+        # Exercise the Windows/zlib path on the Mac too; Apple Compression
+        # passing alone does not qualify portable history invalidation/decoding.
+        add_executable(psx-rewind-history-portable-test
+            "${_presentation_runtime}/tests/test_rewind_history.c"
+            "${_presentation_runtime}/src/rewind_history.c")
+        target_include_directories(psx-rewind-history-portable-test PRIVATE "${_presentation_runtime}/include")
+        target_compile_definitions(psx-rewind-history-portable-test PRIVATE PSX_SDL3=1 PSX_REWIND_TEST_PORTABLE_CODEC=1)
+        target_compile_options(psx-rewind-history-portable-test PRIVATE -UNDEBUG)
+        target_link_libraries(psx-rewind-history-portable-test PRIVATE SDL3::SDL3-static ZLIB::ZLIB)
+        add_test(NAME psx_rewind_history_portable COMMAND psx-rewind-history-portable-test)
         foreach(_source test_gl_presentation.c test_gl_opaque_batch.c test_gl_wide_margins.c)
             string(REGEX REPLACE "test_gl_(.*)\\.c" "\\1" _fixture "${_source}")
             add_test(NAME psx_gl_${_fixture}

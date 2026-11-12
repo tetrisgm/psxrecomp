@@ -8654,8 +8654,8 @@ static void rewind_playback_end(uint64_t key,uint32_t tick,int commit) {
                     ++rewind_verify_diff_words;
                 }
                 for(int d=-2;d<=2;d++) {
-                    const auto &near=rewind_verify_ram[(tick+d)%128];
-                    if(near.ram && near.tick==tick+d && !memcmp(near.ram,actual,bytes))rewind_verify_neighbor=d;
+                    const auto &neighbor=rewind_verify_ram[(tick+d)%128];
+                    if(neighbor.ram && neighbor.tick==tick+d && !memcmp(neighbor.ram,actual,bytes))rewind_verify_neighbor=d;
                 }
                 rewind_verify_tick=tick;++rewind_verify_runs;
             }

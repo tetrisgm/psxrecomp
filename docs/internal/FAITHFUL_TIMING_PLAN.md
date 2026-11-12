@@ -213,6 +213,15 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-11 Windows release portability: llvm-mingw's Release/LTO build exposed
+Windows' `near` macro colliding with a rewind-verification local; renamed the
+local without changing behavior. The shared Mac test suite now exercises the
+portable zlib history path as well as Apple Compression. Its exact decode,
+bounded eviction, branch/freeze and pending-job invalidation checks pass on the
+Mac. The Windows x64 Release/LTO executable links successfully. Packaged PE
+compatibility runs and the final 44-test Mac run are recorded by the title;
+CrossOver evidence must remain distinct from native Windows qualification.
+
 2026-11-11 command-rewind ownership: macOS samples identified worker waits in
 rollback VRAM backup and frontend restaging. Command restoration now retains the
 main-thread GL context across hidden VBlanks, returning it at the first normal

@@ -3,7 +3,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(PSX_REWIND_TEST_PORTABLE_CODEC)
 #include <compression.h>
 #else
 #include <zlib.h>
@@ -49,7 +49,7 @@ static int worker(void *context) {
     RewindHistory *h=context;
     size_t bound=h->raw_capacity+h->raw_capacity/128+4096;
     unsigned char *encoded_buffer=malloc(bound);
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(PSX_REWIND_TEST_PORTABLE_CODEC)
     void *scratch=malloc(compression_encode_scratch_buffer_size(COMPRESSION_LZ4));
 #endif
     for(;;) {
@@ -62,7 +62,7 @@ static int worker(void *context) {
         RhBlob *b=NULL;
         size_t encoded=0;
         if(encoded_buffer) {
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(PSX_REWIND_TEST_PORTABLE_CODEC)
             encoded=compression_encode_buffer(encoded_buffer,bound,j->raw,j->bytes,scratch,COMPRESSION_LZ4);
 #else
             uLongf n=(uLongf)bound;
@@ -84,7 +84,7 @@ static int worker(void *context) {
         j->state=RH_FREE;SDL_CondBroadcast(h->changed);
         SDL_UnlockMutex(h->mutex);
     }
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(PSX_REWIND_TEST_PORTABLE_CODEC)
     free(scratch);
 #endif
     free(encoded_buffer);
@@ -161,7 +161,7 @@ int rewind_history_decode_before(RewindHistory *h,uint64_t key,void *out,size_t 
     if(!b)return 0;
     int ok=0;
     if(cap>=b->raw_bytes) {
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(PSX_REWIND_TEST_PORTABLE_CODEC)
         ok=compression_decode_buffer(out,cap,b->data,b->encoded_bytes,NULL,COMPRESSION_LZ4)==b->raw_bytes;
 #else
         uLongf n=(uLongf)cap;ok=uncompress(out,&n,b->data,(uLong)b->encoded_bytes)==Z_OK && n==b->raw_bytes;
