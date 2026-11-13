@@ -12,8 +12,9 @@ static struct {
     uint64_t resume_tick, presented_tick, complete_ticks[2048], complete_latest, held_incomplete;
     uint64_t complete_cycles[2048], forced_complete;
     uint32_t complete_phases[2048];
-    uint64_t draw_keys[2048], command_tick;
-    int state_enabled,resume_complete;
+    uint64_t draw_keys[2048], command_tick,resume_cycle;
+    uint32_t resume_phase;
+    int state_enabled,resume_complete,pending_publish;
     RewindHistory *history;
     GLuint pbo[3], texture, fbo;
     void *fence[3];
@@ -112,8 +113,9 @@ void gl_renderer_rewind_video_enable(int enabled) {
 }
 void gl_renderer_rewind_video_freeze(int frozen) {
     GL_RT_SYNC("rewind_video_freeze");RV.frozen=!!frozen;
+    if(frozen)rewind_draw_cache_clear();
     rewind_history_freeze(RV.history,frozen);
-    RV.resume_tick=0;RV.presented_tick=0;RV.resume_complete=0;
+    RV.resume_tick=0;RV.presented_tick=0;RV.resume_complete=0;RV.resume_cycle=0;RV.resume_phase=0;
     if(frozen)for(int i=0;i<3;i++)if(RV.fence[i]){p_glDeleteSync(RV.fence[i]);RV.fence[i]=NULL;}
 }
 void gl_renderer_rewind_video_clear(void) {
@@ -162,10 +164,17 @@ static int rewind_video_hold(void) {
     uint64_t tick=RV.command_tick?RV.command_tick:
         (rth_replaying()?s_rth_present_rewind_tick:psx_rewind_frame());
     if(!RV.resume_tick || tick<RV.resume_tick)return 1;
+    if(RV.pending_publish && s_rewind_complete_source) {
+        RV.presented_tick=tick;return 0; /* history remains frozen */
+    }
     if(RV.resume_complete) {
-        if(!s_rewind_complete_source){++RV.held_incomplete;return 1;}
+        if(!s_rewind_complete_source || s_rewind_complete_cycle<RV.resume_cycle ||
+           (s_rewind_complete_cycle==RV.resume_cycle && s_rewind_complete_phase<RV.resume_phase)) {
+            ++RV.held_incomplete;return 1;
+        }
         RV.presented_tick=tick;RV.resume_tick=0;RV.resume_complete=0;RV.frozen=0;
-        atomic_store(&rewind_resume_image_us,(rt_now_ns()-rewind_resume_image_start_ns)/1000u);
+        if(atomic_load(&rewind_resume_image_us)==UINT64_MAX)
+            atomic_store(&rewind_resume_image_us,(rt_now_ns()-rewind_resume_image_start_ns)/1000u);
         rewind_history_freeze(RV.history,0);return 0;
     }
     if(RV.state_enabled) {
@@ -229,7 +238,9 @@ int gl_renderer_rewind_state_presented(uint32_t tick) {
 }
 
 void gl_renderer_rewind_state_branch(uint32_t tick) {
-    GL_RT_SYNC("rewind_state_branch");RV.complete_latest=0;
+    GL_RT_SYNC("rewind_state_branch");
+    rewind_draw_restore_pending(tick);
+    RV.complete_latest=0;
     for(unsigned i=0;i<2048;i++) {
         if(RV.complete_ticks[i]>tick)RV.complete_ticks[i]=0;
         if(RV.complete_ticks[i]>RV.complete_latest)RV.complete_latest=RV.complete_ticks[i];

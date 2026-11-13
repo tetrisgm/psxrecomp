@@ -9446,7 +9446,29 @@ static bool local_mouse_live(int override_word) {
     return pad_ext_live(&g) != 0;
 }
 
+/* Opt-in stage attribution; uses the existing bounded TCP-readable ring. */
+/* Trace stages: 1 events, 2 host input, 3 input completion, 4 audio,
+ * 5 pacing/presentation policy, 6 display, 7 render boundary, 8 state commit. */
+struct RewindFrameTrace {
+    bool active;
+    uint64_t start;
+    static bool enabled() {
+        static const bool on = std::getenv("PSX_REWIND_TRACE") != nullptr;
+        return on;
+    }
+    RewindFrameTrace() : active(enabled() && (psx_rewind_direct() ||
+        gl_renderer_rewind_resume_image_us()==UINT64_MAX)), start(active?host_clock_us():0) {}
+    void next(uint32_t stage) {
+        if (!active) return;
+        const uint64_t now=host_clock_us();
+        host_span_record(HSPAN_REWIND_STAGE,start,now-start,stage);
+        start=now;
+    }
+    ~RewindFrameTrace() { next(6); }
+};
+
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
+    RewindFrameTrace rewind_trace;
     NetplayVblankEpilogue ep{};
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
      * by any resume_at (savestate / selfcheck / RB) during that quantum — the
@@ -9646,6 +9668,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     }
 #endif
 
+    rewind_trace.next(1);
     /* Direct-shortcut claims are settled before any shortcut poll or pad
      * sample this frame (no-op unless a title allowed a direct shortcut). */
     direct_shortcut_claim_update();
@@ -9684,6 +9707,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     if (g_headless && psx_host_pause_depth() > 0)
         host_pause_loop();
 
+    rewind_trace.next(2);
     /* Sample each player's device and feed the matching SIO pad slot.
      * Debug server input override (when active) drives port 1 only. With
      * g_low_latency_input this early sample is re-done after the pacer wait
@@ -9742,6 +9766,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     /* Headless has no pads; PSX_RUMBLE_TRACE still logs what would be sent. */
     if (!g_headless || std::getenv("PSX_RUMBLE_TRACE")) update_controller_rumble();
 
+    rewind_trace.next(3);
     /* Latency ring: open this present cycle's slot, stamping when input was
      * sampled into SIO.  Always-on; queried via the debug server "latency". */
     latency_ring_frame_begin();
@@ -9876,6 +9901,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     }
 #endif
 
+    rewind_trace.next(4);
     /* Render passes (render_pass.c) stay off while presentation is sped up. */
     s_presentation_fast_forward =
         (turbo_loads_active || fmv_skip_active) ? 1 : 0;
@@ -10152,13 +10178,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
             s_netplay_present_sim_watermark = sim;
     }
 
-    /* Command rewind already displays its exact historical image. Hidden
-     * state reconstruction must not re-stage, post-process or swap canonical
-     * VRAM at every replay boundary. The outer VBlank still flushes renderer
-     * work and commits the selected state; the complete-forward-image gate
-     * then resumes ordinary presentation. State-only rewind needs its draws. */
-    if(psx_rewind_direct() && psx_rewind_state_playback()==2)return ep;
-
+    rewind_trace.next(5);
     /* ---- Display from our VRAM ---- */
     probe_reached = 1;
     uint32_t w = 0, h = 0, present_h = 0;
@@ -11504,8 +11524,13 @@ extern "C" int psx_dynres_status_json(char *out, int cap) {
 static void sdl_vblank_present(void) {
     sync_guest_cadence_to_video_standard();
     NetplayVblankEpilogue ep = sdl_vblank_present_body();
-    render_thread_vblank();
-    if(psx_rewind_after_present())rewind_host_pause_loop();
+    {
+        RewindFrameTrace trace;
+        render_thread_vblank();
+        trace.next(7);
+        if(psx_rewind_after_present())rewind_host_pause_loop();
+        trace.next(8);
+    }
     /* Selfcheck span-end rewind: after present-body C++ RAII, before any
      * further guest progress. Longjmps on success — keeps every resim load
      * on the same VBlank boundary (BB fast-poll tails forked #2 vs #3). */

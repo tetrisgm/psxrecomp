@@ -527,9 +527,7 @@ static uint32_t transaction_status(int kind) {
     if ((kind == 2 ? !psx_netplay_active() : kind == 3 ? psx_netplay_active() :
          (psx_netplay_active() && !s_netplay_allowed)) || psx_netplay_is_resimulating() ||
         psx_selfcheck_resim_active() || psx_rewind_is_open() ||
-        /* Exact command playback already owns the displayed image. During
-         * release, replay canonical state without discarded private redraws.
-         * State-only playback still needs those draws to reconstruct images. */
+        /* Command history restores pending private producers at commit. */
         (psx_rewind_state_playback()==2 && psx_rewind_seeking()) ||
         g_ls_mode || g_ls_replay_active)
         return PSX_MOD_RENDER_PASS_SESSION;

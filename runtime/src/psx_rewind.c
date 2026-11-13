@@ -664,10 +664,12 @@ void psx_rewind_configure(uint32_t bios_checksum, uint32_t entry_pc)
 #else
         s_depth=RW_MAX_DEPTH;raw_depth=s_depth;
 #endif
-        /* Command history supplies every backward image. Its state snapshots
-         * are only restart anchors, so retain frequent bounded anchors without
-         * serializing the entire machine for every displayed frame. */
-        s_interval=s_playback.state_only==2?(s_interval<4?s_interval:4):1;
+        /* Capture each available safe boundary. These remain asynchronous,
+         * bounded RAM anchors; unsafe IRQ/callback stacks are still refused.
+         * Skipping a safe boundary makes release replay an extra game frame
+         * before it can restore the already-issued presentation pipeline.
+         * Size the history above from the user's original horizon first. */
+        s_interval=1;
     }
     s_ring = rbe_snap_ring_create(raw_depth);
     s_thumbs = (RwThumb *)calloc(s_depth, sizeof(RwThumb));

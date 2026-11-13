@@ -48,6 +48,16 @@ static void command_rewind(int scale) {
     gl_renderer_set_interpolation_source(1);
     s_interp_valid=2;s_interp_w=320*scale;s_interp_h=240*scale;s_interp_source_path=GL_PRES_VRAM;
     gl_renderer_set_hd_texture_mode(1);
+    /* Restoring clears wall-clock deadlines while the frontend temporarily
+     * owns GL. Full-rate phases must retain the guest-frame cadence. */
+    frame_interpolation_schedule_reset(&s_interp_schedule);
+    atomic_store(&s_pass_q_intervals,1);
+    uint32_t phases[4],wanted=0;
+    check(gl_renderer_pass_plan_full_rate(2,1,phases,4,&wanted)==1 &&
+          wanted==1 && phases[0]==32768,
+          "full-rate main-thread plan survives cleared wall-clock schedule");
+    check(gl_renderer_pass_plan_full_rate(2,1,phases,4,&wanted)==0,
+          "full-rate plan still requires a new guest interval");
     gl_renderer_rewind_state_enable(2);
     glb_set_draw_area(0,0,319,239);glb_set_draw_offset(0,0);
     uint16_t texture[64*64];for(unsigned n=0;n<64*64;n++)texture[n]=(n&1)?0x7fff:0x7c00;
@@ -75,7 +85,7 @@ static void command_rewind(int scale) {
     draw_command(RTH_TEX_RECT,textured,sizeof textured);
     command_pgxp_triangle();
     draw_command(RTH_PASS_END,phase_end,sizeof phase_end);
-    PassGen *g=&s_pgen[s_pgen_write];uint64_t key=g->draw_key[g->n-1];
+    PassGen *g=&s_pgen[s_pgen_write];uint64_t key=g->draw_key[g->n-1],earlier_key=g->draw_key[1];
     check(key!=0,"complete ordered commands become rewind history");
     if(key) {
         uint64_t expected=color_texture_hash(s_pgen_tex[s_pgen_write][g->n-1],g->tex_w,g->tex_h);
@@ -94,6 +104,8 @@ static void command_rewind(int scale) {
         if(ok)check(color_texture_hash(RD.texture,RD.texture_w,RD.texture_h)==expected,
                     "command redraw equals original pixels at requested scale");
         check(RD.pixel_checks==1 && RD.pixel_mismatches==0,"historical full-image diagnostic compares exact replay pixels");
+        check(gl_renderer_rewind_draw_present(100,90,&shown,&tick) && RD.cache_hits==1 && RD.pixel_checks==1,
+              "repeated producer reuses its full-resolution working image");
         check(native_texture_hash()==raw,"command rewind preserves the live GPU native texture mirror");
         int x1,y1,x2,y2;sw_get_draw_area(&x1,&y1,&x2,&y2);
         check(x1==5 && y1==6 && x2==300 && y2==220,"command rewind restores live software draw state");
@@ -103,11 +115,48 @@ static void command_rewind(int scale) {
         check(surface_hash(g_wide_cur,g_wide_w*scale,VRAM_H*scale)==wide,
               "command rewind preserves wide color depth and stencil");
         check(glGetError()==GL_NO_ERROR,"command replay has valid GL state");
+        RV.complete_ticks[98]=98;RV.complete_cycles[98]=12345;
+        RV.complete_phases[98]=32768;RV.draw_keys[98]=earlier_key;
+        check(gl_renderer_rewind_draw_present(98,90,&shown,&tick),"cache accepts the preceding producer");
+        uint64_t checks=RD.pixel_checks,hits=RD.cache_hits;
+        check(gl_renderer_rewind_draw_present(100,90,&shown,&tick) &&
+              RD.pixel_checks==checks && RD.cache_hits==hits+1 &&
+              color_texture_hash(RD.texture,RD.texture_w,RD.texture_h)==expected,
+              "two-image cache restores the exact newer producer without drawing again");
         check(gl_renderer_rewind_draw_presented(100),"release recognizes the exact already-presented command image");
+        test_rewind_mode=2;
+        RV.complete_ticks[102]=102;RV.draw_keys[102]=key;
+        psx_cycle_count=12345;
+        unsigned restored=RD.pending_restored;
+        rewind_draw_restore_pending(100);
+        check(RD.pending_restored==restored,
+              "pending restoration rejects a later-issued phase of an older generation");
+        psx_cycle_count=12346;
+        rewind_draw_restore_pending(100);
+        PassGen *pending=&s_pgen[RD.pending_generation];
+        check(RD.pending_restored==restored+1 && pending->valid && !pending->promoted &&
+              pending->n==2 && pending->complete[1] && pending->draw_key[1]==key,
+              "pending restoration retains eligible producer and phase");
+        unsigned live_generations=0;
+        for(int gi=0;gi<PASS_GENERATIONS;++gi)live_generations+=s_pgen[gi].valid!=0;
+        check(live_generations==1,"preview generations cannot compete with the restored producer");
+        check(color_texture_hash(s_pgen_tex[RD.pending_generation][1],pending->tex_w,pending->tex_h)==expected,
+              "restored pending producer has exact full-resolution pixels");
+        check(native_texture_hash()==raw && pass_cpu_vram_hash()==cpu,
+              "pending restoration preserves live machine texture state");
+        RV.complete_ticks[102]=0;restored=RD.pending_restored;
+        rewind_draw_restore_pending(100);
+        check(RD.pending_restored==restored,"pending restoration rejects discarded branch references");
+        RV.complete_ticks[102]=102;rewind_draw_restore_pending(100);
+        test_rewind_mode=0;
         gl_renderer_rewind_draw_resume(100);s_frame_count=101;s_rewind_complete_source=0;
         check(rewind_video_hold() && RV.frozen,"release holds the command image through native restage");
+        check(RV.complete_latest==100 && RV.complete_ticks[100]==100,
+              "early pending publication cannot relabel the selected machine boundary");
         check(!rewind_state_reconstructing(),"release allows normal forward presentation deadlines");
-        s_rewind_complete_source=1;s_rewind_complete_cycle=99999;
+        s_frame_count=102;s_rewind_complete_source=1;s_rewind_complete_cycle=12344;
+        check(rewind_video_hold(),"resume rejects an older complete producer after early publication");
+        s_rewind_complete_cycle=99999;
         check(!rewind_video_hold() && !RV.frozen && !RV.resume_complete,
               "first complete forward image opens the release gate without an old wall deadline");
         s_rewind_complete_source=0;
@@ -199,7 +248,14 @@ int main(void) {
             static uint16_t snap_a[1024*512], snap_b[1024*512];
             atomic_store(&snapshot_done,0);
             gl_renderer_set_hd_texture_mode(1);
+            s_pt_want=1;
             check(gl_renderer_render_thread_start(2),"snapshot fixture starts render worker");
+            check(s_pt_on,"snapshot fixture starts shared presentation context");
+#ifdef __APPLE__
+            check(s_worker_window && s_worker_window!=s_win &&
+                  (SDL_GetWindowFlags(s_worker_window)&SDL_WINDOW_HIDDEN),
+                  "Cocoa composing context has a private hidden drawable");
+#endif
             rtb_fill_rect(64,64,16,1,0x001f);
             rtb_snapshot_submit(snap_a,snapshot_completed,&snapshot_done);
             rtb_fill_rect(64,64,16,1,0x03e0);
@@ -220,6 +276,9 @@ int main(void) {
             gl_renderer_render_thread_frame_boundary();
             check(!rt_held(),"normal forward rendering returns context to the worker");
             gl_renderer_render_thread_stop();
+            check(!s_worker_window && SDL_GL_GetCurrentWindow()==win,
+                  "stopping presentation returns composition to the visible window");
+            s_pt_want=0;
             gl_renderer_set_hd_texture_mode(0);
         }
         {

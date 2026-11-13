@@ -213,6 +213,22 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-12 rewind release pipeline: retain two full-resolution working images,
+restore pending complete producers only from this branch's commands issued by
+the selected machine cycle, and keep presentation/history frozen until normal
+forward rendering reaches that producer's phase. Main-thread full-rate planning
+now uses the same guest cadence as the queued renderer. Asynchronous bounded
+state capture requests every safe boundary; IRQ/callback snapshot gates remain.
+The native GL fixture checks exact pixels at 1x/4x/9x, native texture isolation,
+future-command refusal, branch references, cache reuse and publication ordering.
+Title qualification and delivery evidence are recorded by R4's release receipt.
+No BIOS, CPU execution architecture, PGXP, controller or menu behavior change.
+On macOS, the composing context now owns a separate hidden drawable; only the
+presentation context attaches to the visible view. This removes shared-view
+drawable updates implicated in the Cocoa GL crash. The real-GL fixture covers
+worker startup, separate drawable ownership and teardown.
+
+
 2026-11-12 hidden GL fixture: a sampled locked-screen stall was in Cocoa's
 SwapWindow/display-link condition wait, not rewind or render-worker ownership.
 The pixel/state fixture now explicitly disables VSync, as isolated runtime

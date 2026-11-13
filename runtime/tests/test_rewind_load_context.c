@@ -230,7 +230,8 @@ static void test_command_playback(void) {
     PsxRewindPlayback callbacks={NULL,playback_begin,playback_step,playback_inputs,playback_apply,playback_end,2,NULL,NULL,2};
     psx_rewind_set_playback(&callbacks);s_depth=50;s_interval=15;
     psx_rewind_configure(123,0x801b0000u);
-    assert(s_interval==4);
+    /* Denser safe anchors retain the original bounded history horizon. */
+    assert(s_interval==1 && s_depth==750);
     capture(10,101);capture(12,124);capture(20,202);
     assert(!s_thumbs[0].px && !s_thumbs[1].px);
     assert(psx_rewind_toggle());psx_rewind_playback_tick(100);psx_rewind_playback_tick(200);

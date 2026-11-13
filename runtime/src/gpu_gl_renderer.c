@@ -443,6 +443,8 @@ static int load_modern_gl(void) {
 
 /* ---- state ------------------------------------------------------------- */
 static SDL_Window   *s_win = NULL;
+static SDL_Window   *s_worker_window = NULL;
+static SDL_Window *render_context_window(void) { return s_worker_window?s_worker_window:s_win; }
 static SDL_GLContext s_ctx = NULL;
 static uint16_t     *s_vram = NULL;       /* CPU VRAM array (gpu.c's storage) */
 /* GL_VENDOR names NVIDIA (captured at context creation). */
@@ -491,6 +493,8 @@ static void rewind_draw_record(const RtCmd *cmd,const void *payload);
 static uint64_t rewind_draw_seal(uint32_t phase,GLuint texture,int w,int h);
 static void rewind_draw_enable(int enabled);
 static void rewind_draw_shutdown(void);
+static void rewind_draw_restore_pending(uint32_t tick);
+static void rewind_draw_cache_clear(void);
 static void rewind_draw_interrupt(void);
 static void rewind_draw_stats(char *out,int capacity);
 
@@ -8998,8 +9002,14 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
 
 uint32_t gl_renderer_pass_plan_full_rate(uint32_t period,uint32_t shown,
     uint32_t *alpha,uint32_t max,uint32_t *wanted) {
-    if(pass_queued())return pass_plan_queued(period,shown,alpha,max,wanted,0);
-    return gl_renderer_pass_plan(period,shown,alpha,max,wanted);
+    if(!pass_queued()) {
+        GL_RT_SYNC("pass_plan_full_rate");
+        /* A full-rate producer is guest-VBlank scheduled on both context
+         * owners. Wall-clock adaptive admission loses its pipeline after a
+         * restore, when the frontend temporarily owns the GL context. */
+        s_intervals_since_plan=0;
+    }
+    return pass_plan_queued(period,shown,alpha,max,wanted,0);
 }
 
 void gl_renderer_pass_plan_diag(GLRenderPassPlanDiag *out) {
@@ -10814,11 +10824,26 @@ static int pt_begin(void) {
     if (!s_pt_ctx) {
         fprintf(stdout, "psxrecomp: present thread: shared context failed (%s); swaps stay on "
                 "the render thread\n", SDL_GetError());
-        SDL_GL_MakeCurrent(s_win, s_ctx);
+        SDL_GL_MakeCurrent(render_context_window(), s_ctx);
         return 0;
     }
     SDL_GL_MakeCurrent(s_win, NULL);   /* creation made it current here */
-    SDL_GL_MakeCurrent(s_win, s_ctx);
+#ifdef __APPLE__
+    /* Two NSOpenGLContexts attached to one NSView both receive drawable
+     * updates. Cocoa can retire that drawable while the other context swaps.
+     * Composition already targets shared FBOs, so give its context a private
+     * hidden drawable and leave only the swap context on the visible view. */
+    s_worker_window=SDL_CreateWindow("Renderer",0,0,1,1,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
+    if(!s_worker_window || SDL_GL_MakeCurrent(s_worker_window,s_ctx)!=0) {
+        if(s_worker_window)SDL_DestroyWindow(s_worker_window);
+        s_worker_window=NULL;
+        SDL_GL_DeleteContext(s_pt_ctx);s_pt_ctx=NULL;
+        SDL_GL_MakeCurrent(s_win,s_ctx);
+        return 0;
+    }
+#else
+    SDL_GL_MakeCurrent(s_win,s_ctx);
+#endif
     memset(s_pts_fbo, 0, sizeof s_pts_fbo);
     memset(s_ptp_fbo, 0, sizeof s_ptp_fbo);
     PtConfig c = { s_pt_slots, pt_cb_ctx, pt_cb_present, pt_cb_dispose, NULL };
@@ -10826,7 +10851,9 @@ static int pt_begin(void) {
         fprintf(stdout, "psxrecomp: present thread: start failed; swaps stay on the render thread\n");
         SDL_GL_DeleteContext(s_pt_ctx);
         s_pt_ctx = NULL;
-        SDL_GL_MakeCurrent(s_win, s_ctx);
+        SDL_GL_MakeCurrent(s_win,s_ctx);
+        if(s_worker_window)SDL_DestroyWindow(s_worker_window);
+        s_worker_window=NULL;
         return 0;
     }
     s_pt_on = 1;
@@ -10851,7 +10878,9 @@ static void pt_end(void) {
     }
     SDL_GL_DeleteContext(s_pt_ctx);
     s_pt_ctx = NULL;
-    SDL_GL_MakeCurrent(s_win, s_ctx);
+    SDL_GL_MakeCurrent(s_win,s_ctx);
+    if(s_worker_window)SDL_DestroyWindow(s_worker_window);
+    s_worker_window=NULL;
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
 }
 
@@ -15670,7 +15699,7 @@ static void gl_rth_exec(void *user, const RtCmd *c, const void *payload) {
 static void gl_rth_ctx(void *user, int current) {
     (void)user;
     if (current) {
-        SDL_GL_MakeCurrent(s_win, s_ctx);
+        SDL_GL_MakeCurrent(render_context_window(), s_ctx);
     } else {
         rewind_draw_interrupt();
         if (rt_on_render_thread() && s_fg_on) {

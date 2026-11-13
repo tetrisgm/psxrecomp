@@ -1285,7 +1285,7 @@ static void test_queued_budget(void) {
           "returning to adaptive planning does not inherit an old rest");
     s_rewind_mode=2;s_rewind_seek=1;
     CHECK(psx_mod_render_pass_plan_full_rate(2,1,a,4)==0,
-          "command resume suppresses hidden private redraws");
+          "command resume restores producers from ordered command history");
     s_rewind_mode=1;
     CHECK(psx_mod_render_pass_plan_full_rate(2,1,a,4)==1,
           "state playback retains required image reconstruction");

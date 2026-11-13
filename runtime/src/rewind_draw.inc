@@ -18,9 +18,15 @@ static struct {
     size_t used;
     uint64_t sequence,rendered,rejected,pixel_checks,pixel_mismatches,last_tick;
     int active,ended,last_rejected_op;
-    GLuint texture,raw_texture,raw_fbo;
+    GLuint texture,spare_texture,raw_texture,raw_fbo;
+    uint64_t texture_key,spare_key,cache_hits;
+    PassGen texture_generation,spare_generation;
+    int spare_w,spare_h;
     uint16_t *native;
     int texture_w,texture_h;
+    unsigned pending_restored;
+    int pending_generation;
+    uint32_t pending_tick;
 } RD;
 static int rewind_draw_op(uint16_t op) {
     switch(op) {
@@ -43,6 +49,7 @@ static void rewind_draw_shutdown(void) {
     if(RD.raw_fbo)p_glDeleteFramebuffers(1,&RD.raw_fbo);
     if(RD.raw_texture)glDeleteTextures(1,&RD.raw_texture);
     if(RD.texture)glDeleteTextures(1,&RD.texture);
+    if(RD.spare_texture)glDeleteTextures(1,&RD.spare_texture);
     memset(&RD,0,sizeof RD);
 }
 static void rewind_draw_enable(int enabled) {
@@ -169,17 +176,29 @@ static void rewind_draw_software_state(const FgState *state) {
     sw_set_draw_offset(state->off[0],state->off[1]);
     sw_set_precise_triangle(0,0,0,0,0,0,0);sw_set_perspective_triangle(0,0,0,0);
 }
-int gl_renderer_rewind_draw_present(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick) {
-    GL_RT_SYNC("rewind_draw_present");
-    uint64_t selected,clock;
-    if(!gl_renderer_rewind_draw_select(key,oldest,&selected,&clock))return 0;
-    uint64_t draw_key=RV.draw_keys[selected%2048];
+static void rewind_draw_cache_clear(void) { RD.texture_key=RD.spare_key=0; }
+static void rewind_draw_cache_swap(void) {
+    GLuint texture=RD.texture;RD.texture=RD.spare_texture;RD.spare_texture=texture;
+    uint64_t key=RD.texture_key;RD.texture_key=RD.spare_key;RD.spare_key=key;
+    int w=RD.texture_w,h=RD.texture_h;RD.texture_w=RD.spare_w;RD.texture_h=RD.spare_h;
+    RD.spare_w=w;RD.spare_h=h;
+    PassGen g=RD.texture_generation;RD.texture_generation=RD.spare_generation;RD.spare_generation=g;
+}
+static int rewind_draw_render(uint64_t draw_key,int decoded) {
     size_t bytes=0;RewindHistoryMeta meta;
-    if(!rewind_history_decode_before(RD.history,draw_key,RD.decoded,RD_CAPACITY,&bytes,&meta) ||
-       meta.key!=draw_key || !rewind_draw_valid((RewindDrawHeader*)RD.decoded,bytes))return 0;
+    if(!decoded && (!rewind_history_decode_before(RD.history,draw_key,RD.decoded,RD_CAPACITY,&bytes,&meta) ||
+       meta.key!=draw_key || !rewind_draw_valid((RewindDrawHeader*)RD.decoded,bytes)))return 0;
     const RewindDrawHeader *h=(const RewindDrawHeader*)RD.decoded;
     if(h->wide_w!=g_wide_w || h->wide_off!=g_wide_off || h->source_path!=s_interp_source_path ||
        !s_hd_native_authority || s_pass_active)return 0;
+    /* Two working images, not pixel history. Backward playback commonly
+     * visits the same producer twice; its next forward producer was just
+     * displayed and can be restored without drawing it a third time. */
+    if(RD.spare_key==draw_key && RD.spare_w==s_interp_w && RD.spare_h==s_interp_h)
+        rewind_draw_cache_swap();
+    if(RD.texture_key==draw_key && RD.texture_w==s_interp_w && RD.texture_h==s_interp_h) {
+        ++RD.cache_hits;return 1;
+    }
     FgState saved;fg_state_capture(&saved);
     const int saved_dither=s_dither_bit;
     uint8_t *saved_hd=NULL;size_t saved_hd_bytes=0;
@@ -229,6 +248,8 @@ int gl_renderer_rewind_draw_present(uint64_t key,uint32_t oldest,uint64_t *shown
     flush_flat_batch();flush_tex_batch();flush_cpu_upload();hiw_flush_queue();
     PassGen produced=s_pgen[s_pgen_write];
     if(ok) {
+        rewind_draw_cache_swap();RD.texture_key=0;
+        RD.texture_generation=produced;
         if(!RD.texture)glGenTextures(1,&RD.texture);
         if(RD.texture_w!=produced.tex_w || RD.texture_h!=produced.tex_h) {
             glBindTexture(GL_TEXTURE_2D,RD.texture);
@@ -251,6 +272,16 @@ int gl_renderer_rewind_draw_present(uint64_t key,uint32_t oldest,uint64_t *shown
     if(saved_hd_bytes && !gpu_hd_textures_residency_load(saved_hd,saved_hd_bytes))ok=0;
     free(saved_hd);
     if(!ok){++RD.rejected;return 0;}
+    RD.texture_key=draw_key;
+    return 1;
+}
+int gl_renderer_rewind_draw_present(uint64_t key,uint32_t oldest,uint64_t *shown,uint64_t *tick) {
+    GL_RT_SYNC("rewind_draw_present");
+    uint64_t selected,clock;
+    if(!gl_renderer_rewind_draw_select(key,oldest,&selected,&clock))return 0;
+    uint64_t draw_key=RV.draw_keys[selected%2048];
+    if(!rewind_draw_render(draw_key,0))return 0;
+    const RewindDrawHeader *h=(const RewindDrawHeader*)RD.decoded;
     RV.command_tick=clock;RV.resume_tick=clock;
     s_rewind_complete_source=1;s_rewind_complete_cycle=h->cycle;
     s_rewind_complete_phase=h->phase;s_rewind_complete_draw_key=draw_key;
@@ -268,15 +299,69 @@ void gl_renderer_rewind_draw_resume(uint32_t tick) {
     GL_RT_SYNC("rewind_draw_resume");
     /* Keep the exact command preview on screen while normal forward drawing
      * rebuilds its pipeline. Native-resolution restage cannot open this gate. */
-    RV.frozen=1;RV.resume_tick=tick;RV.resume_complete=1;
+    RV.frozen=1;RV.resume_tick=tick;RV.resume_complete=1;RV.resume_cycle=0;RV.resume_phase=0;
     rewind_resume_image_start_ns=rt_now_ns();
     atomic_store(&rewind_resume_image_us,UINT64_MAX);
+    if(RD.pending_tick) {
+        PassGen *g=&s_pgen[RD.pending_generation];
+        /* This image was already issued at the restored machine boundary.
+         * Publish it now, then hold it until normal presentation reaches its
+         * phase. Never expose the native-resolution restage or move backward
+         * to the preceding phase-zero image while the queue catches up. */
+        RV.command_tick=RD.pending_tick;RV.pending_publish=1;
+        s_rewind_complete_source=1;s_rewind_complete_cycle=g->created_cycle;
+        s_rewind_complete_phase=g->phase[1];s_rewind_complete_draw_key=g->draw_key[1];
+        p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER,0);
+        int published=interp_present_pair(s_pgen_tex[RD.pending_generation][1],
+                            s_pgen_tex[RD.pending_generation][1],0,s_interp_blend_mode);
+        s_rewind_complete_source=0;RV.command_tick=0;RV.pending_publish=0;
+        /* Publication is included in release_us; no additional image wait. */
+        if(published)atomic_store(&rewind_resume_image_us,0);
+        RV.frozen=1;RV.resume_complete=1;RV.resume_tick=RD.pending_tick;
+        RV.resume_cycle=g->created_cycle;RV.resume_phase=g->phase[1];
+        RD.pending_tick=0;
+    }
 }
 uint64_t gl_renderer_rewind_resume_image_us(void) {
     /* Observing a release must not drain the renderer queue and alter pacing. */
     return atomic_load(&rewind_resume_image_us);
 }
+/* The machine checkpoint omits GPU producer work already issued before
+ * its boundary. Recover only commands from this branch with an eligible
+ * issue cycle; future input may never enter the restored timeline. */
+static void rewind_draw_restore_pending(uint32_t tick) {
+    RD.pending_tick=0;
+    if(!RD.history || psx_rewind_state_playback()!=2)return;
+    for(unsigned i=1;i<=8;++i) {
+        unsigned slot=(tick+i)%2048;
+        if(RV.complete_ticks[slot]!=tick+i || !RV.draw_keys[slot])continue;
+        uint64_t key=RV.draw_keys[slot];size_t bytes=0;RewindHistoryMeta meta;
+        if(!rewind_history_decode_before(RD.history,key,RD.decoded,RD_CAPACITY,&bytes,&meta) ||
+           meta.key!=key || !rewind_draw_valid((RewindDrawHeader*)RD.decoded,bytes))continue;
+        const RewindDrawHeader *h=(const RewindDrawHeader*)RD.decoded;
+        uint64_t issued=(uint32_t)h->begin[7]|((uint64_t)(uint32_t)h->begin[8]<<32);
+        if(issued>psx_cycle_count || !h->phase)continue;
+        uint32_t phase=h->phase;
+        if(!rewind_draw_render(key,1))continue;
+        /* Preview transactions are not live forward generations. */
+        pass_gens_invalidate();
+        uint64_t order[PASS_GENERATIONS];uint32_t valid=0;
+        for(int j=0;j<PASS_GENERATIONS;++j) {order[j]=s_pgen[j].order;if(s_pgen[j].valid)valid|=1u<<j;}
+        int gi=render_pass_generation_write(s_pgen_cur,valid,order,PASS_GENERATIONS);
+        if(!pass_gen_reserve(gi,2,RD.texture_w,RD.texture_h))continue;
+        GLuint spare=s_pgen_tex[gi][1];s_pgen_tex[gi][1]=RD.texture;RD.texture=spare;
+        PassGen *g=&s_pgen[gi];*g=RD.texture_generation;
+        g->valid=1;g->promoted=0;g->order=++s_pgen_order;
+        RD.texture_key=0;
+        g->n=2;g->complete[0]=0;g->complete[1]=1;
+        g->phase[0]=0;g->phase[1]=phase;g->draw_key[0]=0;g->draw_key[1]=key;
+        RD.pending_generation=gi;RD.pending_tick=tick+i;
+        ++RD.pending_restored;return;
+    }
+}
 static void rewind_draw_stats(char *out,int capacity) {
     RewindHistoryStats s;rewind_history_stats(RD.history,&s);
     snprintf(out,(size_t)capacity,",\"draw_last_tick\":%llu,\"resume_complete_pending\":%d,\"draw_pixel_checks\":%llu,\"draw_pixel_mismatches\":%llu,\"draw_rejected_op\":%d,\"draw_entries\":%u,\"draw_bytes\":%llu,\"draw_rendered\":%llu,\"draw_rejected\":%llu,\"draw_dropped\":%llu",(unsigned long long)RD.last_tick,RV.resume_complete,(unsigned long long)RD.pixel_checks,(unsigned long long)RD.pixel_mismatches,RD.last_rejected_op,s.entries,(unsigned long long)s.bytes,(unsigned long long)RD.rendered,(unsigned long long)RD.rejected,(unsigned long long)s.dropped);
+    size_t used=strlen(out);
+    if(used<(size_t)capacity)snprintf(out+used,(size_t)capacity-used,",\"pending_restored\":%u,\"draw_cache_hits\":%llu",RD.pending_restored,(unsigned long long)RD.cache_hits);
 }
