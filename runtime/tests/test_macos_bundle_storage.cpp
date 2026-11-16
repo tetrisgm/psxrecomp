@@ -13,10 +13,12 @@ int main() {
     write(exe,"executable");write(resources/"bundle-id","net.example.test\n");
     write(resources/"game.toml","default-v1");write(resources/"game_options.toml","options-v1");
     write(resources/"mods/state.toml","enabled=true");write(resources/"assets/fonts/font","font");
+    write(resources/"licenses/psxrecomp-LICENSE","license");
     auto root=psx_bundle::prepare(exe,home);
     assert(root==home/"Library/Application Support/net.example.test");
     assert(psx_bundle::read(root/"game.toml")=="default-v1");
     assert(fs::is_symlink(root/"assets"));
+    assert(psx_bundle::read(root/"licenses/psxrecomp-LICENSE")=="license");
     write(root/"mods/state.toml","player preference");
     write(root/"game_options.toml","player options");
     write(resources/"game.toml","default-v2");write(resources/"game_options.toml","options-v2");
@@ -28,6 +30,7 @@ int main() {
     auto moved=base/"Moved.app";fs::rename(base/"R4.app",moved);
     psx_bundle::prepare(moved/"Contents/MacOS/r4-runtime",home);
     assert(psx_bundle::read(root/"assets/fonts/font")=="font");
+    assert(psx_bundle::read(root/"licenses/psxrecomp-LICENSE")=="license");
     assert(psx_bundle::prepare(base/"standalone/r4-runtime",home).empty());
     auto isolated=base/"isolated";
     assert(psx_bundle::prepare(moved/"Contents/MacOS/r4-runtime",home,isolated)==isolated);

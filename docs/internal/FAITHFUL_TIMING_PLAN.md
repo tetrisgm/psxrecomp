@@ -7,6 +7,14 @@ auto-memory ([[psxrecomp-build-faithful-core-not-hacks]],
 
 ---
 
+## 2026-11-16 native bundle storage follow-up
+
+Link packaged licenses into Mac player data so the existing packaged-root
+marker anchors saves/settings there. Native DualSense playtesting exposed an
+ancestor home `.gitignore` winning root discovery without that marker. Bundle
+storage tests cover the marker before and after moving the app. The local
+playtest data link is repaired; final binary rebuild/qualification is pending.
+
 ## 0. North star + guardrails (non-negotiable)
 
 Build the **faithful hardware-timing core** of the static recompiler. The PSX

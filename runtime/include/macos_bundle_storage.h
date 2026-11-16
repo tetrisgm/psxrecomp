@@ -48,7 +48,9 @@ inline fs::path prepare(const fs::path &executable,const fs::path &home,const fs
     const auto root=override_root.empty()?home/"Library/Application Support"/id:override_root;
     if(!root.is_absolute())throw std::runtime_error("Application storage must use an absolute path");
     fs::create_directories(root);
-    for(const auto *name:{"assets","bios","postfx","mods/bundled"})
+    /* The packaged-license marker anchors config resolution to player data,
+     * even when an ancestor (such as the home directory) has a .gitignore. */
+    for(const auto *name:{"assets","bios","postfx","mods/bundled","licenses"})
         resource_link(resources/name,root/name);
     for(const auto *name:{"game.toml","game_options.toml"})
         seed(resources/name,root/name,root/".defaults"/name);
