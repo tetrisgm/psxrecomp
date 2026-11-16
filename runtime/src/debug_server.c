@@ -9681,6 +9681,31 @@ static void handle_session_restart(int id, const char *json)
 }
 #endif
 
+extern void psx_debug_controller_status(char *out, size_t cap);
+static void handle_controller_status(int id, const char *json) {
+    char body[512];
+    (void)json;
+    psx_debug_controller_status(body, sizeof body);
+    send_fmt("{\"id\":%d,\"ok\":true,%s}", id, body);
+}
+
+/* SDL-backed pad: unlike set_input, exercises actual device assignment. */
+extern int psx_debug_virtual_pad(int connected, unsigned buttons, int rx, int ry, int select);
+static void handle_virtual_pad(int id, const char *json) {
+    int connected = json_get_int(json, "connected", 1);
+    int buttons = json_get_int(json, "buttons", 0);
+    int select = json_get_int(json, "select", 0);
+    int rx = json_get_int(json, "rx", 0), ry = json_get_int(json, "ry", 0);
+    if ((connected != 0 && connected != 1) || (select != 0 && select != 1) || buttons < 0 || buttons > 32767 ||
+        rx < -32768 || rx > 32767 || ry < -32768 || ry > 32767) {
+        send_err(id, "invalid virtual pad state"); return;
+    }
+    if (!psx_debug_virtual_pad(connected, (unsigned)buttons, rx, ry, select)) {
+        send_err(id, "SDL virtual gamepad unavailable"); return;
+    }
+    send_ok(id);
+}
+
 /* host_button name=<SDL gamepad button> down=<1|0>, both when omitted. */
 extern int psx_debug_push_host_button(const char *name, int down);
 static void handle_host_button(int id, const char *json)
@@ -16584,6 +16609,8 @@ static const CmdEntry s_commands[] = {
     { "session_restart",   handle_session_restart },
 #endif
     { "host_button",       handle_host_button },
+    { "virtual_pad",       handle_virtual_pad },
+    { "controller_status", handle_controller_status },
     { "menu_host",         handle_menu_host },
     { "host_mouse",        handle_host_mouse },
     { "scanline",          handle_scanline },

@@ -9060,6 +9060,85 @@ extern "C" int psx_debug_push_host_key(const char *name, int down) {
     return SDL_PushEvent(&ev) ? 1 : 0;
 }
 
+extern "C" void psx_debug_controller_status(char *out, size_t cap) {
+    const PlayerInput& p = g_players[0];
+    unsigned held = 0;
+    for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < 32; ++b)
+        if (p1_host_button_down(nullptr, b)) held |= 1u << b;
+    uint8_t sticks[4];
+    read_local_pad_sticks_live(0, sticks);
+    snprintf(out, cap,
+        "\"kind\":%d,\"instance\":%d,\"attached\":%s,"
+        "\"buttons\":%u,\"sticks\":[%u,%u,%u,%u],"
+        "\"rewind_binding\":%d,\"rewind_allowed\":%s,\"rewind_held\":%s",
+        p.kind, (int)p.instance,
+        p.handle && SDL_GameControllerGetAttached(p.handle) ? "true" : "false",
+        held, sticks[0], sticks[1], sticks[2], sticks[3], g_hotkey_pad_rewind,
+        direct_shortcut_active(PSX_ASSIST_BIND_REWIND) ? "true" : "false",
+        rewind_toggle_buttons_down() ? "true" : "false");
+}
+
+/* Opt-in TCP diagnostics: an SDL device, so assignment, mappings, held
+ * buttons and local sticks take the same path as physical controllers. */
+extern "C" int psx_debug_virtual_pad(int connected, unsigned buttons, int rx, int ry, int select) {
+#if defined(PSX_SDL3)
+    static SDL_Joystick *pad = nullptr;
+    static SDL_JoystickID id = 0;
+    static PlayerInput previous;
+    static bool selected = false;
+    /* SDL shutdown destroys virtual devices; do not reuse a prior session's
+     * pointers or restore its seat into a new session. */
+    if (pad && SDL_GetJoystickFromID(id) != pad) {
+        pad = nullptr; id = 0; selected = false;
+    }
+    if (!connected) {
+        if (selected) close_player(g_players[0]);
+        if (pad) SDL_CloseJoystick(pad);
+        pad = nullptr;
+        if (id) SDL_DetachVirtualJoystick(id);
+        id = 0;
+        if (selected) {
+            g_players[0] = previous;
+            selected = false;
+            refresh_player_devices();
+        }
+        return 1;
+    }
+    if (!pad) {
+        SDL_VirtualJoystickDesc desc;
+        SDL_INIT_INTERFACE(&desc);
+        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        desc.naxes = 6; desc.nbuttons = 15;
+        desc.button_mask = (1u << 15) - 1; desc.axis_mask = 63;
+        desc.name = "PSXRecomp diagnostic gamepad";
+        id = SDL_AttachVirtualJoystick(&desc);
+        if (!id) return 0;
+        pad = SDL_OpenJoystick(id);
+        if (!pad) { SDL_DetachVirtualJoystick(id); id = 0; return 0; }
+        SDL_SetJoystickVirtualAxis(pad, 4, -32768);
+        SDL_SetJoystickVirtualAxis(pad, 5, -32768);
+    }
+    if (select && !selected) {
+        close_player(g_players[0]);
+        previous = g_players[0];
+        PlayerInput& p = g_players[0];
+        p.kind = 2; p.adopted_pad = false; p.preferred_instance = id;
+        SDL_GUID guid = SDL_GetJoystickGUID(pad);
+        SDL_GUIDToString(guid, p.guid, sizeof p.guid);
+        open_player(p, 0);
+        selected = true;
+    }
+    for (int b = 0; b < 15; ++b)
+        SDL_SetJoystickVirtualButton(pad, b, (buttons & (1u << b)) != 0);
+    SDL_SetJoystickVirtualAxis(pad, 2, (Sint16)rx);
+    SDL_SetJoystickVirtualAxis(pad, 3, (Sint16)ry);
+    return 1;
+#else
+    (void)connected; (void)buttons; (void)rx; (void)ry; (void)select;
+    return 0;
+#endif
+}
+
 /* Debug: use the same SDL controller-event path as a physical P1 button,
  * rather than setting guest pad RAM or invoking a menu action directly. */
 extern "C" int psx_debug_push_host_button(const char *name, int down) {

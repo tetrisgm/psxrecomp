@@ -213,6 +213,15 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-16 controller regression coverage: opt-in TCP `virtual_pad` attaches an
+SDL gamepad, optionally selects it for P1 without saving preferences, and
+restores the previous seat when detached. `controller_status` exposes the
+assigned input, raw held buttons, local axes and direct-rewind binding/policy.
+This exercises assignment and polling rather than substituting guest pad RAM
+or keyboard F8. R4's native Windows check covers Y hold/release, directional
+look, Back menu, and restoration of the physical seat. No guest execution,
+renderer, rewind playback, or normal controller policy change.
+
 2026-11-12 rewind release pipeline: retain two full-resolution working images,
 restore pending complete producers only from this branch's commands issued by
 the selected machine cycle, and keep presentation/history frozen until normal
