@@ -14,6 +14,16 @@ frontend requests can execute on the guest thread. Online-only hooks retain thei
 existing gate. Runtime tests cover offline/online transitions, alias matching,
 idempotent registration and mod-plan clearing. No timing-core change.
 
+## 2026-11-17 local multiplayer adapters
+
+Game-owned function filters and exact-word instruction hooks now survive mod-plan
+changes. Instruction hooks cover interior sites that function-entry hooks cannot;
+R4's four-view camera loop exposed this distinction in static overlay execution.
+Tests cover guarded words, aliases and online plan clearing. Titles can sample up
+to four assigned host inputs without changing guest Multitap topology; the opt-in
+virtual-pad diagnostic now addresses each seat and all stick/trigger axes.
+Release build and 45 runtime CTests pass; R4 local race qualification is ongoing.
+
 ## 2026-11-16 native bundle storage follow-up
 
 Link packaged licenses into Mac player data so the existing packaged-root

@@ -486,6 +486,12 @@ static bool g_jogcon_ffb_invert = false;
 static PlayerInput g_players[PSX_MAX_PLAYERS];
 /* Offline SIO sample loop bound (from game.toml players; clamped). */
 static int g_offline_pad_count = 2;
+static unsigned g_game_direct_input_count = 0;
+extern "C" int psx_game_set_local_input_count(unsigned count) {
+    if (count > PSX_MAX_PLAYERS) return 0;
+    g_game_direct_input_count = count;
+    return 1;
+}
 /* Set when [controller] lock_mode pins every seat to digital — blocks the
  * DualShock-on-tap hack from settings.toml / Lobby Settings / match_caps. */
 static int g_force_digital_pads = 0;
@@ -7843,7 +7849,7 @@ static void sample_pad_into_sio(int override) {
 #ifndef PSX_NO_DEBUG_TOOLS
     restore_input_override_profile(0);
 #endif
-    int n = g_offline_pad_count;
+    int n = std::max(g_offline_pad_count, (int)g_game_direct_input_count);
     if (n < 1) n = 1;
     if (n > PSX_MAX_PLAYERS) n = PSX_MAX_PLAYERS;
     const uint32_t consumer_sim =
@@ -9080,25 +9086,33 @@ extern "C" void psx_debug_controller_status(char *out, size_t cap) {
 
 /* Opt-in TCP diagnostics: an SDL device, so assignment, mappings, held
  * buttons and local sticks take the same path as physical controllers. */
-extern "C" int psx_debug_virtual_pad(int connected, unsigned buttons, int rx, int ry, int select) {
+extern "C" int psx_debug_virtual_pad(int connected, unsigned buttons, int rx, int ry, int select, int player, int lx, int ly, int lt, int rt) {
 #if defined(PSX_SDL3)
-    static SDL_Joystick *pad = nullptr;
-    static SDL_JoystickID id = 0;
-    static PlayerInput previous;
-    static bool selected = false;
+    if (player < 0 || player >= PSX_MAX_PLAYERS) return 0;
+    struct VirtualPad {
+        SDL_Joystick* pad = nullptr;
+        SDL_JoystickID id = 0;
+        PlayerInput previous{};
+        bool selected = false;
+    };
+    static VirtualPad pads[PSX_MAX_PLAYERS];
+    auto& pad = pads[player].pad;
+    auto& id = pads[player].id;
+    auto& previous = pads[player].previous;
+    auto& selected = pads[player].selected;
     /* SDL shutdown destroys virtual devices; do not reuse a prior session's
      * pointers or restore its seat into a new session. */
     if (pad && SDL_GetJoystickFromID(id) != pad) {
         pad = nullptr; id = 0; selected = false;
     }
     if (!connected) {
-        if (selected) close_player(g_players[0]);
+        if (selected) close_player(g_players[player]);
         if (pad) SDL_CloseJoystick(pad);
         pad = nullptr;
         if (id) SDL_DetachVirtualJoystick(id);
         id = 0;
         if (selected) {
-            g_players[0] = previous;
+            g_players[player] = previous;
             selected = false;
             refresh_player_devices();
         }
@@ -9119,22 +9133,26 @@ extern "C" int psx_debug_virtual_pad(int connected, unsigned buttons, int rx, in
         SDL_SetJoystickVirtualAxis(pad, 5, -32768);
     }
     if (select && !selected) {
-        close_player(g_players[0]);
-        previous = g_players[0];
-        PlayerInput& p = g_players[0];
+        close_player(g_players[player]);
+        previous = g_players[player];
+        PlayerInput& p = g_players[player];
         p.kind = 2; p.adopted_pad = false; p.preferred_instance = id;
         SDL_GUID guid = SDL_GetJoystickGUID(pad);
         SDL_GUIDToString(guid, p.guid, sizeof p.guid);
-        open_player(p, 0);
+        open_player(p, player);
         selected = true;
     }
     for (int b = 0; b < 15; ++b)
         SDL_SetJoystickVirtualButton(pad, b, (buttons & (1u << b)) != 0);
+    SDL_SetJoystickVirtualAxis(pad, 0, (Sint16)lx);
+    SDL_SetJoystickVirtualAxis(pad, 1, (Sint16)ly);
+    SDL_SetJoystickVirtualAxis(pad, 4, (Sint16)lt);
+    SDL_SetJoystickVirtualAxis(pad, 5, (Sint16)rt);
     SDL_SetJoystickVirtualAxis(pad, 2, (Sint16)rx);
     SDL_SetJoystickVirtualAxis(pad, 3, (Sint16)ry);
     return 1;
 #else
-    (void)connected; (void)buttons; (void)rx; (void)ry; (void)select;
+    (void)connected; (void)buttons; (void)rx; (void)ry; (void)select; (void)player; (void)lx; (void)ly; (void)lt; (void)rt;
     return 0;
 #endif
 }

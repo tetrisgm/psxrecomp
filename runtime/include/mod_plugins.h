@@ -68,6 +68,10 @@ extern uint32_t g_psx_mod_guest_functions;
  * execution uses the same guarded table. Inactive plans are inert. */
 int psx_mod_register_instruction_plugin(const char* id, uint32_t address,
                                          uint32_t expected, PSXModFunctionEntryCallback callback);
+/* Game-owned instruction hooks use the same exact-word guard and callback
+ * restrictions, but survive mod-plan changes, including online sessions. */
+int psx_game_register_instruction(uint32_t address, uint32_t expected,
+                                   PSXModFunctionEntryCallback callback);
 void psx_mod_instruction(struct CPUState* cpu, uint32_t address, uint32_t instruction);
 extern uint32_t g_psx_mod_instruction_hooks;
 /* Redirect one audited load/store's effective address without changing its
@@ -94,6 +98,11 @@ int psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
  * Runs on the guest execution thread. Callbacks must guard their game state
  * and private redraws; this does not enable a netplay-only hook offline. */
 int psx_game_register_function_entry(uint32_t address, PSXModFunctionEntryCallback callback);
+int psx_game_register_function_filter(uint32_t address, PSXModFunctionFilterCallback filter);
+/* Game-owned direct controller consumers may sample extra logical pads without
+ * attaching a guest Multitap. Call during startup/on the guest thread; 0 clears.
+ * Does not change physical SIO topology or online seat/input selection. */
+int psx_game_set_local_input_count(unsigned count);
 /* Trusted game code (not a mod package) may hook guest functions for netplay
  * only. These are independent of the mod package plan, which every online
  * match clears, and run only while netplay is active; offline execution stays

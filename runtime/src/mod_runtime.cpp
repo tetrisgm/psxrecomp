@@ -347,6 +347,11 @@ std::vector<ActiveInstructionHook>& active_instruction_hooks() {
     return value;
 }
 
+std::vector<ActiveInstructionHook>& game_instruction_hooks() {
+    static std::vector<ActiveInstructionHook> value;
+    return value;
+}
+
 inline uint32_t function_entry_key(uint32_t address) {
     return address & 0x1FFFFFFFu;
 }
@@ -377,7 +382,7 @@ void clear_function_entry_hooks() {
     active_guest_functions().clear();
     g_psx_mod_guest_functions = 0;
     active_instruction_hooks().clear();
-    g_psx_mod_instruction_hooks = 0;
+    g_psx_mod_instruction_hooks = (uint32_t)game_instruction_hooks().size();
 }
 
 void build_function_entry_hooks(const RuntimeMods& s) {
@@ -406,7 +411,7 @@ void build_function_entry_hooks(const RuntimeMods& s) {
             instructions.push_back({hook.address, hook.expected, hook.callback, &plugin, hook.memory_address});
     std::stable_sort(instructions.begin(), instructions.end(),
                     [](const auto& a, const auto& b) { return a.key < b.key; });
-    g_psx_mod_instruction_hooks = (uint32_t)instructions.size();
+    g_psx_mod_instruction_hooks = (uint32_t)(instructions.size() + game_instruction_hooks().size());
     for (const auto& plugin : s.plan.plugins)
         if (auto callback = mod_pcm_callback(plugin.id))
             pcm_hooks.push_back({callback, &plugin});
@@ -3989,9 +3994,35 @@ extern "C" int psx_mod_register_instruction_plugin(const char* id, uint32_t addr
     return id && PSXRecompV4::mod_register_instruction_plugin(id, address, expected, callback);
 }
 
+extern "C" int psx_game_register_instruction(uint32_t address, uint32_t expected,
+                                              PSXModFunctionEntryCallback callback) {
+    using namespace PSXRecompV4;
+    if (!address || (address & 3u) || address >= 0xC0000000u || !callback) return 0;
+    auto& hooks = game_instruction_hooks();
+    const uint32_t key = function_entry_key(address);
+    for (const auto& hook : hooks)
+        if (hook.key == key && hook.callback == callback) return hook.expected == expected;
+    hooks.push_back({key, expected, callback, nullptr, nullptr});
+    std::stable_sort(hooks.begin(), hooks.end(),
+                    [](const auto& a, const auto& b) { return a.key < b.key; });
+    g_psx_mod_instruction_hooks = (uint32_t)(hooks.size() + active_instruction_hooks().size());
+    return 1;
+}
+
 extern "C" void psx_mod_instruction(CPUState* cpu, uint32_t address, uint32_t instruction) {
     using namespace PSXRecompV4;
     if (!g_psx_mod_instruction_hooks || !cpu || address >= 0xC0000000u) return;
+    const auto& game_hooks = game_instruction_hooks();
+    const auto game_key = function_entry_key(address);
+    auto game_it = std::lower_bound(game_hooks.begin(), game_hooks.end(), game_key,
+                                   [](const auto& h, uint32_t k) { return h.key < k; });
+    for (; game_it != game_hooks.end() && game_it->key == game_key; ++game_it) {
+        if (game_it->expected != instruction || psx_mod_read_word(address) != instruction) continue;
+        const uint32_t pc = cpu->pc;
+        game_it->callback(cpu, address);
+        if (cpu->pc != pc) std::abort();
+        cpu->gpr[0] = 0;
+    }
     if (mod_plan_hooks_parked()) return;
     const auto& hooks = active_instruction_hooks();
     const auto key = function_entry_key(address);
@@ -4142,19 +4173,30 @@ static int register_game_netplay_hook(uint32_t address,
     return 1;
 }
 
-extern "C" int psx_game_register_function_entry(
-    uint32_t address, PSXModFunctionEntryCallback callback) {
+static int register_game_frontend_hook(uint32_t address,
+                                      PSXModFunctionEntryCallback callback,
+                                      PSXModFunctionFilterCallback filter) {
     using namespace PSXRecompV4;
-    if (!address || !callback) return 0;
+    if (!address || (!callback && !filter)) return 0;
     auto& table = game_frontend_entry_hooks();
     const uint32_t key = function_entry_key(address);
     for (const auto& hook : table)
-        if (hook.key == key && hook.callback == callback) return 1;
-    table.push_back({key, callback, nullptr, nullptr});
+        if (hook.key == key && hook.callback == callback && hook.filter == filter) return 1;
+    table.push_back({key, callback, filter, nullptr});
     std::stable_sort(table.begin(), table.end(),
         [](const ActiveFunctionEntryHook& a, const ActiveFunctionEntryHook& b) { return a.key < b.key; });
     update_function_entry_count();
     return 1;
+}
+
+extern "C" int psx_game_register_function_entry(
+    uint32_t address, PSXModFunctionEntryCallback callback) {
+    return callback ? register_game_frontend_hook(address, callback, nullptr) : 0;
+}
+
+extern "C" int psx_game_register_function_filter(
+    uint32_t address, PSXModFunctionFilterCallback filter) {
+    return filter ? register_game_frontend_hook(address, nullptr, filter) : 0;
 }
 
 extern "C" int psx_game_register_netplay_function_entry(
@@ -4176,8 +4218,13 @@ static int game_function_entry(CPUState* cpu, uint32_t address) {
     const uint32_t frontend_key = function_entry_key(address);
     auto first = std::lower_bound(frontend.begin(), frontend.end(), frontend_key,
         [](const ActiveFunctionEntryHook& hook, uint32_t key) { return hook.key < key; });
-    for (; first != frontend.end() && first->key == frontend_key; ++first)
-        first->callback(cpu, address);
+    for (; first != frontend.end() && first->key == frontend_key; ++first) {
+        if (first->callback) first->callback(cpu, address);
+        if (first->filter && first->filter(cpu, address)) {
+            cpu->pc = cpu->gpr[31];
+            return 1;
+        }
+    }
     const auto& table = game_netplay_entry_hooks();
     if (table.empty()) return 0;
     if (!psx_netplay_active()) {

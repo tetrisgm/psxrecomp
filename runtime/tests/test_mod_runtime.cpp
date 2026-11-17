@@ -63,7 +63,12 @@ static PsxLobbyMatchCaps test_match_caps;
 extern "C" const PsxLobbyMatchCaps* psx_lobby_match_caps(void) {
     return &test_match_caps;
 }
-static int game_frontend_entry_hits;
+static int game_frontend_entry_hits, game_frontend_filter_hits;
+static int test_game_frontend_filter(CPUState* cpu, uint32_t) {
+    ++game_frontend_filter_hits;
+    cpu->gpr[2] = 0x5678u;
+    return 1;
+}
 static void test_game_frontend_entry(CPUState*, uint32_t) { ++game_frontend_entry_hits; }
 static int game_netplay_entry_hits;
 static int game_netplay_filter_hits;
@@ -2231,6 +2236,33 @@ int main(int argc, char** argv) {
     psx_mod_function_entry(&game_cpu, 0x80007000u);
     check(game_frontend_entry_hits == 3 && game_netplay_entry_hits == 1,
           "frontend survives mod clear and session changes without invoking online hooks");
+    check(psx_game_register_function_filter(0x80008000u, test_game_frontend_filter) &&
+              psx_game_register_function_filter(0xA0008000u, test_game_frontend_filter),
+          "frontend filter accepts aliases idempotently");
+    game_cpu.gpr[31] = 0x80006000u;
+    check(psx_mod_function_entry(&game_cpu, 0xA0008000u) &&
+              game_cpu.pc == 0x80006000u && game_cpu.gpr[2] == 0x5678u &&
+              game_frontend_filter_hits == 1 && g_psx_mod_function_entry_hooks == 4,
+          "frontend filter consumes an offline call and resumes at its return PC");
+    check(psx_game_register_instruction(0x80009000u, 0x24020001u, test_game_frontend_entry) &&
+              psx_game_register_instruction(0xA0009000u, 0x24020001u, test_game_frontend_entry) &&
+              !psx_game_register_instruction(0x80009001u, 0x24020001u, test_game_frontend_entry),
+          "game instruction registration validates and deduplicates aliases");
+    psx_mod_write_word(0x80009000u, 0x24020001u);
+    const int before_instruction = game_frontend_entry_hits;
+    psx_mod_instruction(&game_cpu, 0xA0009000u, 0x24020001u);
+    psx_mod_instruction(&game_cpu, 0x80009000u, 0x24020002u);
+    psx_mod_write_word(0x80009000u, 0x24020002u);
+    psx_mod_instruction(&game_cpu, 0x80009000u, 0x24020001u);
+    check(game_frontend_entry_hits == before_instruction + 1,
+          "game instructions require both registered word and live RAM to match");
+    check(PSXRecompV4::mod_runtime_clear_for_netplay(&error), error.c_str());
+    test_netplay_active = 1;
+    psx_mod_write_word(0x80009000u, 0x24020001u);
+    psx_mod_instruction(&game_cpu, 0x80009000u, 0x24020001u);
+    check(game_frontend_entry_hits == before_instruction + 2 && g_psx_mod_instruction_hooks == 1,
+          "game instruction hooks survive cleared and parked online plans");
+    test_netplay_active = 0;
     // Reliable identity detects byte replacement even when size/mtime are restored.
     {
         const auto identity_path = root / "identity.bin";

@@ -9690,17 +9690,22 @@ static void handle_controller_status(int id, const char *json) {
 }
 
 /* SDL-backed pad: unlike set_input, exercises actual device assignment. */
-extern int psx_debug_virtual_pad(int connected, unsigned buttons, int rx, int ry, int select);
+extern int psx_debug_virtual_pad(int connected, unsigned buttons, int rx, int ry, int select, int player, int lx, int ly, int lt, int rt);
 static void handle_virtual_pad(int id, const char *json) {
     int connected = json_get_int(json, "connected", 1);
     int buttons = json_get_int(json, "buttons", 0);
     int select = json_get_int(json, "select", 0);
     int rx = json_get_int(json, "rx", 0), ry = json_get_int(json, "ry", 0);
+    const int player = json_get_int(json, "player", 1) - 1;
+    const int lx = json_get_int(json, "lx", 0), ly = json_get_int(json, "ly", 0);
+    const int lt = json_get_int(json, "lt", -32768), rt = json_get_int(json, "rt", -32768);
     if ((connected != 0 && connected != 1) || (select != 0 && select != 1) || buttons < 0 || buttons > 32767 ||
+        player < 0 || player >= PSX_MAX_PLAYERS || lx < -32768 || lx > 32767 || ly < -32768 || ly > 32767 ||
+        lt < -32768 || lt > 32767 || rt < -32768 || rt > 32767 ||
         rx < -32768 || rx > 32767 || ry < -32768 || ry > 32767) {
         send_err(id, "invalid virtual pad state"); return;
     }
-    if (!psx_debug_virtual_pad(connected, (unsigned)buttons, rx, ry, select)) {
+    if (!psx_debug_virtual_pad(connected, (unsigned)buttons, rx, ry, select, player, lx, ly, lt, rt)) {
         send_err(id, "SDL virtual gamepad unavailable"); return;
     }
     send_ok(id);
