@@ -7,6 +7,13 @@ auto-memory ([[psxrecomp-build-faithful-core-not-hacks]],
 
 ---
 
+## 2026-11-17 frontend actions
+
+Added game-owned guest-entry callbacks independent of elective mod plans, so
+frontend requests can execute on the guest thread. Online-only hooks retain their
+existing gate. Runtime tests cover offline/online transitions, alias matching,
+idempotent registration and mod-plan clearing. No timing-core change.
+
 ## 2026-11-16 native bundle storage follow-up
 
 Link packaged licenses into Mac player data so the existing packaged-root

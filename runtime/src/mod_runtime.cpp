@@ -359,9 +359,14 @@ std::vector<ActiveFunctionEntryHook>& game_netplay_entry_hooks() {
     return value;
 }
 
+std::vector<ActiveFunctionEntryHook>& game_frontend_entry_hooks() {
+    static std::vector<ActiveFunctionEntryHook> value;
+    return value;
+}
+
 void update_function_entry_count() {
     g_psx_mod_function_entry_hooks = (uint32_t)(
-        active_function_entry_hooks().size() + game_netplay_entry_hooks().size());
+        active_function_entry_hooks().size() + game_netplay_entry_hooks().size() + game_frontend_entry_hooks().size());
 }
 
 void clear_function_entry_hooks() {
@@ -4034,7 +4039,7 @@ extern "C" uint32_t psx_mod_memory_address(const CPUState* cpu, uint32_t pc,
     return address;
 }
 
-static int game_netplay_function_entry(CPUState* cpu, uint32_t address);
+static int game_function_entry(CPUState* cpu, uint32_t address);
 
 /* Netplay host-output plugins ([[plugin]] netplay = "host_output") run their
  * entry hooks in the shared simulation while the rest of the own-view plan is
@@ -4098,7 +4103,7 @@ extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
     RuntimeMods& s = state();
     if (mod_plan_hooks_parked()) {
         run_host_output_hooks(cpu, address);
-        return game_netplay_function_entry(cpu, address);
+        return game_function_entry(cpu, address);
     }
     const auto& table = active_function_entry_hooks();
     const uint32_t key = function_entry_key(address);
@@ -4117,7 +4122,7 @@ extern "C" int psx_mod_function_entry(CPUState* cpu, uint32_t address) {
             return 1;
         }
     }
-    return game_netplay_function_entry(cpu, address);
+    return game_function_entry(cpu, address);
 }
 
 static int register_game_netplay_hook(uint32_t address,
@@ -4137,6 +4142,21 @@ static int register_game_netplay_hook(uint32_t address,
     return 1;
 }
 
+extern "C" int psx_game_register_function_entry(
+    uint32_t address, PSXModFunctionEntryCallback callback) {
+    using namespace PSXRecompV4;
+    if (!address || !callback) return 0;
+    auto& table = game_frontend_entry_hooks();
+    const uint32_t key = function_entry_key(address);
+    for (const auto& hook : table)
+        if (hook.key == key && hook.callback == callback) return 1;
+    table.push_back({key, callback, nullptr, nullptr});
+    std::stable_sort(table.begin(), table.end(),
+        [](const ActiveFunctionEntryHook& a, const ActiveFunctionEntryHook& b) { return a.key < b.key; });
+    update_function_entry_count();
+    return 1;
+}
+
 extern "C" int psx_game_register_netplay_function_entry(
     uint32_t address, PSXModFunctionEntryCallback callback) {
     return callback ? register_game_netplay_hook(address, callback, nullptr) : 0;
@@ -4150,8 +4170,14 @@ extern "C" int psx_game_register_netplay_function_filter(
 /* Game netplay hooks run only in a netplay session, after the mod plan's
  * hooks (which a match clears). PSX_GAME_FILTER_OFFLINE_PROBE=1 runs them
  * offline too, to test a title's netplay path without opening a session. */
-static int game_netplay_function_entry(CPUState* cpu, uint32_t address) {
+static int game_function_entry(CPUState* cpu, uint32_t address) {
     using namespace PSXRecompV4;
+    const auto& frontend = game_frontend_entry_hooks();
+    const uint32_t frontend_key = function_entry_key(address);
+    auto first = std::lower_bound(frontend.begin(), frontend.end(), frontend_key,
+        [](const ActiveFunctionEntryHook& hook, uint32_t key) { return hook.key < key; });
+    for (; first != frontend.end() && first->key == frontend_key; ++first)
+        first->callback(cpu, address);
     const auto& table = game_netplay_entry_hooks();
     if (table.empty()) return 0;
     if (!psx_netplay_active()) {

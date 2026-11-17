@@ -63,6 +63,8 @@ static PsxLobbyMatchCaps test_match_caps;
 extern "C" const PsxLobbyMatchCaps* psx_lobby_match_caps(void) {
     return &test_match_caps;
 }
+static int game_frontend_entry_hits;
+static void test_game_frontend_entry(CPUState*, uint32_t) { ++game_frontend_entry_hits; }
 static int game_netplay_entry_hits;
 static int game_netplay_filter_hits;
 static int test_netplay_active;
@@ -2210,6 +2212,25 @@ int main(int argc, char** argv) {
     check(!psx_mod_function_entry(&game_cpu, 0x80005000u) &&
               game_netplay_filter_hits == 1,
           "game filter must disarm when netplay stops");
+    // Frontend hooks remain available offline without enabling online hooks.
+    check(!psx_game_register_function_entry(0, test_game_frontend_entry) &&
+              !psx_game_register_function_entry(0x80007000u, nullptr),
+          "frontend registration rejects missing address or callback");
+    check(psx_game_register_function_entry(0x80007000u, test_game_frontend_entry) &&
+              psx_game_register_function_entry(0xA0007000u, test_game_frontend_entry),
+          "frontend registration accepts aliases idempotently");
+    psx_mod_function_entry(&game_cpu, 0xA0007000u);
+    check(game_frontend_entry_hits == 1 && g_psx_mod_function_entry_hooks == 3,
+          "frontend hook runs once offline and matches code aliases");
+    psx_mod_function_entry(&game_cpu, 0x80007004u);
+    check(game_frontend_entry_hits == 1, "frontend hook ignores unrelated addresses");
+    check(PSXRecompV4::mod_runtime_clear_for_netplay(&error), error.c_str());
+    test_netplay_active = 1;
+    psx_mod_function_entry(&game_cpu, 0x80007000u);
+    test_netplay_active = 0;
+    psx_mod_function_entry(&game_cpu, 0x80007000u);
+    check(game_frontend_entry_hits == 3 && game_netplay_entry_hits == 1,
+          "frontend survives mod clear and session changes without invoking online hooks");
     // Reliable identity detects byte replacement even when size/mtime are restored.
     {
         const auto identity_path = root / "identity.bin";

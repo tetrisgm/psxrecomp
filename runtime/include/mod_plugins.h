@@ -90,6 +90,10 @@ uint32_t psx_mod_memory_address(const struct CPUState* cpu, uint32_t pc,
 int psx_mod_register_function_filter_plugin(
     const char* id, uint32_t address, PSXModFunctionFilterCallback callback);
 int psx_mod_function_entry(struct CPUState* cpu, uint32_t address);
+/* Always-active game/frontend integration, independent of elective mod plans.
+ * Runs on the guest execution thread. Callbacks must guard their game state
+ * and private redraws; this does not enable a netplay-only hook offline. */
+int psx_game_register_function_entry(uint32_t address, PSXModFunctionEntryCallback callback);
 /* Trusted game code (not a mod package) may hook guest functions for netplay
  * only. These are independent of the mod package plan, which every online
  * match clears, and run only while netplay is active; offline execution stays
