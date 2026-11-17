@@ -17463,6 +17463,10 @@ bool g_ovl_pause_held = false;
 std::atomic<int> g_ovl_reload_binds{0};
 std::atomic<int> g_ovl_exit{0};            /* PSX_MENU_EXIT_* + 1; 0 = none */
 std::atomic<int> g_ovl_state_req{0};       /* menu save/load: slot + 1, | 0x100 = save; 0 = none */
+std::atomic<int> g_ovl_state_result{1};
+bool g_ovl_state_inflight = false;
+uint32_t g_ovl_state_generation = 0;
+int g_ovl_state_slot = -1, g_ovl_state_save = 0;
 bool g_ovl_video_pending = false;
 PsxHostVideoSettings g_ovl_video_post{};
 PsxHostVideoSettings g_ovl_video_current{}, g_ovl_video_boot{};
@@ -17602,9 +17606,12 @@ int mh_state_thumb(int slot, unsigned* argb, int w, int h) {
 int mh_state_request(int slot, int save) {
     if (slot < 0 || slot >= SAVESTATE_SLOTS || !mh_state_available()) return 0;
     if (!save && !savestate_slot_exists(slot)) return 0;
+    int result = g_ovl_state_result.load();
+    if (result == 0 || !g_ovl_state_result.compare_exchange_strong(result, 0)) return 0;
     g_ovl_state_req = (slot + 1) | (save ? 0x100 : 0);
     return 1;
 }
+int mh_state_status(void) { return g_ovl_state_result.load(); }
 int mh_state_save(int slot) { return mh_state_request(slot, 1); }
 int mh_state_load(int slot) { return mh_state_request(slot, 0); }
 int mh_disc_insert(int n) {
@@ -17710,7 +17717,7 @@ PsxMenuHost g_menu_host = {
 #endif
     nullptr,
     0,
-    mh_state_slot_count, mh_state_available, mh_state_info, mh_state_thumb, mh_state_save, mh_state_load,
+    mh_state_slot_count, mh_state_available, mh_state_info, mh_state_thumb, mh_state_save, mh_state_load, mh_state_status,
 };
 
 int ovl_sink(const void* ev, void*) { return g_ovl && g_ovl->event ? g_ovl->event(g_ovl->ctx, ev) : 0; }
@@ -17810,6 +17817,9 @@ static void recomp_overlay_detach(void) {
     psx_host_set_ui_capture(0);
     if (g_ovl_pause_held) { psx_host_pause_pop(); g_ovl_pause_held = false; }
     g_ovl_pause_wanted = 0;
+    g_ovl_state_req = 0;
+    g_ovl_state_inflight = false;
+    g_ovl_state_result = 1;
     if (g_ovl->detach) g_ovl->detach(g_ovl->ctx);
     g_ovl = nullptr;
     g_ovl_on = false;
@@ -17819,6 +17829,24 @@ static void recomp_overlay_detach(void) {
 static void host_pause_service(void) {
     if (!g_ovl_on) return;
     mh_refresh_snapshot();
+    if (g_ovl_state_inflight) {
+        PSXSavestateStatus state{};
+        savestate_get_status(&state);
+        if (state.generation != g_ovl_state_generation) {
+            g_ovl_state_inflight = false;
+            g_ovl_state_result = state.last_ok && state.last_slot == g_ovl_state_slot &&
+                state.last_load == !g_ovl_state_save ? 1 : -1;
+        }
+    }
+    if (const int req = g_ovl_state_req.exchange(0)) {
+        PSXSavestateStatus state{};
+        savestate_get_status(&state);
+        g_ovl_state_generation = state.generation;
+        g_ovl_state_slot = (req & 0xff) - 1;
+        g_ovl_state_save = (req & 0x100) != 0;
+        g_ovl_state_inflight = !state.pending && savestate_submit_slot(g_ovl_state_slot, g_ovl_state_save);
+        if (!g_ovl_state_inflight) g_ovl_state_result = -1;
+    }
     if (const int disc = g_ovl_disc_req.exchange(0)) {
         const int rc = disc_cycle_now(disc);
         if (rc != PSX_DISC_TRAY_OK) {
@@ -17828,7 +17856,7 @@ static void host_pause_service(void) {
         std::fprintf(stdout, "psxrecomp: in-game menu disc %d -> %d\n", disc, rc);
     }
     psx_host_set_ui_capture(ovl_open());
-    const bool want = g_ovl_pause_wanted != 0 && ovl_open();
+    const bool want = g_ovl_pause_wanted != 0 && ovl_open() && g_ovl_state_result.load() != 0;
     if (want && !g_ovl_pause_held) g_ovl_pause_held = psx_host_pause_push("overlay") != 0;
     else if (!want && g_ovl_pause_held) { psx_host_pause_pop(); g_ovl_pause_held = false; }
     PsxHostVideoSettings video{};
@@ -17922,10 +17950,6 @@ static void host_pause_service(void) {
             }
         }
         (void)psx_mod_save_selection();
-    }
-    if (const int req = g_ovl_state_req.exchange(0)) {
-        const int slot = (req & 0xff) - 1;
-        (void)savestate_submit_slot(slot, (req & 0x100) ? 1 : 0);
     }
     if (g_ovl_reload_binds.exchange(0)) {
         psx_keybinds_init(g_ovl_argv0.c_str());

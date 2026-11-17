@@ -29,6 +29,7 @@ extern "C" {
 #define PSX_MENU_HOST_HAS_DEFAULT_SELECTION 1
 /* PsxMenuHost.state_* (save-state slots) are present (appended). */
 #define PSX_MENU_HOST_HAS_SAVE_STATES 1
+#define PSX_MENU_HOST_HAS_STATE_STATUS 1
 
 /* request_exit */
 enum {
@@ -93,14 +94,18 @@ typedef struct PsxMenuHost {
      * since the Unix epoch); thumb fills w*h ARGB pixels (1 = had one).
      * save/load validate now and queue the request for the main thread
      * (1 = queued, 0 = refused: unavailable, bad slot, or an empty slot to
-     * load). The request runs at the guest's next safe boundary, so a
-     * provider closes its menu (drops its pause) after asking. */
+     * load). The request runs at the guest's next safe boundary, while
+     * the runtime temporarily releases its menu pause. */
     int  (*state_slot_count)(void);
     int  (*state_available)(void);
     int  (*state_info)(int slot, long long *mtime);
     int  (*state_thumb)(int slot, unsigned *argb, int w, int h);
     int  (*state_save)(int slot);
     int  (*state_load)(int slot);
+    /* Latest menu request: 0 pending, 1 completed, -1 failed. The runtime
+     * temporarily releases only the menu pause to reach a safe boundary,
+     * then restores it. Providers may keep their menu open throughout. */
+    int (*state_status)(void);
 } PsxMenuHost;
 
 typedef struct PsxMenuProvider {
