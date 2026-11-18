@@ -7,6 +7,16 @@ auto-memory ([[psxrecomp-build-faithful-core-not-hacks]],
 
 ---
 
+## 2026-11-17 textured mask maintenance
+
+Keep stencil mask bits current during textured draws instead of rebuilding
+full-resolution stencil attachments on every later mask-check enable. Split
+overlapping batches to preserve STP/opaque painter ordering, including opaque
+bloom coverage in split HLE runs. New real-GL fixture compares color, depth and
+stencil at 1x/5x/9x with PGXP enabled: 180 checks pass. R4 Release build and all
+46 runtime tests pass. Replay timing and menu transition qualification continue
+in the title repository; no timing-core change.
+
 ## 2026-11-17 frontend actions
 
 Added game-owned guest-entry callbacks independent of elective mod plans, so

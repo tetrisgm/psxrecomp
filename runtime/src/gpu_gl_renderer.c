@@ -1033,6 +1033,10 @@ static float geo_dither_code(void) {
 /* Opaque textured draws carry the exact mask bit in FBO alpha. Keeping the
  * duplicate stencil copy current is deferred until mask checking is requested. */
 static int s_stencil_valid = 1;
+/* Keep the duplicate stencil current during textured draws. Rebuilding
+ * high-resolution attachments at mask-enable edges stalls effect-heavy scenes.
+ * Alpha remains the authoritative mask for uploads and restored surfaces. */
+static int s_stencil_eager = 1;
 
 /* ---- native-wide compositor (mirrors gpu_sw_renderer.c g_wide_*) ----------
  * Canonical VRAM (the hr FBO) stays 100% faithful. Native-wide lives in
@@ -3993,7 +3997,7 @@ static void tex_draw_passes_ex_at(int nverts, int semi, int tb_mask, int check,
         p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
         fused = bcls_fuse_begin(semi, dmode, tb_mask, check, b3d);
         glDrawArrays(GL_TRIANGLES, first, nverts);
-        if (check) {
+        if (check || (s_stencil_eager && !tb_mask)) {
             glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
             mask_stencil_ex(1, check);
             p_glUniform1i(s_uSemipass, 2);             /* STP=1 texels set the mask bit */
@@ -4012,10 +4016,17 @@ static void tex_draw_passes_ex_at(int nverts, int semi, int tb_mask, int check,
         glEnable(GL_BLEND);
         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
         p_glBlendFuncSeparate(GL_ONE, PSXGL_SRC1_ALPHA, GL_ONE, GL_ZERO);
-        if (tb_mask) mask_stencil_ex(1, check); else glDisable(GL_STENCIL_TEST);
+        if (tb_mask || s_stencil_eager) mask_stencil_ex(tb_mask, check); else glDisable(GL_STENCIL_TEST);
         p_glUniform1i(s_uSemipass, 0);
         glDrawArrays(GL_TRIANGLES, first, nverts);
-        if (!tb_mask && track_stencil) s_stencil_valid = 0;
+        if (!tb_mask && s_stencil_eager) {
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            mask_stencil_ex(1, 0);
+            p_glUniform1i(s_uSemipass, 2);
+            glDrawArrays(GL_TRIANGLES, first, nverts);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            p_glUniform1i(s_uSemipass, 0);
+        } else if (!tb_mask && track_stencil) s_stencil_valid = 0;
     } else {
         glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
         mask_stencil_ex(tb_mask, check);
@@ -4497,7 +4508,10 @@ static void flush_tex_batch_impl(void) {
     /* HLE key 4 admits mixed opaque/translucent runs. If no translucent
      * primitive actually joined this run, use the opaque draw: identical
      * painter order and coverage, with fused bloom classification. */
-    if (s_opaque_batch_fast && semi==4 && !s_tb_has_semi) semi=-1;
+    /* Mask-maintaining overlap splits can leave an opaque-only fragment of
+     * an HLE mixed run. Its bloom coverage must still be opaque, even when
+     * the diagnostic opaque-batch fast path is disabled. */
+    if ((s_opaque_batch_fast || s_stencil_eager) && semi==4 && !s_tb_has_semi) semi=-1;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
     double cw_t0 = cw_ms();
     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
@@ -5234,7 +5248,19 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         const GlBatchClass batch_class = gl_batch_classify(semi, s_mask_check,
             mod_texture_bank_batchable(s_selected_bank_tex != 0, s_mask_check, semi));
         const int batch_semi = batch_class.key;
-        const int isolate = batch_class.isolate;
+        /* Eager STP fixup is a second draw. Keep overlapping primitives in
+         * separate batches so an earlier STP texel cannot mask a later opaque
+         * texel. Non-overlapping geometry can retain ordinary batching. */
+        static int mask_x0, mask_y0, mask_x1, mask_y1;
+        int mx0=xs[0],my0=ys[0],mx1=xs[0],my1=ys[0];
+        for(int v=1;v<3;v++) {
+            if(xs[v]<mx0)mx0=xs[v];if(xs[v]>mx1)mx1=xs[v];
+            if(ys[v]<my0)my0=ys[v];if(ys[v]>my1)my1=ys[v];
+        }
+        if(s_pc_valid){mx1++;my1++;}
+        const int isolate = batch_class.isolate ||
+            (s_stencil_eager && !s_mask_set && s_tb_n &&
+             mx0<mask_x1 && mx1>mask_x0 && my0<mask_y1 && my1>mask_y0);
         const int tdmode = pgxp_tri_depth_mode(semi);
         if (tdmode) depth_before_tri();
         int reason = -1;
@@ -5261,6 +5287,11 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             flush_tex_batch();
         }
         if (s_tb_n + 3 > TEXBATCH_MAXV) { s_batch_reason[6]++; flush_tex_batch(); }
+        if(s_tb_n==0){mask_x0=mx0;mask_y0=my0;mask_x1=mx1;mask_y1=my1;}
+        else {
+            if(mx0<mask_x0)mask_x0=mx0;if(my0<mask_y0)mask_y0=my0;
+            if(mx1>mask_x1)mask_x1=mx1;if(my1>mask_y1)mask_y1=my1;
+        }
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
             s_tb_has_semi = 0;
             s_tb_semi = batch_semi; s_tb_mask = s_mask_set; s_tb_filter = filter; s_tb_gate = gate;
@@ -5647,6 +5678,7 @@ static void glb_set_mask_bits(int s, int c) {
         /* Land all alpha-authoritative work before deriving stencil from it. */
         flush_cpu_upload();
         rebuild_mask_stencils();
+        s_stencil_eager = 1;
     }
     s_mask_set = s ? 1 : 0;
     s_mask_check = next_check;

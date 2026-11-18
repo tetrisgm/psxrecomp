@@ -81,7 +81,7 @@ if(BUILD_TESTING AND NOT TARGET psx-presentation-scene-test)
         target_compile_options(psx-rewind-history-portable-test PRIVATE -UNDEBUG)
         target_link_libraries(psx-rewind-history-portable-test PRIVATE SDL3::SDL3-static ZLIB::ZLIB)
         add_test(NAME psx_rewind_history_portable COMMAND psx-rewind-history-portable-test)
-        foreach(_source test_gl_presentation.c test_gl_opaque_batch.c test_gl_wide_margins.c)
+        foreach(_source test_gl_presentation.c test_gl_opaque_batch.c test_gl_wide_margins.c test_gl_eager_mask.c)
             string(REGEX REPLACE "test_gl_(.*)\\.c" "\\1" _fixture "${_source}")
             add_test(NAME psx_gl_${_fixture}
                 COMMAND "${Python3_EXECUTABLE}"
