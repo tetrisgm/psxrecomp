@@ -17,7 +17,7 @@ Mac/Windows diagnostics expose a performance regression from eager stencil batch
 splits: deferred reconstruction reduces ~1,300 batches to ~70 per frame. Further
 remove unused media-snapshot checksum caching; recovery probes retain checksum
 verification. R4's v9 Release builds and 49 CTests pass, but natural finish/replay,
-visual menu coverage and satisfactory live performance remain unqualified.
+visual menu coverage and satisfactory live performance remain unqualified. Subsequent v19 Mac/Windows builds and 50 runtime tests pass; earlier v12 two-machine race yielded 1,536/1,536 matching live hashes. The final v19 two-machine check could not connect after the PC stopped answering, so current visual qualification is pending.
 No guest timing changes or release publication.
 
 ## 2026-11-17 integrated menu service initialization
