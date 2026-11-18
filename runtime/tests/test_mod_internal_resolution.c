@@ -14,7 +14,10 @@ int main(void) {
     CHECK(!psx_mod_set_internal_resolution(8193u));
     CHECK(!psx_mod_set_internal_resolution(UINT32_MAX));
     CHECK(psx_mod_internal_resolution_request() == 1080u);
+    psx_mod_set_attract_background(1);
+    CHECK(psx_mod_attract_background() == 1);
     psx_mod_internal_resolution_reset();
+    CHECK(psx_mod_attract_background() == 0);
     CHECK(psx_mod_internal_resolution_request() == 0u);
     CHECK(psx_mod_set_internal_resolution(120u));
     CHECK(psx_mod_set_internal_resolution(8192u));

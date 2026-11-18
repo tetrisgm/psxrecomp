@@ -112,7 +112,7 @@ static void test_resolution(void) {
     r = psx_host_enh_resolve_resolution(&base, &req);
     CHECK(r.internal_resolution == PSX_IR_NATIVE && r.dynamic_resolution == 0);
 
-    /* Old explicit choices keep their meaning; absent/invalid text uses 4x. */
+    /* Old explicit choices keep their meaning; absent/invalid text uses 3x. */
     static const struct { const char* text; int value; } choices[] = {
         {"default", PSX_IR_UNSET}, {"native", PSX_IR_NATIVE}, {"720p", 720},
         {"1080p", 1080}, {"1440p", 1440}, {"4k", 2160}, {"5k", 2880}, {"8k", 4320},
@@ -129,14 +129,14 @@ static void test_resolution(void) {
     psx_host_enh_reset();
     psx_host_enh_requests(&req);
     CHECK(!req.resolution && req.resolution_value == PSX_IR_UNSET);
-    activate("psx.internal-resolution");                /* fresh profile: fixed 4x */
+    activate("psx.internal-resolution");                /* fresh profile: fixed 3x */
     psx_host_enh_requests(&req);
-    CHECK(req.resolution && req.resolution_value == PSX_IR_SCALE(4));
+    CHECK(req.resolution && req.resolution_value == PSX_IR_SCALE(3));
     const PsxHostResolution old_4k = {2160, 1};
     r = psx_host_enh_resolve_resolution(&old_4k, &req);
-    CHECK(r.internal_resolution == PSX_IR_SCALE(4) && r.dynamic_resolution == 0);
-    CHECK(psx_resolve_internal_scale(r.internal_resolution, 240, 0, 32) == 4);
-    CHECK(psx_resolve_internal_scale(r.internal_resolution, 480, 0, 32) == 4);
+    CHECK(r.internal_resolution == PSX_IR_SCALE(3) && r.dynamic_resolution == 0);
+    CHECK(psx_resolve_internal_scale(r.internal_resolution, 240, 0, 32) == 3);
+    CHECK(psx_resolve_internal_scale(r.internal_resolution, 480, 0, 32) == 3);
     set_opt(IR, "internal-resolution", "resolution", "auto");
     psx_host_enh_reset();
     activate("psx.internal-resolution");

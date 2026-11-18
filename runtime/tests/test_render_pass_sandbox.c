@@ -282,6 +282,10 @@ uint32_t gl_renderer_local_view_unavailable(void) { return s_local_status; }
 int gl_renderer_local_view_begin(int x, int y, int w, int h) {
     return gl_renderer_pass_begin(x, y, w, h, 0, 0, 0);
 }
+void gl_renderer_local_view_clear(void) {}
+int gl_renderer_local_view_begin_complete(int x, int y, int w, int h) {
+    return gl_renderer_local_view_begin(x, y, w, h);
+}
 int gl_renderer_local_view_end(int keep) {
     gl_renderer_pass_end(0, 0);
     if (keep) s_local_kept++;

@@ -1009,8 +1009,9 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
                                                  pass->h, reuse)
           : eye >= 0 ? gl_renderer_stereo_begin(pass->x, pass->y, pass->w,
                                                pass->h, reuse)
-          : eye == RP_EYE_LOCAL ? gl_renderer_local_view_begin(pass->x, pass->y,
-                                                               pass->w, pass->h)
+          : eye == RP_EYE_LOCAL ? (complete_image ? gl_renderer_local_view_begin_complete :
+                                             gl_renderer_local_view_begin)(pass->x, pass->y,
+                                                                           pass->w, pass->h)
                     : gl_renderer_pass_begin(pass->x, pass->y, pass->w,
                                                pass->h, open, s_plan_period, reuse |
                             (complete_image ? GL_PASS_COMPLETE_IMAGE : 0)))) {
@@ -1206,8 +1207,8 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
     return ok;
 }
 
-int psx_mod_render_local_view(struct CPUState *cpu, const PSXModRenderPass *rect,
-                              PSXModRenderPassFn fn, void *user) {
+static int render_local_view(struct CPUState *cpu, const PSXModRenderPass *rect,
+                              PSXModRenderPassFn fn, void *user, int complete) {
     PSXModRenderPass r;
     s_stats.local_attempts++;
     if (!rect || rect->struct_size < sizeof r ||
@@ -1217,7 +1218,21 @@ int psx_mod_render_local_view(struct CPUState *cpu, const PSXModRenderPass *rect
     }
     r = *rect;
     r.alpha_q16 = 0;
-    return render_transaction(cpu, &r, fn, user, RP_EYE_LOCAL, 0);
+    return render_transaction(cpu, &r, fn, user, RP_EYE_LOCAL, complete);
+}
+
+int psx_mod_render_local_view(struct CPUState *cpu, const PSXModRenderPass *rect,
+                              PSXModRenderPassFn fn, void *user) {
+    return render_local_view(cpu, rect, fn, user, 0);
+}
+
+int psx_mod_render_local_view_complete(struct CPUState *cpu, const PSXModRenderPass *rect,
+                                       PSXModRenderPassFn fn, void *user) {
+    return render_local_view(cpu, rect, fn, user, 1);
+}
+
+void psx_mod_render_local_view_clear(void) {
+    gl_renderer_local_view_clear();
 }
 
 uint32_t psx_mod_render_local_view_status(void) {

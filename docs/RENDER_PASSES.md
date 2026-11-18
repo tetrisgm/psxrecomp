@@ -298,12 +298,18 @@ identical on every peer) can give each player their own seat's single view:
 at the point where the next flip will show `rect` and the guest has finished
 drawing it, `fn` redraws that rect with the game's code (alpha 0) in the same
 sandbox as a pass. Everything a pass restores is restored; the difference is
-the product. The OpenGL presenter's surface keeps the rect's colour (the
-internal-resolution surface and the native-wide band) until the guest draws
-there again, while the stencil, raw mirror, CPU VRAM rows, out-of-rect journal
-and coherency state are put back. Its draws skip the software raster, so the
-authoritative CPU VRAM never sees them. A committed image cancels any
+the product. The OpenGL presenter captures the rect's colour in a separate
+image, then restores canonical colour, depth, stencil, raw mirror, CPU VRAM,
+out-of-rect journal and coherency state. Native-wide images combine their
+own centre and margins before restoration. A committed image cancels any
 `psx_netplay_present_local_view()` crop.
+
+`psx_mod_render_local_view_complete` starts from transparent black for a full
+redraw. Its last completed image survives partial shared drawing and display
+buffer flips until the next own image is complete. The title must call
+`psx_mod_render_local_view_clear()` on scene exit or canonical fallback.
+This prevents alternating player/shared views between guest draw and flip.
+The original partial-redraw API instead expires on overlapping guest writes.
 
 It needs a netplay session on a forward frame and the OpenGL dual-raster
 presenter (a surface separate from the authoritative VRAM); it does not need
@@ -316,7 +322,7 @@ high-resolution window; `NO_PRESENTER` without an OpenGL surface or with
 24-bit scanout; plus the usual `FAST_FORWARD`, `DISABLED` and `BUSY`.
 `render_pass_stats` counts `local_attempts` and `local_views` and reports
 `local_status`. `PSX_RENDER_PASS_VERIFY=1` checks the guest state as for a
-pass (the kept rect is the product, so its VRAM comparison is skipped).
+pass, including restoration of the canonical colour surface.
 R4's online Link Battle (`src/mods/r4_link_netplay.c`) is the worked example.
 
 ## Gates

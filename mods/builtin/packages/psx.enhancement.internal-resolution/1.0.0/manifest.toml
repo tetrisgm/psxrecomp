@@ -3,7 +3,7 @@ id = "psx.enhancement.internal-resolution"
 version = "1.0.0"
 name = "Internal Resolution"
 author = "psxrecomp"
-description = "Render the 3D picture at a selected internal scale before fitting it to the window. Defaults to 4x. Higher choices render sharper geometry and use more GPU memory; the renderer reduces the effective scale when hardware or memory limits require it. Presentation only: each player keeps their own choice in netplay."
+description = "Render the 3D picture at a selected internal scale before fitting it to the window. Defaults to 3x. Higher choices render sharper geometry and use more GPU memory; the renderer reduces the effective scale when hardware or memory limits require it. Presentation only: each player keeps their own choice in netplay."
 resolver = "declarative"
 save_compatibility = "shared"
 
@@ -15,7 +15,7 @@ game_id = "*"
 [[feature]]
 id = "internal-resolution"
 name = "Internal Resolution"
-description = "Enabled at 4x by default. Disable for native resolution, or select 1x through 32x. The effective scale remains subject to GPU and memory limits."
+description = "Enabled at 3x by default. Disable for native resolution, or select 1x through 32x. The effective scale remains subject to GPU and memory limits."
 group = "Visual"
 default_enabled = true
 
@@ -23,10 +23,10 @@ default_enabled = true
 feature = "internal-resolution"
 id = "resolution"
 label = "Internal resolution"
-description = "1x is native; 4x is the default. Fixed scales through 32x use the same factor for every title. Height presets, Match display, Auto and Game default remain available for saved choices. Hardware and memory limits may reduce the effective scale."
+description = "1x is native; 3x is the default. Fixed scales through 32x use the same factor for every title. Height presets, Match display, Auto and Game default remain available for saved choices. Hardware and memory limits may reduce the effective scale."
 group = "Visual"
 type = "choice"
-default = "4x"
+default = "3x"
 
 [[option.choice]]
 value = "default"

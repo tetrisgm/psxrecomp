@@ -15,6 +15,7 @@
 #elif !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
 #endif
+#include "internal_resolution.h"
 #include <time.h>
 #ifdef __APPLE__
 #include <pthread.h>
@@ -10943,9 +10944,9 @@ static void handle_video_set(int id, const char *json)
         send_err(id, "video_set needs internal_resolution and/or supersample");
         return;
     }
-    if (ir != k_absent && !(ir == 1 || ir == -1 || ir == -2 || (ir >= 2 && ir <= 8640))) {
+    if (ir != k_absent && !psx_ir_value_valid(ir)) {
         send_err(id, "invalid internal_resolution (1 native, -1 match display, -2 auto, "
-                     "2..8640 lines)");
+                     "fixed scales -101..-132, or 2..8640 lines)");
         return;
     }
     if (ss != k_absent && (ss < 1000 || ss > 4000)) {

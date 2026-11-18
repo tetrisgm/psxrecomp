@@ -633,6 +633,15 @@ if(BUILD_TESTING)
                 LABELS "gpu;opengl;hardware" TIMEOUT 180
                 ENVIRONMENT "PSX_GL_HIRES_WINDOW=${_depth_window}")
         endforeach()
+        add_test(NAME gl_local_view_test
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_texture_filter.py"
+                --fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gl_local_view.c"
+                --cc "${CMAKE_C_COMPILER}"
+                --sdl-include "$<TARGET_PROPERTY:SDL3::Headers,INTERFACE_INCLUDE_DIRECTORIES>"
+                --sdl-library "$<TARGET_FILE:SDL3::SDL3-static>"
+                --output "${CMAKE_CURRENT_BINARY_DIR}/gl-local-view-results")
+        set_tests_properties(gl_local_view_test PROPERTIES LABELS "gpu;opengl;hardware" TIMEOUT 180)
         add_test(NAME gl_eager_mask_test
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_gl_texture_filter.py"
@@ -2436,6 +2445,16 @@ if(BUILD_TESTING)
                                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_rb_verify_lost_post.py
                                  --compiler ${CMAKE_C_COMPILER}
                                  --recomp-net ${_RNET_ROOT})
+            endif()
+            add_test(NAME netplay_rb_tip_extend_test
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_netplay_rb_tip_extend.py
+                             --compiler ${CMAKE_C_COMPILER})
+            if(NOT CMAKE_CROSSCOMPILING)
+                add_test(NAME crc32_native_test
+                         COMMAND ${Python3_EXECUTABLE}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_crc32_native.py
+                                 --compiler ${CMAKE_C_COMPILER})
             endif()
             add_test(NAME overlay_retry_c11_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_overlay_retry_c11.py --compiler ${CMAKE_C_COMPILER})
         endif()

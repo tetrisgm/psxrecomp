@@ -10,6 +10,7 @@ extern "C" {
 /* Runtime session plumbing; plugins use mod_plugins.h. Zero means no request. */
 uint32_t psx_mod_internal_resolution_request(void);
 void psx_mod_internal_resolution_reset(void);
+int psx_mod_attract_background(void);
 
 #ifdef __cplusplus
 }

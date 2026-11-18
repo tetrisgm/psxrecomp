@@ -7,6 +7,19 @@ auto-memory ([[psxrecomp-build-faithful-core-not-hacks]],
 
 ---
 
+## 2026-11-18 R4 rollback and presentation qualification
+
+Invalidate stale frame confirmations when continuing an already-running replay;
+retain complete local-player images independently of canonical buffer writes;
+support transient menu-background scale and aspect-preserving cover presentation.
+Real-GL attachment and local-view fixtures pass alongside the rollback regression.
+Mac/Windows diagnostics expose a performance regression from eager stencil batch
+splits: deferred reconstruction reduces ~1,300 batches to ~70 per frame. Further
+remove unused media-snapshot checksum caching; recovery probes retain checksum
+verification. R4's v9 Release builds and 49 CTests pass, but natural finish/replay,
+visual menu coverage and satisfactory live performance remain unqualified.
+No guest timing changes or release publication.
+
 ## 2026-11-17 integrated menu service initialization
 
 Initialize launcher networking callbacks and disc identity even when the separate

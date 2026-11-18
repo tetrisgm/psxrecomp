@@ -45,6 +45,14 @@ if(BUILD_TESTING AND NOT TARGET psx-presentation-scene-test)
         "${_presentation_runtime}/src/psx_ram_geometry.c")
     target_include_directories(psx-pgxp-propagation-test PRIVATE "${_presentation_runtime}/include")
     add_test(NAME psx_pgxp_propagation COMMAND psx-pgxp-propagation-test)
+    if(Python3_Interpreter_FOUND AND NOT MSVC AND NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME psx_crc32_native
+            COMMAND "${Python3_EXECUTABLE}" "${_presentation_runtime}/tests/test_crc32_native.py"
+                    --compiler "${CMAKE_C_COMPILER}")
+        add_test(NAME psx_netplay_rb_tip_extend
+            COMMAND "${Python3_EXECUTABLE}" "${_presentation_runtime}/tests/test_netplay_rb_tip_extend.py"
+                    --compiler "${CMAKE_C_COMPILER}")
+    endif()
     if(APPLE AND Python3_Interpreter_FOUND AND TARGET SDL3::SDL3-static)
         add_executable(psx-keyboard-pad-chord-test
             "${_presentation_runtime}/tests/test_keyboard_pad_chord.c"
@@ -81,7 +89,7 @@ if(BUILD_TESTING AND NOT TARGET psx-presentation-scene-test)
         target_compile_options(psx-rewind-history-portable-test PRIVATE -UNDEBUG)
         target_link_libraries(psx-rewind-history-portable-test PRIVATE SDL3::SDL3-static ZLIB::ZLIB)
         add_test(NAME psx_rewind_history_portable COMMAND psx-rewind-history-portable-test)
-        foreach(_source test_gl_presentation.c test_gl_opaque_batch.c test_gl_wide_margins.c test_gl_eager_mask.c)
+        foreach(_source test_gl_presentation.c test_gl_opaque_batch.c test_gl_wide_margins.c test_gl_eager_mask.c test_gl_local_view.c)
             string(REGEX REPLACE "test_gl_(.*)\\.c" "\\1" _fixture "${_source}")
             add_test(NAME psx_gl_${_fixture}
                 COMMAND "${Python3_EXECUTABLE}"

@@ -231,7 +231,11 @@ that identical frame; only what its window shows changes:
   example its seat's single full-screen view, inside the render-pass sandbox
   (docs/RENDER_PASSES.md, "Netplay local view"). The machine is restored
   afterwards, so the canonical frame stays in the authoritative VRAM, rollback
-  snapshots and digests; only the OpenGL presenter's surface keeps the image.
+  snapshots and digests; the OpenGL presenter keeps a separate completed image.
+  The complete-redraw variant retains the image across shared frame drawing
+  and buffer flips; the title explicitly clears it on scene exit or when
+  returning to canonical presentation. Pause overlays can be redrawn within
+  the same local-view sandbox.
   A committed image cancels any `psx_netplay_present_local_view` crop
   (`psx_netplay_local_view_clear`). Forward netplay frames only; a title falls
   back to the crop when `psx_mod_render_local_view_status()` is not ready

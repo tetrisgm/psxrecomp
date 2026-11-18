@@ -650,6 +650,10 @@ int psx_mod_set_widescreen_hud_size(int proportional);
  * win over it, and each session clears this request before activating its
  * committed mod plan. */
 int psx_mod_set_internal_resolution(uint32_t target_lines);
+/* Decorative attract background: one raster step below the player choice,
+ * centered aspect-preserving cover presentation. Clear before gameplay/UI.
+ * Host-only, transient, and reset at session start; never saves settings. */
+void psx_mod_set_attract_background(int active);
 /*
  * Set the wall-clock cadence of simulated guest VBlanks. A value of zero
  * removes frontend pacing; 60 and higher request that many native guest
@@ -841,6 +845,15 @@ uint32_t psx_mod_render_pass_status(void);
 int psx_mod_render_local_view(struct CPUState* cpu,
                               const PSXModRenderPass* rect,
                               PSXModRenderPassFn fn, void* user);
+/* Full redraw variant: begin on transparent black, without pixels from the
+ * shared split-screen image. Canonical colour is restored after capture.
+ * Retain the last complete image across guest double-buffer flips and partial
+ * draws until its replacement is ready. Call clear on scene exit or
+ * before falling back to the canonical view. */
+int psx_mod_render_local_view_complete(struct CPUState* cpu,
+                                      const PSXModRenderPass* rect,
+                                      PSXModRenderPassFn fn, void* user);
+void psx_mod_render_local_view_clear(void);
 uint32_t psx_mod_render_local_view_status(void);
 /* 1 while a psx_mod_render_local_view draw runs. In that scope a netplay
  * match's own-view mods ([[plugin]] netplay = "local_view") run their hooks

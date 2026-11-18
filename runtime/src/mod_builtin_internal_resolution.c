@@ -5,7 +5,7 @@
  * Match display, or Auto (Match display with dynamic resolution) --
  * is a property of the host renderer, not of any particular disc, so it ships
  * here and mods/builtin/packages/psx.enhancement.internal-resolution targets
- * game_id "*". Fresh profiles default to fixed 4x, independent of the title's
+ * game_id "*". Fresh profiles default to fixed 3x, independent of the title's
  * old height preset. Saved scales/presets and Game default remain explicit
  * choices. Disabling the feature selects Native (host_enhancements.h).
  *

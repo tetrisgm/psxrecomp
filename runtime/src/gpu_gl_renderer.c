@@ -96,6 +96,7 @@
 #include "host_osd.h"
 #include "psx_savestate_menu.h"
 #include "psx_host_menu.h"
+#include "mod_internal_resolution.h"
 #include "host_time.h"
 #include "latency_ring.h"
 #include "gpu_timeline.h"
@@ -768,9 +769,21 @@ static uint64_t s_idle_ticks_accum_fwd(uint64_t add);
 static int      s_pass_active = 0;
 /* The open transaction is a netplay local view (gl_renderer_local_view_*):
  * its draws reach only the presenter surface, never the authoritative CPU
- * VRAM, and end(keep) keeps the rect's presented colour. */
-static int      s_pass_local = 0;
+ * VRAM, and end(keep) caches the rect's colour before restoring the surface. */
+static int      s_pass_local = 0, s_pass_local_complete = 0;
 static uint64_t s_local_commits = 0;
+/* Own-view colour is presentation output, never the next shared frame's
+ * drawing destination. Canonical draws invalidate overlapping partial products;
+ * complete images remain published until explicitly replaced or cleared. */
+static GLuint s_local_tex, s_local_fbo, s_local_wide_tex, s_local_wide_fbo;
+static int s_local_tw, s_local_th, s_local_wide_tw, s_local_wide_th;
+static int s_local_has_wide, s_local_complete;
+static int s_local_valid, s_local_x, s_local_y, s_local_w, s_local_h, s_local_scale;
+static int local_image_matches(int x, int y, int w, int h) {
+    return s_local_valid && s_local_scale == s_hr_scale &&
+           s_local_x == x && (s_local_complete || s_local_y == y) &&
+           s_local_w == w && s_local_h == h;
+}
 /* Textures/framebuffers made for passes (pass_make_color_fbo, pass image
  * slots), and the count when the current pass began: a pass that allocated
  * is left out of the pass-cost average (render_pass_cost_add). */
@@ -1033,10 +1046,11 @@ static float geo_dither_code(void) {
 /* Opaque textured draws carry the exact mask bit in FBO alpha. Keeping the
  * duplicate stencil copy current is deferred until mask checking is requested. */
 static int s_stencil_valid = 1;
-/* Keep the duplicate stencil current during textured draws. Rebuilding
- * high-resolution attachments at mask-enable edges stalls effect-heavy scenes.
- * Alpha remains the authoritative mask for uploads and restored surfaces. */
-static int s_stencil_eager = 1;
+/* Derive stencil at mask-enable edges from authoritative alpha. Eager STP
+ * fixups require splitting overlapping geometry and can turn a scene into
+ * thousands of draw calls. Keep the eager path as the attachment-parity
+ * fixture's comparison; ordinary draws retain painter-ordered batching. */
+static int s_stencil_eager = 0;
 
 /* ---- native-wide compositor (mirrors gpu_sw_renderer.c g_wide_*) ----------
  * Canonical VRAM (the hr FBO) stays 100% faithful. Native-wide lives in
@@ -1334,6 +1348,10 @@ static void present_dirty_rect(int x0, int y0, int x1, int y1, int set) {
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
     if (x1 >= VRAM_W) x1 = VRAM_W - 1; if (y1 >= VRAM_H) y1 = VRAM_H - 1;
     if (x0 > x1 || y0 > y1) return;
+    if (set && !s_pass_active && s_local_valid && !s_local_complete &&
+        x0 < s_local_x + s_local_w && x1 >= s_local_x &&
+        y0 < s_local_y + s_local_h && y1 >= s_local_y)
+        s_local_valid = 0;
     int tx0 = x0 / PRES_TILE, tx1 = x1 / PRES_TILE;
     uint64_t mask = (~0ull << tx0) & (~0ull >> (63 - tx1));
     for (int ty = y0 / PRES_TILE; ty <= y1 / PRES_TILE; ty++) {
@@ -5678,7 +5696,6 @@ static void glb_set_mask_bits(int s, int c) {
         /* Land all alpha-authoritative work before deriving stencil from it. */
         flush_cpu_upload();
         rebuild_mask_stencils();
-        s_stencil_eager = 1;
     }
     s_mask_set = s ? 1 : 0;
     s_mask_check = next_check;
@@ -6284,7 +6301,9 @@ float gl_renderer_get_post_gamma(void) {
 static void letterbox_rect_aspect(int ww, int wh, int num, int den,
                                   int *x, int *y, int *w, int *h) {
     int dw = ww, dh = (ww * den) / num;
-    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
+    if (psx_mod_attract_background()) {
+        if (dh < wh) { dh = wh; dw = (wh * num + den - 1) / den; }
+    } else if (dh > wh) { dh = wh; dw = (wh * num) / den; }
     *x = (ww - dw) / 2;
     *y = (wh - dh) / 2;
     *w = dw; *h = dh;
@@ -8816,6 +8835,7 @@ uint64_t gl_renderer_perf_ticks(void) { return SDL_GetPerformanceCounter(); }
 uint64_t gl_renderer_perf_frequency(void) { return SDL_GetPerformanceFrequency(); }
 
 static void pass_gens_invalidate(void) {
+    s_local_valid = 0;
     for(int i=0;i<PASS_GENERATIONS;++i)s_pgen[i].valid=s_pgen[i].promoted=0;
     s_pgen_promote = -1;
 }
@@ -9262,6 +9282,10 @@ static void pass_resources_release(void) {
     s_xr_color_prog=s_xr_native_tex=0;
     pass_free_color_fbo(&s_capture_read_tex,NULL,&s_capture_read_fbo,&s_capture_read_w,&s_capture_read_h);
     stereo_resources_release();
+    pass_free_color_fbo(&s_local_tex, NULL, &s_local_fbo, &s_local_tw, &s_local_th);
+    pass_free_color_fbo(&s_local_wide_tex, NULL, &s_local_wide_fbo,
+                        &s_local_wide_tw, &s_local_wide_th);
+    s_local_valid = 0;
     for(int gi=0;gi<PASS_GENERATIONS;++gi)pass_gen_release(gi);
     pass_gens_invalidate();
     pass_free_color_fbo(&s_pb_hr_tex, &s_pb_hr_rb, &s_pb_hr_fbo,
@@ -9573,6 +9597,11 @@ backed_up:
     s_pj_cpu.n = 0;
     s_pass_active = 1;
     s_pass_local = local;
+    s_pass_local_complete = kind == 2 && complete_image;
+    if (kind == 2 && complete_image) {
+        pass_private_clear(s_hr_fbo, x, y, w, h);
+        if (s_pb_wide_src) pass_private_clear(s_pb_wide_src, 0, y, g_wide_w, h);
+    }
     pass_stage_done(0);
     return 1;
 }
@@ -9665,13 +9694,54 @@ int gl_renderer_local_view_begin(int x, int y, int w, int h) {
     GL_RT_SYNC("local_view_begin");
     return transaction_begin(x, y, w, h, 0, 0, 0, 2, psx_cycle_count);
 }
+int gl_renderer_local_view_begin_complete(int x, int y, int w, int h) {
+    GL_RT_SYNC("local_view_begin_complete");
+    return transaction_begin(x, y, w, h, 0, 0, GL_PASS_COMPLETE_IMAGE, 2, psx_cycle_count);
+}
+void gl_renderer_local_view_clear(void) {
+    GL_RT_SYNC("local_view_clear");
+    s_local_valid = 0;
+}
 int gl_renderer_local_view_end(int keep) {
     GL_RT_SYNC("local_view_end");
     if (!s_pass_active || !s_pass_local) return 0;
     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
-    transaction_restore_ex(keep ? 1 : 0);
-    if (keep) s_local_commits++;
-    return 1;
+    const int S = s_hr_scale, complete = s_pass_local_complete;
+    int ok = !keep || pass_make_color_fbo(&s_local_tex, NULL, &s_local_fbo,
+        &s_local_tw, &s_local_th, VRAM_W*S, VRAM_H*S, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
+    const int wide = s_pb_wide_src != 0;
+    if (keep && ok && wide)
+        ok = pass_make_color_fbo(&s_local_wide_tex, NULL, &s_local_wide_fbo,
+            &s_local_wide_tw, &s_local_wide_th, g_wide_w*S, VRAM_H*S,
+            GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
+    if (keep && ok) {
+        pass_blit(s_hr_fbo, s_local_fbo, s_pass_x*S, s_pass_y*S,
+            s_pass_x*S, s_pass_y*S, s_pass_w*S, s_pass_h*S, GL_COLOR_BUFFER_BIT);
+        if (wide) {
+            pass_blit(s_pb_wide_src, s_local_wide_fbo, 0, s_pass_y*S,
+                0, s_pass_y*S, g_wide_w*S, s_pass_h*S, GL_COLOR_BUFFER_BIT);
+            /* The fast wide mirror draws only the margins. Complete its
+             * centre from the still-live own view before restoring canonical
+             * colour; the presenter must never fill it from shared colour. */
+            if (wide_center_is_canonical())
+                pass_blit(s_hr_fbo, s_local_wide_fbo, s_pass_x*S, s_pass_y*S,
+                    g_wide_off*S, s_pass_y*S, (g_wide_w-2*g_wide_off)*S,
+                    s_pass_h*S, GL_COLOR_BUFFER_BIT);
+        }
+    }
+    /* Restore colour too: retained HUD pixels must not enter a later shared
+     * partial redraw (notably a pause frame), or seed another own-view draw. */
+    transaction_restore_ex(0);
+    if (keep && ok) {
+        present_dirty_rect(s_pass_x, s_pass_y, s_pass_x+s_pass_w-1,
+                           s_pass_y+s_pass_h-1, 1);
+        s_local_x=s_pass_x; s_local_y=s_pass_y;
+        s_local_w=s_pass_w; s_local_h=s_pass_h; s_local_scale=S;
+        s_local_has_wide=wide; s_local_complete=complete;
+        s_local_valid=1;
+        ++s_local_commits;
+    }
+    return ok;
 }
 
 int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
@@ -11412,6 +11482,12 @@ static void present_vram_impl(int disp_x, int disp_y, int w, int h, int linear,
         }
     }
 
+    if (!s_hiw && local_image_matches(disp_x, disp_y, w, h)) {
+        src_fbo = interp_fbo = s_local_fbo; src_tex = s_local_tex;
+        src_scale = s_local_scale;
+        disp_y = s_local_y;
+    }
+
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
@@ -11585,6 +11661,15 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     flush_tex_batch();
     flush_cpu_upload();
     hiw_flush_queue();   /* windowed: queued wide mirrors */
+    /* Local-only widescreen never expands the shared guest's cull. Without
+     * a completed own view, exposing its margins shows rejected geometry
+     * and unrelated buffer pixels (attract mode and canonical UI). */
+    if (gpu_ws_local_view_only() &&
+        !(s_local_has_wide && s_local_wide_fbo &&
+          local_image_matches(disp_x, disp_y, s_local_w, disp_h))) {
+        present_vram_impl(disp_x, disp_y, g_wide_w-2*g_wide_off, disp_h, linear, 1);
+        return 1;
+    }
     if (!s_native_surface_enabled && s_force_present_remaining <= 0 &&
         s_last_present_path == GL_PRES_WIDE &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
@@ -11604,7 +11689,13 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
-    wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */
+    const int local_image = s_local_has_wide && s_local_wide_fbo &&
+        local_image_matches(disp_x, disp_y, s_local_w, disp_h) &&
+        s_local_wide_tw == g_wide_w * s_hr_scale;
+    if (local_image) {
+        fbo = s_local_wide_fbo; tex = s_local_wide_tex; wide_as = s_local_scale;
+        disp_y = s_local_y;
+    } else wide_blit_center(fbo, disp_x, disp_y, disp_h);
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
@@ -11624,7 +11715,7 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
                                    ? (float)wide_as / (float)s_out_scale : 1.0f;
             postfx_note_source(fbo, tex, (float)g_wide_w*wext, (float)VRAM_H*wext,
                                0, disp_y, g_wide_w, disp_h);
-            if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2*g_wide_off)
+            if (!local_image && !s_hiw && wide_center_is_canonical() && g_wide_w > 2*g_wide_off)
                 postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W,s_hr_scale),
                                    present_alloc_extent(VRAM_H,s_hr_scale),disp_x,disp_y,
                                    g_wide_w-2*g_wide_off,disp_h,g_wide_off,g_wide_w);
@@ -11649,7 +11740,7 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
     postfx_note_source(fbo, tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
                       0, disp_y, g_wide_w, disp_h);
-    if (!s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
+    if (!local_image && !s_hiw && wide_center_is_canonical() && g_wide_w > 2 * g_wide_off)
         postfx_note_center(s_hr_fbo, s_hr_tex, present_alloc_extent(VRAM_W, s_hr_scale),
                            present_alloc_extent(VRAM_H, s_hr_scale), disp_x, disp_y,
                            g_wide_w - 2 * g_wide_off, disp_h, g_wide_off, g_wide_w);
@@ -12179,15 +12270,15 @@ int gl_renderer_request_internal_scale(int scale) {
  * render queue and apply under the owned context before acknowledging it.
  * A queued dynamic-resolution step is not proof its allocation succeeded. */
 /* Whether gl_renderer_set_internal_scale_live can move the scale on this
- * session at all: not in windowed high-resolution mode, not with
- * CPU-authoritative dual rendering, and only with a live raster context. */
+ * session at all: a live raster context outside windowed high-resolution mode.
+ * Dual rendering rescales presentation only. */
 int gl_renderer_internal_scale_live_capable(void) {
-    return (s_ctx && s_raster_ok && !s_hiw && !s_cpu_auth_dual) ? 1 : 0;
+    return (s_ctx && s_raster_ok && !s_hiw) ? 1 : 0;
 }
 
 int gl_renderer_set_internal_scale_live(int scale) {
     if (s_ctx) GL_RT_SYNC("set_internal_scale_live");
-    if (!s_ctx || !s_raster_ok || s_hiw || s_cpu_auth_dual || s_pass_active) return 0;
+    if (!s_ctx || !s_raster_ok || s_hiw || s_pass_active) return 0;
     int reason = 0;
     if (scale < 1) scale = 1;
     scale = psx_gl_clamp_full_vram_scale(scale, GL_MAX_INTERNAL_SCALE, s_gl_max_dim,

@@ -23,7 +23,7 @@
  * Audio cards, the in-game menu). The title's game.toml [video] / [audio] keys
  * stay its BASELINE: each enabled option replaces its part, and an option
  * left at "Game default" keeps the baseline value. Internal Resolution starts
- * enabled at fixed 4x; disabling it selects native resolution with dynamic
+ * enabled at fixed 3x; disabling it selects native resolution with dynamic
  * resolution off. The other mods leave the baseline unchanged when disabled
  * (docs/MOD_PACKAGES.md "Built-in host enhancements").
  *
@@ -104,7 +104,7 @@ typedef struct PsxHostResolution {
 #define PSX_HOST_ENH_STRENGTH_DEFAULT 50
 #define PSX_HOST_ENH_REWIND_DEPTH_DEFAULT 50
 #define PSX_HOST_ENH_REWIND_INTERVAL_DEFAULT 15
-#define PSX_HOST_ENH_RESOLUTION_DEFAULT PSX_IR_SCALE(4)
+#define PSX_HOST_ENH_RESOLUTION_DEFAULT PSX_IR_SCALE(3)
 
 /* The effective look: the baseline, with every part an enabled mod names
  * replaced. Pure. */
@@ -140,7 +140,7 @@ static inline PsxHostLook psx_host_enh_resolve(const PsxHostLook* baseline,
 static inline PsxHostResolution psx_host_enh_resolve_resolution(
         const PsxHostResolution* baseline, const PsxHostEnhRequests* req) {
     /* Off is the native reference; an explicitly saved Game default still
-     * opts into the title baseline. Fresh enabled profiles select fixed 4x. */
+     * opts into the title baseline. Fresh enabled profiles select fixed 3x. */
     PsxHostResolution out = {PSX_IR_NATIVE, 0};
     if (req->resolution) {
         out = *baseline;
@@ -194,7 +194,7 @@ int psx_host_enh_parse_fmv_filter(const char* text);    /* default nearest bilin
 int psx_host_enh_parse_rewind_depth(const char* text);  /* "50" "100" "150" "200" */
 int psx_host_enh_parse_rewind_interval(const char* text);/* "1" "4" "8" "12" "15" */
 /* "default" -> PSX_IR_UNSET; fixed 1x..32x and legacy height ids are retained.
- * Missing/unknown option text uses the shared 4x default. */
+ * Missing/unknown option text uses the shared 3x default. */
 int psx_host_enh_parse_internal_resolution(const char* text);
 
 #ifdef __cplusplus

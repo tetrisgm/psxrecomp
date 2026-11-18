@@ -1497,6 +1497,7 @@ static void apply_internal_resolution(int display_px_h) {
     if (preset == PSX_IR_UNSET) return;
     g_video_scale = psx_resolve_internal_scale_ss_cap(preset, g_video_ref_lines,
         display_px_h, video_scale_ceiling(), display_supersample(nullptr), g_video_match_max_lines);
+    if (psx_mod_attract_background() && g_video_scale > 1) --g_video_scale;
 }
 
 static std::string   g_bezel_path;      /* mod-owned OpenGL margin artwork */
@@ -17856,6 +17857,13 @@ static void recomp_overlay_detach(void) {
 }
 
 static void host_pause_service(void) {
+    static int last_background = 0;
+    const int background = psx_mod_attract_background();
+    if (background != last_background && g_gl_active &&
+        gl_renderer_internal_scale_live_capable()) {
+        if (video_resolution_apply_live(g_video_internal_res, g_video_dynres, g_video_ss_milli))
+            last_background = background;
+    }
     if (!g_ovl_on) return;
     mh_refresh_snapshot();
     if (g_ovl_state_inflight) {
@@ -21748,7 +21756,8 @@ session_reboot:
         /* Live A/B keys: allocate the surfaces at the Match display scale
          * (the ceiling) so key 1 can step the internal scale at run time,
          * then start at the configured scale with the controller off. */
-        const bool dbg_live_scale = debug_toggles_on() && g_video_scale_applies;
+        const bool dbg_live_scale = debug_toggles_on() && g_video_scale_applies &&
+                                    !netplay_cpu_auth_gpu();
         const int dbg_start_scale = g_video_requested_scale > 0 ? g_video_requested_scale : 1;
         if (dbg_live_scale) {
             const int ds = psx_resolve_internal_scale(

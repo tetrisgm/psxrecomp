@@ -2,6 +2,9 @@
  * fixture links the real session adapter instead. */
 /* These renderer fixtures also run without a trusted title profile. */
 static int test_title_profile_active, test_title_profile_banks;
+static int test_local_view_only, test_attract_background;
+int psx_mod_attract_background(void) { return test_attract_background; }
+int gpu_ws_local_view_only(void) { return test_local_view_only; }
 int psx_mod_netplay_is_active(void) { return test_title_profile_active; }
 int psx_mod_netplay_requires_texture_banks(void) { return test_title_profile_banks; }
 #ifndef PSX_TEST_HD_TEXTURE_PACK
