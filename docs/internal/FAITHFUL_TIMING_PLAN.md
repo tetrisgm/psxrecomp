@@ -255,6 +255,17 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+2026-11-17 R4 direct-IP audit: discard queued provider exit requests after
+draw callbacks have stopped and the provider is detached. The runtime lobby
+pump and draw thread can both request a transition; an old request must not
+exit the newly booted session. Mac Release, 47 title tests, 19 launcher tests
+and actual-race smoke pass. Mac/Windows direct-start gameplay, independent
+inputs and retire/results/title/menu return pass with 345 matching shared core
+digests and zero dispatch/segment misses. Windows used the preceding engine
+binary because Smart App Control blocked the rebuilt executable; the integrated
+lobby-start fix is not yet end-to-end qualified. PGXP geometry/texture/CPU
+tracking forced on for gameplay. R4 report: docs/recovery/DIRECT_IP_AUDIT_20261117.md.
+
 2026-11-16 controller regression coverage: opt-in TCP `virtual_pad` attaches an
 SDL gamepad, optionally selects it for P1 without saving preferences, and
 restores the previous seat when detached. `controller_status` exposes the

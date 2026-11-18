@@ -17844,6 +17844,12 @@ static void recomp_overlay_detach(void) {
     g_ovl_state_inflight = false;
     g_ovl_state_result = 1;
     if (g_ovl->detach) g_ovl->detach(g_ovl->ctx);
+    /* Both the runtime's lobby pump and the provider can request the same
+     * transition. The render callback may post its request after the main
+     * thread has consumed the first one. With draws stopped and the provider
+     * detached, discard requests owned by this session before attaching the
+     * next one; otherwise its first service call immediately exits again. */
+    g_ovl_exit = 0;
     g_ovl = nullptr;
     g_ovl_on = false;
     psx_runtime_menu_set_fallback_enabled(1);
