@@ -24,6 +24,11 @@
  */
 #include "crc32.h"
 #include <stddef.h>
+#if defined(__ARM_FEATURE_CRC32) && defined(__aarch64__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#include <arm_acle.h>
+#include <string.h>
+#define PSX_CRC32_ARM 1
+#endif
 
 static uint32_t s_table[256];
 static int      s_table_ready = 0;
@@ -66,12 +71,24 @@ static void crc32_init_table8(void) {
  * non-contiguous code ranges) be computed without concatenating into a temp
  * buffer, and matches crc32_compute over the concatenation of the same bytes.
  *
- * Bytes are read individually (data[0]..data[7]), not via a reinterpreted
- * 32-bit load, so this has no dependency on host byte order or pointer
- * alignment — the slicing speedup comes from breaking the serial
- * crc-depends-on-previous-crc chain, not from fewer loads, so there is
- * nothing to gain from a wider load here and real portability to lose. */
+ * The portable slicing path reads bytes individually. On little-endian ARM64
+ * targets advertising CRC32 instructions, use the equivalent IEEE operation;
+ * memcpy keeps its eight-byte loads valid for unaligned input.
+ */
 uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+#ifdef PSX_CRC32_ARM
+    /* IEEE CRC32 instructions (not CRC32C). memcpy permits unaligned input;
+     * the compile-time architecture feature guarantees instruction support. */
+    while (len >= 8) {
+        uint64_t word;
+        memcpy(&word, data, sizeof word);
+        crc = __crc32d(crc, word);
+        data += 8;
+        len -= 8;
+    }
+    while (len--) crc = __crc32b(crc, *data++);
+    return crc;
+#else
     if (!s_table_ready) crc32_init_table();
     if (!s_table8_ready) crc32_init_table8();
 
@@ -88,6 +105,7 @@ uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
     while (len--)
         crc = s_table[(crc ^ *data++) & 0xFFu] ^ (crc >> 8);
     return crc;
+#endif
 }
 
 uint32_t crc32_compute(const uint8_t *data, size_t len) {
