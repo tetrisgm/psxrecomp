@@ -17208,6 +17208,114 @@ namespace {
         g_rui_config_ini_path = (exe / "config.ini").string();
     }
 
+    void ae_init_launcher_netplay(RecompLauncherCGameInfo* gi, int game_players_n)
+    {
+#if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+        g_lnch_game_players = game_players_n;
+        /* ae_disc_verify only fills netplay_ok/disc_fp when this is true. */
+        g_lnch_netplay_available =
+            game_players_n >= 2 && game_players_n <= PSX_MAX_PLAYERS;
+        gi->netplay_supported = g_lnch_netplay_available ? 1 : 0;
+        /* Append-only members past the positional initializer. */
+#if defined(RECOMP_LAUNCHER_HAS_NETPLAY_HANDOFF)
+        g_lnch_netplay_callbacks.ingest_launch = ae_np_ingest_launch;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_HOST_RELAY)
+        g_lnch_netplay_callbacks.relay_host_get = ae_np_relay_host_get;
+        g_lnch_netplay_callbacks.relay_host_set = ae_np_relay_host_set;
+        g_lnch_netplay_callbacks.relay_status = ae_np_relay_status;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_HOST_RELAY_ICE)
+        g_lnch_netplay_callbacks.relay_via_ice_get = ae_np_relay_via_ice_get;
+        g_lnch_netplay_callbacks.relay_via_ice_set = ae_np_relay_via_ice_set;
+#endif
+        g_lnch_netplay_callbacks.memcard_offer_set = ae_np_memcard_offer_set;
+        g_lnch_netplay_callbacks.guest_memcard_get = ae_np_guest_memcard_get;
+        g_lnch_netplay_callbacks.guest_memcard_set = ae_np_guest_memcard_set;
+        g_lnch_netplay_callbacks.chat_send = ae_np_chat_send;
+        g_lnch_netplay_callbacks.chat_count = ae_np_chat_count;
+        g_lnch_netplay_callbacks.chat_get = ae_np_chat_get;
+        g_lnch_netplay_callbacks.host_can_spectate = ae_np_host_can_spectate;
+        g_lnch_netplay_callbacks.online_count = ae_np_online_count;
+        g_lnch_netplay_callbacks.online_get = ae_np_online_get;
+        g_lnch_netplay_callbacks.server_chat_send = ae_np_server_chat_send;
+        g_lnch_netplay_callbacks.server_chat_count = ae_np_server_chat_count;
+        g_lnch_netplay_callbacks.server_chat_get = ae_np_server_chat_get;
+#if defined(RECOMP_LAUNCHER_HAS_ACCOUNT)
+        /* Optional Discord sign-in. Guarded on the launcher ABI macro so this
+         * runtime still builds against a recomp-ui that predates it -- the UI
+         * and the runner can land in either order. */
+        g_lnch_netplay_callbacks.account_available = ae_np_account_available;
+        g_lnch_netplay_callbacks.account_login_begin = ae_np_account_login_begin;
+        g_lnch_netplay_callbacks.account_state = ae_np_account_state;
+        g_lnch_netplay_callbacks.account_handle = ae_np_account_handle;
+        g_lnch_netplay_callbacks.account_username = ae_np_account_username;
+        g_lnch_netplay_callbacks.account_error = ae_np_account_error;
+        g_lnch_netplay_callbacks.account_sign_out = ae_np_account_sign_out;
+        g_lnch_netplay_callbacks.account_set_handle = ae_np_account_set_handle;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
+        g_lnch_netplay_callbacks.list_scope_set = ae_np_list_scope_set;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
+        g_lnch_netplay_callbacks.chat_report = ae_np_chat_report;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_SET_BLOCKS)
+        g_lnch_netplay_callbacks.set_blocks = ae_np_set_blocks;
+#endif
+#if defined(RECOMP_LAUNCHER_HAS_AUTOMATCH)
+        /* Server-run pairing. Same guard discipline as the account block:
+         * the runner and the UI land in either order. */
+        g_lnch_netplay_callbacks.automatch_available = ae_np_automatch_available;
+        g_lnch_netplay_callbacks.automatch_ruleset_count = ae_np_automatch_ruleset_count;
+        g_lnch_netplay_callbacks.automatch_ruleset_get = ae_np_automatch_ruleset_get;
+        g_lnch_netplay_callbacks.automatch_queue = ae_np_automatch_queue;
+        g_lnch_netplay_callbacks.automatch_cancel = ae_np_automatch_cancel;
+        g_lnch_netplay_callbacks.automatch_state = ae_np_automatch_state;
+        g_lnch_netplay_callbacks.automatch_queued_secs = ae_np_automatch_queued_secs;
+        g_lnch_netplay_callbacks.automatch_pool = ae_np_automatch_pool;
+        g_lnch_netplay_callbacks.automatch_found_get = ae_np_automatch_found_get;
+        g_lnch_netplay_callbacks.automatch_accept = ae_np_automatch_accept;
+        g_lnch_netplay_callbacks.automatch_error = ae_np_automatch_error;
+#endif
+        g_lnch_netplay_callbacks.seat_move_self = ae_np_seat_move_self;
+        g_lnch_netplay_callbacks.seat_swap_request = ae_np_seat_swap_request;
+        g_lnch_netplay_callbacks.seat_swap_incoming = ae_np_seat_swap_incoming;
+        g_lnch_netplay_callbacks.seat_swap_respond = ae_np_seat_swap_respond;
+        g_lnch_netplay_callbacks.seat_swap_outgoing = ae_np_seat_swap_outgoing;
+        g_lnch_netplay_callbacks.seat_swap_clear = ae_np_seat_swap_clear;
+        g_lnch_netplay_callbacks.allow_spectators_get = ae_np_allow_spectators_get;
+        g_lnch_netplay_callbacks.allow_spectators_set = ae_np_allow_spectators_set;
+        g_lnch_netplay_callbacks.lobby_allow_spectators = ae_np_lobby_allow_spectators;
+        g_lnch_netplay_callbacks.lobby_max_spectators = ae_np_lobby_max_spectators;
+        g_lnch_netplay_callbacks.lobby_spectator_count = ae_np_lobby_spectator_count;
+        g_lnch_netplay_callbacks.local_is_spectator = ae_np_local_is_spectator;
+        g_lnch_netplay_callbacks.spectator_slot = ae_np_spectator_slot;
+        /* Lobby mod-plan callbacks exist only for content-negotiation titles. */
+        if (g_netplay_content_negotiation) {
+            g_lnch_netplay_callbacks.need_mods_count = ae_np_need_mods_count;
+            g_lnch_netplay_callbacks.need_mods_get = ae_np_need_mods_get;
+            g_lnch_netplay_callbacks.need_mods_can_transfer = ae_np_need_mods_can_transfer;
+            g_lnch_netplay_callbacks.mod_xfer_start = ae_np_mod_xfer_start;
+            g_lnch_netplay_callbacks.mod_xfer_cancel = ae_np_mod_xfer_cancel;
+            g_lnch_netplay_callbacks.mod_xfer_progress = ae_np_mod_xfer_progress;
+            g_lnch_netplay_callbacks.mod_xfer_failed = ae_np_mod_xfer_failed;
+            g_lnch_netplay_callbacks.push_match_caps = ae_np_push_match_caps_cb;
+            g_lnch_netplay_callbacks.lobby_mods_count = ae_np_lobby_mods_count;
+            g_lnch_netplay_callbacks.lobby_mods_get = ae_np_lobby_mods_get;
+            g_lnch_netplay_callbacks.lobby_mods_missing = ae_np_lobby_mods_missing;
+            g_lnch_netplay_callbacks.lobby_mods_download = ae_np_lobby_mods_download;
+            g_lnch_netplay_callbacks.lobby_mods_can_download = ae_np_lobby_mods_can_download;
+        }
+        gi->netplay = g_lnch_netplay_available
+            ? &g_lnch_netplay_callbacks : nullptr;
+#else
+        g_lnch_netplay_available = false;
+        gi->netplay_supported = 0;
+        gi->netplay = nullptr;
+#endif
+    }
+
     void ae_fill_psx_launcher_game_info(
         RecompLauncherCGameInfo* gi,
         const char* game_name_c,
@@ -17325,110 +17433,7 @@ namespace {
          * lifetime; "" when the build shipped no PNG, which recomp-ui treats
          * as "leave the toolkit default". */
         gi->window_icon_path = psx_window_icon_path(g_lnch_argv0);
-#if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
-        g_lnch_game_players = game_players_n;
-        /* ae_disc_verify only fills netplay_ok/disc_fp when this is true. */
-        g_lnch_netplay_available =
-            game_players_n >= 2 && game_players_n <= PSX_MAX_PLAYERS;
-        gi->netplay_supported = g_lnch_netplay_available ? 1 : 0;
-        /* Append-only members past the positional initializer. */
-#if defined(RECOMP_LAUNCHER_HAS_NETPLAY_HANDOFF)
-        g_lnch_netplay_callbacks.ingest_launch = ae_np_ingest_launch;
-#endif
-#if defined(RECOMP_LAUNCHER_HAS_HOST_RELAY)
-        g_lnch_netplay_callbacks.relay_host_get = ae_np_relay_host_get;
-        g_lnch_netplay_callbacks.relay_host_set = ae_np_relay_host_set;
-        g_lnch_netplay_callbacks.relay_status = ae_np_relay_status;
-#endif
-#if defined(RECOMP_LAUNCHER_HAS_HOST_RELAY_ICE)
-        g_lnch_netplay_callbacks.relay_via_ice_get = ae_np_relay_via_ice_get;
-        g_lnch_netplay_callbacks.relay_via_ice_set = ae_np_relay_via_ice_set;
-#endif
-        g_lnch_netplay_callbacks.memcard_offer_set = ae_np_memcard_offer_set;
-        g_lnch_netplay_callbacks.guest_memcard_get = ae_np_guest_memcard_get;
-        g_lnch_netplay_callbacks.guest_memcard_set = ae_np_guest_memcard_set;
-        g_lnch_netplay_callbacks.chat_send = ae_np_chat_send;
-        g_lnch_netplay_callbacks.chat_count = ae_np_chat_count;
-        g_lnch_netplay_callbacks.chat_get = ae_np_chat_get;
-        g_lnch_netplay_callbacks.host_can_spectate = ae_np_host_can_spectate;
-        g_lnch_netplay_callbacks.online_count = ae_np_online_count;
-        g_lnch_netplay_callbacks.online_get = ae_np_online_get;
-        g_lnch_netplay_callbacks.server_chat_send = ae_np_server_chat_send;
-        g_lnch_netplay_callbacks.server_chat_count = ae_np_server_chat_count;
-        g_lnch_netplay_callbacks.server_chat_get = ae_np_server_chat_get;
-#if defined(RECOMP_LAUNCHER_HAS_ACCOUNT)
-        /* Optional Discord sign-in. Guarded on the launcher ABI macro so this
-         * runtime still builds against a recomp-ui that predates it -- the UI
-         * and the runner can land in either order. */
-        g_lnch_netplay_callbacks.account_available = ae_np_account_available;
-        g_lnch_netplay_callbacks.account_login_begin = ae_np_account_login_begin;
-        g_lnch_netplay_callbacks.account_state = ae_np_account_state;
-        g_lnch_netplay_callbacks.account_handle = ae_np_account_handle;
-        g_lnch_netplay_callbacks.account_username = ae_np_account_username;
-        g_lnch_netplay_callbacks.account_error = ae_np_account_error;
-        g_lnch_netplay_callbacks.account_sign_out = ae_np_account_sign_out;
-        g_lnch_netplay_callbacks.account_set_handle = ae_np_account_set_handle;
-#endif
-#if defined(RECOMP_LAUNCHER_HAS_LIST_SCOPE)
-        g_lnch_netplay_callbacks.list_scope_set = ae_np_list_scope_set;
-#endif
-#if defined(RECOMP_LAUNCHER_HAS_CHAT_REPORT)
-        g_lnch_netplay_callbacks.chat_report = ae_np_chat_report;
-#endif
-#if defined(RECOMP_LAUNCHER_HAS_SET_BLOCKS)
-        g_lnch_netplay_callbacks.set_blocks = ae_np_set_blocks;
-#endif
-#if defined(RECOMP_LAUNCHER_HAS_AUTOMATCH)
-        /* Server-run pairing. Same guard discipline as the account block:
-         * the runner and the UI land in either order. */
-        g_lnch_netplay_callbacks.automatch_available = ae_np_automatch_available;
-        g_lnch_netplay_callbacks.automatch_ruleset_count = ae_np_automatch_ruleset_count;
-        g_lnch_netplay_callbacks.automatch_ruleset_get = ae_np_automatch_ruleset_get;
-        g_lnch_netplay_callbacks.automatch_queue = ae_np_automatch_queue;
-        g_lnch_netplay_callbacks.automatch_cancel = ae_np_automatch_cancel;
-        g_lnch_netplay_callbacks.automatch_state = ae_np_automatch_state;
-        g_lnch_netplay_callbacks.automatch_queued_secs = ae_np_automatch_queued_secs;
-        g_lnch_netplay_callbacks.automatch_pool = ae_np_automatch_pool;
-        g_lnch_netplay_callbacks.automatch_found_get = ae_np_automatch_found_get;
-        g_lnch_netplay_callbacks.automatch_accept = ae_np_automatch_accept;
-        g_lnch_netplay_callbacks.automatch_error = ae_np_automatch_error;
-#endif
-        g_lnch_netplay_callbacks.seat_move_self = ae_np_seat_move_self;
-        g_lnch_netplay_callbacks.seat_swap_request = ae_np_seat_swap_request;
-        g_lnch_netplay_callbacks.seat_swap_incoming = ae_np_seat_swap_incoming;
-        g_lnch_netplay_callbacks.seat_swap_respond = ae_np_seat_swap_respond;
-        g_lnch_netplay_callbacks.seat_swap_outgoing = ae_np_seat_swap_outgoing;
-        g_lnch_netplay_callbacks.seat_swap_clear = ae_np_seat_swap_clear;
-        g_lnch_netplay_callbacks.allow_spectators_get = ae_np_allow_spectators_get;
-        g_lnch_netplay_callbacks.allow_spectators_set = ae_np_allow_spectators_set;
-        g_lnch_netplay_callbacks.lobby_allow_spectators = ae_np_lobby_allow_spectators;
-        g_lnch_netplay_callbacks.lobby_max_spectators = ae_np_lobby_max_spectators;
-        g_lnch_netplay_callbacks.lobby_spectator_count = ae_np_lobby_spectator_count;
-        g_lnch_netplay_callbacks.local_is_spectator = ae_np_local_is_spectator;
-        g_lnch_netplay_callbacks.spectator_slot = ae_np_spectator_slot;
-        /* Lobby mod-plan callbacks exist only for content-negotiation titles. */
-        if (g_netplay_content_negotiation) {
-            g_lnch_netplay_callbacks.need_mods_count = ae_np_need_mods_count;
-            g_lnch_netplay_callbacks.need_mods_get = ae_np_need_mods_get;
-            g_lnch_netplay_callbacks.need_mods_can_transfer = ae_np_need_mods_can_transfer;
-            g_lnch_netplay_callbacks.mod_xfer_start = ae_np_mod_xfer_start;
-            g_lnch_netplay_callbacks.mod_xfer_cancel = ae_np_mod_xfer_cancel;
-            g_lnch_netplay_callbacks.mod_xfer_progress = ae_np_mod_xfer_progress;
-            g_lnch_netplay_callbacks.mod_xfer_failed = ae_np_mod_xfer_failed;
-            g_lnch_netplay_callbacks.push_match_caps = ae_np_push_match_caps_cb;
-            g_lnch_netplay_callbacks.lobby_mods_count = ae_np_lobby_mods_count;
-            g_lnch_netplay_callbacks.lobby_mods_get = ae_np_lobby_mods_get;
-            g_lnch_netplay_callbacks.lobby_mods_missing = ae_np_lobby_mods_missing;
-            g_lnch_netplay_callbacks.lobby_mods_download = ae_np_lobby_mods_download;
-            g_lnch_netplay_callbacks.lobby_mods_can_download = ae_np_lobby_mods_can_download;
-        }
-        gi->netplay = g_lnch_netplay_available
-            ? &g_lnch_netplay_callbacks : nullptr;
-#else
-        g_lnch_netplay_available = false;
-        gi->netplay_supported = 0;
-        gi->netplay = nullptr;
-#endif
+        ae_init_launcher_netplay(gi, game_players_n);
         gi->resume_netplay_room = resume_netplay_room ? 1 : 0;
 #if defined(PSX_HAS_LOBBY_CLIENT)
         gi->resume_netplay_endpoint =
@@ -19706,6 +19711,20 @@ int main(int argc, char** argv) {
     }
 
 #if defined(RECOMP_LAUNCHER)
+    // The in-game menu also needs these callbacks when preboot UI is skipped.
+    // Initialize shared services independently of opening a launcher window.
+    g_lnch_expected_serial = game_id;
+    g_lnch_expected_crc = game_disc_crc;
+    g_lnch_has_crc = game_has_disc_crc;
+    g_lnch_argv0 = argv[0];
+    {
+        RecompLauncherCGameInfo services{};
+        ae_init_launcher_netplay(&services, game_players);
+    }
+#if defined(PSX_HAS_RECOMP_NET) && defined(PSX_HAS_LOBBY_CLIENT)
+    g_lnch_netplay_game_name = game_name.empty() ? "PSX" : game_name;
+    psx_lobby_set_max_slots(game_players);
+#endif
     /* Noninteractive acceptance of the real launcher callback AFTER config
      * resolution. Regional routing probes intentionally return before here. */
     if (cli_launcher_disc_check) {

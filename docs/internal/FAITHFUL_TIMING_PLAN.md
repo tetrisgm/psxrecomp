@@ -7,6 +7,13 @@ auto-memory ([[psxrecomp-build-faithful-core-not-hacks]],
 
 ---
 
+## 2026-11-17 integrated menu service initialization
+
+Initialize launcher networking callbacks and disc identity even when the separate
+preboot window is skipped. The integrated home menu otherwise has no online
+capability despite a network-enabled build. Release build and 47 R4 CTests pass;
+visual lobby qualification continues in the title's menu audit. No timing-core change.
+
 ## 2026-11-17 textured mask maintenance
 
 Keep stencil mask bits current during textured draws instead of rebuilding
