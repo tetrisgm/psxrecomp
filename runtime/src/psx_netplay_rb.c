@@ -493,17 +493,16 @@ static uint32_t g_platform_kf_stream_count;
 /* §115: tip+1 fork accepted (HC primed past it) — refuse re-heal/stream. */
 static uint32_t g_platform_accepted_fork;
 
-/* §100: recent FMV media snap CRCs — prefer choose_load ticks we already
- * sealed, and let probe_match confirm without a ring edge-case miss. */
-#define RB_MEDIA_CRC_RING 32u
-typedef struct RbMediaCrc {
+/* Recent media snapshots eligible for choose_load. Only membership is used
+ * here; full snapshot checksums are computed and verified by MEDIA-KF probes.
+ * Do not hash every live snapshot while XA music is playing. */
+#define RB_MEDIA_SNAP_RING 32u
+typedef struct RbMediaSnap {
     uint32_t tick;
-    uint32_t size;
-    uint32_t crc;
-} RbMediaCrc;
-static RbMediaCrc g_media_crc[RB_MEDIA_CRC_RING];
-static uint32_t g_media_crc_head;
-static uint32_t g_media_crc_n;
+} RbMediaSnap;
+static RbMediaSnap g_media_snap[RB_MEDIA_SNAP_RING];
+static uint32_t g_media_snap_head;
+static uint32_t g_media_snap_n;
 /* Highest FMV media tick whose CRC was probe-matched (peer aligned). */
 static uint32_t g_media_crc_peer_match_through;
 
@@ -1403,43 +1402,33 @@ static int rb_in_fmv_lockstep_window(void)
     return sim < g_fmv_lockstep_until;
 }
 
-static void rb_media_crc_note(uint32_t tick, uint32_t size, uint32_t crc)
+static void rb_media_snap_note(uint32_t tick, uint32_t size)
 {
-    RbMediaCrc *e;
+    RbMediaSnap *e;
     uint32_t i;
     if (tick == 0u || size == 0u)
         return;
-    for (i = 0; i < g_media_crc_n && i < RB_MEDIA_CRC_RING; ++i) {
-        uint32_t idx = (g_media_crc_head + RB_MEDIA_CRC_RING - 1u - i) %
-                       RB_MEDIA_CRC_RING;
-        if (g_media_crc[idx].tick == tick) {
-            g_media_crc[idx].size = size;
-            g_media_crc[idx].crc = crc;
+    for (i = 0; i < g_media_snap_n && i < RB_MEDIA_SNAP_RING; ++i) {
+        uint32_t idx = (g_media_snap_head + RB_MEDIA_SNAP_RING - 1u - i) %
+                       RB_MEDIA_SNAP_RING;
+        if (g_media_snap[idx].tick == tick) {
             return;
         }
     }
-    e = &g_media_crc[g_media_crc_head % RB_MEDIA_CRC_RING];
+    e = &g_media_snap[g_media_snap_head % RB_MEDIA_SNAP_RING];
     e->tick = tick;
-    e->size = size;
-    e->crc = crc;
-    g_media_crc_head = (g_media_crc_head + 1u) % RB_MEDIA_CRC_RING;
-    if (g_media_crc_n < RB_MEDIA_CRC_RING)
-        g_media_crc_n++;
+    g_media_snap_head = (g_media_snap_head + 1u) % RB_MEDIA_SNAP_RING;
+    if (g_media_snap_n < RB_MEDIA_SNAP_RING)
+        g_media_snap_n++;
 }
 
-static int rb_media_crc_lookup(uint32_t tick, uint32_t *size_out, uint32_t *crc_out)
+static int rb_media_snap_known(uint32_t tick)
 {
-    uint32_t i;
-    for (i = 0; i < g_media_crc_n && i < RB_MEDIA_CRC_RING; ++i) {
-        uint32_t idx = (g_media_crc_head + RB_MEDIA_CRC_RING - 1u - i) %
-                       RB_MEDIA_CRC_RING;
-        if (g_media_crc[idx].tick == tick) {
-            if (size_out)
-                *size_out = g_media_crc[idx].size;
-            if (crc_out)
-                *crc_out = g_media_crc[idx].crc;
+    for (uint32_t i = 0; i < g_media_snap_n && i < RB_MEDIA_SNAP_RING; ++i) {
+        uint32_t idx = (g_media_snap_head + RB_MEDIA_SNAP_RING - 1u - i) %
+                       RB_MEDIA_SNAP_RING;
+        if (g_media_snap[idx].tick == tick)
             return 1;
-        }
     }
     return 0;
 }
@@ -3868,7 +3857,7 @@ static int choose_load_tick_inner(uint32_t mismatch, uint32_t *out_load)
         }
     }
     /* §99/§100: tip-slack with FMV media interval when MEDIA_KF covers the
-     * bout. Prefer ticks whose CRC we already cached (peer more likely to
+     * bout. Prefer recorded media snapshot ticks (peer more likely to
      * hash-match and skip the 3.7 MB xfer). */
     if (rb_want_heal_kf(mismatch, mismatch > 0u ? mismatch - 1u : 0u) &&
         mismatch > 0u) {
@@ -3882,8 +3871,7 @@ static int choose_load_tick_inner(uint32_t mismatch, uint32_t *out_load)
             mcap -= (mcap % miv);
         for (;;) {
             if (netplay_snap_ring_has(g_snaps, mcap)) {
-                uint32_t csz = 0, ccrc = 0;
-                if (rb_media_crc_lookup(mcap, &csz, &ccrc) ||
+                if (rb_media_snap_known(mcap) ||
                     (g_media_crc_peer_match_through > 0u &&
                      mcap <= g_media_crc_peer_match_through)) {
                     *out_load = mcap;
@@ -6328,6 +6316,15 @@ static void schedule_episode_rereplay(uint32_t prefer_plus_one)
      * reloaded live 3013, initiator replayed 3017; POST diverge). */
     if (rnet_rb_get_phase(g_rb) == nRNetRbPhaseReplay && g_episode_snap_applied &&
         !g_pending_load_valid && sess() && rnet_session_sim_tick(sess()) <= prefer) {
+        /* The unchanged prefix can keep running, but FRAME_COMMITs for
+         * the changed suffix still belong to the previous sealed history.
+         * Apply the same confirmation reset as a reloaded rereplay; otherwise
+         * a faster follower compares against the initiator's obsolete hash
+         * while the initiator is still replaying the replacement inputs. */
+        const uint32_t sim = rnet_session_sim_tick(sess());
+        if (g_b.hc)
+            netplay_hc_prime_after(g_b.hc, sim ? sim - 1u : 0u);
+        g_tip_extend_prime_tick = prefer;
         fprintf(stderr,
                 "psxrecomp: rb tip-extend continue replay at sim=%u (prefer=%u "
                 "target=%u, nothing to redo)\n",
@@ -6670,10 +6667,10 @@ void psx_netplay_rb_shutdown(void)
     g_fmv_media_hi = 0;
     g_fmv_unmatched_desync = 0;
     g_fmv_unmatched_desync_arm_sim = 0;
-    g_media_crc_head = 0;
-    g_media_crc_n = 0;
+    g_media_snap_head = 0;
+    g_media_snap_n = 0;
     g_media_crc_peer_match_through = 0;
-    memset(g_media_crc, 0, sizeof(g_media_crc));
+    memset(g_media_snap, 0, sizeof(g_media_snap));
     g_resim_diverge_tick = 0;
     g_resim_diverge_streak = 0;
     g_bl_mismatch_streak = 0;
@@ -7320,14 +7317,13 @@ void psx_netplay_rb_poll(struct CPUState *cpu_in, uint32_t resume_pc)
                 if (g_rb && rnet_rb_is_resimulating(g_rb) &&
                     g_pending_save_tick > g_auth_snap_through)
                     g_auth_snap_through = g_pending_save_tick;
-                /* §100: cache FMV media snap CRC for later MEDIA-KF probe. */
+                /* Remember media eligibility; hash only when a probe needs it. */
                 if (rb_fmv_media_active()) {
                     size_t sz = 0;
                     const uint8_t *p = netplay_snap_ring_peek(
                         g_snaps, g_pending_save_tick, &sz);
                     if (p && sz)
-                        rb_media_crc_note(g_pending_save_tick, (uint32_t)sz,
-                                          rnet_checksum(p, sz));
+                        rb_media_snap_note(g_pending_save_tick, (uint32_t)sz);
                 }
                 g_pending_save_valid = 0;
                 s_snap_fail_logged = 0;
@@ -7470,8 +7466,8 @@ int psx_netplay_rb_media_kf_probe_match(uint32_t size, uint32_t crc)
     got = rnet_checksum(p, sz);
     if (got != crc)
         return 0;
-    /* §100: refresh CRC ring + peer-match watermark (skip xfer). */
-    rb_media_crc_note(load, size, got);
+    /* Refresh eligibility and the verified peer-match watermark. */
+    rb_media_snap_note(load, size);
     if (!rb_media_kf_seal_local(load))
         return 0;
     if (load > g_media_crc_peer_match_through)
