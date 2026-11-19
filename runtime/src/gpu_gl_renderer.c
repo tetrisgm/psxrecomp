@@ -2579,16 +2579,8 @@ static int coverage_fast_enabled(void) {
     return enabled;
 }
 
-static float s_pgxp_depth_tol = -1.0f;
-static float pgxp_depth_tol(void) {
-    if (s_pgxp_depth_tol < 0.0f) {
-        const char *e = getenv("PSX_PGXP_DEPTH_TOL");
-        s_pgxp_depth_tol = e && *e ? (float)atof(e) : 0.02f;
-        if (s_pgxp_depth_tol < 0.0f) s_pgxp_depth_tol = 0.0f;
-        if (s_pgxp_depth_tol > 0.5f) s_pgxp_depth_tol = 0.5f;
-    }
-    return s_pgxp_depth_tol;
-}
+static float s_pgxp_depth_tol = 0.02f;   /* [video] pgxp_depth_tolerance */
+static float pgxp_depth_tol(void) { return s_pgxp_depth_tol; }
 static void depth_apply_ex(int mode, int tex) {
     if (mode == 0) return;
     glEnable(GL_DEPTH_TEST);
@@ -3609,6 +3601,9 @@ void gl_renderer_set_pgxp_seam(int mode) {
     pgxp_render_wanted_update();
 }
 int  gl_renderer_get_pgxp_seam(void) { return s_pgxp_seam; }
+void gl_renderer_set_pgxp_depth_tolerance(float tol) {
+    GL_RT_SYNC("set_pgxp_depth_tolerance");
+    s_pgxp_depth_tol = tol < 0.0f ? 0.0f : tol > 0.5f ? 0.5f : tol; }
 void gl_renderer_set_pgxp_depth_threshold(float sz) {
     GL_RT_SYNC("set_pgxp_depth_threshold"); s_pgxp_depth_threshold = sz; }
 void gl_renderer_pgxp_depth_clear_reasons(uint64_t out[5]) {

@@ -1392,6 +1392,7 @@ static int           g_video_dithering = 1;   /* [video] dithering / PSX_DITHERI
 static int           g_video_pgxp_color_correction = 0;
 static int           g_video_pgxp_seam = 0;
 static float         g_video_pgxp_depth_threshold = 4096.0f;
+static float         g_video_pgxp_depth_tolerance = 0.02f;
 /* [video] pgxp_mod_only (G1.12): the title ships PGXP through the
  * psx.enhancement.pgxp mod, which is then the one switch -- the [video]
  * geometry_correction / perspective_texturing / pgxp_cpu_mode values are not
@@ -18653,6 +18654,7 @@ int main(int argc, char** argv) {
             g_video_pgxp_color_correction = gc.runtime.video_pgxp_color_correction ? 1 : 0;
             g_video_pgxp_seam = gc.runtime.video_pgxp_seam;
             g_video_pgxp_depth_threshold = (float)gc.runtime.video_pgxp_depth_threshold;
+            g_video_pgxp_depth_tolerance = (float)gc.runtime.video_pgxp_depth_tolerance;
             g_video_renderer   = gc.runtime.video_renderer;
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_scanlines  = gc.runtime.video_scanlines;
@@ -21200,6 +21202,8 @@ session_reboot:
     gl_renderer_set_pgxp_seam(g_video_pgxp_seam);
     if (const char* e = std::getenv("PSX_PGXP_DEPTH_THRESHOLD")) g_video_pgxp_depth_threshold = (float)std::atof(e);
     gl_renderer_set_pgxp_depth_threshold(g_video_pgxp_depth_threshold);
+    if (const char* e = std::getenv("PSX_PGXP_DEPTH_TOL")) g_video_pgxp_depth_tolerance = (float)std::atof(e);
+    gl_renderer_set_pgxp_depth_tolerance(g_video_pgxp_depth_tolerance);
     /* [video] texture_window_batching A/B (same image, fewer GL draws). */
     if (const char* e = std::getenv("PSX_GL_TEXWIN_BATCH"))
         gl_renderer_set_texture_window_batching((*e && *e != '0') ? 1 : 0);

@@ -648,6 +648,11 @@ struct RuntimeConfig {
     bool                  video_pgxp_color_correction = false;
     int                   video_pgxp_seam = 0;
     double                video_pgxp_depth_threshold = 4096.0;
+    // pgxp_depth_tolerance: the colour pass's depth pull toward the camera,
+    // as a fraction of the distance (0..0.5, default 0.02). A later polygon
+    // within it wins as in painter order. Titles that hide geometry by draw
+    // order raise it so the depth buffer does not expose those faces.
+    double                video_pgxp_depth_tolerance = 0.02;
 
     // pgxp_mod_only: the title ships PGXP through the psx.enhancement.pgxp
     // mod (typically a default-on override of it), which is then the one

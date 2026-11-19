@@ -1266,7 +1266,8 @@ times a frame; without it far beams vanish behind the previous view's depth.
 no bias) cut R4's lane markings into the road: they are separate polygons
 drawn after it, a hair off its plane once SZ is quantised per vertex. A 3D
 batch is now two passes: the colour pass tests with its depth pulled toward
-the camera by 2% of the distance (`PSX_PGXP_DEPTH_TOL`) and writes no depth;
+the camera by 2% of the distance (`[video] pgxp_depth_tolerance`, env
+`PSX_PGXP_DEPTH_TOL`) and writes no depth;
 a colourless pass then writes the true depth. A later surface within the
 tolerance wins as in painter order; anything clearly behind stays occluded.
 Inside one batch the order is painter's. On slots 1-3 at 10x the image
@@ -1278,6 +1279,15 @@ nearer than SZ 1024 (`PSX_PGXP_DEPTH_NEAR`) now stay out of the depth buffer
 (painter order), the tolerance gains an absolute 48 SZ, and every displayed
 frame starts with a cleared depth buffer. Slots 1-4 at 10x: depth on vs off
 differ by 801 / 92 / 25 / 0 px, none in the tachometer area.
+
+**Draw-order-hidden faces.** Some titles hide a face by drawing a nearer
+surface after it, not by culling it: R4 draws wall-top faces before the wall
+front that covers them on the console. At the 2% tolerance the earlier,
+nearer face wins the depth test and shows as a dark wedge on the wall (GL
+only; the software renderer keeps painter order). R4 sets
+`pgxp_depth_tolerance = 0.5`: a later surface up to half the distance
+behind still wins, while far scenery (Max Detail's sections, the tunnel's
+overhead sign) stays occluded behind near walls.
 
 **Perspective-correct colour.** Gouraud colour on 3D triangles interpolates
 with 1/SZ (textured triangles with perspective UVs share their w).

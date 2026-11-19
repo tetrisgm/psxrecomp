@@ -485,7 +485,8 @@ static void test_pgxp_title_keys() {
     check(!gc.runtime.video_pgxp_mod_only,
           "pgxp_mod_only defaults OFF (unchanged behaviour)");
     check(!gc.runtime.video_pgxp_depth_buffer && !gc.runtime.video_pgxp_color_correction &&
-          gc.runtime.video_pgxp_seam == 0 && gc.runtime.video_pgxp_depth_threshold == 4096.0,
+          gc.runtime.video_pgxp_seam == 0 && gc.runtime.video_pgxp_depth_threshold == 4096.0 &&
+          gc.runtime.video_pgxp_depth_tolerance == 0.02,
           "PGXP renderer features default OFF (G1.14)");
     fs::remove(p);
 
@@ -494,10 +495,12 @@ static void test_pgxp_title_keys() {
         "pgxp_depth_buffer = true\n"
         "pgxp_color_correction = true\n"
         "pgxp_seam = \"wide\"\n"
-        "pgxp_depth_threshold = 2048.0\n");
+        "pgxp_depth_threshold = 2048.0\n"
+        "pgxp_depth_tolerance = 0.5\n");
     gc = PSXRecompV4::load_game_config(p);
     check(gc.runtime.video_pgxp_depth_buffer && gc.runtime.video_pgxp_color_correction &&
-          gc.runtime.video_pgxp_seam == 2 && gc.runtime.video_pgxp_depth_threshold == 2048.0,
+          gc.runtime.video_pgxp_seam == 2 && gc.runtime.video_pgxp_depth_threshold == 2048.0 &&
+          gc.runtime.video_pgxp_depth_tolerance == 0.5,
           "PGXP renderer keys are honoured");
     fs::remove(p);
 
